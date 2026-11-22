@@ -112,6 +112,7 @@ func (j *judge) group(name string) *model.Finding {
 
 // explain adds evidence to a package's explained group.
 func (j *judge) explain(name string, e model.Evidence) {
+	j.touch(name, e.Path)
 	j.attach(j.group(name), e, maxExplainedEvidence)
 }
 
@@ -120,6 +121,7 @@ func (j *judge) explain(name string, e model.Evidence) {
 // is what the change would rank as on its own; an exception never drops a
 // finding together with evidence more serious than the finding itself.
 func (j *judge) foldIntoPackage(name string, e model.Evidence, sev model.Severity) {
+	j.touch(name, e.Path)
 	if f := j.pkgFinding[name]; f != nil {
 		j.attach(f, e, maxEvidence)
 		if sev > j.foldedMax[f] {
@@ -403,7 +405,7 @@ func (j *judge) finishPackages() {
 			}
 			if f.Severity < model.SevBackdoor && ch.Pkg != nil {
 				f.Severity = model.SevBackdoor
-				f.Title = fmt.Sprintf("New package %s %s since the snapshot, with %d %s no trusted source has", name, ch.Pkg.New, len(unver), plural(len(unver), "program", "programs"))
+				f.Title = fmt.Sprintf("New package %s %s since the snapshot, with %d %s no trusted source confirmed", name, ch.Pkg.New, len(unver), plural(len(unver), "file", "files"))
 				f.Why = unverifiedWhy(unver)
 			}
 		}
@@ -424,6 +426,12 @@ func (j *judge) finishPackages() {
 			}
 			sort.Strings(reasons)
 			f.Evidence[0].After = strings.Join(append([]string{ch.Pkg.New}, reasons...), "; ")
+		}
+		// Package findings accept exactly the files they showed: the value names
+		// a digest of every (path, content) pair, so other content at the
+		// same version is a finding again.
+		if f != nil && len(f.Evidence) > 0 && (strings.HasPrefix(f.Key, "snap.pkg_upgraded:") || strings.HasPrefix(f.Key, "snap.pkg_installed:") || strings.HasPrefix(f.Key, "snap.pkg_downgraded:")) {
+			f.Evidence[0].After += "; files " + j.pkgDigest(name, ch.Kind == diff.PkgInstalled)
 		}
 	}
 	j.uncheckedPkgs = unchecked
@@ -504,10 +512,8 @@ func (j *judge) uncheckedNote() {
 		f.Why += fmt.Sprintf(" %d of the packages they belong to changed since the snapshot.", len(ids))
 	}
 	// The value an exception accepts names every changed package and
-	// version, and the exact set of files.
-	sort.Strings(paths)
-	sum := sha256.Sum256([]byte(strings.Join(paths, "\n")))
-	f.Evidence = []model.Evidence{{After: strings.Join(append(ids, "files "+hex.EncodeToString(sum[:])), "; "), Detail: files + " that could not be checked"}}
+	// version, and every file with its content.
+	f.Evidence = []model.Evidence{{After: strings.Join(append(ids, "files "+j.contentDigest(paths)), "; "), Detail: files + " that could not be checked"}}
 	for _, e := range items {
 		j.attach(f, e, maxEvidence)
 	}
@@ -532,10 +538,10 @@ func (j *judge) unexplain(name string, ch diff.Change, g *model.Finding, unver [
 		f.Severity = model.SevBackdoor
 		f.Why = unverifiedWhy(unver)
 		if installed {
-			f.Title = fmt.Sprintf("New package %s %s since the snapshot, with %d %s no trusted source has", name, pc.New, n, plural(n, "program", "programs"))
+			f.Title = fmt.Sprintf("New package %s %s since the snapshot, with %d %s no trusted source confirmed", name, pc.New, n, plural(n, "file", "files"))
 			f.Fix = fixPurge(name)
 		} else {
-			f.Title = fmt.Sprintf("%s changed from %s to %s, a version no trusted source has; %d %s changed", name, pc.Old, pc.New, n, plural(n, "program", "programs"))
+			f.Title = fmt.Sprintf("%s changed from %s to %s, a version no trusted source confirmed; %d %s changed", name, pc.Old, pc.New, n, plural(n, "file", "files"))
 			f.Fix = fixDowngrade(name, pc.Old)
 		}
 		for _, e := range unver {
@@ -738,4 +744,53 @@ func (j *judge) isPersistLocation(p string) bool {
 		}
 	}
 	return false
+}
+
+// touch records a path shown with a package's change.
+func (j *judge) touch(name, p string) {
+	if name == "" || p == "" {
+		return
+	}
+	if j.touched[name] == nil {
+		j.touched[name] = map[string]bool{}
+	}
+	j.touched[name][p] = true
+}
+
+// pkgDigest is a digest of the paths shown with a package's change (and,
+// for a new package, every file it lists) with their current content.
+func (j *judge) pkgDigest(name string, listed bool) string {
+	var paths []string
+	for p := range j.touched[name] {
+		paths = append(paths, p)
+	}
+	if p := j.pkgs[name]; listed && p != nil {
+		paths = append(paths, p.Files...)
+	}
+	return j.contentDigest(paths)
+}
+
+// contentDigest hashes the sorted, distinct (path, content) pairs of paths:
+// a file's SHA-256, a persistence file's, or what the path is now.
+func (j *judge) contentDigest(paths []string) string {
+	sort.Strings(paths)
+	h := sha256.New()
+	prev := ""
+	for i, p := range paths {
+		if i > 0 && p == prev {
+			continue
+		}
+		prev = p
+		content := "absent"
+		switch e, pf := j.files[p], j.persist[p]; {
+		case e != nil && e.SHA256 != "":
+			content = e.SHA256
+		case e != nil:
+			content = e.Type + " " + e.Target
+		case pf != nil:
+			content = pf.SHA256
+		}
+		fmt.Fprintf(h, "%s\x00%s\n", p, content)
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }

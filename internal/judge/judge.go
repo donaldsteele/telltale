@@ -9,6 +9,8 @@ package judge
 
 import (
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -87,8 +89,13 @@ type judge struct {
 	gshadowRisk bool                        // a group change gives a group a password or a privileged group a member or admin
 	unconfirmed map[string]bool             // changed package -> a changed file of it was not confirmed
 	listeners   []diff.Change
-	persistDone map[string]*model.Finding // persistence path -> its finding (nil: explained)
-	acctChanged map[string]bool           // account database -> the account comparison found a change in it
+	persistDone map[string]*model.Finding  // persistence path -> its finding (nil: explained)
+	acctChanged map[string]bool            // account database -> the account comparison found a change in it
+	acctDirty   map[string]bool            // account database -> it holds a duplicate name or a line glibc rejects
+	touched     map[string]map[string]bool // changed package -> paths shown with its change
+	privGID     map[int]bool               // ids of privileged groups on either side
+	budget      []string                   // reasons package verification stopped at a limit
+	scanLimit   []string                   // reasons package verification could not run at all
 	foldedMax   map[*model.Finding]model.Severity
 }
 
@@ -101,6 +108,7 @@ func newJudge(in Input, c *model.Collection) *judge {
 		pkgChange: map[string]diff.Change{}, pkgFinding: map[string]*model.Finding{}, persistDone: map[string]*model.Finding{},
 		pkgReasons: map[string][]string{}, unverIn: map[string][]model.Evidence{}, unchecked: map[string][]model.Evidence{}, unconfirmed: map[string]bool{},
 		acctChanged: map[string]bool{}, foldedMax: map[*model.Finding]model.Severity{},
+		acctDirty: map[string]bool{}, touched: map[string]map[string]bool{}, privGID: map[int]bool{},
 	}
 	if in.Snapshot != nil && in.Snapshot.Collection != nil {
 		j.old = in.Snapshot.Collection
@@ -111,7 +119,43 @@ func newJudge(in Input, c *model.Collection) *judge {
 	} else {
 		j.oldOwned, j.oldFiles, j.oldPersist = map[string]string{}, map[string]*model.FileEntry{}, map[string]*model.PersistFile{}
 	}
+	for _, col := range []*model.Collection{c, j.old} {
+		if col == nil {
+			continue
+		}
+		for _, g := range col.Accounts.Groups {
+			if privilegedGroups[g.Name] {
+				j.privGID[g.GID] = true
+			}
+		}
+	}
+	for _, e := range append(append([]string(nil), c.Accounts.Duplicates...), c.Accounts.Malformed...) {
+		if i := strings.LastIndexByte(e, ':'); i > 0 {
+			j.acctDirty[e[:i]] = true
+		}
+	}
+	seen := map[string]bool{}
+	for _, u := range c.Accounts.Users {
+		if seen[u.Name] {
+			j.acctDirty["/etc/passwd"] = true
+		}
+		seen[u.Name] = true
+	}
+	seenG := map[string]bool{}
+	for _, g := range c.Accounts.Groups {
+		if seenG[g.Name] {
+			j.acctDirty["/etc/group"] = true
+		}
+		seenG[g.Name] = true
+	}
 	return j
+}
+
+// privileged reports whether a group makes its members root (or lets them
+// read secrets, logs or raw devices, or write /usr/local): by its name, or
+// by sharing the id of such a group on this machine.
+func (j *judge) privileged(g *model.Group) bool {
+	return g != nil && (privilegedGroups[g.Name] || j.privGID[g.GID])
 }
 
 func indexCollection(c *model.Collection) (map[string]string, map[string]*model.FileEntry, map[string]*model.PersistFile, map[string]*model.Package) {
@@ -161,7 +205,7 @@ func Judge(in Input) *model.Report {
 		j.skipped = append(j.skipped, model.Skip{Check: "snapshot", Reason: "the snapshot holds no collected data, so nothing was compared with it"})
 	}
 	j.uncheckedNote()
-	j.duplicateAccounts()
+	j.accountAnomalies()
 	j.heuristics()
 	j.fillWhen()
 	j.finishGroups()
@@ -236,10 +280,28 @@ func (j *judge) heuristics() {
 	}
 }
 
-// duplicateAccounts flags account names that appear on more than one line
-// of /etc/passwd. Tools disagree about which line counts, so a second line
-// for a familiar name can hide another identity, such as user id 0.
-func (j *judge) duplicateAccounts() {
+// accountAnomalies flags what the collector found in the account databases
+// beyond the accounts themselves: a name on more than one line (programs
+// disagree about which line counts, so a second line can hide another
+// password or identity behind a familiar name) and lines glibc rejects.
+// A collection that still lists duplicate users is checked too.
+func (j *judge) accountAnomalies() {
+	dup := func(entry string, ev []model.Evidence) {
+		file, name := splitEntry(entry)
+		j.add(&model.Finding{
+			Key: "acct.duplicate:" + entry, ID: "TT-JUDGE-001", Source: srcHeuristic, Severity: model.SevBackdoor,
+			Title: fmt.Sprintf("%q appears on more than one line of %s", name, file),
+			Why: "Lookups by name use the first line, while other programs (group membership, some tools) read every line. " +
+				"A second line for a familiar name is a way to hide another password, user id or group membership behind it.",
+			Fix:      fixKeepOnly(file, "then remove the extra line with vipw -s, vigr or vigr -s as fits the file"),
+			Evidence: ev,
+			Refs:     []string{"T1136.001", "T1098"},
+		})
+	}
+	for _, e := range j.c.Accounts.Duplicates {
+		file, _ := splitEntry(e)
+		dup(e, []model.Evidence{{Path: file, After: e, Detail: "name on more than one line", When: j.whenFor(file)}})
+	}
 	byName := map[string][]model.User{}
 	var order []string
 	for _, u := range j.c.Accounts.Users {
@@ -253,22 +315,55 @@ func (j *judge) duplicateAccounts() {
 	}
 	for _, name := range order {
 		us := byName[name]
-		if len(us) < 2 {
+		if len(us) < 2 || slices.Contains(j.c.Accounts.Duplicates, "/etc/passwd:"+name) {
 			continue
 		}
-		f := &model.Finding{
-			Key: "acct.duplicate:" + name, ID: "TT-JUDGE-001", Source: srcHeuristic, Severity: model.SevBackdoor,
-			Title: fmt.Sprintf("Account %q appears %d times in /etc/passwd", name, len(us)),
-			Why: "Programs disagree about which line counts: login may use one line while other tools use another. " +
-				"A second line for an existing name is a way to hide a second identity, for example user id 0, behind a familiar name.",
-			Fix:  keep("/etc/passwd", "/etc/shadow") + "   # then remove the extra line with vipw",
-			Refs: []string{"T1136.001"},
-		}
+		var ev []model.Evidence
 		for _, u := range us {
-			f.Evidence = append(f.Evidence, model.Evidence{Path: "/etc/passwd", After: fmt.Sprintf("uid %d gid %d shell %s home %s", u.UID, u.GID, u.Shell, u.Home), Detail: "line for " + name})
+			ev = append(ev, model.Evidence{Path: "/etc/passwd", After: fmt.Sprintf("uid %d gid %d shell %s home %s", u.UID, u.GID, u.Shell, u.Home), Detail: "line for " + name})
 		}
-		j.add(f)
+		dup("/etc/passwd:"+name, ev)
 	}
+	groups := map[string][]model.Group{}
+	var gorder []string
+	for _, g := range j.c.Accounts.Groups {
+		if _, ok := groups[g.Name]; !ok {
+			gorder = append(gorder, g.Name)
+		}
+		groups[g.Name] = append(groups[g.Name], g)
+	}
+	for _, name := range gorder {
+		gs := groups[name]
+		if len(gs) < 2 || slices.Contains(j.c.Accounts.Duplicates, "/etc/group:"+name) {
+			continue
+		}
+		var ev []model.Evidence
+		for _, g := range gs {
+			ev = append(ev, model.Evidence{Path: "/etc/group", After: fmt.Sprintf("gid %d members %s", g.GID, strings.Join(g.Members, ",")), Detail: "line for " + name})
+		}
+		dup("/etc/group:"+name, ev)
+	}
+	for _, e := range j.c.Accounts.Malformed {
+		file, line := splitEntry(e)
+		n, _ := strconv.Atoi(line)
+		j.add(&model.Finding{
+			Key: "acct.malformed:" + e, ID: "TT-JUDGE-002", Source: srcHeuristic, Severity: model.SevBackdoor,
+			Title: fmt.Sprintf("Line %s of %s is not a valid entry", line, file),
+			Why: "glibc skips this line, but other programs that read the file may not. A line written so that tools disagree about it is a way to hide an account or a password. " +
+				"Its content is not shown, since it may hold a password hash.",
+			Fix:      fixKeepOnly(file, "then look at line "+line+" and remove or correct it with vipw -s, vigr or vigr -s as fits the file"),
+			Evidence: []model.Evidence{{Path: file, Line: n, After: e, Detail: "rejected by glibc's parser", When: j.whenFor(file)}},
+			Refs:     []string{"T1136.001"},
+		})
+	}
+}
+
+// splitEntry splits "<file>:<name or line>".
+func splitEntry(e string) (string, string) {
+	if i := strings.LastIndexByte(e, ':'); i > 0 {
+		return e[:i], e[i+1:]
+	}
+	return e, ""
 }
 
 // whenFor is when the file at p last changed: its inode change time (which,

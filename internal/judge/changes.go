@@ -18,7 +18,12 @@ func (j *judge) index(chs []diff.Change) {
 	for _, ch := range chs {
 		switch ch.Kind {
 		case diff.PkgUpgraded, diff.PkgDowngraded, diff.PkgInstalled, diff.PkgRemoved:
-			if ch.Pkg != nil {
+			// An architecture edited in dpkg status shows as an install and a
+			// removal of the same name: the package installed now counts.
+			if ch.Pkg == nil {
+				continue
+			}
+			if prev, ok := j.pkgChange[ch.Pkg.Name]; !ok || prev.Kind == diff.PkgRemoved {
 				j.pkgChange[ch.Pkg.Name] = ch
 			}
 		case diff.ListenerAdded:
@@ -40,7 +45,7 @@ func (j *judge) index(chs []diff.Change) {
 			if shadowChanged(o, n) {
 				j.acctChanged["/etc/gshadow"] = true
 			}
-			if pw, added, admins := groupGains(o, n); pw || (privilegedGroups[ch.Subject] && (len(added) > 0 || admins)) {
+			if pw, added, admins := groupGains(o, n); pw || ((j.privileged(o) || j.privileged(n)) && (len(added) > 0 || admins)) {
 				j.gshadowRisk = true
 			}
 		}
@@ -109,7 +114,9 @@ func (j *judge) changes(chs []diff.Change) {
 	for _, ch := range chs {
 		switch ch.Kind {
 		case diff.PkgUpgraded, diff.PkgDowngraded, diff.PkgInstalled, diff.PkgRemoved:
-			j.packageChange(ch)
+			if ch.Pkg != nil && j.pkgChange[ch.Pkg.Name].Kind == ch.Kind {
+				j.packageChange(ch)
+			}
 		}
 	}
 	for _, ch := range chs {
@@ -185,7 +192,14 @@ const (
 	catLink
 	catLoosened
 	catAccount
+	catHandedOff
 )
+
+// handedOff reports whether a root-owned directory now belongs to another
+// account, which can then add or replace what is inside it.
+func handedOff(old, cur *model.FileEntry) bool {
+	return old != nil && cur != nil && old.Type == "dir" && cur.Type == "dir" && old.UID == 0 && cur.UID != 0
+}
 
 // accountNote says why a content-only change of an account database is a
 // note, or "": passwd or shadow content in which the account comparison
@@ -198,9 +212,9 @@ func (j *judge) accountNote(p string, old, cur *model.FileEntry) string {
 		return ""
 	}
 	switch {
-	case (p == "/etc/passwd" || p == "/etc/shadow") && !j.acctChanged[p]:
+	case (p == "/etc/passwd" || p == "/etc/shadow") && !j.acctChanged[p] && !j.acctDirty[p]:
 		return "The account comparison found no change to user ids, groups, shells, home directories or passwords in this file, so this is most likely an ageing (chage) or comment (GECOS) change. Duplicate account names are reported on their own."
-	case p == "/etc/gshadow" && j.acctChanged[p] && !j.gshadowRisk:
+	case p == "/etc/gshadow" && j.acctChanged[p] && !j.gshadowRisk && !j.acctDirty[p] && !j.acctDirty["/etc/group"]:
 		return "The group comparison shows each change in this file (shown above as group changes); none gives a group a password or a privileged group a new member or administrator."
 	}
 	return ""
@@ -265,7 +279,7 @@ func (j *judge) fileChange(ch diff.Change) {
 		}
 		// An account database whose change the account comparison shows,
 		// without password data.
-		if accountDBs[p] && j.acctChanged[p] {
+		if accountDBs[p] && j.acctChanged[p] && !j.acctDirty[p] {
 			return
 		}
 	}
@@ -307,6 +321,8 @@ func (j *judge) fileChange(ch diff.Change) {
 		cat = catLink
 	case newlyWritable(old, cur):
 		cat = catLoosened
+	case handedOff(old, cur):
+		cat = catHandedOff
 	case accountWhy != "":
 		cat = catAccount
 	case j.placed(ch, e, old, cur, owner, ev):
@@ -354,6 +370,9 @@ func (j *judge) fileChange(ch diff.Change) {
 		why = fmt.Sprintf("This link now points to %s: %s. A program or file replaced by a link runs or reads whatever sits at the other end, so it no longer matters what the package installed here.",
 			linkTarget(p, cur.Target), linkWhy)
 		refs = []string{"T1574"}
+	case catHandedOff:
+		why = fmt.Sprintf("This system directory now belongs to user id %d instead of root, so that account can add or replace the programs and settings inside it.", cur.UID)
+		refs = []string{"T1222.002"}
 	case catLoosened:
 		why = fmt.Sprintf("This directory is now writable by its group or by everyone (mode %04o), so they can add or replace the programs and settings inside it.", cur.Mode&0o7777)
 		refs = []string{"T1222.002"}
@@ -407,10 +426,13 @@ func (j *judge) placed(ch diff.Change, e, old, cur *model.FileEntry, owner strin
 		ev.Detail = "dpkg's record of the package"
 		j.foldIntoPackage(dpkgInfoPackage(p), ev, model.SevNote)
 		return true
-	case (j.unverified[p] || j.uncheckedSpecial[p]) && j.pkgChanged(owner):
-		// A program goes on its package's change, which it makes a
-		// backdoor sign; anything else is counted in the grouped note.
-		if e.Type == "file" && pkgverify.InScope(p, e.Mode) {
+	case (j.unverified[p] || j.uncheckedSpecial[p]) && j.pkgChanged(owner) && j.classify(j.unverKind[p]) != classScanLimit:
+		// A version no trusted source confirmed explains none of its
+		// files: every one goes on the package's change, which it makes
+		// a backdoor sign. When a source could not be used, programs go
+		// into the note on unchecked files and the rest is counted in
+		// the grouped note.
+		if j.classify(j.unverKind[p]) == classNotFound || (e.Type == "file" && pkgverify.InScope(p, e.Mode)) {
 			j.unverifiedProgram(owner, p, ev)
 		}
 		return true
@@ -438,8 +460,9 @@ func (j *judge) placed(ch diff.Change, e, old, cur *model.FileEntry, owner strin
 // every such package).
 func (j *judge) unverifiedProgram(pkg, p string, ev model.Evidence) {
 	r := j.unverReason[p]
-	if notInTrustedSource(j.unverKind[p]) {
-		ev.Detail = "changed; no trusted source has this version: " + r
+	j.touch(pkg, p)
+	if j.classify(j.unverKind[p]) == classNotFound {
+		ev.Detail = "changed; no trusted source confirmed this version: " + r
 		j.unverIn[pkg] = append(j.unverIn[pkg], ev)
 		return
 	}
@@ -450,21 +473,53 @@ func (j *judge) unverifiedProgram(pkg, p string, ev model.Evidence) {
 	j.unchecked[pkg] = append(j.unchecked[pkg], ev)
 }
 
-// notInTrustedSource reports whether an unverifiable verdict's kind says
-// that verification ran and found the installed version in no trusted
-// source, or only in a source whose key was not given. A verdict without a
-// kind counts too: that is the cautious reading.
-func notInTrustedSource(kind string) bool {
-	return kind == pkgverify.KindNotFound || kind == pkgverify.KindUntrusted || kind == ""
+// Classes of unverifiable verdict, by what the judge does with them.
+type verdictClass int
+
+const (
+	// classNotFound: no trusted source confirmed the version, or the kind
+	// comes from data root can write (a version string, an architecture,
+	// a package count, a file size). Treated as a version no trusted source
+	// has: a backdoor sign.
+	classNotFound verdictClass = iota
+	// classUnchecked: a package source could not be read or used (the
+	// network, a signature, the reference bundle). One note for all.
+	classUnchecked
+	// classScanLimit: package verification could not run for this scan at
+	// all; files are judged as if it had not run.
+	classScanLimit
+)
+
+// classify sorts an unverifiable verdict by its pkgverify kind. Only the
+// network kinds count as "could not check"; Ubuntu Pro does too, but only
+// on an Ubuntu host with an ESM source configured. A verdict without a kind
+// is read cautiously, as not found.
+func (j *judge) classify(kind string) verdictClass {
+	switch kind {
+	case pkgverify.KindUnreachable, pkgverify.KindBadSignature, pkgverify.KindNotInBundle:
+		return classUnchecked
+	case pkgverify.KindPro:
+		if j.esmHost() {
+			return classUnchecked
+		}
+	case pkgverify.KindScanLimit:
+		return classScanLimit
+	}
+	return classNotFound
 }
 
-// sourceUnusable reports whether a file could not be checked because a
-// package source could not be read or used: unreachable, failing its
-// signature, missing from the reference bundle, or not checked at all.
-func sourceUnusable(kind string) bool {
-	switch kind {
-	case pkgverify.KindUnreachable, pkgverify.KindBadSignature, pkgverify.KindNotInBundle, pkgverify.KindNotChecked:
-		return true
+// esmHost reports whether the machine is Ubuntu with an ESM source, the
+// only place Pro package versions are expected.
+func (j *judge) esmHost() bool {
+	if j.c.Host.OSID != "ubuntu" {
+		return false
+	}
+	for _, s := range j.c.Packages.Sources {
+		for _, u := range s.URIs {
+			if strings.Contains(u, "esm.ubuntu.com") {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -996,9 +1051,10 @@ func (j *judge) userChanged(ch diff.Change) {
 }
 
 // privilegedGroups make their members root, or let them read logs,
-// secrets or raw devices, without any password changing.
+// secrets or raw devices, or write /usr/local (staff), without any
+// password changing.
 var privilegedGroups = map[string]bool{"root": true, "sudo": true, "wheel": true, "admin": true, "adm": true, "shadow": true,
-	"disk": true, "docker": true, "lxd": true, "libvirt": true}
+	"disk": true, "docker": true, "lxd": true, "libvirt": true, "staff": true}
 
 func (j *judge) groupChanged(ch diff.Change) {
 	name := ch.Subject
@@ -1019,11 +1075,11 @@ func (j *judge) groupChanged(ch diff.Change) {
 		f.Severity = model.SevBackdoor
 		f.Title = fmt.Sprintf("Group %q was given a password since the snapshot", name)
 		f.Why = "Anyone who knows a group's password can join it with newgrp, without being a member. Group passwords are almost never used, so a new one is a quiet way back into the group's rights."
-	case privilegedGroups[name] && admins:
+	case (j.privileged(o) || j.privileged(n)) && admins:
 		f.Severity = model.SevBackdoor
 		f.Title = fmt.Sprintf("The %q group has a new administrator since the snapshot", name)
 		f.Why = "A group administrator can add anyone to the group. For this group that means root, or access to secrets or raw disks, without any password changing."
-	case privilegedGroups[name] && len(added) > 0:
+	case (j.privileged(o) || j.privileged(n)) && len(added) > 0:
 		f.Severity = model.SevBackdoor
 		f.Title = fmt.Sprintf("%s added to the %q group since the snapshot", strings.Join(added, ", "), name)
 		f.Why = "Members of this group can become root, or read logs, secrets or raw disks, without any password changing. Adding an account to it is a quiet way to keep root access."

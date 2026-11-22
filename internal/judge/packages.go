@@ -2,6 +2,7 @@ package judge
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -114,6 +115,18 @@ func (j *judge) packages() {
 		j.pkgPath[v.Path] = j.add(j.suspicious(v))
 	}
 	j.unverifiable(r.Unverifiable)
+	if len(j.scanLimit) > 0 {
+		j.couldNot = append(j.couldNot, "changed package files: package verification could not run for this scan ("+strings.Join(j.scanLimit, "; ")+")")
+	}
+	if len(j.budget) > 0 {
+		j.add(&model.Finding{
+			Key: "pkg.budget_exceeded", ID: "TT-PKG-008", Source: srcPackage, Severity: model.SevNote,
+			Title: "Package verification stopped at one of its limits",
+			Why: "The machine lists more packages than telltale checks in one scan, or more versions missing from the archive than it looks up (" + strings.Join(j.budget, "; ") +
+				"). The files it did not get to are reported as not verified, and setuid programs, modules and boot files among them as backdoor signs. A machine with that many packages is itself unusual.",
+			Evidence: []model.Evidence{{After: strings.Join(j.budget, "; "), Detail: "limit reached"}},
+		})
+	}
 	j.conffiles(r.Conffiles)
 	if n := lower[pkgverify.SourceSnapshot] + lower[pkgverify.SourceLaunchpad]; n > 0 {
 		j.add(lowerTrust(lower, n))
@@ -249,18 +262,25 @@ func (j *judge) unverifiable(vs []pkgverify.FileVerdict) {
 			owner = j.owned[v.Path]
 		}
 		cat := j.specialCategory(v.Path)
-		// A special file that could not be checked because a source could
-		// not be used (or, for a package that changed since the snapshot,
-		// for any reason but "no trusted source has this version") goes
-		// into the one note on unchecked files: a network failure must not
-		// raise one backdoor sign per module or setuid program.
-		if cat != "" && ((j.pkgChanged(owner) && !notInTrustedSource(v.Kind)) || (!j.pkgChanged(owner) && sourceUnusable(v.Kind))) {
+		class := j.classify(v.Kind)
+		switch {
+		case v.Kind == pkgverify.KindBudget && !slices.Contains(j.budget, v.Reason):
+			j.budget = append(j.budget, v.Reason)
+		case class == classScanLimit && !slices.Contains(j.scanLimit, v.Reason):
+			j.scanLimit = append(j.scanLimit, v.Reason)
+		}
+		// A special file that could not be checked because a package source
+		// could not be used goes into the one note on unchecked files: a
+		// network failure must not raise one backdoor sign per module or
+		// setuid program. When verification could not run at all, it is
+		// judged as if it had not run; anything else is a backdoor sign.
+		if cat != "" && class == classUnchecked {
 			j.uncheckedSpecial[v.Path] = true
 			j.uncheckedFiles = append(j.uncheckedFiles, model.Evidence{Path: v.Path, After: v.Actual,
 				Detail: strings.TrimSpace(v.Package+" "+v.Version) + ": could not be checked: " + v.Reason, When: j.whenFor(v.Path)})
 			continue
 		}
-		if cat != "" {
+		if cat != "" && class == classNotFound {
 			j.pkgPath[v.Path] = j.add(&model.Finding{
 				Key: "pkg.unverifiable:" + v.Path, ID: "TT-PKG-003", Source: srcPackage, Severity: model.SevBackdoor,
 				Title: fmt.Sprintf("%s (a %s) could not be verified against its package", v.Path, cat),
