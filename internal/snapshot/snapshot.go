@@ -26,9 +26,12 @@ var ErrBadPassphrase = errors.New("wrong passphrase")
 var ErrUnknownFinding = errors.New("no finding with that key in the last report")
 
 const (
-	ageMagic     = "age-encryption.org/v1"
-	maxPlainSize = 512 << 20
+	ageMagic      = "age-encryption.org/v1"
+	maxReportSize = 64 << 20
 )
+
+// maxPlainSize bounds the uncompressed snapshot; a variable so tests can lower it.
+var maxPlainSize int64 = 256 << 20
 
 // New builds a snapshot from a collection taken with key.
 func New(c *model.Collection, checks []model.CheckResult, key []byte) *model.Snapshot {
@@ -101,9 +104,26 @@ func Read(r io.Reader, passphrase string) (*model.Snapshot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read snapshot: %w", err)
 	}
-	var s model.Snapshot
-	if err := json.NewDecoder(io.LimitReader(zr, maxPlainSize)).Decode(&s); err != nil {
+	data, err := io.ReadAll(io.LimitReader(zr, maxPlainSize+1))
+	if err != nil {
 		return nil, fmt.Errorf("read snapshot: %w", err)
+	}
+	if int64(len(data)) > maxPlainSize {
+		return nil, fmt.Errorf("snapshot too large (over %d MiB uncompressed)", maxPlainSize>>20)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	var s model.Snapshot
+	if err := dec.Decode(&s); err != nil {
+		return nil, fmt.Errorf("read snapshot: %w", err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("read snapshot: unexpected data after the snapshot")
+	}
+	if s.Schema != model.SnapshotSchema {
+		return nil, fmt.Errorf("snapshot has schema %d, this version reads schema %d", s.Schema, model.SnapshotSchema)
+	}
+	if s.Collection == nil {
+		return nil, errors.New("snapshot has no collection")
 	}
 	return &s, nil
 }
@@ -161,9 +181,17 @@ func LastReportPath(snapshotPath string) string { return snapshotPath + ".last-r
 // Accept records an exception for the finding with the given key, using the
 // finding's current value from the last report, and rewrites the snapshot.
 func Accept(path, passphrase, key, note string, at time.Time) error {
-	rb, err := os.ReadFile(LastReportPath(path))
+	rf, err := os.Open(LastReportPath(path))
 	if err != nil {
 		return fmt.Errorf("no last report next to the snapshot (run a scan first): %w", err)
+	}
+	rb, err := io.ReadAll(io.LimitReader(rf, maxReportSize+1))
+	rf.Close()
+	if err != nil {
+		return fmt.Errorf("read last report: %w", err)
+	}
+	if len(rb) > maxReportSize {
+		return errors.New("last report too large")
 	}
 	var rep model.Report
 	if err := json.Unmarshal(rb, &rep); err != nil {

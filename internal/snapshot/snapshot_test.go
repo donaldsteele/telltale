@@ -2,10 +2,12 @@ package snapshot
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,5 +110,84 @@ func TestAcceptAddsException(t *testing.T) {
 	}
 	if err := Accept(path, "pw", "k1", "", time.Now()); err == nil {
 		t.Fatal("want error without report")
+	}
+}
+
+func gz(t *testing.T, v string) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	zw := gzip.NewWriter(&b)
+	zw.Write([]byte(v))
+	zw.Close()
+	return b.Bytes()
+}
+
+func TestReadRejectsHostileInput(t *testing.T) {
+	cases := map[string][]byte{
+		"garbage":        []byte("this is not a snapshot at all"),
+		"empty json":     gz(t, "{}"),
+		"future schema":  gz(t, `{"schema":99,"collection":{}}`),
+		"no collection":  gz(t, `{"schema":1}`),
+		"trailing data":  gz(t, `{"schema":1,"collection":{}} {"x":1}`),
+		"truncated gzip": gz(t, `{"schema":1,"collection":{}}`)[:12],
+	}
+	for name, in := range cases {
+		if _, err := Read(bytes.NewReader(in), ""); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	_, err := Read(bytes.NewReader(gz(t, `{"schema":99,"collection":{}}`)), "")
+	if err == nil || !strings.Contains(err.Error(), "schema 99") || !strings.Contains(err.Error(), "schema 1") {
+		t.Fatalf("schema error unclear: %v", err)
+	}
+}
+
+func TestReadOversize(t *testing.T) {
+	old := maxPlainSize
+	maxPlainSize = 1 << 20
+	defer func() { maxPlainSize = old }()
+	big := `{"schema":1,"collection":{},"pad":"` + strings.Repeat("a", 2<<20) + `"}`
+	_, err := Read(bytes.NewReader(gz(t, big)), "")
+	if err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func reportFor(t *testing.T, path string) {
+	t.Helper()
+	rb, _ := json.Marshal(model.Report{Findings: []model.Finding{{Key: "k", Title: "t"}}})
+	if err := os.WriteFile(LastReportPath(path), rb, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAcceptWrongPassphraseLeavesFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s")
+	if err := WriteFile(path, sample(), "right"); err != nil {
+		t.Fatal(err)
+	}
+	reportFor(t, path)
+	before, _ := os.ReadFile(path)
+	if err := Accept(path, "wrong", "k", "", time.Now()); !errors.Is(err, ErrBadPassphrase) {
+		t.Fatalf("err = %v", err)
+	}
+	after, _ := os.ReadFile(path)
+	if !bytes.Equal(before, after) {
+		t.Fatal("file changed")
+	}
+}
+
+func TestAcceptPlain(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s")
+	if err := WriteFile(path, sample(), ""); err != nil {
+		t.Fatal(err)
+	}
+	reportFor(t, path)
+	if err := Accept(path, "", "k", "n", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	s, err := ReadFile(path, "")
+	if err != nil || len(s.Exceptions) != 1 {
+		t.Fatalf("%+v %v", s, err)
 	}
 }

@@ -27,6 +27,7 @@ func runSnapshot(ctx *Context) int {
 	out := fs.String("out", "", "")
 	noEnc := fs.Bool("no-encrypt", false, "")
 	nonRoot := fs.Bool("allow-non-root", false, "")
+	force := fs.Bool("force", false, "")
 	root := fs.String("root", "/", "")
 	procRoot := fs.String("proc-root", "/proc", "")
 	sysRoot := fs.String("sys-root", "/sys", "")
@@ -38,6 +39,9 @@ func runSnapshot(ctx *Context) int {
 	}
 	if os.Geteuid() != 0 && !*nonRoot {
 		return fail(fmt.Errorf("not running as root, so the snapshot would miss files and processes only root can see; run with sudo, or pass --allow-non-root to accept an incomplete snapshot"))
+	}
+	if _, err := os.Lstat(*out); err == nil && !*force {
+		return fail(fmt.Errorf("%s already exists; pass --force to overwrite it", *out))
 	}
 	pass := ""
 	if !*noEnc {
