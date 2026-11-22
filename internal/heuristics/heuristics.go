@@ -7,12 +7,10 @@ import (
 	"fmt"
 	"path"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/donaldsteele/telltale/internal/escape"
 	"github.com/donaldsteele/telltale/internal/model"
-	"github.com/donaldsteele/telltale/internal/redact"
 )
 
 const source = "heuristic"
@@ -45,13 +43,13 @@ func Run(c *model.Collection, ctx model.ScanContext, owned map[string]string) []
 	var out []model.Finding
 	out = append(out, accounts(c)...)
 	out = append(out, ldPreload(c)...)
-	out = append(out, processes(c, ctx)...)
+	out = append(out, processes(c, ctx, owned)...)
 	out = append(out, authorizedKeys(c, ctx)...)
 	out = append(out, files(c, owned)...)
 	out = append(out, modules(c, owned)...)
 	out = append(out, listeners(c, ctx, owned)...)
 	out = append(out, crossView(c)...)
-	out = append(out, persistLinks(c)...)
+	out = append(out, persistLinks(c, owned)...)
 	out = append(out, localDiversions(c)...)
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out
@@ -182,34 +180,6 @@ func suspiciousExe(p model.Process, homes map[int]string) (string, model.Severit
 		}
 	}
 	return "", 0, false
-}
-
-func processes(c *model.Collection, ctx model.ScanContext) []model.Finding {
-	homes := map[int]string{}
-	for _, u := range c.Accounts.Users {
-		if !isNIS(u.Name) {
-			homes[u.UID] = u.Home
-		}
-	}
-	var out []model.Finding
-	for _, p := range c.Runtime.Processes {
-		reason, sev, bad := suspiciousExe(p, homes)
-		if !bad {
-			continue
-		}
-		pid := strconv.Itoa(p.PID)
-		cmdline, _ := redact.Line(ctx.DigestKey, p.Cmdline)
-		out = append(out, model.Finding{
-			Key: "heur.proc_exe:" + pid, ID: idProcExe, Source: source, Severity: sev,
-			Title: fmt.Sprintf("Process %s (%s) looks hidden: %s", pid, nameOf(p), reason),
-			Why:   "Legitimate software is installed in system directories and stays on disk. Programs run from temporary or hidden locations, or deleted while running, are typical of malware.",
-			Fix: fmt.Sprintf("%s && cp /proc/%s/exe %s/%s.exe; ls -l /proc/%s/cwd /proc/%s/fd; kill -STOP %s   # suspends, does not kill: investigate before killing",
-				saveEvidence, pid, evidenceDir, pid, pid, pid, pid),
-			Evidence: []model.Evidence{{Path: p.Exe, Detail: fmt.Sprintf("exe=%s cmdline=%s uid=%d deleted=%t", p.Exe, cmdline, p.UID, p.ExeDeleted)}},
-			Refs:     []string{"T1036"},
-		})
-	}
-	return out
 }
 
 func nameOf(p model.Process) string {
@@ -451,43 +421,6 @@ func modules(c *model.Collection, owned map[string]string) []model.Finding {
 	return out
 }
 
-func listeners(c *model.Collection, ctx model.ScanContext, owned map[string]string) []model.Finding {
-	procs := map[int]model.Process{}
-	for _, p := range c.Runtime.Processes {
-		procs[p.PID] = p
-	}
-	seen := map[string]bool{}
-	var out []model.Finding
-	for _, s := range c.Runtime.Sockets {
-		if !s.Listening {
-			continue
-		}
-		p, ok := procs[s.PID]
-		if !ok || p.Exe == "" {
-			continue
-		}
-		if _, ok := owned[p.Exe]; ok {
-			continue
-		}
-		port := s.Local[strings.LastIndex(s.Local, ":")+1:]
-		if seen[port] {
-			continue
-		}
-		seen[port] = true
-		cmdline, _ := redact.Line(ctx.DigestKey, p.Cmdline)
-		out = append(out, model.Finding{
-			Key: "heur.unowned_listener:" + port, ID: idListener, Source: source, Severity: model.SevNote,
-			Title: fmt.Sprintf("Port %s is open, served by %s which belongs to no package", port, p.Exe),
-			Why:   "A service you did not install from your distribution may be fine (your own software) or a backdoor listening for connections.",
-			Fix: fmt.Sprintf("%s && cp /proc/%d/exe %s/%d.exe; ls -l /proc/%d/cwd /proc/%d/fd   # investigate; stop with 'kill -STOP %d' if unrecognised",
-				saveEvidence, p.PID, evidenceDir, p.PID, p.PID, p.PID, p.PID),
-			Evidence: []model.Evidence{{Path: p.Exe, Detail: fmt.Sprintf("%s %s pid=%d cmdline=%s", s.Proto, s.Local, p.PID, cmdline)}},
-			Refs:     []string{"T1571"},
-		})
-	}
-	return out
-}
-
 func crossView(c *model.Collection) []model.Finding {
 	var out []model.Finding
 	for _, r := range c.CrossView {
@@ -505,61 +438,6 @@ func crossView(c *model.Collection) []model.Finding {
 			f.Evidence = append(f.Evidence, model.Evidence{Detail: h})
 		}
 		out = append(out, f)
-	}
-	return out
-}
-
-var maskedWeak = []string{"auditd", "apparmor", "ufw", "nftables", "fail2ban"}
-
-func persistLinks(c *model.Collection) []model.Finding {
-	var out []model.Finding
-	for _, p := range c.Persist {
-		if p.Mode&0o170000 != 0o120000 || len(p.Lines) == 0 {
-			continue
-		}
-		target := strings.TrimSpace(p.Lines[0])
-		if !path.IsAbs(target) {
-			target = path.Join(path.Dir(p.Path), target)
-		}
-		target = path.Clean(target)
-		ev := []model.Evidence{{Path: p.Path, Line: 1, After: p.Lines[0], Detail: "symlink to " + target}}
-		key := "heur.persist_link:" + p.Path
-		if target == "/dev/null" {
-			base := path.Base(p.Path)
-			for _, w := range maskedWeak {
-				if strings.HasPrefix(base, w) {
-					out = append(out, model.Finding{
-						Key: key, ID: idPersistLink, Source: source, Severity: model.SevWeak,
-						Title: fmt.Sprintf("Security service %s is masked", base),
-						Why:   "A link to /dev/null stops this service from ever starting. Attackers mask logging and protection services; you may also have done it on purpose.",
-						Fix: fix([]string{base}, func(q []string) string {
-							return "systemctl unmask " + q[0] + "   # only if you did not mask it deliberately"
-						}),
-						Evidence: ev, Refs: []string{"T1543.002"},
-					})
-					break
-				}
-			}
-			continue
-		}
-		ok := false
-		for _, pre := range []string{"/usr/", "/lib/", "/etc/", "/run/systemd/"} {
-			if strings.HasPrefix(target, pre) {
-				ok = true
-			}
-		}
-		if ok {
-			continue
-		}
-		out = append(out, model.Finding{
-			Key: key, ID: idPersistLink, Source: source, Severity: model.SevBackdoor,
-			Title: fmt.Sprintf("%s is a link to %s, outside the system directories", p.Path, target),
-			Why:   "Startup entries that point at files in temporary or user-writable places (as `systemctl link` can create) run whatever sits there, and the real code is not in the usual locations.",
-			Fix: fix([]string{p.Path, target}, func(q []string) string {
-				return keep(q[0]) + " && { cp -a --parents " + q[1] + " " + evidenceDir + "/ 2>/dev/null || echo 'link target not saved (missing or unreadable)'; } && rm " + q[0] + "   # inspect the saved copies first; rm only runs once the link itself is saved"
-			}),
-			Evidence: ev, Refs: []string{"T1543.002", "T1053.003"},
-		})
 	}
 	return out
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/donaldsteele/telltale/internal/collect"
 	"github.com/donaldsteele/telltale/internal/diff"
 	"github.com/donaldsteele/telltale/internal/escape"
+	"github.com/donaldsteele/telltale/internal/heuristics"
 	"github.com/donaldsteele/telltale/internal/judge"
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/internal/pkgverify"
@@ -129,6 +130,9 @@ func runScan(ctx *Context) int {
 	}
 
 	opt := pkgverify.Options{Full: *full, Offline: *offline, RefsDir: *refs, ExtraKeys: extra, Root: *root}
+	// Startup links into package-owned files outside the system directories
+	// are only notes; the target is verified so a tampered one still shows.
+	opt.ExtraPaths = heuristics.PackageLinkTargets(c, c.Packages.Owners())
 	if snap != nil {
 		opt.OnlyPaths = changedOwnedPaths(snap, c)
 	}
