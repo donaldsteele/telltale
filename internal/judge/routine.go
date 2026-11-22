@@ -358,7 +358,7 @@ func (j *judge) rebuilderOK(name string) bool {
 // not be used (a real outage): not confirmed, but not contradicted either.
 func (j *judge) couldNotCheck(name string) bool {
 	_, down := j.unreachable[name]
-	return down && j.pkgChanged(name) && !j.confirmed[name]
+	return down && j.pkgChanged(name) && j.pkgChange[name].Kind != diff.PkgRemoved && !j.confirmed[name]
 }
 
 // broughtScripts reports whether a package change brings new maintainer

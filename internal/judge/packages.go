@@ -375,11 +375,19 @@ func clockSkew(s pkgverify.ClockSkew) *model.Finding {
 	days := int((d + 12*time.Hour) / (24 * time.Hour))
 	by := fmt.Sprintf("%d %s %s", days, plural(days, "day", "days"), dir)
 	const layout = "2006-01-02 15:04 UTC"
+	title := "The machine's clock is out of date: the clock is " + by + " the newest signed index"
+	why := "The clock of the machine that ran package verification said " + s.Clock.UTC().Format(layout) + ", while the newest index the archive signed is dated " + s.Signed.UTC().Format(layout) + ". "
+	if dir == "ahead of" {
+		title = "The machine's clock, or the archive mirror's index, is out of date: the clock is " + by + " the newest signed index"
+		why += "Either the clock is wrong, or the mirror that answered served an old index (a mirror that stopped updating, or one replaying old files, looks the same from here). A clock cannot be right when it is past the date until which a signed index is valid. "
+	} else {
+		why += "The clock is wrong: a clock cannot be right when it is behind what the archive has already signed. "
+	}
+	why += "Package verification took its time from the signed indexes, so the clock decided nothing there; but root can set the clock, and a wrong one breaks certificate checks, log times and scheduled jobs."
 	return &model.Finding{
 		Key: "pkg.clock_skew", ID: "TT-PKG-009", Source: srcPackage, Severity: model.SevNote,
-		Title: "The machine's clock, or the archive mirror's index, is out of date: the clock is " + by + " the newest signed index",
-		Why: "The clock of the machine that ran package verification said " + s.Clock.UTC().Format(layout) + ", while the newest index the archive signed is dated " + s.Signed.UTC().Format(layout) +
-			". Either the clock is wrong, or the mirror that answered served an old index (a mirror that stopped updating, or one replaying old files, looks the same from here). A clock cannot be right when it is behind what the archive has already signed, or past the date until which a signed index is valid. Package verification took its time from the signed indexes, so the clock decided nothing there; but root can set the clock, and a wrong one breaks certificate checks, log times and scheduled jobs.",
+		Title:    title,
+		Why:      why,
 		Fix:      "timedatectl set-ntp true   # or set the clock by hand with: date -u -s 'YYYY-MM-DD HH:MM:SS'",
 		Evidence: []model.Evidence{{After: "clock " + by + " the signed date", Detail: "clock " + s.Clock.UTC().Format(layout) + "; newest signed index " + s.Signed.UTC().Format(layout)}},
 		Refs:     []string{"T1070.006"},

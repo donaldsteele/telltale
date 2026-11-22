@@ -2585,7 +2585,7 @@ func TestJudgeClockSkewIsANote(t *testing.T) {
 		t.Errorf("title %q, why %q", f.Title, f.Why)
 	}
 	res.ClockSkew = &pkgverify.ClockSkew{Clock: now.Add(-50 * time.Hour), Signed: now}
-	if f := must(t, run(clean(), nil, res), "pkg.clock_skew", model.SevNote); !strings.Contains(f.Title, "2 days behind") {
+	if f := must(t, run(clean(), nil, res), "pkg.clock_skew", model.SevNote); !strings.Contains(f.Title, "2 days behind") || strings.Contains(f.Title+f.Why, "mirror") {
 		t.Errorf("title %q", f.Title)
 	}
 	absent(t, run(clean(), nil, archive()), "pkg.clock_skew")
@@ -2649,4 +2649,22 @@ func TestJudgeRemovalExplainsNoPresentBootFile(t *testing.T) {
 	if r.ExitCode == 2 {
 		t.Errorf("a real kernel removal: %v", keys(r))
 	}
+}
+
+// A removed (rc) kernel package is never the rebuilder "that could not be
+// checked" for a present, changed initrd and grub.cfg during an outage:
+// both stay backdoor signs.
+func TestJudgeRemovedPackageDoesNotExcuseBootFilesDuringOutage(t *testing.T) {
+	old := clean()
+	old.Packages.Installed = append(old.Packages.Installed, pkg("linux-image-6.1.0-25-amd64", "6.1.106-3"))
+	old.Files = append(old.Files, file("/boot/initrd.img-6.1.0-25-amd64", "initrd", 0o644), file("/boot/grub/grub.cfg", "menu", 0o444))
+	cur := clone(old)
+	removePkg(cur, "linux-image-6.1.0-25-amd64")
+	setFile(cur, file("/boot/initrd.img-6.1.0-25-amd64", "evil initrd", 0o644))
+	setFile(cur, file("/boot/grub/grub.cfg", "menu init=/bin/bash", 0o444))
+	res := &pkgverify.Result{Mode: pkgverify.ModeArchive, Errors: []string{"https://deb.debian.org/debian/dists/bookworm/InRelease: dial tcp: i/o timeout"},
+		Unverifiable: []pkgverify.FileVerdict{{Path: "/boot/vmlinuz-6.1.0-25-amd64", Package: "linux-image-6.1.0-25-amd64", Version: "6.1.106-3", Reason: "could not read the official archive index: dial tcp: i/o timeout", Kind: pkgverify.KindUnreachable}}}
+	r := run(cur, snapOf(old), res)
+	must(t, r, "snap.file_modified:/boot/initrd.img-6.1.0-25-amd64", model.SevBackdoor)
+	must(t, r, "snap.file_modified:/boot/grub/grub.cfg", model.SevBackdoor)
 }
