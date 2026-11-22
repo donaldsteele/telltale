@@ -237,7 +237,10 @@ func (t *textWriter) finding(f *model.Finding) {
 		t.wrap(indent+"Why: ", indent+"     ", escape.Terminal(f.Why))
 	}
 	if f.Fix != "" {
-		t.printf("%sFix: %s\n", indent, escape.Terminal(f.Fix))
+		t.printf("%sFix: %s\n", indent, FixText(f.Fix))
+	}
+	if f.Key != "" {
+		t.printf("%sID: %s\n", indent, escape.Terminal(f.Key))
 	}
 }
 
@@ -265,4 +268,14 @@ func (t *textWriter) explained(gs []model.Finding) {
 			}
 		}
 	}
+}
+
+// FixText is a fix command as it is shown: byte for byte as built, since it
+// is a shell command and escaping would change what it does. A command that
+// holds a control or format character anyway is shown escaped and marked.
+func FixText(fix string) string {
+	if escape.HasUnsafe(fix) {
+		return escape.Terminal(fix) + "   (contains control characters; do not paste, edit by hand)"
+	}
+	return fix
 }

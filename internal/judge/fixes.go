@@ -2,6 +2,7 @@ package judge
 
 import (
 	"fmt"
+	"github.com/donaldsteele/telltale/internal/escape"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,7 +39,7 @@ func unsafeText(s string) bool {
 }
 
 // sq single-quotes s for a POSIX shell.
-func sq(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+func sq(s string) string { return escape.ShellQuote(s) }
 
 // command builds a command from machine values: build gets them quoted. If
 // any value is unsafe, the result is ctrlNote instead.

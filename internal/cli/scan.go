@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
@@ -118,7 +119,7 @@ func runScan(ctx *Context) int {
 		}
 	}
 
-	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	runCtx, stop := scanContext()
 	defer stop()
 
 	fmt.Fprintln(ctx.Stderr, "Collecting this machine...")
@@ -219,10 +220,9 @@ func changedOwnedPaths(snap *model.Snapshot, cur *model.Collection) map[string]b
 		if col == nil {
 			continue
 		}
-		for _, p := range col.Packages.Installed {
-			for _, f := range p.Files {
-				owned[f] = true
-			}
+		// Owners applies the merged-/usr aliases (/bin/ls is /usr/bin/ls).
+		for p := range col.Packages.Owners() {
+			owned[p] = true
 		}
 	}
 	only := map[string]bool{}
@@ -252,4 +252,10 @@ func isMaintainerScript(p string) bool {
 		}
 	}
 	return false
+}
+
+// scanContext is cancelled by an interrupt, a terminate or a hangup (a dropped
+// SSH session), so the deferred clean-up of the temporary cache always runs.
+var scanContext = func() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 }

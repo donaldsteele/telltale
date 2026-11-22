@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -152,5 +153,36 @@ func TestChangedOwnedPathsAddsMaintainerScripts(t *testing.T) {
 		if !got[p] {
 			t.Errorf("missing %s in %v", p, got)
 		}
+	}
+}
+
+func TestChangedOwnedPathsMergedUsr(t *testing.T) {
+	file := func(p, sha string) model.FileEntry { return model.FileEntry{Path: p, Type: "file", SHA256: sha} }
+	pk := model.Packages{Installed: []model.Package{{Name: "ssh", Files: []string{"/bin/ssh"}}}}
+	old := &model.Collection{Packages: pk, Files: []model.FileEntry{file("/usr/bin/ssh", "a")}}
+	cur := &model.Collection{Packages: pk, Files: []model.FileEntry{file("/usr/bin/ssh", "b")}}
+	if got := changedOwnedPaths(&model.Snapshot{Collection: old}, cur); !got["/usr/bin/ssh"] {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestScanCancelledRemovesTheCache(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	old := scanContext
+	scanContext = func() (context.Context, context.CancelFunc) {
+		c, cancel := context.WithCancel(context.Background())
+		cancel()
+		return c, cancel
+	}
+	t.Cleanup(func() { scanContext = old })
+	var out, errb bytes.Buffer
+	code := Run([]string{"scan", "--no-color", "--root", "../collect/testdata/root1", "--proc-root", "../collect/testdata/proc1",
+		"--sys-root", "../collect/testdata/root1"}, strings.NewReader(""), &out, &errb)
+	if code != 3 {
+		t.Fatalf("exit %d, stderr %s", code, errb.String())
+	}
+	if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
+		t.Fatalf("left behind: %v", ents)
 	}
 }

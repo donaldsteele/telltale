@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"github.com/donaldsteele/telltale/internal/escape"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -111,7 +113,7 @@ func hostile() *model.Report {
 	r := tampering()
 	r.Host.Hostname = "evil\x1b[2Jhost<b>"
 	r.Findings[0].Title = "title \x1b]0;pwned\x07 <img src=x onerror=alert(1)>"
-	r.Findings[0].Fix = "rm -rf / \x1b[2J<script>alert(2)</script>"
+	r.Findings[0].Fix = "rm " + escape.ShellQuote("/x'; <script>alert(2)</script>")
 	r.Findings[0].Evidence = []model.Evidence{{Path: "/tmp/\x1b[2J<script>alert(1)</script>", Line: 1,
 		Before: "a\x1b[2Jb", After: "<script>alert(3)</script>\x00", Detail: "x\rcarriage"}}
 	r.Explained[0].Key = "explained:pk\x1b[2Jg"
@@ -181,5 +183,63 @@ func TestJSONNamesSeverity(t *testing.T) {
 	var back model.Report
 	if err := json.Unmarshal(b.Bytes(), &back); err != nil || back.ExitCode != 2 {
 		t.Errorf("%v %+v", err, back.ExitCode)
+	}
+}
+
+func TestFixPrintsByteForByte(t *testing.T) {
+	bash, bashErr := exec.LookPath("bash")
+	for _, name := range []string{"/etc/cron.d/x'; echo INJECTED; '", "a\nb", "a\x1b[2Jb", "a\u202eb", "back\\slash", "bad\xffbyte"} {
+		fix := "rm " + escape.ShellQuote(name)
+		r := clean()
+		r.Findings = []model.Finding{{Key: "k", Severity: model.SevBackdoor, Title: "t", Fix: fix}}
+		var b bytes.Buffer
+		Text(&b, r, TextOptions{})
+		if !strings.Contains(b.String(), "Fix: "+fix+"\n") {
+			t.Errorf("%q: fix not printed as built:\n%s", name, b.String())
+		}
+		if bashErr == nil {
+			out, err := exec.Command(bash, "-c", "printf %s "+strings.TrimPrefix(fix, "rm ")).Output()
+			if err != nil || string(out) != name {
+				t.Errorf("%q: bash gave %q", name, out)
+			}
+		}
+	}
+	// Defence in depth: a raw control character is shown escaped and marked.
+	r := clean()
+	r.Findings = []model.Finding{{Key: "k", Severity: model.SevNote, Title: "t", Fix: "rm \x1b[2J"}}
+	var b bytes.Buffer
+	Text(&b, r, TextOptions{})
+	if strings.Contains(b.String(), "\x1b") || !strings.Contains(b.String(), "do not paste") {
+		t.Errorf("%q", b.String())
+	}
+}
+
+func TestIDShownAndEscaped(t *testing.T) {
+	r := clean()
+	r.Findings = []model.Finding{{Key: "snap.file_added:/tmp/a\x1b[2J<b>", Severity: model.SevNote, Title: "t"}}
+	var b bytes.Buffer
+	Text(&b, r, TextOptions{})
+	if !strings.Contains(b.String(), `ID: snap.file_added:/tmp/a\x1b[2J<b>`) {
+		t.Errorf("%q", b.String())
+	}
+	b.Reset()
+	HTML(&b, r)
+	if !strings.Contains(b.String(), "ID: <code>snap.file_added:/tmp/a\\x1b[2J&lt;b&gt;</code>") {
+		t.Errorf("html lacks the escaped ID")
+	}
+}
+
+func TestBuiltInFixesPrintExactly(t *testing.T) {
+	for _, fix := range []string{
+		`find /bin /sbin /usr /lib /etc /boot /root -xdev \( -type f -o -type d ! -perm -1000 \) -perm -0002 -exec chmod o-w {} +`,
+		`sed -i 's/^ENCRYPT_METHOD.*/ENCRYPT_METHOD YESCRYPT/' /etc/login.defs && awk -F: '$2 != "" && $2 !~ /^[!*]/ && $2 !~ /^\$(y|6)\$/ {print $1}' /etc/shadow | xargs -r -n1 passwd -e`,
+	} {
+		r := clean()
+		r.Findings = []model.Finding{{Key: "k", Severity: model.SevWeak, Title: "t", Fix: fix}}
+		var b bytes.Buffer
+		Text(&b, r, TextOptions{})
+		if !strings.Contains(b.String(), "Fix: "+fix+"\n") {
+			t.Errorf("not exact:\n%s", b.String())
+		}
 	}
 }

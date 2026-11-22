@@ -19,6 +19,7 @@ var htmlSource string
 // context-aware escaping, which neutralises markup.
 var htmlTemplate = template.Must(template.New("report").Funcs(template.FuncMap{
 	"esc":   escape.Terminal,
+	"fix":   FixText,
 	"label": Label,
 	"class": func(s model.Severity) string { return strings.ToLower(Label(s)) },
 	"time":  func(t model.Report) string { return t.Time.UTC().Format(timeLayout) },

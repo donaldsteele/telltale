@@ -10,6 +10,7 @@ package checklist
 
 import (
 	"fmt"
+	"github.com/donaldsteele/telltale/internal/escape"
 	"path"
 	"sort"
 	"strings"
@@ -91,7 +92,7 @@ func shellQuote(s string) string {
 	}) < 0 {
 		return s
 	}
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+	return escape.ShellQuote(s)
 }
 
 func quoteAll(ss []string) string {

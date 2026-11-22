@@ -48,7 +48,8 @@ h2{font-size:1.05rem;margin:1.5rem 0 .25rem}
 {{- if .Detail}}<div class="dim">{{esc .Detail}}</div>{{end}}
 </div>{{end}}
 {{if .Why}}<p><strong>Why:</strong> {{esc .Why}}</p>{{end}}
-{{if .Fix}}<p><strong>Fix:</strong></p><pre>{{esc .Fix}}</pre>{{end}}
+{{if .Fix}}<p><strong>Fix:</strong></p><pre>{{fix .Fix}}</pre>{{end}}
+{{if .Key}}<p class="dim">ID: <code>{{esc .Key}}</code></p>{{end}}
 </section>
 {{end}}
 {{if .Explained}}

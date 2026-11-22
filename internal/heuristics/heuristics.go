@@ -5,6 +5,7 @@ package heuristics
 
 import (
 	"fmt"
+	"github.com/donaldsteele/telltale/internal/escape"
 	"path"
 	"sort"
 	"strconv"
@@ -69,7 +70,7 @@ func hasCtrl(s string) bool {
 }
 
 // sq single-quotes s for a POSIX shell.
-func sq(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+func sq(s string) string { return escape.ShellQuote(s) }
 
 // fix builds a command from attacker-controllable values. Every value is
 // shell-quoted; if any contains a control byte no command is produced.
