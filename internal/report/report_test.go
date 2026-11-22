@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
-	"github.com/donaldsteele/telltale/internal/escape"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/donaldsteele/telltale/internal/checklist"
+	"github.com/donaldsteele/telltale/internal/escape"
 	"github.com/donaldsteele/telltale/internal/model"
 )
 
@@ -230,16 +231,35 @@ func TestIDShownAndEscaped(t *testing.T) {
 }
 
 func TestBuiltInFixesPrintExactly(t *testing.T) {
-	for _, fix := range []string{
-		`find /bin /sbin /usr /lib /etc /boot /root -xdev \( -type f -o -type d ! -perm -1000 \) -perm -0002 -exec chmod o-w {} +`,
-		`sed -i 's/^ENCRYPT_METHOD.*/ENCRYPT_METHOD YESCRYPT/' /etc/login.defs && awk -F: '$2 != "" && $2 !~ /^[!*]/ && $2 !~ /^\$(y|6)\$/ {print $1}' /etc/shadow | xargs -r -n1 passwd -e`,
-	} {
+	for _, id := range []string{"TT-FILE-005", "TT-ACCT-004"} {
+		it, ok := checklist.ByID(id)
+		if !ok || it.Fix == "" {
+			t.Fatalf("no item %s", id)
+		}
 		r := clean()
-		r.Findings = []model.Finding{{Key: "k", Severity: model.SevWeak, Title: "t", Fix: fix}}
+		r.Findings = []model.Finding{{Key: "k", Severity: model.SevWeak, Title: "t", Fix: it.Fix}}
 		var b bytes.Buffer
 		Text(&b, r, TextOptions{})
-		if !strings.Contains(b.String(), "Fix: "+fix+"\n") {
-			t.Errorf("not exact:\n%s", b.String())
+		if !strings.Contains(b.String(), "Fix: "+it.Fix+"\n") || strings.Contains(b.String(), "do not paste") {
+			t.Errorf("%s not exact:\n%s", id, b.String())
+		}
+	}
+}
+
+func TestMultiLineFixPrintsUnderTheFixColumn(t *testing.T) {
+	r := clean()
+	r.Findings = []model.Finding{{Key: "k", Severity: model.SevWeak, Title: "t", Fix: "# note\ngrep -rn x /etc"}}
+	var b bytes.Buffer
+	Text(&b, r, TextOptions{})
+	if !strings.Contains(b.String(), "            Fix: # note\n                 grep -rn x /etc\n") || strings.Contains(b.String(), "do not paste") {
+		t.Errorf("%q", b.String())
+	}
+	for _, bad := range []string{"rm ‮", "rm  x", "rm \x00"} {
+		r.Findings[0].Fix = bad
+		b.Reset()
+		Text(&b, r, TextOptions{})
+		if !strings.Contains(b.String(), "do not paste") {
+			t.Errorf("%q printed without the marker", bad)
 		}
 	}
 }

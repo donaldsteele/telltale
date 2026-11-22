@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/pkgverify"
 )
 
 func scanArgs(root string, extra ...string) []string {
@@ -184,5 +185,84 @@ func TestScanCancelledRemovesTheCache(t *testing.T) {
 	}
 	if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
 		t.Fatalf("left behind: %v", ents)
+	}
+}
+
+// firstWrite runs check when the first byte of output arrives.
+type firstWrite struct {
+	buf   bytes.Buffer
+	check func()
+	done  bool
+}
+
+func (w *firstWrite) Write(p []byte) (int, error) {
+	if !w.done {
+		w.done = true
+		w.check()
+	}
+	return w.buf.Write(p)
+}
+
+func TestScanRemovesTheCacheBeforeAnyOutput(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	old := verifyPackages
+	verifyPackages = func(_ context.Context, _ *model.Collection, opt pkgverify.Options) *pkgverify.Result {
+		if opt.CacheDir == "" {
+			t.Error("no cache dir given")
+		}
+		os.WriteFile(filepath.Join(opt.CacheDir, "index"), []byte("x"), 0o600)
+		return &pkgverify.Result{Mode: pkgverify.ModeArchive}
+	}
+	t.Cleanup(func() { verifyPackages = old })
+	out := &firstWrite{}
+	out.check = func() {
+		if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
+			t.Errorf("the cache still exists when output starts: %v", ents)
+		}
+	}
+	var errb bytes.Buffer
+	code := Run([]string{"scan", "--no-color", "--root", "../collect/testdata/root1", "--proc-root", "../collect/testdata/proc1",
+		"--sys-root", "../collect/testdata/root1"}, strings.NewReader(""), out, &errb)
+	if code == 3 || !out.done {
+		t.Fatalf("exit %d, output %v, stderr %s", code, out.done, errb.String())
+	}
+}
+
+// A NUL cannot be in a shell word: an account named root\0x must not get a
+// command that bash would run on root.
+func TestScanNULAccountNamesNoCommandOnRoot(t *testing.T) {
+	root := fixtureRoot(t)
+	pw := filepath.Join(root, "etc/passwd")
+	f, err := os.OpenFile(pw, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString("root\x00x:x:0:0::/root:/bin/bash\n")
+	f.Close()
+	var out, errb bytes.Buffer
+	Run(scanArgs(root, "--json", "-"), strings.NewReader(""), &out, &errb)
+	var rep model.Report
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("%v: %s", err, errb.String())
+	}
+	sawNote := false
+	for _, f := range rep.Findings {
+		for _, line := range strings.Split(f.Fix, "\n") {
+			if strings.Contains(line, "x00x") || strings.Contains(line, "root\\x00") {
+				if !strings.HasPrefix(line, "# ") || !strings.Contains(line, "NUL byte") {
+					t.Errorf("%s: a command names the NUL account: %q", f.Key, line)
+				}
+				sawNote = true
+			}
+			for _, bad := range []string{"userdel -f root", "passwd -l root", "passwd -e root", "-s /usr/sbin/nologin root"} {
+				if strings.Contains(line, bad) && !strings.HasPrefix(line, "#") {
+					t.Errorf("%s: %q", f.Key, line)
+				}
+			}
+		}
+	}
+	if !sawNote {
+		t.Error("no note about the NUL account")
 	}
 }

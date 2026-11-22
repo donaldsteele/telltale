@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/donaldsteele/telltale/internal/escape"
 	"github.com/donaldsteele/telltale/internal/model"
 )
 
@@ -300,6 +301,9 @@ func rootLoginValue(v string) string {
 // of sshd_config when s is the default (the top is always the global
 // section, and the first value wins there).
 func sshdLineFix(cfg *sshdConfig, s sshdSetting, name, value string) string {
+	if !escape.Quotable(s.Path) {
+		return nulNote(s.Path)
+	}
 	if s.Path == "" {
 		return fmt.Sprintf("sed -i%s '1i %s %s' %s", followFlag(cfg.links[mainSSHDConfig]), name, value, mainSSHDConfig)
 	}
@@ -360,7 +364,7 @@ func serverBlockFix(addr string) string {
 // applying Match blocks the first value wins). It returns "" when the
 // address has characters that cannot go into a sed script safely.
 func serverBlockBefore(cfg *sshdConfig, b matchBlock, addr string) string {
-	if addr == "" || strings.Trim(addr, "0123456789abcdefABCDEF.:") != "" {
+	if addr == "" || strings.Trim(addr, "0123456789abcdefABCDEF.:") != "" || !escape.Quotable(b.Path) {
 		return ""
 	}
 	return fmt.Sprintf(`sed -i%s -e '%di Match Address %s' -e '%di\    PermitRootLogin prohibit-password' %s`,
@@ -438,7 +442,18 @@ func fixRootLoginIn(v sshdView, ctx model.ScanContext) string {
 	if len(cmds) == 0 {
 		return ""
 	}
-	return strings.Join(cmds, " && ") + reloadSSH
+	var run, notes []string
+	for _, c := range cmds {
+		if strings.HasPrefix(c, "#") {
+			notes = append(notes, c)
+		} else {
+			run = append(run, c)
+		}
+	}
+	if len(run) == 0 {
+		return joinNotes("", notes)
+	}
+	return joinNotes(strings.Join(run, " && ")+reloadSSH, notes)
 }
 
 // sshdItem checks one keyword's effective value for clients that no Match
@@ -557,7 +572,7 @@ func fixSSHDFiles(c *model.Collection, _ model.ScanContext) string {
 	if len(paths) == 0 {
 		return ""
 	}
-	return "chown root:root " + quoteAll(paths) + " && chmod 644 " + quoteAll(paths)
+	return overPaths(paths, func(q string) string { return "chown root:root " + q + " && chmod 644 " + q })
 }
 
 // looseSetting is a Match-block setting that loosens a checked keyword.
@@ -663,15 +678,22 @@ func fixMatchBlocks(c *model.Collection, ctx model.ScanContext) string {
 	if len(order) == 0 {
 		return ""
 	}
-	var cmds []string
+	var cmds, notes []string
 	for _, p := range order {
+		if !escape.Quotable(p) {
+			notes = append(notes, nulNote(p))
+			continue
+		}
 		cmd := "sed -i" + followFlag(cfg.links[p])
 		for _, n := range lines[p] {
 			cmd += fmt.Sprintf(" -e '%ds/^/#/'", n)
 		}
 		cmds = append(cmds, cmd+" "+shellQuote(p))
 	}
-	return strings.Join(cmds, " && ") + reloadSSH
+	if len(cmds) == 0 {
+		return joinNotes("", notes)
+	}
+	return joinNotes(strings.Join(cmds, " && ")+reloadSSH, notes)
 }
 
 // --- Accounts ---
@@ -701,15 +723,32 @@ func uid0Extra(c *model.Collection) ([]string, string) {
 	return sortedUnique(extra), ""
 }
 
+// perUser runs cmd for each account name; a name with a NUL byte is left out
+// and named in a comment instead.
 func perUser(names []string, cmd string) string {
-	if len(names) == 0 {
-		return ""
-	}
-	cmds := make([]string, len(names))
-	for i, n := range names {
+	cmd, notes := perUserCmd(names, cmd)
+	return joinNotes(cmd, notes)
+}
+
+func perUserCmd(names []string, cmd string) (string, []string) {
+	kept, notes := splitNUL(names)
+	cmds := make([]string, len(kept))
+	for i, n := range kept {
 		cmds[i] = cmd + " " + shellQuote(n)
 	}
-	return strings.Join(cmds, " && ")
+	return strings.Join(cmds, " && "), notes
+}
+
+// andThen chains two command texts; a text that is only comment lines is
+// put on its own line, since "&& # ..." would not parse.
+func andThen(a, b string) string {
+	if b == "" {
+		return a
+	}
+	if a == "" || strings.HasPrefix(b, "#") {
+		return joinNotes(a, []string{b})
+	}
+	return a + " && " + b
 }
 
 func fixUID0(c *model.Collection, _ model.ScanContext) string {
@@ -817,7 +856,7 @@ func fixHashAlgo(c *model.Collection, _ model.ScanContext) string {
 	if len(names) == 0 {
 		return ""
 	}
-	return `sed -i 's/^ENCRYPT_METHOD.*/ENCRYPT_METHOD YESCRYPT/' /etc/login.defs && ` + perUser(names, "passwd -e")
+	return andThen(`sed -i 's/^ENCRYPT_METHOD.*/ENCRYPT_METHOD YESCRYPT/' /etc/login.defs`, perUser(names, "passwd -e"))
 }
 
 // --- sudo ---
@@ -898,7 +937,7 @@ func sudoRuleFix(re *regexp.Regexp, script string) func(*model.Collection, model
 		if len(hits) == 0 {
 			return ""
 		}
-		return "sed -i" + followFlag(link) + " '" + script + "' " + quoteAll(hits) + " && visudo -c"
+		return overPaths(hits, func(q string) string { return "sed -i" + followFlag(link) + " '" + script + "' " + q + " && visudo -c" })
 	}
 }
 
@@ -1009,7 +1048,7 @@ func fixNoPasswd(c *model.Collection, ctx model.ScanContext) string {
 			names = append(names, u.Name)
 		}
 		if len(names) > 0 {
-			b.WriteString("# check that " + strings.Join(names, ", ") + " can give sudo a password before running this, or nobody may be able to become root\n")
+			b.WriteString("# check that " + escapeAll(names) + " can give sudo a password before running this, or nobody may be able to become root\n")
 		}
 		return b.String() + base
 	}
@@ -1026,8 +1065,8 @@ func fixNoPasswd(c *model.Collection, ctx model.ScanContext) string {
 	if len(need) > 1 {
 		verb = "have"
 	}
-	fmt.Fprintf(&b, "# %s %s no usable password: without NOPASSWD sudo asks for one, so set it first or nobody may be able to become root\n", strings.Join(need, ", "), verb)
-	return b.String() + perUser(need, "passwd") + " && " + base
+	fmt.Fprintf(&b, "# %s %s no usable password: without NOPASSWD sudo asks for one, so set it first or nobody may be able to become root\n", escapeAll(need), verb)
+	return b.String() + andThen(perUser(need, "passwd"), base)
 }
 
 func sudoPaths(c *model.Collection) []string {
@@ -1058,7 +1097,7 @@ func fixSudoersFiles(c *model.Collection, _ model.ScanContext) string {
 	if len(paths) == 0 {
 		return ""
 	}
-	return "chown root:root " + quoteAll(paths) + " && chmod 440 " + quoteAll(paths)
+	return overPaths(paths, func(q string) string { return "chown root:root " + q + " && chmod 440 " + q })
 }
 
 // --- Files ---
@@ -1118,7 +1157,7 @@ func fixWorldWritable(c *model.Collection, _ model.ScanContext) string {
 	if len(bad) == 0 || len(bad) > 20 {
 		return ""
 	}
-	return "chmod o-w " + quoteAll(bad)
+	return overPaths(bad, func(q string) string { return "chmod o-w " + q })
 }
 
 var cronDirs = []string{"/etc/cron.d", "/etc/cron.hourly", "/etc/cron.daily", "/etc/cron.weekly", "/etc/cron.monthly"}
@@ -1162,7 +1201,7 @@ func fixCronDirs(c *model.Collection, _ model.ScanContext) string {
 	if len(paths) == 0 {
 		return ""
 	}
-	return "chmod 700 " + quoteAll(paths) + " && chown root:root " + quoteAll(paths)
+	return overPaths(paths, func(q string) string { return "chmod 700 " + q + " && chown root:root " + q })
 }
 
 // --- Firewall ---

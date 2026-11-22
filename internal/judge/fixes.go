@@ -2,13 +2,13 @@ package judge
 
 import (
 	"fmt"
-	"github.com/donaldsteele/telltale/internal/escape"
 	"sort"
 	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/donaldsteele/telltale/internal/escape"
 	"github.com/donaldsteele/telltale/internal/model"
 )
 

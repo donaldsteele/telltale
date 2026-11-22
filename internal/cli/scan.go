@@ -142,7 +142,12 @@ func runScan(ctx *Context) int {
 		opt.CacheDir = dir
 		fmt.Fprintln(ctx.Stderr, "Verifying packages against the archive (this can take a while)...")
 	}
-	pkg := pkgverify.Verify(runCtx, c, opt)
+	pkg := verifyPackages(runCtx, c, opt)
+	// The cache is not needed any more: remove it before anything is written,
+	// so a closed pipe (SIGPIPE) cannot leave it behind.
+	if opt.CacheDir != "" {
+		os.RemoveAll(opt.CacheDir)
+	}
 	if runCtx.Err() != nil {
 		return fail(errors.New("interrupted"))
 	}
@@ -259,3 +264,6 @@ func isMaintainerScript(p string) bool {
 var scanContext = func() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 }
+
+// verifyPackages is pkgverify.Verify; tests replace it.
+var verifyPackages = pkgverify.Verify

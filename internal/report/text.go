@@ -237,7 +237,11 @@ func (t *textWriter) finding(f *model.Finding) {
 		t.wrap(indent+"Why: ", indent+"     ", escape.Terminal(f.Why))
 	}
 	if f.Fix != "" {
-		t.printf("%sFix: %s\n", indent, FixText(f.Fix))
+		lines := strings.Split(FixText(f.Fix), "\n")
+		t.printf("%sFix: %s\n", indent, lines[0])
+		for _, l := range lines[1:] {
+			t.printf("%s     %s\n", indent, l)
+		}
 	}
 	if f.Key != "" {
 		t.printf("%sID: %s\n", indent, escape.Terminal(f.Key))

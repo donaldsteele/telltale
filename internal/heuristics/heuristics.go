@@ -5,12 +5,12 @@ package heuristics
 
 import (
 	"fmt"
-	"github.com/donaldsteele/telltale/internal/escape"
 	"path"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/donaldsteele/telltale/internal/escape"
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/internal/redact"
 )

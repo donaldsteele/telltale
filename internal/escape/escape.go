@@ -74,12 +74,10 @@ func writeHexByte(b *strings.Builder, c byte) {
 	b.WriteByte(hexDigits[c&0x0f])
 }
 
-// mustEscape reports whether a valid rune at or above U+00A0 can disguise
-// text or otherwise misbehave, so it must be shown as an escape instead.
-func mustEscape(r rune) bool {
-	return unicode.IsControl(r) ||
-		unicode.Is(unicode.Cf, r) || // format: bidi overrides, zero-width marks
-		unicode.Is(unicode.Zl, r) || // line separator
-		unicode.Is(unicode.Zp, r) || // paragraph separator
-		unicode.Is(unicode.Co, r) // private use
-}
+// NeedsEscape reports whether a valid rune must not be shown or pasted raw:
+// C0, DEL and C1 controls, format characters (bidi overrides, zero-width
+// marks), line and paragraph separators, private use, surrogates, unassigned
+// runes and every space other than U+0020.
+func NeedsEscape(r rune) bool { return !unicode.IsPrint(r) }
+
+func mustEscape(r rune) bool { return NeedsEscape(r) }

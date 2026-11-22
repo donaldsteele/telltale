@@ -10,11 +10,11 @@ package checklist
 
 import (
 	"fmt"
-	"github.com/donaldsteele/telltale/internal/escape"
 	"path"
 	"sort"
 	"strings"
 
+	"github.com/donaldsteele/telltale/internal/escape"
 	"github.com/donaldsteele/telltale/internal/model"
 )
 
@@ -223,4 +223,55 @@ func sortedUnique(ss []string) []string {
 		}
 	}
 	return out
+}
+
+// A NUL byte cannot be part of a shell word, so a value holding one gets no
+// command: it is left out and named in a comment line instead.
+func nulNote(s string) string {
+	return "# " + escape.Terminal(s) + " contains a NUL byte and cannot be typed safely; inspect it by hand"
+}
+
+// splitNUL separates the values a shell can be given from those it cannot.
+func splitNUL(vals []string) (kept, notes []string) {
+	for _, v := range vals {
+		if escape.Quotable(v) {
+			kept = append(kept, v)
+		} else {
+			notes = append(notes, nulNote(v))
+		}
+	}
+	return kept, notes
+}
+
+// joinNotes puts the comment lines after a command (or alone, when every
+// value was left out).
+func joinNotes(cmd string, notes []string) string {
+	if len(notes) == 0 {
+		return cmd
+	}
+	if cmd == "" {
+		return strings.Join(notes, "\n")
+	}
+	return cmd + "\n" + strings.Join(notes, "\n")
+}
+
+// overPaths builds a command over a list of machine values; build gets them
+// quoted and joined. Values with a NUL are left out.
+func overPaths(vals []string, build func(quoted string) string) string {
+	kept, notes := splitNUL(vals)
+	cmd := ""
+	if len(kept) > 0 {
+		cmd = build(quoteAll(kept))
+	}
+	return joinNotes(cmd, notes)
+}
+
+// escapeAll joins names for a comment line: a name from the machine must not
+// end the comment.
+func escapeAll(ss []string) string {
+	e := make([]string, len(ss))
+	for i, s := range ss {
+		e[i] = escape.Terminal(s)
+	}
+	return strings.Join(e, ", ")
 }
