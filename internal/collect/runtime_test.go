@@ -1,6 +1,7 @@
 package collect
 
 import (
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"io/fs"
@@ -373,7 +374,7 @@ func TestCollectDeletedExeEntry(t *testing.T) {
 		{PID: 5, Exe: "/usr/bin/live"},
 	}
 	have := []model.FileEntry{{Path: "/usr/bin/covered", Type: "file"}}
-	got := ensureExeEntries(root, have, procs, 1<<20)
+	got, _ := ensureExeEntries(root, have, procs, nil, 1<<20)
 	by := map[string]model.FileEntry{}
 	n := 0
 	for _, e := range got {
@@ -391,7 +392,7 @@ func TestCollectDeletedExeEntry(t *testing.T) {
 		t.Error("missing file got an entry")
 	}
 	// Over the hash cap: entry without a hash.
-	got = ensureExeEntries(root, nil, procs[:1], 3)
+	got, _ = ensureExeEntries(root, nil, procs[:1], nil, 3)
 	if len(got) != 1 || got[0].SHA256 != "" {
 		t.Errorf("oversize: %+v", got)
 	}
@@ -406,8 +407,37 @@ func TestCollectLinkTargetEntry(t *testing.T) {
 		{Path: "/etc/cron.daily/n", Mode: 0o120777, Lines: []string{"/dev/null"}},
 		{Path: "/etc/cron.daily/f", Mode: 0o100644, Lines: []string{"/opt/g/notalink"}},
 	}
-	got := ensureEntries(root, nil, linkTargets(persist), 1<<20)
-	if len(got) != 1 || got[0].Path != "/opt/g/cron" || got[0].SHA256 != sum("#!/bin/sh\n") {
+	got, _ := ensureEntries(root, nil, linkTargets(persist), nil, 1<<20)
+	if len(got) != 1 || got[0].Path != "/opt/g/cron" || got[0].SHA256 != sum("#!/bin/sh\n") || !got[0].Supplementary || got[0].MD5 != md5hex("#!/bin/sh\n") {
 		t.Errorf("entries: %+v", got)
+	}
+}
+
+func md5hex(s string) string {
+	h := md5.Sum([]byte(s))
+	return hex.EncodeToString(h[:])
+}
+
+// A startup link into /proc, /sys, /dev or a skipped mount is never opened:
+// reading /proc/kmsg or a trace pipe would consume or hang.
+func TestCollectEntriesNeverReadKernelFiles(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "mnt/net"), 0o755)
+	os.WriteFile(filepath.Join(root, "mnt/net/f"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(root, "ok"), []byte("x"), 0o644)
+	old := testHookBeforeOpen
+	var opened []string
+	testHookBeforeOpen = func(p string) { opened = append(opened, p) }
+	t.Cleanup(func() { testHookBeforeOpen = old })
+	paths := []string{"/proc/self/stat", "/proc/kmsg", "/sys/kernel/tracing/trace_pipe", "/dev/zero", "/mnt/net/f", "/ok"}
+	got, skips := ensureEntries(root, nil, paths, []model.Mount{{Path: "/mnt/net", FSType: "nfs4"}}, 1<<20)
+	if len(got) != 1 || got[0].Path != "/ok" {
+		t.Errorf("entries: %+v", got)
+	}
+	if len(opened) != 1 || !strings.HasSuffix(opened[0], "/ok") {
+		t.Errorf("opened: %v", opened)
+	}
+	if len(skips) != 5 {
+		t.Errorf("skips recorded: %+v", skips)
 	}
 }

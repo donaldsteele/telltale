@@ -161,25 +161,26 @@ func ldPreload(c *model.Collection) []model.Finding {
 	return nil
 }
 
-// suspiciousExe classifies a process executable. homes maps uid to home.
-func suspiciousExe(p model.Process, homes map[int]string) (string, model.Severity, bool) {
+// suspiciousExe classifies a process executable. homes maps uid to home. The
+// class names the situation and, with the program path, keys the finding.
+func suspiciousExe(p model.Process, homes map[int]string) (class, reason string, sev model.Severity, bad bool) {
 	if p.ExeDeleted {
-		return "the program file was deleted after it started", model.SevBackdoor, true
+		return "deleted", "the program file was deleted after it started", model.SevBackdoor, true
 	}
 	for _, d := range []string{"/tmp/", "/dev/shm/", "/var/tmp/"} {
 		if strings.HasPrefix(p.Exe, d) {
-			return "it runs from " + strings.TrimSuffix(d, "/"), model.SevBackdoor, true
+			return "tmp", "it runs from " + strings.TrimSuffix(d, "/"), model.SevBackdoor, true
 		}
 	}
 	for _, comp := range strings.Split(p.Exe, "/") {
 		if strings.HasPrefix(comp, ".") && comp != "." && comp != ".." {
 			if h := homes[p.UID]; p.UID > 0 && h != "" && h != "/" && strings.HasPrefix(p.Exe, strings.TrimSuffix(h, "/")+"/") {
-				return "its path has a hidden (dot) component, inside the owner's own home", model.SevNote, true
+				return "hidden_home", "its path has a hidden (dot) component, inside the owner's own home", model.SevNote, true
 			}
-			return "its path has a hidden (dot) component", model.SevBackdoor, true
+			return "hidden", "its path has a hidden (dot) component", model.SevBackdoor, true
 		}
 	}
-	return "", 0, false
+	return "", "", 0, false
 }
 
 func nameOf(p model.Process) string {

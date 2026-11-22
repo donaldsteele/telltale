@@ -288,6 +288,9 @@ func (j *judge) heuristics() {
 			f.Source = srcCrossview
 		}
 		f := f
+		if strings.HasPrefix(f.Key, "heur.persist_link_pkg:") {
+			j.rankPackageLink(&f)
+		}
 		j.add(&f)
 	}
 }
@@ -560,4 +563,50 @@ func (j *judge) report(checks []model.CheckResult, applied []model.Exception) *m
 	r.Skipped = append(append(r.Skipped, j.c.Skipped...), j.skipped...)
 	r.ExitCode = exitCode(r.Findings)
 	return r
+}
+
+// rankPackageLink ranks a startup link into a package-owned file outside the
+// system directories (R68b). With no trusted source for the file, root could
+// have overwritten it, so the note stands only when the file is verified, or
+// matches the md5 the machine's own dpkg database holds for it. A mismatch
+// against a trusted source is also reported by package verification itself.
+func (j *judge) rankPackageLink(f *model.Finding) {
+	pf := j.persist[strings.TrimPrefix(f.Key, "heur.persist_link_pkg:")]
+	if pf == nil {
+		return
+	}
+	target, ok := pf.LinkTarget()
+	if !ok {
+		return
+	}
+	const localOnly = " The file was checked only against the machine's own checksums, which root can edit."
+	if r := j.in.Pkg; r != nil {
+		for _, v := range r.Mismatch {
+			if v.Path == target {
+				f.Severity = model.SevBackdoor
+				f.Why = "The startup entry runs a package-owned file that no longer matches its package (see the tampering finding for it). " + f.Why
+				return
+			}
+		}
+		if v, ok := j.verified[target]; ok {
+			if v.Source == pkgverify.SourceOfflineLocal {
+				f.Why += localOnly
+			}
+			return
+		}
+	}
+	// No trusted verdict: the machine's own md5 for the file decides.
+	var want, got string
+	if p := j.pkgs[j.owned[target]]; p != nil {
+		want = strings.ToLower(p.LocalMD5[target])
+	}
+	if e := j.files[target]; e != nil {
+		got = strings.ToLower(e.MD5)
+	}
+	if want == "" || got == "" || want != got {
+		f.Severity = model.SevBackdoor
+		f.Why = "The startup entry runs a package-owned file outside the system directories that no trusted source could check, and the machine's own checksum for it is missing or does not match the file: it may have been overwritten. " + f.Why
+		return
+	}
+	f.Why += localOnly
 }

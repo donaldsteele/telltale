@@ -355,6 +355,7 @@ func Persistence(root string, users []model.User, key []byte) ([]model.PersistFi
 			c.file(path.Join(home, n), model.PersistKindShellRC)
 		}
 		c.systemd(path.Join(home, ".config/systemd/user"), true)
+		c.systemd(path.Join(home, ".local/share/systemd/user"), true)
 		for _, pat := range akf {
 			c.file(expandAKF(pat, home, u.Name), model.PersistKindAuthorizedKeys)
 		}

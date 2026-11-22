@@ -36,7 +36,7 @@ func nameList(s []string) string {
 
 // procGroup is the processes that share a program path and a finding.
 type procGroup struct {
-	kind   string // "proc_exe" or "stale_exe"
+	class  string // deleted, tmp, hidden, hidden_home or stale
 	exe    string
 	reason string
 	sev    model.Severity
@@ -47,7 +47,7 @@ type procGroup struct {
 func onlyDeleted(p model.Process, homes map[int]string) bool {
 	q := p
 	q.ExeDeleted = false
-	_, _, other := suspiciousExe(q, homes)
+	_, _, _, other := suspiciousExe(q, homes)
 	return !other
 }
 
@@ -73,43 +73,37 @@ func processes(c *model.Collection, ctx model.ScanContext, owned map[string]stri
 	for _, f := range c.Files {
 		files[f.Path] = f
 	}
-	type gk struct {
-		kind, exe string
-		sev       model.Severity
-	}
+	type gk struct{ class, exe string }
 	idx := map[gk]int{}
 	var groups []*procGroup
 	for _, p := range c.Runtime.Processes {
-		reason, sev, bad := suspiciousExe(p, homes)
+		class, reason, sev, bad := suspiciousExe(p, homes)
 		if !bad {
 			continue
 		}
-		kind := "proc_exe"
 		if p.ExeDeleted && onlyDeleted(p, homes) && staleAfterUpgrade(p, files, owned) {
-			kind, sev = "stale_exe", model.SevNote
+			class, sev = "stale", model.SevNote
 		}
-		k := gk{kind, p.Exe, sev}
+		k := gk{class, p.Exe}
 		i, ok := idx[k]
 		if !ok {
 			i = len(groups)
 			idx[k] = i
-			groups = append(groups, &procGroup{kind: kind, exe: p.Exe, reason: reason, sev: sev})
+			groups = append(groups, &procGroup{class: class, exe: p.Exe, reason: reason, sev: sev})
 		}
 		groups[i].procs = append(groups[i].procs, p)
 	}
-	// Keys are the program path. When one program has groups of different
-	// severities (the same hidden path under two owners), the milder one
-	// gets a suffix so keys stay unique and stable.
-	taken := map[string]bool{}
+	// Keys are the situation and the program path, never a pid or port: the
+	// same program in another situation never shares a key.
 	sort.SliceStable(groups, func(i, j int) bool { return groups[i].sev > groups[j].sev })
 	var out []model.Finding
 	for _, g := range groups {
-		out = append(out, g.finding(ctx, taken))
+		out = append(out, g.finding(ctx))
 	}
 	return out
 }
 
-func (g *procGroup) finding(ctx model.ScanContext, taken map[string]bool) model.Finding {
+func (g *procGroup) finding(ctx model.ScanContext) model.Finding {
 	sort.SliceStable(g.procs, func(i, j int) bool { return g.procs[i].PID < g.procs[j].PID })
 	pids := make([]int, len(g.procs))
 	for i, p := range g.procs {
@@ -123,23 +117,18 @@ func (g *procGroup) finding(ctx model.ScanContext, taken map[string]bool) model.
 	}
 	who += " (" + nameOf(first) + ")"
 
-	key := "heur." + g.kind + ":" + g.exe
-	if taken[key] {
-		key += "#" + strings.ToLower(g.sev.String())
+	key := "heur.proc_exe:" + g.class + ":" + g.exe
+	if g.class == "stale" {
+		key = "heur.stale_exe:" + g.exe
 	}
-	taken[key] = true
 
 	fp := strconv.Itoa(first.PID)
 	var others string
 	if many {
-		rest := make([]string, 0, len(pids)-1)
-		for _, p := range pids[1:] {
-			rest = append(rest, strconv.Itoa(p))
-		}
-		others = "; the same program also runs as " + strings.Join(rest, ", ")
+		others = "; the same program also runs as " + pidsCapped(pids[1:])
 	}
 	f := model.Finding{Key: key, Source: source, Severity: g.sev}
-	if g.kind == "stale_exe" {
+	if g.class == "stale" {
 		f.ID = idProcExe
 		verb := "still runs"
 		if many {
@@ -169,6 +158,10 @@ func (g *procGroup) finding(ctx model.ScanContext, taken map[string]bool) model.
 		}
 		cmdline, _ := redact.Line(ctx.DigestKey, p.Cmdline)
 		f.Evidence = append(f.Evidence, model.Evidence{Path: p.Exe, Detail: fmt.Sprintf("pid=%d exe=%s cmdline=%s uid=%d deleted=%t", p.PID, p.Exe, cmdline, p.UID, p.ExeDeleted)})
+	}
+	if len(f.Evidence) > 0 {
+		// What accept records: the situation and the program, never a pid.
+		f.Evidence[0].After = g.class + " " + g.exe
 	}
 	return f
 }
@@ -238,6 +231,9 @@ func listeners(c *model.Collection, ctx model.ScanContext, owned map[string]stri
 			}
 			f.Evidence = append(f.Evidence, model.Evidence{Path: g.exe, Detail: d})
 		}
+		if len(f.Evidence) > 0 {
+			f.Evidence[0].After = "listener " + g.exe
+		}
 		out = append(out, f)
 	}
 	return out
@@ -245,16 +241,29 @@ func listeners(c *model.Collection, ctx model.ScanContext, owned map[string]stri
 
 // otherPIDs names the further processes of the program, for a fix comment.
 func (g *listenGroup) otherPIDs() string {
-	var rest []string
+	var rest []int
 	seen := map[int]bool{g.first.PID: true}
 	for _, p := range g.pids {
 		if !seen[p] {
 			seen[p] = true
-			rest = append(rest, strconv.Itoa(p))
+			rest = append(rest, p)
 		}
 	}
 	if len(rest) == 0 {
 		return ""
 	}
-	return "; the same program also runs as " + strings.Join(rest, ", ")
+	return "; the same program also runs as " + pidsCapped(rest)
+}
+
+// pidsCapped joins pids, at most maxEvidence of them, then "and N more".
+func pidsCapped(pids []int) string {
+	var s []string
+	for i, p := range pids {
+		if i == maxEvidence {
+			s = append(s, fmt.Sprintf("and %d more", len(pids)-i))
+			break
+		}
+		s = append(s, strconv.Itoa(p))
+	}
+	return strings.Join(s, ", ")
 }

@@ -1957,3 +1957,17 @@ func TestPkgverifyExtraPaths(t *testing.T) {
 	res = Verify(context.Background(), c, opt)
 	wantPaths(t, "only+extra Mismatch", res.Mismatch, readme)
 }
+
+// The package lists /bin/toolctl; this merged-/usr machine collects it at
+// /usr/bin/toolctl. ExtraPaths names the collected spelling.
+func TestPkgverifyExtraPathsMergedUsrAlias(t *testing.T) {
+	f := toolFixture(t)
+	c := toolCollection(map[string]string{"/usr/bin/toolctl": "evil\n"})
+	opt := f.opts()
+	opt.OnlyPaths = map[string]bool{}
+	res := Verify(context.Background(), c, opt)
+	wantPaths(t, "without extra", res.Mismatch)
+	opt.ExtraPaths = []string{"/usr/bin/toolctl"}
+	res = Verify(context.Background(), c, opt)
+	wantPaths(t, "with extra", res.Mismatch, "/usr/bin/toolctl")
+}

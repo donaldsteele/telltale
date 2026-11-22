@@ -124,6 +124,9 @@ func compareFiles(old, cur []model.FileEntry) []Change {
 	for _, n := range cur {
 		seen[n.Path] = true
 		o, ok := om[n.Path]
+		if !ok && n.Supplementary {
+			continue // exists only while something refers to it
+		}
 		if !ok {
 			out = append(out, Change{Kind: FileAdded, Subject: n.Path, After: describeFile(n)})
 			continue
@@ -163,7 +166,7 @@ func compareFiles(old, cur []model.FileEntry) []Change {
 		}
 	}
 	for _, o := range old {
-		if !seen[o.Path] {
+		if !seen[o.Path] && !o.Supplementary {
 			out = append(out, Change{Kind: FileRemoved, Subject: o.Path, Before: describeFile(o)})
 		}
 	}

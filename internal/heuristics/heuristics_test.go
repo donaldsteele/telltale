@@ -128,7 +128,7 @@ func TestHeuristicLDPreload(t *testing.T) {
 func TestHeuristicDeletedExe(t *testing.T) {
 	c := cleanCollection()
 	c.Runtime.Processes = append(c.Runtime.Processes, model.Process{PID: 77, UID: 0, Exe: "/usr/bin/x", Cmdline: "x -a", ExeDeleted: true})
-	f := want(t, c, "heur.proc_exe:/usr/bin/x", model.SevBackdoor)
+	f := want(t, c, "heur.proc_exe:deleted:/usr/bin/x", model.SevBackdoor)
 	if !strings.Contains(f.Fix, "kill -STOP 77") || !strings.Contains(f.Fix, "cp /proc/77/exe /root/telltale-evidence/77.exe") {
 		t.Errorf("fix: %s", f.Fix)
 	}
@@ -138,10 +138,10 @@ func TestHeuristicDeletedExe(t *testing.T) {
 }
 
 func TestHeuristicProcExePaths(t *testing.T) {
-	for _, exe := range []string{"/tmp/a", "/dev/shm/a", "/var/tmp/a", "/home/u/.cache/a", "/usr/bin/.hidden"} {
+	for exe, class := range map[string]string{"/tmp/a": "tmp", "/dev/shm/a": "tmp", "/var/tmp/a": "tmp", "/home/u/.cache/a": "hidden", "/usr/bin/.hidden": "hidden"} {
 		c := cleanCollection()
 		c.Runtime.Processes = append(c.Runtime.Processes, model.Process{PID: 9, UID: 1000, Exe: exe})
-		want(t, c, "heur.proc_exe:"+exe, model.SevBackdoor)
+		want(t, c, "heur.proc_exe:"+class+":"+exe, model.SevBackdoor)
 	}
 }
 
@@ -304,7 +304,7 @@ func TestHeuristicEscapedQuoteCommand(t *testing.T) {
 func TestHeuristicCmdlineRedacted(t *testing.T) {
 	c := cleanCollection()
 	c.Runtime.Processes = append(c.Runtime.Processes, model.Process{PID: 8, UID: 0, Exe: "/tmp/m", Cmdline: "mysql --password=secret -h x"})
-	f := want(t, c, "heur.proc_exe:/tmp/m", model.SevBackdoor)
+	f := want(t, c, "heur.proc_exe:tmp:/tmp/m", model.SevBackdoor)
 	if strings.Contains(f.Evidence[0].Detail, "secret") {
 		t.Errorf("leaked: %s", f.Evidence[0].Detail)
 	}
@@ -318,10 +318,10 @@ func TestHeuristicHiddenDirInOwnHome(t *testing.T) {
 		model.Process{PID: 22, UID: 0, Exe: "/home/alice/.cache/x/bin"},
 		model.Process{PID: 23, UID: 1000, Exe: "/tmp/x"})
 	c.Accounts.Users[2].Home = "/home/alice"
-	want(t, c, "heur.proc_exe:/home/alice/.cache/x/bin#note", model.SevNote)
-	want(t, c, "heur.proc_exe:/home/bob/.cache/x/bin", model.SevBackdoor)
-	want(t, c, "heur.proc_exe:/home/alice/.cache/x/bin", model.SevBackdoor)
-	want(t, c, "heur.proc_exe:/tmp/x", model.SevBackdoor)
+	want(t, c, "heur.proc_exe:hidden_home:/home/alice/.cache/x/bin", model.SevNote)
+	want(t, c, "heur.proc_exe:hidden:/home/bob/.cache/x/bin", model.SevBackdoor)
+	want(t, c, "heur.proc_exe:hidden:/home/alice/.cache/x/bin", model.SevBackdoor)
+	want(t, c, "heur.proc_exe:tmp:/tmp/x", model.SevBackdoor)
 }
 
 func TestPersistLinkFixRemovesDanglingLink(t *testing.T) {
@@ -468,6 +468,7 @@ func TestPersistLinkPackageOwnedTargetIsNote(t *testing.T) {
 	const l, tgt = "/etc/cron.daily/google-chrome", "/opt/google/chrome/cron/google-chrome"
 	c := cleanCollection()
 	c.Persist = append(c.Persist, link(l, tgt))
+	c.Files = append(c.Files, model.FileEntry{Path: tgt, Type: "file", Mode: 0o100755})
 	owned := cleanOwned()
 	owned[tgt] = "google-chrome-stable"
 	fs := runOwned(c, owned)
@@ -483,6 +484,20 @@ func TestPersistLinkPackageOwnedTargetIsNote(t *testing.T) {
 	}
 	if find(fs, "heur.persist_link:"+l) != nil {
 		t.Error("also flagged as a backdoor sign")
+	}
+	// Counter-tests: the target is a symlink or missing: backdoor sign.
+	for name, files := range map[string][]model.FileEntry{
+		"symlink": {{Path: tgt, Type: "symlink", Target: "/tmp/evil"}},
+		"missing": nil,
+		"error":   {{Path: tgt, Type: "file", Err: "read: denied"}},
+	} {
+		c2 := cleanCollection()
+		c2.Persist = append(c2.Persist, link(l, tgt))
+		c2.Files = append(c2.Files, files...)
+		f := find(runOwned(c2, owned), "heur.persist_link:"+l)
+		if f == nil || f.Severity != model.SevBackdoor || find(runOwned(c2, owned), "heur.persist_link_pkg:"+l) != nil {
+			t.Errorf("%s target: want a backdoor sign, got %+v", name, f)
+		}
 	}
 	// Counter-test: a target no package owns stays a backdoor sign.
 	delete(owned, tgt)
@@ -539,7 +554,7 @@ func TestStaleExeAfterUpgradeIsNote(t *testing.T) {
 		"no start time":      {staleCollection(time.Time{}, start, "/usr/bin/node", true), owned, "/usr/bin/node"},
 	} {
 		fs := runOwned(tc.c, tc.owned)
-		f := find(fs, "heur.proc_exe:"+tc.exe)
+		f := find(fs, "heur.proc_exe:deleted:"+tc.exe)
 		if f == nil || f.Severity != model.SevBackdoor {
 			t.Errorf("%s: want a backdoor sign, got %v", name, keys(fs))
 		}
@@ -552,9 +567,13 @@ func TestStaleExeAfterUpgradeIsNote(t *testing.T) {
 func userUnitCollection(linkPath, target string) *model.Collection {
 	c := cleanCollection()
 	c.Accounts.Users[2].Home = "/home/alice"
-	c.Persist = append(c.Persist, link(linkPath, target),
-		model.PersistFile{Path: "/home/alice/.config/systemd/user/x.service", Kind: model.PersistKindSystemdUnit, Mode: 0o100644,
-			Lines: []string{"[Service]", "ExecStart=/usr/bin/x --serve", "Restart=always"}})
+	unit := model.PersistFile{Path: "/home/alice/.config/systemd/user/x.service", Kind: model.PersistKindSystemdUnit, Mode: 0o100644,
+		Lines: []string{"[Service]", "ExecStart=/usr/bin/x --serve", "Restart=always"}}
+	c.Persist = append(c.Persist, link(linkPath, target), unit)
+	if target != unit.Path {
+		unit.Path = target
+		c.Persist = append(c.Persist, unit)
+	}
 	return c
 }
 
@@ -629,7 +648,7 @@ func TestProcFindingsGroupedByProgram(t *testing.T) {
 			t.Errorf("title lacks port %s: %s", port, l.Title)
 		}
 	}
-	p := find(fs, "heur.proc_exe:/tmp/m")
+	p := find(fs, "heur.proc_exe:tmp:/tmp/m")
 	if p == nil || p.Severity != model.SevBackdoor || !strings.Contains(p.Title, "40, 41 and 42") {
 		t.Fatalf("proc finding: %+v", p)
 	}
@@ -640,14 +659,14 @@ func TestProcFindingsGroupedByProgram(t *testing.T) {
 	for pid := 50; pid < 59; pid++ {
 		c.Runtime.Processes = append(c.Runtime.Processes, model.Process{PID: pid, UID: 1000, Exe: "/tmp/many", Comm: "worker"})
 	}
-	p = find(runOwned(c, owned), "heur.proc_exe:/tmp/many")
+	p = find(runOwned(c, owned), "heur.proc_exe:tmp:/tmp/many")
 	if p == nil || !strings.Contains(p.Title, "50, 51 and 7 more (worker)") {
 		t.Errorf("title: %+v", p)
 	}
 	// The key is the same on a second scan with different pids.
 	c2 := cleanCollection()
 	c2.Runtime.Processes = append(c2.Runtime.Processes, model.Process{PID: 900, UID: 1000, Exe: "/tmp/m", Comm: "m"})
-	if find(runOwned(c2, owned), "heur.proc_exe:/tmp/m") == nil {
+	if find(runOwned(c2, owned), "heur.proc_exe:tmp:/tmp/m") == nil {
 		t.Error("key changed with the pid")
 	}
 }
@@ -664,7 +683,11 @@ func TestDevWorkstationFixtureHasNoBackdoorSigns(t *testing.T) {
 	for _, pid := range []int{99230, 743634, 7} {
 		c.Runtime.Processes = append(c.Runtime.Processes, model.Process{PID: pid, UID: 1000, Exe: "/usr/bin/node", Comm: "node", ExeDeleted: true, Started: start})
 	}
-	c.Files = append(c.Files, model.FileEntry{Path: "/usr/bin/node", Type: "file", Mode: 0o100755, CTime: start.Add(24 * time.Hour)})
+	c.Files = append(c.Files, model.FileEntry{Path: "/usr/bin/node", Type: "file", Mode: 0o100755, CTime: start.Add(24 * time.Hour)},
+		model.FileEntry{Path: "/opt/google/chrome/cron/google-chrome", Type: "file", Mode: 0o100755})
+	for _, n := range []string{"a", "b"} {
+		c.Persist = append(c.Persist, model.PersistFile{Path: "/home/alice/.config/systemd/user/" + n + ".service", Mode: 0o100644, Lines: []string{"ExecStart=/usr/bin/" + n}})
+	}
 	owned := cleanOwned()
 	owned["/opt/google/chrome/cron/google-chrome"] = "google-chrome-stable"
 	owned["/usr/bin/node"] = "nodejs"
@@ -701,5 +724,52 @@ func TestPackageLinkTargets(t *testing.T) {
 	got := PackageLinkTargets(c, map[string]string{"/opt/p/a": "p", "/usr/lib/d": "p"})
 	if len(got) != 1 || got[0] != "/opt/p/a" {
 		t.Errorf("got %v, want [/opt/p/a]", got)
+	}
+}
+
+func TestUserUnitUncollectedAndHostileTargets(t *testing.T) {
+	const l = "/home/alice/.config/systemd/user/default.target.wants/x.service"
+	backdoor := func(name string, c *model.Collection) {
+		t.Helper()
+		fs := runOwned(c, cleanOwned())
+		f := find(fs, "heur.persist_link:"+l)
+		if f == nil || f.Severity != model.SevBackdoor || find(fs, "heur.user_unit:"+l) != nil {
+			t.Errorf("%s: want a backdoor sign, got %v", name, keys(fs))
+		}
+	}
+	// A unit in a tree whose contents are never collected has no note.
+	c := userUnitCollection(l, "/home/alice/.config/systemd/user/x.service")
+	c.Persist[len(c.Persist)-2].Lines = []string{"/home/alice/.local/share/systemd/user/evil.service"}
+	c.Persist = c.Persist[:len(c.Persist)-1]
+	backdoor("uncollected unit", c)
+	// The link text was redacted: it is not what the link holds.
+	c = userUnitCollection(l, "/home/alice/.config/systemd/user/x.service")
+	for i := range c.Persist {
+		if c.Persist[i].Path == l {
+			c.Persist[i].Lines = []string{"/home/alice/.config/systemd/user/key=x/../../../../../../tmp/evil.service"}
+			c.Persist[i].Redactions = 1
+		}
+	}
+	backdoor("redacted user-unit link", c)
+	c = cleanCollection()
+	c.Persist = append(c.Persist, model.PersistFile{Path: "/etc/systemd/system/y.service", Kind: model.PersistKindSystemdUnit, Mode: 0o120777, Lines: []string{"/usr/key=x/../../tmp/evil"}, Redactions: 1})
+	if f := find(runOwned(c, cleanOwned()), "heur.persist_link:/etc/systemd/system/y.service"); f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("redacted system-prefix link: %+v", f)
+	}
+	// A home in a temporary tree is never "the same home".
+	c = cleanCollection()
+	c.Accounts.Users[2].Home = "/tmp/h"
+	tl := "/tmp/h/.config/systemd/user/default.target.wants/x.service"
+	c.Persist = append(c.Persist, link(tl, "/tmp/h/.config/systemd/user/x.service"),
+		model.PersistFile{Path: "/tmp/h/.config/systemd/user/x.service", Mode: 0o100644, Lines: []string{"ExecStart=/tmp/x"}})
+	fs := runOwned(c, cleanOwned())
+	if f := find(fs, "heur.persist_link:"+tl); f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("home in /tmp: %v", keys(fs))
+	}
+	// A system-wide user unit that was not collected is as before: no finding.
+	c = userUnitCollection(l, "/usr/lib/systemd/user/x.service")
+	c.Persist = c.Persist[:len(c.Persist)-1]
+	if fs := runOwned(c, cleanOwned()); len(fs) != 0 {
+		t.Errorf("uncollected /usr/lib target: %v", keys(fs))
 	}
 }

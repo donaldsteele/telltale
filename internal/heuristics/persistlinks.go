@@ -30,7 +30,7 @@ func PackageLinkTargets(c *model.Collection, owned map[string]string) []string {
 	seen := map[string]bool{}
 	for _, p := range c.Persist {
 		t, ok := p.LinkTarget()
-		if !ok || t == "/dev/null" || inSystemDir(t) || owned[t] == "" || seen[t] {
+		if !ok || p.Redactions > 0 || t == "/dev/null" || inSystemDir(t) || owned[t] == "" || seen[t] {
 			continue
 		}
 		seen[t] = true
@@ -52,7 +52,7 @@ func userUnitOwner(c *model.Collection, link, target string) (string, bool) {
 	unitDir := path.Dir(dir)
 	for _, u := range c.Accounts.Users {
 		h := path.Clean(u.Home)
-		if isNIS(u.Name) || u.Home == "" || h == "/" || unitDir != h+"/.config/systemd/user" {
+		if isNIS(u.Name) || u.Home == "" || h == "/" || tempDir(h) || unitDir != h+"/.config/systemd/user" {
 			continue
 		}
 		for _, pre := range []string{h + "/.config/systemd/user/", h + "/.local/share/systemd/user/", "/etc/systemd/user/", "/usr/lib/systemd/user/"} {
@@ -89,7 +89,8 @@ func persistLinks(c *model.Collection, owned map[string]string) []model.Finding 
 		}
 		ev := []model.Evidence{{Path: p.Path, Line: 1, After: p.Lines[0], Detail: "symlink to " + target}}
 		key := "heur.persist_link:" + p.Path
-		if target == "/dev/null" {
+		redacted := p.Redactions > 0 // the target text is not what the link holds
+		if target == "/dev/null" && !redacted {
 			base := path.Base(p.Path)
 			for _, w := range maskedWeak {
 				if strings.HasPrefix(base, w) {
@@ -107,7 +108,7 @@ func persistLinks(c *model.Collection, owned map[string]string) []model.Finding 
 			}
 			continue
 		}
-		if owner, ok := userUnitOwner(c, p.Path, target); ok {
+		if owner, ok := userUnitOwner(c, p.Path, target); ok && !redacted && collectedUnit(c, target) {
 			unit := path.Base(p.Path)
 			for _, l := range execStarts(c, target) {
 				ev = append(ev, model.Evidence{Path: target, Detail: l})
@@ -123,16 +124,16 @@ func persistLinks(c *model.Collection, owned map[string]string) []model.Finding 
 			})
 			continue
 		}
-		if inSystemDir(target) {
+		if !redacted && inSystemDir(target) {
 			continue
 		}
-		if pkg := owned[target]; pkg != "" {
+		if pkg := owned[target]; pkg != "" && !redacted && regularFile(c, target) {
 			out = append(out, model.Finding{
 				Key: "heur.persist_link_pkg:" + p.Path, ID: idPersistLink, Source: source, Severity: model.SevNote,
 				Title: fmt.Sprintf("%s runs %s from package %s, outside the system directories", p.Path, target, pkg),
 				Why:   "The package placed this file outside the usual locations. Its contents are checked against the package where a trusted source exists.",
 				Fix: fix([]string{pkg}, func(q []string) string {
-					return "dpkg --verify " + q[0] + "   # prints nothing when the package's files are unchanged"
+					return "dpkg --verify " + q[0] + "   # compares with the machine's own checksums, which root can edit; a clean result is weak evidence"
 				}),
 				Evidence: ev, Refs: []string{"T1543.002", "T1053.003"},
 			})
@@ -149,4 +150,36 @@ func persistLinks(c *model.Collection, owned map[string]string) []model.Finding 
 		})
 	}
 	return out
+}
+
+// tempDir reports whether p is in a world-writable temporary tree.
+func tempDir(p string) bool {
+	for _, d := range []string{"/tmp", "/var/tmp", "/dev/shm"} {
+		if p == d || strings.HasPrefix(p, d+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// collectedUnit reports whether p is a regular unit file whose contents were
+// collected.
+func collectedUnit(c *model.Collection, p string) bool {
+	for _, f := range c.Persist {
+		if f.Path == p {
+			return f.Mode&0o170000 == 0o100000
+		}
+	}
+	return false
+}
+
+// regularFile reports whether the file scan saw p as a regular file it could
+// read.
+func regularFile(c *model.Collection, p string) bool {
+	for _, f := range c.Files {
+		if f.Path == p {
+			return f.Type == "file" && f.Err == ""
+		}
+	}
+	return false
 }

@@ -285,3 +285,17 @@ func TestPersistenceSSHDUnreadableIncludeIsSkipped(t *testing.T) {
 		t.Errorf("unreadable sshd include not recorded as %s: %+v", model.SkipCheckSSHDConfig, skips)
 	}
 }
+
+func TestPersistenceCollectsUserUnitsInLocalShare(t *testing.T) {
+	root := t.TempDir()
+	d := filepath.Join(root, "home/a/.local/share/systemd/user")
+	os.MkdirAll(d, 0o755)
+	os.WriteFile(filepath.Join(d, "evil.service"), []byte("[Service]\nExecStart=/tmp/x\n"), 0o644)
+	pf, _ := Persistence(root, []model.User{{Name: "a", Home: "/home/a"}}, testKey)
+	for _, p := range pf {
+		if p.Path == "/home/a/.local/share/systemd/user/evil.service" && len(p.Lines) == 2 {
+			return
+		}
+	}
+	t.Fatalf("unit not collected: %+v", pf)
+}

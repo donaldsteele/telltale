@@ -311,16 +311,15 @@ func bootTime(procRoot string) int64 {
 
 // ensureExeEntries adds to files the current entry of the exe path of every
 // process whose program file was deleted, when the file scan did not cover
-// it: heuristics compare it with the running process. Hashing stays within
-// maxHash. A path that no longer exists gets no entry.
-func ensureExeEntries(root string, files []model.FileEntry, procs []model.Process, maxHash int64) []model.FileEntry {
+// it: heuristics compare it with the running process.
+func ensureExeEntries(root string, files []model.FileEntry, procs []model.Process, mounts []model.Mount, maxHash int64) ([]model.FileEntry, []model.Skip) {
 	var paths []string
 	for _, p := range procs {
 		if p.ExeDeleted && p.Exe != "" {
 			paths = append(paths, p.Exe)
 		}
 	}
-	return ensureEntries(root, files, paths, maxHash)
+	return ensureEntries(root, files, paths, mounts, maxHash)
 }
 
 // linkTargets lists the absolute targets of the symlinks in persist, except
@@ -328,16 +327,39 @@ func ensureExeEntries(root string, files []model.FileEntry, procs []model.Proces
 func linkTargets(persist []model.PersistFile) []string {
 	var out []string
 	for _, p := range persist {
-		if t, ok := p.LinkTarget(); ok && t != "/dev/null" {
+		if t, ok := p.LinkTarget(); ok && p.Redactions == 0 && t != "/dev/null" {
 			out = append(out, t)
 		}
 	}
 	return out
 }
 
+// neverRead are trees a path chosen by someone else is never opened in: a
+// link to /proc/kmsg or a trace pipe would consume or block on the read.
+var neverRead = []string{"/proc", "/sys", "/dev"}
+
+// underSkippedMount reports whether p lies under a mount of a kind the file
+// scan does not enter (network, proc, tmpfs ...).
+func underSkippedMount(p string, mounts []model.Mount) bool {
+	for _, m := range mounts {
+		if !skipFS(m.FSType) {
+			continue
+		}
+		mp := filepath.Clean(m.Path)
+		if mp == "/" || p == mp || strings.HasPrefix(p, mp+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // ensureEntries adds to files the current entry of each of paths the file
-// scan did not cover. A path that does not exist gets no entry.
-func ensureEntries(root string, files []model.FileEntry, paths []string, maxHash int64) []model.FileEntry {
+// scan did not cover, marked Supplementary, with an md5 for comparing with
+// dpkg's records. A path that does not exist gets no entry. Paths under
+// /proc, /sys and /dev, and under mounts the file scan skips, are never
+// opened.
+func ensureEntries(root string, files []model.FileEntry, paths []string, mounts []model.Mount, maxHash int64) ([]model.FileEntry, []model.Skip) {
+	var skips []model.Skip
 	have := make(map[string]bool, len(files))
 	for _, e := range files {
 		have[e.Path] = true
@@ -347,11 +369,22 @@ func ensureEntries(root string, files []model.FileEntry, paths []string, maxHash
 		if !filepath.IsAbs(p) || have[p] {
 			continue
 		}
+		p = filepath.Clean(p)
 		have[p] = true
-		var skips []model.Skip
-		if e, ok := statEntry(root+p, p, FileOptions{MaxHashBytes: maxHash}, &skips); ok {
+		refused := underSkippedMount(p, mounts)
+		for _, d := range neverRead {
+			if p == d || strings.HasPrefix(p, d+"/") {
+				refused = true
+			}
+		}
+		if refused {
+			skips = append(skips, model.Skip{Check: checkName, Reason: p + ": not opened (kernel, device or skipped mount)"})
+			continue
+		}
+		if e, ok := statEntry(root+p, p, FileOptions{MaxHashBytes: maxHash, MD5: true}, &skips); ok {
+			e.Supplementary = true
 			files = append(files, e)
 		}
 	}
-	return files
+	return files, skips
 }

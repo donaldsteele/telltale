@@ -2,6 +2,7 @@
 package collect
 
 import (
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -30,6 +31,8 @@ var skipFSTypes = []string{"nfs", "nfs4", "cifs", "smb3", "sshfs", "fuse.*", "pr
 type FileOptions struct {
 	MaxHashBytes int64
 	Mounts       []model.Mount
+	// MD5 also records the md5 of regular files, to compare with dpkg.
+	MD5 bool
 }
 
 // testHookBeforeOpen, when non-nil, runs just before a file is opened for
@@ -189,11 +192,19 @@ func statEntry(p, mp string, opt FileOptions, skips *[]model.Skip) (model.FileEn
 			r = io.LimitReader(f, opt.MaxHashBytes) // file may have grown since Lstat
 		}
 		h := sha256.New()
-		if _, err := io.Copy(h, r); err != nil {
+		m := md5.New()
+		var w io.Writer = h
+		if opt.MD5 {
+			w = io.MultiWriter(h, m)
+		}
+		if _, err := io.Copy(w, r); err != nil {
 			e.Err = fmt.Sprintf("read: %v", err)
 			return e, true
 		}
 		e.SHA256 = hex.EncodeToString(h.Sum(nil))
+		if opt.MD5 {
+			e.MD5 = hex.EncodeToString(m.Sum(nil))
+		}
 	case "dir":
 		fd, err := unix.Open(p, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_DIRECTORY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 		if err == nil {

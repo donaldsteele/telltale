@@ -311,3 +311,28 @@ func TestCompareAccountsFirstEntryCounts(t *testing.T) {
 		}
 	}
 }
+
+// Entries added outside the file scan (the file behind a deleted program, the
+// target of a startup link) exist only while something refers to them.
+func TestCompareSupplementaryEntriesAreNeverAddedOrRemoved(t *testing.T) {
+	sup := model.FileEntry{Path: "/opt/vendor/app", Type: "file", SHA256: "aa", Supplementary: true}
+	empty := &model.Collection{}
+	withSup := &model.Collection{Files: []model.FileEntry{sup}}
+	// A stale process (or an enabled user unit) appears: not a new file.
+	for _, c := range Compare(snap(empty), withSup, nil) {
+		if c.Kind == FileAdded || c.Kind == FileRemoved {
+			t.Errorf("one-sided supplementary entry reported: %+v", c)
+		}
+	}
+	// And it disappears again.
+	for _, c := range Compare(snap(withSup), empty, nil) {
+		if c.Kind == FileAdded || c.Kind == FileRemoved {
+			t.Errorf("one-sided supplementary entry reported: %+v", c)
+		}
+	}
+	// A normal entry on the other side is compared normally.
+	changed := &model.Collection{Files: []model.FileEntry{{Path: "/opt/vendor/app", Type: "file", SHA256: "bb"}}}
+	find(t, Compare(snap(withSup), changed, nil), FileModified, "/opt/vendor/app")
+	// An ordinary one-sided entry is still added.
+	find(t, Compare(snap(empty), &model.Collection{Files: []model.FileEntry{{Path: "/opt/new", Type: "file"}}}, nil), FileAdded, "/opt/new")
+}

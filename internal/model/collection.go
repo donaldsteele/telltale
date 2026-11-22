@@ -67,6 +67,12 @@ type FileEntry struct {
 	Size   int64     `json:"size"`
 	MTime  time.Time `json:"mtime"`
 	CTime  time.Time `json:"ctime"`
+	// Supplementary marks an entry added outside the file scan (the file a
+	// deleted program was started from, the target of a startup link). It
+	// exists only while something refers to it, so a snapshot comparison
+	// never reports it as added or removed.
+	Supplementary bool   `json:"supplementary,omitempty"`
+	MD5           string `json:"md5,omitempty"` // only for supplementary entries
 }
 
 // Accounts holds local users and groups, read the way glibc's files

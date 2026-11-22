@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -2667,4 +2668,86 @@ func TestJudgeRemovedPackageDoesNotExcuseBootFilesDuringOutage(t *testing.T) {
 	r := run(cur, snapOf(old), res)
 	must(t, r, "snap.file_modified:/boot/initrd.img-6.1.0-25-amd64", model.SevBackdoor)
 	must(t, r, "snap.file_modified:/boot/grub/grub.cfg", model.SevBackdoor)
+}
+
+// R71b: accept records the first evidence's After (or the title). For grouped
+// process and listener findings it must not hold pids or ports, so that an
+// exception sticks across scans, and it must not carry over to the same
+// program in a more serious situation.
+func TestAcceptedProcessAndListenerNotesStickAcrossScans(t *testing.T) {
+	mk := func(pid, port int) *model.Collection {
+		c := clean()
+		c.Accounts.Users = append(c.Accounts.Users, model.User{Name: "alice", UID: 1000, GID: 1000, Home: "/home/alice", Shell: "/bin/bash", Password: model.PasswordState{Known: true, Set: true, Algo: "yescrypt", Digest: "d-alice", LastChange: 20000}})
+		c.Runtime.Processes = []model.Process{
+			{PID: pid, UID: 1000, Exe: "/home/alice/.cache/x/bin", Comm: "x"},
+			{PID: pid + 1, UID: 1000, Exe: "/opt/app/app", Comm: "app"},
+		}
+		c.Runtime.Sockets = []model.Socket{{Proto: "tcp", Local: "0.0.0.0:" + strconv.Itoa(port), State: "LISTEN", Listening: true, PID: pid + 1}}
+		return c
+	}
+	const noteKey, lisKey = "heur.proc_exe:hidden_home:/home/alice/.cache/x/bin", "heur.unowned_listener:/opt/app/app"
+	first := mk(1111, 40001)
+	s := snapOf(first)
+	r := run(first, s, nil)
+	for _, k := range []string{noteKey, lisKey} {
+		f := must(t, r, k, model.SevNote)
+		s.Exceptions = append(s.Exceptions, model.Exception{FindingKey: k, AcceptedValue: currentValue(f), At: taken})
+	}
+	second := mk(2222, 40002)
+	r = run(second, s, nil)
+	absent(t, r, noteKey)
+	absent(t, r, lisKey)
+	if len(r.Exceptions) < 2 {
+		t.Errorf("exceptions not applied: %+v", r.Exceptions)
+	}
+	// The same program as another user (a hidden path outside the owner's
+	// home) is a backdoor sign under another key and is not covered.
+	third := mk(3333, 40003)
+	third.Runtime.Processes = append(third.Runtime.Processes, model.Process{PID: 3400, UID: 0, Exe: "/home/alice/.cache/x/bin", Comm: "x"})
+	r = run(third, s, nil)
+	must(t, r, "heur.proc_exe:hidden:/home/alice/.cache/x/bin", model.SevBackdoor)
+	absent(t, r, noteKey)
+}
+
+func pkgLinkCollection(withMD5 bool) *model.Collection {
+	c := clean()
+	p := pkg("gchrome", "1.0", "/opt/g/c")
+	if withMD5 {
+		p.LocalMD5 = map[string]string{"/opt/g/c": "0123456789abcdef0123456789abcdef"}
+	}
+	c.Packages.Installed = append(c.Packages.Installed, p)
+	c.Files = append(c.Files, model.FileEntry{Path: "/opt/g/c", Type: "file", Mode: 0o100755, SHA256: h("c"), MD5: "0123456789abcdef0123456789abcdef", Supplementary: true})
+	c.Persist = append(c.Persist, model.PersistFile{Path: "/etc/cron.daily/g", Kind: model.PersistKindSystemdEnabled, Mode: 0o120777, Lines: []string{"/opt/g/c"}})
+	return c
+}
+
+func TestPackageLinkRankedByVerdictAndLocalChecksum(t *testing.T) {
+	const key = "heur.persist_link_pkg:/etc/cron.daily/g"
+	v := pkgverify.FileVerdict{Path: "/opt/g/c", Package: "gchrome", Version: "1.0"}
+	unver := func() *pkgverify.Result {
+		return &pkgverify.Result{Mode: pkgverify.ModeArchive, Unverifiable: []pkgverify.FileVerdict{{Path: v.Path, Package: v.Package, Version: v.Version, Reason: "no key", Kind: pkgverify.KindUntrusted}}}
+	}
+	// Verified by a trusted source: a note.
+	f := must(t, run(pkgLinkCollection(true), nil, archive(v)), key, model.SevNote)
+	if strings.Contains(f.Why, "root can edit") {
+		t.Errorf("trusted verification worded as local-only: %s", f.Why)
+	}
+	// Unverifiable, but the machine's own md5 matches: a note, worded as weak.
+	f = must(t, run(pkgLinkCollection(true), nil, unver()), key, model.SevNote)
+	if !strings.Contains(f.Why, "checked only against the machine's own checksums, which root can edit") {
+		t.Errorf("why: %s", f.Why)
+	}
+	// Unverifiable and the md5 differs from the file: a backdoor sign.
+	c := pkgLinkCollection(true)
+	c.Files[len(c.Files)-1].MD5 = "ffffffffffffffffffffffffffffffff"
+	must(t, run(c, nil, unver()), key, model.SevBackdoor)
+	// Unverifiable and the machine holds no md5 for it: a backdoor sign.
+	must(t, run(pkgLinkCollection(false), nil, unver()), key, model.SevBackdoor)
+	// No verification at all behaves the same.
+	must(t, run(pkgLinkCollection(false), nil, nil), key, model.SevBackdoor)
+	// A mismatch is tampering through its own finding, and the link is not a note.
+	mm := &pkgverify.Result{Mode: pkgverify.ModeArchive, Mismatch: []pkgverify.FileVerdict{{Path: "/opt/g/c", Package: "gchrome", Version: "1.0", Expected: "sha256:aa", Actual: "sha256:bb", Reason: "differs", Kind: pkgverify.KindContentDiffers}}}
+	r := run(pkgLinkCollection(true), nil, mm)
+	must(t, r, key, model.SevBackdoor)
+	must(t, r, "pkg.mismatch:/opt/g/c", model.SevTampering)
 }
