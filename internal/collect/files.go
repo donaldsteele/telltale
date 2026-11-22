@@ -68,6 +68,12 @@ func Files(root string, paths []string, opt FileOptions) ([]model.FileEntry, []m
 		skips = append(skips, model.Skip{Check: checkName, Reason: path + ": " + reason})
 	}
 
+	seen := make(map[string]int)
+	add := func(e model.FileEntry) {
+		seen[e.Path] = len(entries)
+		entries = append(entries, e)
+	}
+
 	for _, start := range paths {
 		start = filepath.Clean("/" + start)
 		real := filepath.Clean(root + start)
@@ -77,18 +83,13 @@ func Files(root string, paths []string, opt FileOptions) ([]model.FileEntry, []m
 				mp = "/"
 			}
 			if err != nil {
-				switch {
-				case errors.Is(err, fs.ErrNotExist):
+				if i, ok := seen[mp]; ok {
+					// Already recorded by the pre-read call (e.g. unreadable dir).
+					entries[i].Err = err.Error()
+				} else if errors.Is(err, fs.ErrNotExist) {
 					skip(mp, "vanished: "+err.Error())
-				case d != nil && d.IsDir() || mp == start:
-					// Could not list a directory (or stat the start).
-					e, ok := statEntry(p, mp, opt, &skips)
-					if ok {
-						e.Err = err.Error()
-						entries = append(entries, e)
-					}
-				default:
-					entries = append(entries, model.FileEntry{Path: mp, Err: err.Error()})
+				} else {
+					add(model.FileEntry{Path: mp, Err: err.Error()})
 				}
 				if d != nil && d.IsDir() {
 					return fs.SkipDir
@@ -100,14 +101,14 @@ func Files(root string, paths []string, opt FileOptions) ([]model.FileEntry, []m
 					skip(mp, "not descending into "+t+" mount")
 					// Still record the mount point itself.
 					if e, ok := statEntry(p, mp, opt, &skips); ok {
-						entries = append(entries, e)
+						add(e)
 					}
 					return fs.SkipDir
 				}
 			}
 			e, ok := statEntry(p, mp, opt, &skips)
 			if ok {
-				entries = append(entries, e)
+				add(e)
 			}
 			return nil
 		})
@@ -170,6 +171,12 @@ func statEntry(p, mp string, opt FileOptions, skips *[]model.Skip) (model.FileEn
 			e.Err = err.Error()
 			return e, true
 		}
+		var fst unix.Stat_t
+		if err := unix.Fstat(fd, &fst); err != nil || fst.Mode&unix.S_IFMT != unix.S_IFREG || fst.Dev != st.Dev || fst.Ino != st.Ino {
+			unix.Close(fd)
+			e.Err = "changed while reading"
+			return e, true
+		}
 		f := os.NewFile(uintptr(fd), p)
 		defer f.Close()
 		e.Flags = inodeFlags(fd)
@@ -177,8 +184,12 @@ func statEntry(p, mp string, opt FileOptions, skips *[]model.Skip) (model.FileEn
 			e.Err = "too large to hash"
 			return e, true
 		}
+		var r io.Reader = f
+		if opt.MaxHashBytes > 0 {
+			r = io.LimitReader(f, opt.MaxHashBytes) // file may have grown since Lstat
+		}
 		h := sha256.New()
-		if _, err := io.Copy(h, f); err != nil {
+		if _, err := io.Copy(h, r); err != nil {
 			e.Err = fmt.Sprintf("read: %v", err)
 			return e, true
 		}

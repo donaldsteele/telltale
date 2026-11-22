@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/donaldsteele/telltale/internal/model"
 	"golang.org/x/sys/unix"
@@ -270,5 +271,57 @@ func TestFilesNoCapsOnPlainFile(t *testing.T) {
 	entries, _ := Files(root, []string{"/f"}, FileOptions{})
 	if len(entries) != 1 || entries[0].Caps != "" {
 		t.Fatalf("%+v", entries)
+	}
+}
+
+func TestFilesUnreadableDirIsOneEntry(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root can read everything")
+	}
+	root := t.TempDir()
+	d := filepath.Join(root, "locked")
+	os.Mkdir(d, 0o755)
+	os.WriteFile(filepath.Join(d, "f"), []byte("x"), 0o644)
+	os.Chmod(d, 0o000)
+	defer os.Chmod(d, 0o755)
+	entries, skips := Files(root, []string{"/"}, FileOptions{})
+	n := 0
+	for _, e := range entries {
+		if e.Path == "/locked" {
+			n++
+			if e.Err == "" || e.Type != "dir" {
+				t.Errorf("entry: %+v", e)
+			}
+		}
+	}
+	if n != 1 || len(skips) != 0 {
+		t.Fatalf("n=%d skips=%v", n, skips)
+	}
+}
+
+func TestFilesSwappedForFIFODoesNotHang(t *testing.T) {
+	root := t.TempDir()
+	f := filepath.Join(root, "swap")
+	os.WriteFile(f, []byte("x"), 0o644)
+	testHookBeforeOpen = func(p string) {
+		os.Remove(p)
+		if err := unix.Mkfifo(p, 0o644); err != nil {
+			t.Errorf("mkfifo: %v", err)
+		}
+	}
+	defer func() { testHookBeforeOpen = nil }()
+	type res struct {
+		e []model.FileEntry
+		s []model.Skip
+	}
+	ch := make(chan res, 1)
+	go func() { e, s := Files(root, []string{"/swap"}, FileOptions{}); ch <- res{e, s} }()
+	select {
+	case r := <-ch:
+		if len(r.e) != 1 || r.e[0].Err == "" || r.e[0].SHA256 != "" {
+			t.Fatalf("%+v %v", r.e, r.s)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("walk hung on FIFO")
 	}
 }
