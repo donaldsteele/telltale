@@ -91,6 +91,9 @@ var (
 	// ErrWrongSuite means a validly signed index is for another suite or
 	// pocket than the one asked for, or the archive does not carry the suite.
 	ErrWrongSuite = errors.New("index is for another suite")
+	// ErrNoSuchIndex means a suite's signed Release lists no Packages index
+	// for the component and architecture asked for.
+	ErrNoSuchIndex = errors.New("no such index")
 )
 
 var (

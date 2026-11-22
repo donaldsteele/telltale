@@ -6,6 +6,7 @@ require (
 	filippo.io/age v1.3.2
 	github.com/ProtonMail/go-crypto v1.5.2
 	github.com/google/nftables v0.3.0
+	github.com/klauspost/compress v1.20.5
 	github.com/ulikunitz/xz v0.5.17
 	golang.org/x/sys v0.50.0
 )

@@ -4,6 +4,8 @@ package pkgverify
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -131,4 +133,106 @@ func TestOnlineFindOldUbuntu(t *testing.T) {
 		}
 		t.Logf("%+v: %+v", c.key, ref)
 	}
+}
+
+// fetchTable downloads a .deb found by FindOld and reads its file table.
+func fetchTable(t *testing.T, ctx context.Context, key PkgKey, distro string) (DebRef, map[string]DebFile) {
+	t.Helper()
+	f, err := NewOldFinder(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := f.Find(ctx, key, distro)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp, err := os.CreateTemp(t.TempDir(), "deb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tmp.Close()
+	if err := downloadDeb(ctx, defaultClient, ref, tmp); err != nil {
+		t.Fatal(err)
+	}
+	files, err := DebFiles(tmp, ref.Size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ref, files
+}
+
+// The expected file hashes were checked when the test was written by
+// extracting the same .debs with dpkg-deb and running sha256sum.
+
+func TestOnlineDebFileTable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	// A superseded bookworm security update: data.tar.xz.
+	ref, files := fetchTable(t, ctx, PkgKey{"openssh-server", "1:9.2p1-2+deb12u3", "amd64"}, "debian")
+	if ref.SHA256 != "08ffb1599d05a815ce7d82e84570ab42b0b6152cba8e421a51ab1ba0709ed706" {
+		t.Errorf("ref %+v", ref)
+	}
+	if len(files) != 23 {
+		t.Errorf("%d files, want 23", len(files))
+	}
+	if f := files["/usr/sbin/sshd"]; f.SHA256 != "838332fe9777b307794760e1c4800b16ac17a93a2fe3f2580ceca8ca6ca2caa5" || f.Mode != 0o755 || f.Conffile {
+		t.Errorf("/usr/sbin/sshd = %+v", f)
+	}
+	pam := files["/etc/pam.d/sshd"]
+	if !pam.Conffile || pam.SHA256 != "65822d20f36db29cb50275526854b584df7a04a9efe975f3801473f81b44f521" || sha256hex(pam.Text) != pam.SHA256 {
+		t.Errorf("/etc/pam.d/sshd: conffile %v, sha256 %s, %d bytes of text", pam.Conffile, pam.SHA256, len(pam.Text))
+	}
+}
+
+func TestOnlineUbuntuZstdDeb(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	// Ubuntu noble builds data.tar.zst.
+	_, files := fetchTable(t, ctx, PkgKey{"hello", "2.10-3build1", "amd64"}, "ubuntu")
+	if len(files) != 6 {
+		t.Errorf("%d files, want 6", len(files))
+	}
+	if f := files["/usr/bin/hello"]; f.SHA256 != "d288b98ce5f0a3981ea833f3b1d6484dfdde9ee36a00ee3b50bd3a9f7b01f75f" || f.Mode != 0o755 {
+		t.Errorf("/usr/bin/hello = %+v", f)
+	}
+}
+
+// TestOnlineVerifyAndBundle verifies a made-up Debian 12 machine running an
+// old openssh-server against the real archives, then builds a reference
+// bundle and verifies again from it alone.
+func TestOnlineVerifyAndBundle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	c := &model.Collection{
+		Schema: model.CollectionSchema,
+		Host:   model.Host{OSID: "debian", OSVersionID: "12", Arch: "amd64"},
+		Files: []model.FileEntry{
+			{Path: "/usr/sbin/sshd", Type: "file", Mode: 0o100755, SHA256: "838332fe9777b307794760e1c4800b16ac17a93a2fe3f2580ceca8ca6ca2caa5"},
+			{Path: "/usr/lib/openssh/ssh-session-cleanup", Type: "file", Mode: 0o100755, SHA256: sha256hex([]byte("tampered"))},
+		},
+		Packages: model.Packages{Installed: []model.Package{{
+			Name: "openssh-server", Version: "1:9.2p1-2+deb12u3", Arch: "amd64", Status: "install ok installed",
+			Files: []string{"/usr/sbin/sshd", "/usr/lib/openssh/ssh-session-cleanup"},
+		}}},
+	}
+	check := func(res *Result, source string) {
+		t.Helper()
+		if len(res.Verified) != 1 || res.Verified[0].Path != "/usr/sbin/sshd" || res.Verified[0].Source != source {
+			t.Errorf("Verified = %+v", res.Verified)
+		}
+		if len(res.Mismatch) != 1 || res.Mismatch[0].Path != "/usr/lib/openssh/ssh-session-cleanup" {
+			t.Errorf("Mismatch = %+v", res.Mismatch)
+		}
+		if len(res.Unverifiable) != 0 || len(res.Errors) != 0 {
+			t.Errorf("Unverifiable = %+v, Errors = %q", res.Unverifiable, res.Errors)
+		}
+		t.Logf("sources: %q", res.SourcesUsed)
+	}
+	check(Verify(ctx, c, Options{CacheDir: t.TempDir()}), SourceArchive)
+
+	dir := filepath.Join(t.TempDir(), "refs")
+	if err := WriteBundle(ctx, c, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	check(Verify(ctx, c, Options{RefsDir: dir}), SourceRefs)
 }

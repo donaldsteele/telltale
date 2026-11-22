@@ -3,6 +3,7 @@ package pkgverify
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto"
 	"encoding/binary"
@@ -33,10 +34,11 @@ const (
 var maxPackagesSize int64 = 256 << 20
 
 // Index fetches suite's InRelease, verifies its signature with the archive's
-// built-in keys and its Valid-Until, then fetches the Packages.xz for
-// component and arch, checks its size and SHA-256 against the signed Release,
-// and returns every package in it. Architecture "all" packages in the index
-// are keyed with Arch "all".
+// keys and its Valid-Until, then fetches the Packages.xz (or, for archives
+// that publish no xz index, Packages.gz or Packages) for component and arch,
+// checks its size and SHA-256 against the signed Release, and returns every
+// package in it. Architecture "all" packages in the index are keyed with Arch
+// "all". A Release without that index gives ErrNoSuchIndex.
 func (a *Archive) Index(ctx context.Context, suite, component, arch string) (map[PkgKey]DebRef, error) {
 	if !slices.Contains(a.Suites, suite) {
 		return nil, fmt.Errorf("%w: %q is not one of %s's suites %v", ErrWrongSuite, suite, a.BaseURL, a.Suites)
@@ -45,29 +47,44 @@ func (a *Archive) Index(ctx context.Context, suite, component, arch string) (map
 	if err != nil {
 		return nil, err
 	}
-	name := component + "/binary-" + arch + "/Packages.xz"
-	fh, ok := rel.sha256[name]
-	if !ok {
-		return nil, fmt.Errorf("%s %s: Release lists no SHA256 for %s", a.BaseURL, suite, name)
+	dir := component + "/binary-" + arch + "/"
+	var name string
+	var fh fileHash
+	// Official archives publish Packages.xz; many third-party repositories
+	// publish only Packages.gz or an uncompressed Packages.
+	for _, n := range []string{"Packages.xz", "Packages.gz", "Packages"} {
+		if h, ok := rel.sha256[dir+n]; ok {
+			name, fh = n, h
+			break
+		}
+	}
+	if name == "" {
+		return nil, fmt.Errorf("%w: %s %s: Release lists no SHA256 for %sPackages.xz", ErrNoSuchIndex, a.BaseURL, suite, dir)
 	}
 	if fh.size > maxPackagesXZSize {
-		return nil, fmt.Errorf("%s %s: %s is %d bytes, larger than %d", a.BaseURL, suite, name, fh.size, maxPackagesXZSize)
+		return nil, fmt.Errorf("%s %s: %s%s is %d bytes, larger than %d", a.BaseURL, suite, dir, name, fh.size, maxPackagesXZSize)
 	}
-	data, err := a.packagesXZ(ctx, suite, component, arch, fh, rel.byHash)
+	data, err := a.packagesFile(ctx, suite, dir, name, fh, rel.byHash)
 	if err != nil {
 		return nil, err
 	}
-	xr, err := xz.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("%s %s %s: %w", a.BaseURL, suite, name, err)
+	var r io.Reader = bytes.NewReader(data)
+	switch name {
+	case "Packages.xz":
+		r, err = xz.NewReader(r)
+	case "Packages.gz":
+		r, err = gzip.NewReader(r)
 	}
-	lr := &io.LimitedReader{R: xr, N: maxPackagesSize + 1}
+	if err != nil {
+		return nil, fmt.Errorf("%s %s %s%s: %w", a.BaseURL, suite, dir, name, err)
+	}
+	lr := &io.LimitedReader{R: r, N: maxPackagesSize + 1}
 	idx, err := parsePackages(lr, a.base(), arch)
 	if lr.N <= 0 {
-		return nil, fmt.Errorf("%s %s %s: decompressed index larger than %d bytes", a.BaseURL, suite, name, maxPackagesSize)
+		return nil, fmt.Errorf("%s %s %s%s: decompressed index larger than %d bytes", a.BaseURL, suite, dir, name, maxPackagesSize)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%s %s %s: %w", a.BaseURL, suite, name, err)
+		return nil, fmt.Errorf("%s %s %s%s: %w", a.BaseURL, suite, dir, name, err)
 	}
 	return idx, nil
 }
@@ -398,20 +415,20 @@ func parseReleaseDate(s string) (time.Time, error) {
 	return time.Time{}, err
 }
 
-// packagesXZ returns the Packages.xz whose size and SHA-256 the signed
-// Release gives. The cache is keyed by that SHA-256, and every copy, cached
-// or downloaded, is checked against it.
-func (a *Archive) packagesXZ(ctx context.Context, suite, component, arch string, fh fileHash, byHash bool) ([]byte, error) {
-	cache := a.cachePath("packages-" + fh.hash + ".xz")
+// packagesFile returns the index file name in dir (relative to the suite)
+// whose size and SHA-256 the signed Release gives. The cache is keyed by that
+// SHA-256, and every copy, cached or downloaded, is checked against it.
+func (a *Archive) packagesFile(ctx context.Context, suite, dir, name string, fh fileHash, byHash bool) ([]byte, error) {
+	cache := a.cachePath("packages-" + fh.hash + strings.TrimPrefix(name, "Packages"))
 	if b := readCache(cache, fh.size); b != nil && int64(len(b)) == fh.size && hashHex(b) == fh.hash {
 		return b, nil
 	}
-	dir := a.base() + "/dists/" + suite + "/" + component + "/binary-" + arch + "/"
-	urls := []string{dir + "Packages.xz"}
+	base := a.base() + "/dists/" + suite + "/" + dir
+	urls := []string{base + name}
 	if byHash {
 		// By-hash cannot race with an archive update between the InRelease
 		// and the index download.
-		urls = []string{dir + "by-hash/SHA256/" + fh.hash, dir + "Packages.xz"}
+		urls = []string{base + "by-hash/SHA256/" + fh.hash, base + name}
 	}
 	var b []byte
 	var err error

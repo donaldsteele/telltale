@@ -22,7 +22,8 @@ import (
 
 const (
 	maxAPIAnswer = 16 << 20
-	maxDebSize   = 4 << 30
+	// maxDebSize bounds every .deb download.
+	maxDebSize = 2 << 30
 	// maxSnapshotAttempts bounds how many signed snapshot indexes one lookup
 	// may download before falling back.
 	maxSnapshotAttempts = 4
@@ -47,6 +48,10 @@ type OldFinder struct {
 	Launchpad      string           // https://api.launchpad.net/devel
 	DebianKeyring  openpgp.EntityList
 	UbuntuKeyring  openpgp.EntityList
+	// SignedOnly stops at the signed snapshot indexes, never falling back to
+	// sources trusted through HTTPS alone. A reference bundle can carry
+	// only what the built-in keys can check again.
+	SignedOnly bool
 }
 
 // NewOldFinder returns an OldFinder for the real snapshot services with the
@@ -236,6 +241,9 @@ func (f *OldFinder) findDebian(ctx context.Context, key PkgKey) (DebRef, error) 
 			lastErr = err
 		}
 	}
+	if f.SignedOnly {
+		return DebRef{}, signedOnlyError(key, lastErr)
+	}
 	ref, err := f.snapshotFile(ctx, hash, infos)
 	if err != nil && lastErr != nil {
 		return DebRef{}, fmt.Errorf("%w (no signed snapshot index either: %v)", err, lastErr)
@@ -330,6 +338,7 @@ func (f *OldFinder) findUbuntu(ctx context.Context, key PkgKey) (DebRef, error) 
 	slices.SortStableFunc(matches, func(a, b match) int { return a.published.Compare(b.published) })
 
 	attempts := 0
+	var lastErr error
 	for _, m := range matches {
 		if m.published.Before(ubuntuSnapshotStart) || !componentName.MatchString(m.Component) {
 			continue
@@ -350,9 +359,22 @@ func (f *OldFinder) findUbuntu(ctx context.Context, key PkgKey) (DebRef, error) 
 			if tampered(err) {
 				return DebRef{}, err
 			}
+			lastErr = err
 		}
 	}
+	if f.SignedOnly {
+		return DebRef{}, signedOnlyError(key, lastErr)
+	}
 	return f.launchpadFile(ctx, key, matches[0].Self)
+}
+
+// signedOnlyError explains why a SignedOnly lookup gave up. It is not
+// ErrNotFound: the version exists, only not where the built-in keys reach.
+func signedOnlyError(key PkgKey, lastErr error) error {
+	if lastErr != nil {
+		return fmt.Errorf("%s %s %s: no signed snapshot index has it, and sources trusted through HTTPS alone are not used here: %w", key.Name, key.Version, key.Arch, lastErr)
+	}
+	return fmt.Errorf("%s %s %s: no signed snapshot index has it, and sources trusted through HTTPS alone are not used here", key.Name, key.Version, key.Arch)
 }
 
 // launchpadFile asks Launchpad for the .deb's HTTPS URL, size and SHA-256.
