@@ -325,3 +325,18 @@ func TestFilesSwappedForFIFODoesNotHang(t *testing.T) {
 		t.Fatal("walk hung on FIFO")
 	}
 }
+
+// A start path the machine does not have is not a path that vanished.
+func TestFilesMissingStartPathIsSilent(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	entries, skips := Files(root, []string{"/etc", "/lib32"}, FileOptions{})
+	if len(skips) != 0 {
+		t.Fatalf("skips for a start path that never existed: %+v", skips)
+	}
+	if len(entries) != 1 || entries[0].Path != "/etc" {
+		t.Fatalf("entries %+v", entries)
+	}
+}

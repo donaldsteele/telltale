@@ -90,7 +90,12 @@ func Files(root string, paths []string, opt FileOptions) ([]model.FileEntry, []m
 					// Already recorded by the pre-read call (e.g. unreadable dir).
 					entries[i].Err = err.Error()
 				} else if errors.Is(err, fs.ErrNotExist) {
-					skip(mp, "vanished: "+err.Error())
+					// A start path this machine does not have (/lib32 on
+					// most) is not worth a line; a path that went away
+					// during the walk is.
+					if mp != start {
+						skip(mp, "vanished: "+err.Error())
+					}
 				} else {
 					add(model.FileEntry{Path: mp, Err: err.Error()})
 				}

@@ -336,3 +336,31 @@ func TestCompareSupplementaryEntriesAreNeverAddedOrRemoved(t *testing.T) {
 	// An ordinary one-sided entry is still added.
 	find(t, Compare(snap(empty), &model.Collection{Files: []model.FileEntry{{Path: "/opt/new", Type: "file"}}}, nil), FileAdded, "/opt/new")
 }
+
+// A directory grows and shrinks, and gains its hash-index flag, as entries
+// come and go. That is not a change to the directory; its mode, owner and the
+// flags an owner can set (immutable, append-only) still are.
+func TestCompareDirectoryBookkeepingIsNotAChange(t *testing.T) {
+	old := &model.Collection{Files: []model.FileEntry{
+		{Path: "/var/lib/dpkg/info", Type: "dir", Mode: 0755, Size: 12288, Flags: 0x81000},
+		{Path: "/etc/cron.d", Type: "dir", Mode: 0755, Size: 4096, Flags: 0x80000},
+		{Path: "/etc/x", Type: "file", Mode: 0644, Size: 10, Flags: 0x80000},
+	}}
+	cur := &model.Collection{Files: []model.FileEntry{
+		{Path: "/var/lib/dpkg/info", Type: "dir", Mode: 0755, Size: 4096, Flags: 0x80000},
+		{Path: "/etc/cron.d", Type: "dir", Mode: 0777, Size: 8192, Flags: 0x80010},
+		{Path: "/etc/x", Type: "file", Mode: 0644, Size: 11, Flags: 0x81000},
+	}}
+	cs := Compare(snap(old), cur, nil)
+	for _, c := range cs {
+		if c.Subject == "/var/lib/dpkg/info" {
+			t.Errorf("bookkeeping reported as a change: %+v", c)
+		}
+	}
+	if m := find(t, cs, "file_modified", "/etc/cron.d"); m.After != "mode 0777 flags 0x80010" {
+		t.Errorf("directory mode and immutable flag: got %q -> %q", m.Before, m.After)
+	}
+	if m := find(t, cs, "file_modified", "/etc/x"); m.After != "size 11 flags 0x81000" {
+		t.Errorf("a file's size and flags still count: got %q -> %q", m.Before, m.After)
+	}
+}

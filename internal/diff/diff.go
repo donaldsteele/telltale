@@ -155,7 +155,15 @@ func compareFiles(old, cur []model.FileEntry, incomplete []string) []Change {
 			if o.SHA256 != n.SHA256 {
 				s.add("sha256", short(o.SHA256), short(n.SHA256))
 			}
-			if o.Size != n.Size {
+			// A directory's size and its hash-index flag are the
+			// filesystem's bookkeeping: they move when entries come and
+			// go, and those entries are compared themselves.
+			dir := o.Type == "dir" && n.Type == "dir"
+			oFlags, nFlags := o.Flags, n.Flags
+			if dir {
+				oFlags, nFlags = oFlags&^dirIndexFlag, nFlags&^dirIndexFlag
+			}
+			if o.Size != n.Size && !dir {
 				s.add("size", fmt.Sprint(o.Size), fmt.Sprint(n.Size))
 			}
 			if o.Mode&07777 != n.Mode&07777 {
@@ -164,7 +172,7 @@ func compareFiles(old, cur []model.FileEntry, incomplete []string) []Change {
 			if o.UID != n.UID || o.GID != n.GID {
 				s.add("owner", fmt.Sprintf("%d:%d", o.UID, o.GID), fmt.Sprintf("%d:%d", n.UID, n.GID))
 			}
-			if o.Flags != n.Flags {
+			if oFlags != nFlags {
 				s.add("flags", fmt.Sprintf("%#x", o.Flags), fmt.Sprintf("%#x", n.Flags))
 			}
 			if o.Caps != n.Caps {
@@ -203,6 +211,10 @@ func typeTarget(f model.FileEntry) string {
 	}
 	return f.Type
 }
+
+// dirIndexFlag is FS_INDEX_FL: the kernel sets it on a directory once it has
+// enough entries to be hash-indexed.
+const dirIndexFlag = 0x1000
 
 func describeFile(f model.FileEntry) string {
 	return fmt.Sprintf("%s mode %04o owner %d:%d sha256 %s", typeTarget(f), f.Mode&07777, f.UID, f.GID, short(f.SHA256))
