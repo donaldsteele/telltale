@@ -1,6 +1,7 @@
 {
   "requires": {},
   "with_snapshot": {
+    "comment": "Without a snapshot an unpackaged listener is a note (plenty of machines run one). Against a clean snapshot it is new, and its program is a new file that belongs to no package: a backdoor sign.",
     "must": [
       {
         "key_prefix": "heur.unowned_listener:/usr/local/sbin/lab-svcd",
@@ -8,7 +9,7 @@
       },
       {
         "key_prefix": "snap.listener:tcp",
-        "severity": "note"
+        "severity": "backdoor sign"
       }
     ]
   },

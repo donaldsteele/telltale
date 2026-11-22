@@ -1,5 +1,8 @@
 {
   "requires": {"variant": "noexec"},
-  "with_snapshot": {"must_not_severity_above": "note"},
+  "with_snapshot": {
+    "comment": "A checklist item that was not met when the snapshot was taken and is still not met stays a weak setting (the spec raises only items that passed then and fail now). Nothing but such items may rank above a note here; TestCleanMachinesAreClean checks that.",
+    "must_not_severity_above": "weak setting"
+  },
   "without_snapshot": {"must_not_severity_above": "weak setting"}
 }

@@ -34,6 +34,13 @@ var (
 // NetworkName is the internal Docker network every lab container joins.
 const NetworkName = "telltale-lab"
 
+// EgressNetworkName is the lab's one network with a route out. Only machines
+// with nothing planted may join it.
+const EgressNetworkName = "telltale-lab-egress"
+
+// Label marks every container, network, volume and image the lab creates.
+const Label = "telltale-lab=1"
+
 // Opts tunes how a machine is started.
 type Opts struct {
 	Noexec     bool     // /tmp and /dev/shm mounted noexec
@@ -42,6 +49,21 @@ type Opts struct {
 	Caps       []string // extra capabilities, e.g. "LINUX_IMMUTABLE"
 	Ext4Volume bool     // loop-mounted ext4 image at /lab-ext4; implies Privileged (test skips if the mount fails)
 	Hostname   string   // container hostname; default <distro>-<variant>
+	// Egress puts the machine on the telltale-lab-egress network, which has a
+	// route out, instead of the internal one. Only for machines with nothing
+	// planted (the update-noise test needs the package archive).
+	Egress bool
+	// ExecShm mounts /dev/shm without noexec, as on a real machine (Docker's
+	// own /dev/shm is noexec). Ignored with Noexec.
+	ExecShm bool
+	// Binds are extra read-only bind mounts, "hostdir:containerdir".
+	Binds []string
+}
+
+// BuildOpts picks a flavour of an image.
+type BuildOpts struct {
+	Newer   bool // built at the *_NEWER package snapshot (then upgraded, with openssl installed)
+	Systemd bool // systemd installed, for Opts.Systemd
 }
 
 // Machine is a running lab container.
@@ -49,14 +71,18 @@ type Machine struct {
 	Name     string
 	Image    string
 	Hostname string
+	// Egress is true when the machine has a route out (see Opts.Egress).
+	Egress  bool
+	network string
 }
 
 var (
-	labDir   string
-	buildMu  sync.Mutex
-	built    = map[string]bool{}
-	netMu    sync.Mutex
-	netReady bool
+	labDir      string
+	buildMu     sync.Mutex
+	built       = map[string]bool{}
+	netMu       sync.Mutex
+	netReady    bool
+	egressReady bool
 )
 
 func init() {
@@ -106,15 +132,44 @@ func ensureNetwork(t testing.TB) {
 	if netReady {
 		return
 	}
-	if _, _, code := docker("network", "inspect", NetworkName); code != 0 {
-		if _, se, code := docker("network", "create", "--internal", NetworkName); code != 0 && !strings.Contains(se, "already exists") {
-			t.Fatalf("create network %s: %s", NetworkName, se)
-		}
-	}
+	createNetwork(t, NetworkName, true)
 	if !NetworkInternal(t) {
 		t.Fatalf("network %s exists but is not internal; refusing to use it", NetworkName)
 	}
 	netReady = true
+}
+
+// ensureEgressNetwork creates the lab's network with a route out.
+func ensureEgressNetwork(t testing.TB) {
+	t.Helper()
+	netMu.Lock()
+	defer netMu.Unlock()
+	if egressReady {
+		return
+	}
+	createNetwork(t, EgressNetworkName, false)
+	egressReady = true
+}
+
+// createNetwork makes a labelled lab network. One left from before the lab
+// labelled its networks is replaced when nothing is attached to it.
+func createNetwork(t testing.TB, name string, internal bool) {
+	t.Helper()
+	if lbl, _, code := docker("network", "inspect", "--format", `{{index .Labels "telltale-lab"}}`, name); code == 0 {
+		if strings.TrimSpace(lbl) == "1" {
+			return
+		}
+		if _, _, code := docker("network", "rm", name); code != 0 {
+			return // in use: keep it as it is
+		}
+	}
+	args := []string{"network", "create", "--label", Label}
+	if internal {
+		args = append(args, "--internal")
+	}
+	if _, se, code := docker(append(args, name)...); code != 0 && !strings.Contains(se, "already exists") {
+		t.Fatalf("create network %s: %s", name, se)
+	}
 }
 
 // NetworkInternal reports whether the lab network has no route out.
@@ -172,6 +227,13 @@ func stageContext(dir, distro, variant string) (string, error) {
 // tag, telltale-lab/<distro>-<variant>:<hash of inputs>.
 func Build(t testing.TB, distro, variant string) string {
 	t.Helper()
+	return BuildWith(t, distro, variant, BuildOpts{})
+}
+
+// BuildWith is Build for a flavour of the image; the flavour is part of the
+// tag (telltale-lab/<distro>-<variant>-newer:<hash>, ...-systemd:<hash>).
+func BuildWith(t testing.TB, distro, variant string, bo BuildOpts) string {
+	t.Helper()
 	if !contains(Distros, distro) || !contains(Variants, variant) {
 		t.Fatalf("unknown distro %q or variant %q", distro, variant)
 	}
@@ -180,7 +242,17 @@ func Build(t testing.TB, distro, variant string) string {
 	if err != nil {
 		t.Fatalf("stage build context: %v", err)
 	}
-	tag := fmt.Sprintf("telltale-lab/%s-%s:%s", distro, variant, hash)
+	name := distro + "-" + variant
+	args := []string{"build", "-q", "--label", Label, "--build-arg", "VARIANT=" + variant}
+	if bo.Newer {
+		name += "-newer"
+		args = append(args, "--build-arg", "LAB_NEWER=1")
+	}
+	if bo.Systemd {
+		name += "-systemd"
+		args = append(args, "--build-arg", "LAB_SYSTEMD=1")
+	}
+	tag := fmt.Sprintf("telltale-lab/%s:%s", name, hash)
 	buildMu.Lock()
 	defer buildMu.Unlock()
 	if built[tag] {
@@ -188,7 +260,7 @@ func Build(t testing.TB, distro, variant string) string {
 	}
 	if _, _, code := docker("image", "inspect", tag); code != 0 {
 		start := time.Now()
-		so, se, code := docker("build", "-q", "--build-arg", "VARIANT="+variant, "-t", tag, dir)
+		so, se, code := docker(append(args, "-t", tag, dir)...)
 		if code != 0 {
 			t.Fatalf("build %s failed (exit %d):\n%s%s", tag, code, so, se)
 		}
@@ -196,6 +268,20 @@ func Build(t testing.TB, distro, variant string) string {
 	}
 	built[tag] = true
 	return tag
+}
+
+// RemoveImages removes every telltale-lab image of one distro and forgets
+// that they were built. Images of other projects are never touched.
+func RemoveImages(distro string) {
+	buildMu.Lock()
+	defer buildMu.Unlock()
+	out, _, _ := docker("image", "ls", "--format", "{{.Repository}}:{{.Tag}}", "--filter", "reference=telltale-lab/"+distro+"-*")
+	for _, tag := range strings.Fields(out) {
+		if strings.HasPrefix(tag, "telltale-lab/"+distro+"-") {
+			docker("image", "rm", tag)
+			delete(built, tag)
+		}
+	}
 }
 
 func contains(l []string, s string) bool {
@@ -210,20 +296,36 @@ func contains(l []string, s string) bool {
 // Start runs image on the lab network. The container is removed by t.Cleanup.
 func Start(t testing.TB, image string, opts Opts) *Machine {
 	t.Helper()
-	ensureNetwork(t)
+	network := NetworkName
+	if opts.Egress {
+		if opts.Privileged || opts.Ext4Volume || opts.Systemd || len(opts.Caps) > 0 {
+			t.Fatalf("a machine with a route out gets no extra privileges")
+		}
+		network = EgressNetworkName
+		ensureEgressNetwork(t)
+	} else {
+		ensureNetwork(t)
+	}
 	short := strings.TrimPrefix(strings.SplitN(image, ":", 2)[0], "telltale-lab/")
 	name := fmt.Sprintf("telltale-lab-%s-%s", short, randHex())
 	host := opts.Hostname
 	if host == "" {
 		host = short
 	}
-	args := []string{"run", "-d", "--name", name, "--network", NetworkName, "--hostname", host,
-		"--label", "telltale-lab=1"}
+	// SYS_PTRACE is what lets root see the programs of other accounts'
+	// processes (/proc/PID/exe), as root on a real machine can.
+	args := []string{"run", "-d", "--name", name, "--network", network, "--hostname", host,
+		"--label", Label, "--cap-add", "SYS_PTRACE"}
+	for _, b := range opts.Binds {
+		args = append(args, "-v", b+":ro")
+	}
 	if lbl, _, _ := docker("image", "inspect", "--format", `{{index .Config.Labels "lab.variant"}}`, image); strings.TrimSpace(lbl) == "noexec" {
 		opts.Noexec = true
 	}
 	if opts.Noexec {
 		args = append(args, "--tmpfs", "/tmp:noexec", "--tmpfs", "/dev/shm:noexec")
+	} else if opts.ExecShm {
+		args = append(args, "--tmpfs", "/dev/shm:exec,nosuid,nodev,size=64m")
 	}
 	if opts.Privileged {
 		args = append(args, "--privileged")
@@ -232,8 +334,10 @@ func Start(t testing.TB, image string, opts Opts) *Machine {
 		args = append(args, "--cap-add", c)
 	}
 	if opts.Systemd {
+		// systemd needs a cgroup tree it may write. It gets its own: a private
+		// cgroup namespace, never the host's tree.
 		args = append(args, "--entrypoint", "/sbin/init", "--tmpfs", "/run", "--tmpfs", "/run/lock",
-			"-v", "/sys/fs/cgroup:/sys/fs/cgroup:rw", "--cgroupns", "host", "--stop-signal", "SIGRTMIN+3")
+			"--privileged", "--cgroupns", "private", "--stop-signal", "SIGRTMIN+3")
 	}
 	if opts.Ext4Volume {
 		// A loop mount inside the container needs privileges; the image file is
@@ -242,7 +346,7 @@ func Start(t testing.TB, image string, opts Opts) *Machine {
 	}
 	args = append(args, image)
 
-	m := &Machine{Name: name, Image: image, Hostname: host}
+	m := &Machine{Name: name, Image: image, Hostname: host, Egress: opts.Egress, network: network}
 	t.Cleanup(func() {
 		if t.Failed() {
 			so, _, _ := docker("logs", "--tail", "40", name)
@@ -342,11 +446,11 @@ func (m *Machine) CopyOut(t testing.TB, path, hostPath string) {
 
 // IP is the machine's address on the lab network.
 func (m *Machine) IP() string {
-	return containerIP(m.Name)
+	return containerIP(m.Name, m.network)
 }
 
-func containerIP(name string) string {
-	out, _, _ := docker("inspect", "--format", `{{(index .NetworkSettings.Networks "`+NetworkName+`").IPAddress}}`, name)
+func containerIP(name, network string) string {
+	out, _, _ := docker("inspect", "--format", `{{(index .NetworkSettings.Networks "`+network+`").IPAddress}}`, name)
 	return strings.TrimSpace(out)
 }
 
@@ -382,7 +486,7 @@ func StartSink(t testing.TB) *Sink {
 			buildMu.Unlock()
 			t.Fatal(err)
 		}
-		if so, se, code := docker("build", "-q", "-t", tag, dir); code != 0 {
+		if so, se, code := docker("build", "-q", "--label", Label, "-t", tag, dir); code != 0 {
 			buildMu.Unlock()
 			t.Fatalf("docker build sink: %s%s", so, se)
 		}
@@ -392,12 +496,12 @@ func StartSink(t testing.TB) *Sink {
 	name := "telltale-lab-sink-" + randHex()
 	t.Cleanup(func() { docker("rm", "-f", name) })
 	mustDocker(t, "run", "-d", "--name", name, "--network", NetworkName, "--network-alias", "sink",
-		"--label", "telltale-lab=1", tag)
+		"--label", Label, tag)
 	return &Sink{name: name}
 }
 
 // IP is the sink's address on the lab network.
-func (s *Sink) IP() string { return containerIP(s.name) }
+func (s *Sink) IP() string { return containerIP(s.name, NetworkName) }
 
 // Log returns everything the sink has logged so far.
 func (s *Sink) Log(t testing.TB) string {

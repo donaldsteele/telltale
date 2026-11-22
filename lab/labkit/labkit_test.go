@@ -20,8 +20,13 @@ var wantOS = map[string][2]string{
 
 func TestCleanMachinesBoot(t *testing.T) {
 	for _, distro := range labkit.Distros {
+		// One distro at a time, and its images go when it is done: the Docker
+		// disk is shared.
 		t.Run(distro, func(t *testing.T) {
-			t.Parallel()
+			labkit.RequireFree(t)
+			if distro != "debian12" { // the tests below use debian12's
+				t.Cleanup(func() { labkit.ReleaseImages(distro) })
+			}
 			m := labkit.Start(t, labkit.Build(t, distro, "clean"), labkit.Opts{})
 			out, code := m.Exec(t, "ss", "-ltn")
 			if code != 0 || !strings.Contains(out, ":22 ") {

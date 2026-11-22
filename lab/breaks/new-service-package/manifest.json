@@ -1,10 +1,11 @@
 {
   "requires": {},
   "with_snapshot": {
+    "comment": "The spec ranks a newly installed package that adds a listening service or an enabled unit as a backdoor sign; the listener itself, served by the package's own program, is a note.",
     "must": [
       {
         "key_prefix": "snap.pkg_installed:lighttpd",
-        "severity": "note"
+        "severity": "backdoor sign"
       },
       {
         "key_prefix": "snap.listener:tcp",

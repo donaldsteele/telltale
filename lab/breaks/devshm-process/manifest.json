@@ -1,5 +1,7 @@
 {
-  "requires": {},
+  "requires": {
+    "exec_shm": true
+  },
   "with_snapshot": {
     "must": [
       {

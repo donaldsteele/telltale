@@ -4,36 +4,12 @@ package lab
 
 import (
 	"encoding/json"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/lab/labkit"
 )
-
-var binPath string
-
-func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "telltale-lab-bin")
-	if err != nil {
-		panic(err)
-	}
-	binPath = filepath.Join(dir, "telltale")
-	cmd := exec.Command("go", "build", "-o", binPath, "./cmd/telltale")
-	cmd.Dir = ".."
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		os.RemoveAll(dir)
-		println("build telltale:", err.Error(), string(out))
-		os.Exit(1)
-	}
-	code := m.Run()
-	os.RemoveAll(dir)
-	os.Exit(code)
-}
 
 var wantOS = map[string][2]string{
 	"debian12":   {"debian", "12"},
@@ -43,9 +19,9 @@ var wantOS = map[string][2]string{
 }
 
 func TestCollectInEveryCleanDistro(t *testing.T) {
-	for _, distro := range labkit.Distros {
-		t.Run(distro, func(t *testing.T) {
-			t.Parallel()
+	eachDistro(t, func(t *testing.T, distro string) {
+		t.Run("clean", func(t *testing.T) {
+			slot(t)
 			m := labkit.Start(t, labkit.Build(t, distro, "clean"), labkit.Opts{})
 			m.CopyIn(t, binPath, "/usr/local/bin/telltale")
 			m.Exec(t, "chmod", "755", "/usr/local/bin/telltale")
@@ -96,5 +72,5 @@ func TestCollectInEveryCleanDistro(t *testing.T) {
 				t.Error("no openssh-server package")
 			}
 		})
-	}
+	})
 }

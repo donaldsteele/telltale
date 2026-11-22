@@ -7,6 +7,8 @@ services:
     build: ./sink
     image: telltale-lab/sink:compose
     container_name: telltale-lab-sink
+    labels:
+      telltale-lab: "1"
     networks:
       lab:
         aliases: [sink]
@@ -14,3 +16,5 @@ networks:
   lab:
     name: telltale-lab
     internal: true
+    labels:
+      telltale-lab: "1"

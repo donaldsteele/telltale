@@ -23,6 +23,7 @@ type Requires struct {
 	Privileged    bool     `json:"privileged,omitempty"`     // labkit Opts.Privileged
 	Caps          []string `json:"caps,omitempty"`           // labkit Opts.Caps
 	Systemd       bool     `json:"systemd,omitempty"`        // labkit Opts.Systemd
+	ExecShm       bool     `json:"exec_shm,omitempty"`       // labkit Opts.ExecShm: /dev/shm allows running programs
 	NewerSnapshot bool     `json:"newer_snapshot,omitempty"` // the image is built at the *_NEWER package snapshot
 	Distros       []string `json:"distros,omitempty"`        // only these distros; empty means all
 }
