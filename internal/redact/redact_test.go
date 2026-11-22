@@ -172,3 +172,58 @@ func TestRedactCommentedSecret(t *testing.T) {
 		t.Errorf("Line = %q, n = %d", got, n)
 	}
 }
+
+func TestRedactEnvironmentQuotedValueWithSpaces(t *testing.T) {
+	got, n := Line(testKey, `Environment="DB_PASS=a b c"`)
+	if strings.Contains(got, "a b c") || strings.Contains(got, " b c") {
+		t.Errorf("value leaked: %q", got)
+	}
+	if !strings.HasPrefix(got, `Environment="DB_PASS=<redacted h:`) || !strings.HasSuffix(got, `>"`) || n != 1 {
+		t.Errorf("Line = %q, n = %d", got, n)
+	}
+}
+
+func TestRedactEnvironmentTwoQuotedAssignments(t *testing.T) {
+	got, n := Line(testKey, `Environment='X=1 2' "Y=3 4"`)
+	for _, s := range []string{"1 2", "3 4", "X=1", "Y=3"} {
+		if strings.Contains(got, s) {
+			t.Errorf("%q leaked in %q", s, got)
+		}
+	}
+	if !strings.Contains(got, "X=") || !strings.Contains(got, "Y=") || n != 2 {
+		t.Errorf("Line = %q, n = %d", got, n)
+	}
+}
+
+func TestRedactExportThenCommandSecret(t *testing.T) {
+	got, _ := Line(testKey, "export T_TOKEN=abc && curl --password=zzz")
+	if strings.Contains(got, "abc") || strings.Contains(got, "zzz") {
+		t.Errorf("secret leaked: %q", got)
+	}
+}
+
+func TestRedactTwoKeyValuesOneLine(t *testing.T) {
+	got, _ := Line(testKey, "password=x token=y")
+	if strings.Contains(got, "password=x") || strings.Contains(got, "token=y") || strings.HasSuffix(got, "=x") || strings.HasSuffix(got, "=y") {
+		t.Errorf("secret leaked: %q", got)
+	}
+}
+
+func TestRedactIdempotent(t *testing.T) {
+	for _, line := range []string{
+		`Environment="DB_PASS=a b c"`,
+		`Environment='X=1 2' "Y=3 4"`,
+		`export T_TOKEN=abc && curl --password=zzz`,
+		`export T_TOKEN="a b"`,
+		`password=x token=y`,
+		`fetch https://admin:hunter2@example.com/ token=abc`,
+		`api_key: s3cr3t`,
+		`PermitRootLogin no`,
+	} {
+		once, _ := Line(testKey, line)
+		twice, n2 := Line(testKey, once)
+		if twice != once || n2 != 0 {
+			t.Errorf("not idempotent for %q: once %q, twice %q, n=%d", line, once, twice, n2)
+		}
+	}
+}
