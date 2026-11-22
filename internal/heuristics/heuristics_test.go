@@ -372,3 +372,28 @@ func TestLocalDiversion(t *testing.T) {
 		t.Errorf("fix not quoted: %q", q)
 	}
 }
+
+func TestLocalDiversionStockUbuntu(t *testing.T) {
+	c := &model.Collection{Packages: model.Packages{Diversions: []model.Diversion{
+		// Exactly as ubuntu:22.04 and ubuntu:24.04 images record them.
+		{Path: "/usr/bin/man", DivertTo: "/usr/bin/man.REAL", Package: ":"},
+		{Path: "/sbin/initctl", DivertTo: "/sbin/initctl.distrib", Package: ":"},
+		// The same paths diverted anywhere else are not the stock ones.
+		{Path: "/usr/bin/man", DivertTo: "/usr/bin/man.orig", Package: ":"},
+	}}}
+	sev := map[string][]model.Severity{}
+	for _, f := range Run(c, model.ScanContext{}, nil) {
+		if f.ID == "TT-HEUR-014" {
+			sev[f.Evidence[0].Detail] = append(sev[f.Evidence[0].Detail], f.Severity)
+		}
+	}
+	for detail, want := range map[string]model.Severity{
+		"local diversion to /usr/bin/man.REAL":     model.SevNote,
+		"local diversion to /sbin/initctl.distrib": model.SevNote,
+		"local diversion to /usr/bin/man.orig":     model.SevBackdoor,
+	} {
+		if got := sev[detail]; len(got) != 1 || got[0] != want {
+			t.Errorf("%s: severities %v, want %v", detail, got, want)
+		}
+	}
+}

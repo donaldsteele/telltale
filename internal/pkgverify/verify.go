@@ -1032,7 +1032,9 @@ func (s *session) judgeFile(e *model.FileEntry, exp []expect, lst []*pkgResult) 
 		}
 		return v, ConffileDiff{}, verdictUnverifiable
 	}
-	var modeV FileVerdict
+	// The best verdict among the matching shippers: an exact mode, then a
+	// noted mode difference, then added privilege.
+	var noted, modeV FileVerdict
 	matchedConf := false
 	for i := range exp {
 		x := &exp[i]
@@ -1043,16 +1045,21 @@ func (s *session) judgeFile(e *model.FileEntry, exp []expect, lst []*pkgResult) 
 			matchedConf = true
 			continue
 		}
-		if why := s.modeDiff(e.Path, e.Mode, x.f); why != "" {
-			if modeV.Reason == "" {
-				modeV = verdict(x)
-				modeV.Reason = why
-			}
-			continue
+		why, bad := s.modeDiff(e.Path, e.Mode, x.f)
+		switch {
+		case why == "":
+			return verdict(x), ConffileDiff{}, verdictVerified
+		case !bad && noted.Reason == "":
+			noted = verdict(x)
+			noted.Reason = why
+		case bad && modeV.Reason == "":
+			modeV = verdict(x)
+			modeV.Reason = why
 		}
-		return verdict(x), ConffileDiff{}, verdictVerified
 	}
 	switch {
+	case noted.Reason != "":
+		return noted, ConffileDiff{}, verdictVerified
 	case modeV.Reason != "":
 		return modeV, ConffileDiff{}, verdictMismatch
 	case matchedConf:
@@ -1118,37 +1125,59 @@ func (s *session) judgeUnshipped(e *model.FileEntry, regular bool, lst []*pkgRes
 	return v, ConffileDiff{}, verdictMismatch
 }
 
+// privilegeBits are the mode bits whose addition grants more than the
+// package intended: setuid, setgid, sticky, and write for group or others.
+const privilegeBits = 0o7000 | 0o022
+
 // modeDiff compares a file's mode on disk with what is expected: a
 // dpkg-statoverride for the path if there is one, else the package's mode or
-// one its own postinst sets. An added setuid or setgid bit, or any
-// difference on an executable, is reported; permission changes on other
-// files are not.
-func (s *session) modeDiff(p string, diskMode uint32, f DebFile) string {
+// one its own postinst sets. Only added privilege (privilegeBits on disk
+// that no expected mode has) is a mismatch. Any other difference is a
+// reason on a verified file ("less permissive" when the disk only lacks
+// bits); an exact match gives "".
+func (s *session) modeDiff(p string, diskMode uint32, f DebFile) (reason string, mismatch bool) {
 	disk := diskMode & 0o7777
 	o, ok := s.overrides[p]
 	if a := usrAlias(p); !ok && a != "" {
 		o, ok = s.overrides[a]
 	}
-	expected := append([]uint32{f.Mode & 0o7777}, f.ScriptModes...)
-	if ok {
-		expected = []uint32{o.Mode & 0o7777}
+	type expected struct {
+		mode  uint32
+		label string
 	}
-	for _, want := range expected {
-		if disk == want || (disk&^want&0o6000 == 0 && (disk|want)&0o111 == 0) {
-			return ""
+	exp := []expected{{f.Mode & 0o7777, "deb"}}
+	for _, m := range f.ScriptModes {
+		exp = append(exp, expected{m & 0o7777, "maintainer script"})
+	}
+	if ok {
+		exp = []expected{{o.Mode & 0o7777, "statoverride"}}
+	}
+	for _, e := range exp {
+		if disk == e.mode {
+			return "", false
 		}
 	}
-	switch {
-	case ok:
-		return fmt.Sprintf("mode differs: statoverride %04o, disk %04o", expected[0], disk)
-	case len(f.ScriptModes) > 0:
+	other := ""
+	for _, e := range exp {
+		switch {
+		case disk&^e.mode&privilegeBits != 0:
+		case disk&^e.mode == 0:
+			return fmt.Sprintf("mode differs (less permissive): %s %04o, disk %04o", e.label, e.mode, disk), false
+		case other == "":
+			other = fmt.Sprintf("mode differs: %s %04o, disk %04o", e.label, e.mode, disk)
+		}
+	}
+	if other != "" {
+		return other, false
+	}
+	if !ok && len(f.ScriptModes) > 0 {
 		var sm []string
 		for _, m := range f.ScriptModes {
 			sm = append(sm, fmt.Sprintf("%04o", m))
 		}
-		return fmt.Sprintf("mode differs: deb %04o (maintainer script sets %s), disk %04o", expected[0], strings.Join(sm, " or "), disk)
+		return fmt.Sprintf("mode differs: deb %04o (maintainer script sets %s), disk %04o", exp[0].mode, strings.Join(sm, " or "), disk), true
 	}
-	return fmt.Sprintf("mode differs: deb %04o, disk %04o", expected[0], disk)
+	return fmt.Sprintf("mode differs: %s %04o, disk %04o", exp[0].label, exp[0].mode, disk), true
 }
 
 // explain words an error for a verdict, naming the bundle in refs mode.

@@ -272,9 +272,15 @@ var (
 	addSetBits = map[string]uint32{"u+s": 0o4000, "g+s": 0o2000, "ug+s": 0o6000, "+s": 0o6000}
 )
 
+// shellExpansion holds the characters through which a shell word can stand
+// for something other than itself.
+const shellExpansion = "$`*?[]{}()~\\\"'<>"
+
 // scriptChmods records the literal "chmod MODE PATH..." commands of a
-// maintainer script: an octal or u+s/g+s mode and absolute paths without
-// shell expansion. Recursive changes and anything computed are ignored.
+// maintainer script: an octal or u+s/g+s mode and absolute paths, each
+// optionally in plain quotes. A command with any variable, substitution,
+// glob, brace or escape among its arguments counts for none of them;
+// recursive changes are ignored.
 func (c *control) scriptChmods(script string) {
 	for _, line := range strings.Split(script, "\n") {
 		if i := strings.IndexByte(line, '#'); i >= 0 {
@@ -309,11 +315,18 @@ func (c *control) scriptChmods(script string) {
 				}
 				set = uint32(m)
 			}
+			paths := make([]string, 0, len(args)-1)
 			for _, p := range args[1:] {
-				p = strings.Trim(p, `"'`)
-				if !validTablePath(p) || strings.ContainsAny(p, "$`*?[") {
-					continue
+				if len(p) >= 2 && (p[0] == '"' || p[0] == '\'') && p[len(p)-1] == p[0] {
+					p = p[1 : len(p)-1]
 				}
+				if !validTablePath(p) || strings.ContainsAny(p, shellExpansion) {
+					paths = nil
+					break
+				}
+				paths = append(paths, p)
+			}
+			for _, p := range paths {
 				if isAdd {
 					c.addBits[p] |= add
 				} else if !slices.Contains(c.setModes[p], set) {

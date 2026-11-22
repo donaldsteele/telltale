@@ -537,6 +537,23 @@ func persistLinks(c *model.Collection) []model.Finding {
 // diversionDirs are the system trees where a local diversion is suspicious.
 var diversionDirs = []string{"/bin/", "/sbin/", "/usr/", "/lib/", "/lib32/", "/lib64/", "/libx32/", "/etc/", "/boot/"}
 
+// The local diversions Ubuntu's official images make, exactly as
+// /var/lib/dpkg/diversions records them in ubuntu:22.04 and ubuntu:24.04
+// (read 2026-11-22): the minimised images replace man with a hint to run
+// unminimize, and the container images replace initctl. Only these exact
+// pairs are notes; any other local diversion is a backdoor sign.
+const (
+	stockUbuntuManPath       = "/usr/bin/man"
+	stockUbuntuManDivert     = "/usr/bin/man.REAL"
+	stockUbuntuInitctlPath   = "/sbin/initctl"
+	stockUbuntuInitctlDivert = "/sbin/initctl.distrib"
+)
+
+func stockUbuntuDiversion(d model.Diversion) bool {
+	return (d.Path == stockUbuntuManPath && d.DivertTo == stockUbuntuManDivert) ||
+		(d.Path == stockUbuntuInitctlPath && d.DivertTo == stockUbuntuInitctlDivert)
+}
+
 // localDiversions flags dpkg-divert --local entries for system files: every
 // package's version of the file is installed elsewhere, so whatever sits at
 // the original path is never replaced by updates or checked against a
@@ -557,10 +574,16 @@ func localDiversions(c *model.Collection) []model.Finding {
 		if !system {
 			continue
 		}
+		sev := model.SevBackdoor
+		why := "A local dpkg diversion makes every package install its version of this file under another name, so the file at the original path is never replaced by updates and is not the packaged one. Image builders use it (Ubuntu's minimised images divert /usr/bin/man); an attacker can use it to keep a replaced system program in place."
+		if stockUbuntuDiversion(d) {
+			sev = model.SevNote
+			why = "Ubuntu's official images make exactly this local diversion, so it is expected on machines built from them. The file at the original path is not the packaged one and is not checked against a package; if this machine was not built from such an image, treat it as a backdoor sign."
+		}
 		out = append(out, model.Finding{
-			Key: "heur.local_diversion:" + d.Path, ID: idDiversion, Source: source, Severity: model.SevBackdoor,
+			Key: "heur.local_diversion:" + d.Path, ID: idDiversion, Source: source, Severity: sev,
 			Title: fmt.Sprintf("%s is locally diverted to %s", d.Path, d.DivertTo),
-			Why:   "A local dpkg diversion makes every package install its version of this file under another name, so the file at the original path is never replaced by updates and is not the packaged one. Image builders use it (Ubuntu's minimised images divert /usr/bin/man); an attacker can use it to keep a replaced system program in place.",
+			Why:   why,
 			Fix: fix([]string{d.Path, d.DivertTo}, func(q []string) string {
 				return keep(q[0]) + " && { cp -a --parents " + q[1] + " " + evidenceDir + "/ 2>/dev/null || echo 'diverted file not saved (missing or unreadable)'; } && rm " + q[0] + " && dpkg-divert --local --rename --remove " + q[0] + "   # puts the packaged file back; inspect the saved copies first"
 			}),
