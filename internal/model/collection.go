@@ -207,8 +207,12 @@ type Mount struct {
 
 // Packages holds the dpkg view of the machine.
 type Packages struct {
-	Installed []Package   `json:"installed"`
-	Sources   []AptSource `json:"sources"`
+	Installed []Package `json:"installed"`
+	// Residual lists packages that were removed but not purged (dpkg state
+	// config-files): name, version, architecture and status only. Their
+	// files are gone, but dpkg keeps their postrm script and runs it on purge.
+	Residual []Package   `json:"residual,omitempty"`
+	Sources  []AptSource `json:"sources"`
 	// Diversions come from /var/lib/dpkg/diversions.
 	Diversions []Diversion `json:"diversions,omitempty"`
 	// StatOverrides come from /var/lib/dpkg/statoverride.

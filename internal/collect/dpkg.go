@@ -42,6 +42,13 @@ func installedStatus(s string) bool {
 	return s == "install ok installed" || s == "hold ok installed"
 }
 
+// residualStatus reports whether a dpkg status is that of a package removed
+// but not purged: its files are gone, its postrm waits for the purge.
+func residualStatus(s string) bool {
+	f := strings.Fields(s)
+	return len(f) == 3 && f[2] == "config-files"
+}
+
 type dpkgEntry struct {
 	p         model.Package
 	multiArch bool
@@ -55,10 +62,15 @@ func Packages(root string) (model.Packages, []model.Skip) {
 		skips = append(skips, model.Skip{Check: dpkgCheck, Reason: fmt.Sprintf(f, a...)})
 	}
 	var ents []dpkgEntry
+	var residual []model.Package
 	var cur dpkgEntry
 	flush := func() {
-		if cur.p.Name != "" && installedStatus(cur.p.Status) {
+		switch p := cur.p; {
+		case p.Name == "":
+		case installedStatus(p.Status):
 			ents = append(ents, cur)
+		case residualStatus(p.Status) && safePkgToken(p.Name) && (p.Arch == "" || safePkgToken(p.Arch)):
+			residual = append(residual, model.Package{Name: p.Name, Version: p.Version, Arch: p.Arch, Status: p.Status})
 		}
 		cur = dpkgEntry{}
 	}
@@ -114,7 +126,14 @@ func Packages(root string) (model.Packages, []model.Skip) {
 		return ents[i].p.Arch < ents[j].p.Arch
 	})
 
-	pk := model.Packages{Installed: make([]model.Package, 0, len(ents))}
+	sort.SliceStable(residual, func(i, j int) bool {
+		if residual[i].Name != residual[j].Name {
+			return residual[i].Name < residual[j].Name
+		}
+		return residual[i].Arch < residual[j].Arch
+	})
+
+	pk := model.Packages{Installed: make([]model.Package, 0, len(ents)), Residual: residual}
 	for _, e := range ents {
 		p := e.p
 		if !safePkgToken(p.Name) || (p.Arch != "" && !safePkgToken(p.Arch)) {

@@ -140,8 +140,9 @@ func (p *fieldParser) rawFieldMaybeNull(last bool) (v uint64, present, ok bool) 
 	return v, n > 0, true
 }
 
-// maxID is the first id glibc refuses: (uid_t)-1 and anything that does
-// not fit in 32 bits make it drop the line.
+// maxID is the largest id glibc accepts. It reads the field with strtoul
+// and drops the line only when the value is above this, which "-1" is too
+// (a minus sign negates modulo 2^64).
 const maxID = 1<<32 - 1
 
 // idField reads a user or group id: required (INT_FIELD) or, for the NIS
@@ -154,7 +155,7 @@ func (p *fieldParser) idField(nis bool) (int, bool) {
 	} else {
 		v, ok = p.intField()
 	}
-	if !ok || v >= maxID {
+	if !ok || v > maxID {
 		return 0, false
 	}
 	return int(v), true

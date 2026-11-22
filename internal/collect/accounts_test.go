@@ -255,9 +255,9 @@ func TestAccountsReadLikeGlibc(t *testing.T) {
 
 // Empty-name lines are used by glibc (getpwuid(0) returns an empty-name uid
 // 0 line placed first; initgroups honours ":x:27:eve"), so they are
-// reported as malformed with what they claim. Lines whose ids are -1 or
-// 2^32 and above are dropped by glibc, so a later line for the same name
-// counts; they are dropped here too and reported.
+// reported as malformed with what they claim. Lines whose ids are above
+// 4294967295 ("-1" too, read as unsigned long) are dropped by glibc, so a
+// later line for the same name counts; they are dropped here too and reported.
 func TestAccountsEmptyNamesAndOutOfRangeIDs(t *testing.T) {
 	acc, _ := Accounts(accountsRoot(t,
 		":x:0:0::/tmp/x:/tmp/x/sh\nroot:x:0:0:root:/root:/bin/bash\nalice:x:4294968296:1000::/home/alice:/bin/bash\nalice:x:0:0::/home/alice:/bin/bash\nbig:x:4294967295:0::/:/bin/sh\nneg:x:-1:0::/:/bin/sh\n",
@@ -267,7 +267,6 @@ func TestAccountsEmptyNamesAndOutOfRangeIDs(t *testing.T) {
 	for _, want := range []string{
 		"/etc/passwd:1 (empty name, uid 0)",
 		"/etc/passwd:3",
-		"/etc/passwd:5",
 		"/etc/passwd:6",
 		"/etc/shadow:1 (empty name)",
 		"/etc/group:3 (empty name, gid 27, members eve)",
@@ -280,13 +279,55 @@ func TestAccountsEmptyNamesAndOutOfRangeIDs(t *testing.T) {
 	if alice, ok := userByName(acc, "alice"); !ok || alice.UID != 0 {
 		t.Errorf("alice = %+v (glibc resolves alice to uid 0)", alice)
 	}
-	for _, name := range []string{"big", "neg"} {
-		if _, ok := userByName(acc, name); ok {
-			t.Errorf("%s kept although glibc drops its line", name)
-		}
+	if _, ok := userByName(acc, "neg"); ok {
+		t.Errorf("neg kept although glibc drops its line")
+	}
+	// glibc keeps an id of 4294967295: only values above it are refused.
+	if big, ok := userByName(acc, "big"); !ok || big.UID != 4294967295 || slices.Contains(acc.Malformed, "/etc/passwd:5") {
+		t.Errorf("big = %+v (kept %v), malformed %q; glibc keeps uid 4294967295", big, ok, acc.Malformed)
 	}
 	js, _ := json.Marshal(acc)
 	if strings.Contains(string(js), "grouphash") || strings.Contains(string(js), "$6$x") {
 		t.Errorf("a hash was kept")
+	}
+}
+
+// The lines and the expected reading come from glibc 2.41's fgetpwent and
+// fgetgrent: an id is refused only above 4294967295 (which "-1" and
+// "-4294967295" are, read as unsigned long).
+func TestAccountsIDBoundaryMatchesGlibc(t *testing.T) {
+	acc, _ := Accounts(accountsRoot(t,
+		"alice:x:4294967295:0::/home/alice:/bin/bash\nalice:x:0:0::/home/alice:/bin/bash\npg:x:7:4294967295::/:/bin/sh\n"+
+			"max:x:4294967294:0::/:/bin/sh\nplus:x:+5:0::/:/bin/sh\nws:x: 7:0::/:/bin/sh\nover:x:4294967296:0::/:/bin/sh\n"+
+			"neg:x:-1:0::/:/bin/sh\nneg2:x:-4294967295:0::/:/bin/sh\ngbig:x:5:4294967296::/:/bin/sh\n",
+		"",
+		"root:x:0:\ngmax:x:4294967295:dave\nbigg:x:4294967296:bob\nnegg:x:-1:bob\nokg:x:4294967294:carl\n",
+		""), testKey)
+	for name, uid := range map[string]int{"alice": 4294967295, "pg": 7, "max": 4294967294, "plus": 5, "ws": 7} {
+		if u, ok := userByName(acc, name); !ok || u.UID != uid {
+			t.Errorf("%s = %+v (kept %v), want uid %d", name, u, ok, uid)
+		}
+	}
+	if pg, _ := userByName(acc, "pg"); pg.GID != 4294967295 {
+		t.Errorf("pg gid = %d, want 4294967295", pg.GID)
+	}
+	for _, name := range []string{"over", "neg", "neg2", "gbig"} {
+		if _, ok := userByName(acc, name); ok {
+			t.Errorf("%s kept although glibc drops its line", name)
+		}
+	}
+	if !slices.Contains(acc.Duplicates, "/etc/passwd:alice") {
+		t.Errorf("duplicates %q lack the second alice line", acc.Duplicates)
+	}
+	groups := map[string]int{}
+	for _, g := range acc.Groups {
+		groups[g.Name] = g.GID
+	}
+	if len(groups) != 3 || groups["gmax"] != 4294967295 || groups["okg"] != 4294967294 {
+		t.Errorf("groups = %v, want root, gmax (4294967295) and okg", groups)
+	}
+	want := []string{"/etc/passwd:7", "/etc/passwd:8", "/etc/passwd:9", "/etc/passwd:10", "/etc/group:3", "/etc/group:4"}
+	if !slices.Equal(acc.Malformed, want) {
+		t.Errorf("malformed = %q, want %q", acc.Malformed, want)
 	}
 }

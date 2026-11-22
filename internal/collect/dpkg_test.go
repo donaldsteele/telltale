@@ -207,3 +207,18 @@ func TestDpkgNoDiversionFiles(t *testing.T) {
 		t.Errorf("diversions %v, overrides %v, skips %v", pk.Diversions, pk.StatOverrides, skips)
 	}
 }
+
+// A package removed but not purged keeps its postrm, which dpkg runs on
+// purge, so its name and version are recorded apart from the installed ones.
+func TestDpkgStatusKeepsRemovedNotPurged(t *testing.T) {
+	pk, _ := Packages(dpkgRoot(t))
+	want := []model.Package{{Name: "gone", Version: "1.0", Arch: "amd64", Status: "deinstall ok config-files"}}
+	if !reflect.DeepEqual(pk.Residual, want) {
+		t.Fatalf("residual = %+v, want %+v", pk.Residual, want)
+	}
+	for _, p := range pk.Installed {
+		if p.Name == "gone" {
+			t.Errorf("a removed package is listed as installed")
+		}
+	}
+}
