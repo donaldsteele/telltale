@@ -9,6 +9,9 @@ type LineChange struct {
 	Op   string // "add" or "del"
 }
 
+// maxCells bounds the LCS table (4 bytes per cell, so 16 MiB).
+const maxCells = 4 << 20
+
 // diffLines returns the line-level difference between a and b using a
 // longest-common-subsequence table. Deletions precede additions at the same
 // position.
@@ -23,6 +26,17 @@ func diffLines(a, b []string) []LineChange {
 		sa, sb = sa[:len(sa)-1], sb[:len(sb)-1]
 	}
 	n, m := len(sa), len(sb)
+	if n*m > maxCells {
+		// Too large for the table: report the whole differing block.
+		out := make([]LineChange, 0, n+m)
+		for i, s := range sa {
+			out = append(out, LineChange{Line: pre + i + 1, Old: s, Op: "del"})
+		}
+		for j, s := range sb {
+			out = append(out, LineChange{Line: pre + j + 1, New: s, Op: "add"})
+		}
+		return out
+	}
 	t := make([][]int32, n+1)
 	for i := range t {
 		t[i] = make([]int32, m+1)

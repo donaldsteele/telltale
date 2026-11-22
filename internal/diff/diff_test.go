@@ -162,6 +162,12 @@ func TestCompareVersionsDebianRules(t *testing.T) {
 		{"1.10", "1.9", 1},
 		{"1.0", "1.0", 0},
 		{"1.0-1", "1.0", 1},
+		{"1.x", "1.2", 1},
+		{"1.+", "1.2", 1},
+		{"1.0-a1", "1.0-1", 1},
+		{"1.0", "1.0.0", -1},
+		{"1.0~rc1", "1.0~rc1.1", -1},
+		{"2:1.0", "1:9.9", 1},
 	} {
 		if got := CompareVersions(c.a, c.b); got != c.want {
 			t.Errorf("CompareVersions(%q,%q)=%d want %d", c.a, c.b, got, c.want)
@@ -187,14 +193,17 @@ func TestCompareListenersModulesChecks(t *testing.T) {
 		Processes: []model.Process{{PID: 7, Exe: "/usr/sbin/named"}},
 		Modules:   []model.KernelModule{{Name: "ext4"}, {Name: "rootkit"}},
 	}}
+	old.Runtime.Sockets = append(old.Runtime.Sockets, model.Socket{Proto: "tcp", Local: "127.0.0.1:80", Listening: true})
+	cur.Runtime.Sockets = append(cur.Runtime.Sockets, model.Socket{Proto: "tcp", Local: "0.0.0.0:80", Listening: true})
 	cs := Compare(snap(old), cur, nil)
-	find(t, cs, "listener_added", "tcp6 22")
-	u := find(t, cs, "listener_added", "udp6 53")
+	find(t, cs, "listener_added", "tcp 0.0.0.0:80")
+	find(t, cs, "listener_added", "tcp6 [::]:22")
+	u := find(t, cs, "listener_added", "udp6 [::]:53")
 	if u.After != "/usr/sbin/named" {
 		t.Errorf("%+v", u)
 	}
 	find(t, cs, "module_added", "rootkit")
-	if len(cs) != 3 {
+	if len(cs) != 4 {
 		t.Errorf("%+v", cs)
 	}
 }
@@ -227,3 +236,30 @@ func TestCompareNoChanges(t *testing.T) {
 }
 
 func timeAt(s int) time.Time { return time.Unix(int64(s), 0) }
+
+func TestComparePersistMetadata(t *testing.T) {
+	old := &model.Collection{Persist: []model.PersistFile{{Path: "/k", SHA256: "a", Lines: []string{"x"}, Mode: 0600, UID: 1000, MTime: timeAt(1)}}}
+	cur := &model.Collection{Persist: []model.PersistFile{{Path: "/k", SHA256: "a", Lines: []string{"x"}, Mode: 0666, UID: 0, MTime: timeAt(2)}}}
+	c := find(t, Compare(snap(old), cur, nil), "persist_changed", "/k")
+	if c.Before != "mode 0600 owner 1000" || c.After != "mode 0666 owner 0" || len(c.Lines) != 0 {
+		t.Errorf("%+v", c)
+	}
+	cur.Persist[0].Mode, cur.Persist[0].UID = 0600, 1000
+	if cs := Compare(snap(old), cur, nil); len(cs) != 0 {
+		t.Errorf("mtime only: %+v", cs)
+	}
+}
+
+func TestDiffLinesLargeBounded(t *testing.T) {
+	a := make([]string, 50000)
+	b := make([]string, 50000)
+	for i := range a {
+		a[i] = fmt.Sprintf("a%d", i)
+		b[i] = fmt.Sprintf("b%d", i)
+	}
+	start := time.Now()
+	ls := diffLines(a, b)
+	if len(ls) != 100000 || time.Since(start) > 5*time.Second {
+		t.Errorf("len %d in %v", len(ls), time.Since(start))
+	}
+}

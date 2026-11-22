@@ -204,10 +204,25 @@ func comparePersist(old, cur []model.PersistFile) []Change {
 			continue
 		}
 		lines := diffLines(o.Lines, n.Lines)
-		if len(lines) == 0 && o.SHA256 == n.SHA256 {
-			continue
+		var s summary
+		if o.Mode&07777 != n.Mode&07777 {
+			s.add("mode", fmt.Sprintf("%04o", o.Mode&07777), fmt.Sprintf("%04o", n.Mode&07777))
 		}
-		out = append(out, Change{Kind: PersistChanged, Subject: n.Path, Before: o.SHA256, After: n.SHA256, Lines: lines})
+		if o.UID != n.UID {
+			s.add("owner", fmt.Sprint(o.UID), fmt.Sprint(n.UID))
+		}
+		contentChanged := len(lines) > 0 || o.SHA256 != n.SHA256
+		switch {
+		case len(s.before) > 0:
+			if contentChanged {
+				s.before = append([]string{"sha256 " + short(o.SHA256)}, s.before...)
+				s.after = append([]string{"sha256 " + short(n.SHA256)}, s.after...)
+			}
+			b, a := s.join()
+			out = append(out, Change{Kind: PersistChanged, Subject: n.Path, Before: b, After: a, Lines: lines})
+		case contentChanged:
+			out = append(out, Change{Kind: PersistChanged, Subject: n.Path, Before: o.SHA256, After: n.SHA256, Lines: lines})
+		}
 	}
 	for _, o := range old {
 		if !seen[o.Path] {
@@ -338,17 +353,14 @@ func comparePackages(old, cur []model.Package) []Change {
 	return out
 }
 
-// listenKey identifies a listener by protocol, family and local port.
-func listenKey(s model.Socket) (key, subject string) {
+// listenKey identifies a listener by protocol, family and local address;
+// the key doubles as the change subject, e.g. "tcp6 [::]:22".
+func listenKey(s model.Socket) string {
 	proto := strings.TrimSuffix(s.Proto, "6")
-	host, port := s.Local, s.Local
-	if i := strings.LastIndex(s.Local, ":"); i >= 0 {
-		host, port = s.Local[:i], s.Local[i+1:]
-	}
-	if strings.HasPrefix(host, "[") || strings.HasSuffix(s.Proto, "6") {
+	if strings.HasPrefix(s.Local, "[") || strings.HasSuffix(s.Proto, "6") {
 		proto += "6"
 	}
-	return proto + " " + port, proto + " " + port
+	return proto + " " + s.Local
 }
 
 func compareRuntime(old, cur model.Runtime) []Change {
@@ -356,8 +368,7 @@ func compareRuntime(old, cur model.Runtime) []Change {
 	had := make(map[string]bool)
 	for _, s := range old.Sockets {
 		if s.Listening {
-			k, _ := listenKey(s)
-			had[k] = true
+			had[listenKey(s)] = true
 		}
 	}
 	exe := make(map[int]string, len(cur.Processes))
@@ -368,12 +379,12 @@ func compareRuntime(old, cur model.Runtime) []Change {
 		if !s.Listening {
 			continue
 		}
-		k, subj := listenKey(s)
+		k := listenKey(s)
 		if had[k] {
 			continue
 		}
 		had[k] = true
-		out = append(out, Change{Kind: ListenerAdded, Subject: subj, After: exe[s.PID]})
+		out = append(out, Change{Kind: ListenerAdded, Subject: k, After: exe[s.PID]})
 	}
 	mods := make(map[string]bool, len(old.Modules))
 	for _, m := range old.Modules {

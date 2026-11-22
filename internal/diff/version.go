@@ -38,13 +38,15 @@ rest:
 }
 
 // order is the sort weight of one character in a non-digit run: '~' lowest,
-// then end of string, then letters, then everything else.
+// then digits and end of string, then letters, then everything else.
 func order(s string, i int) int {
 	if i >= len(s) {
 		return 0
 	}
 	c := s[i]
 	switch {
+	case c >= '0' && c <= '9':
+		return 0
 	case c == '~':
 		return -1
 	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
