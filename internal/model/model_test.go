@@ -153,3 +153,27 @@ func TestReportJSONFieldNamesSnakeCase(t *testing.T) {
 		}
 	}
 }
+
+func TestSeverityJSON(t *testing.T) {
+	b, err := json.Marshal(Finding{Key: "k", Severity: SevTampering})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"severity":"tampering"`) {
+		t.Fatalf("got %s", b)
+	}
+	for s := SevExplained; s <= SevTampering; s++ {
+		b, _ := json.Marshal(s)
+		var back Severity
+		if err := json.Unmarshal(b, &back); err != nil || back != s {
+			t.Errorf("round trip %v: %s -> %v, %v", s, b, back, err)
+		}
+	}
+	var bad Severity
+	if err := json.Unmarshal([]byte(`"bogus"`), &bad); err == nil {
+		t.Error("unknown name accepted")
+	}
+	if err := json.Unmarshal([]byte(`3`), &bad); err == nil {
+		t.Error("number accepted")
+	}
+}

@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Severity ranks how concerning a finding is. Higher values are more severe.
 type Severity int
@@ -54,4 +57,24 @@ type Finding struct {
 	Severity Severity   `json:"severity"`
 	Evidence []Evidence `json:"evidence,omitempty"`
 	Refs     []string   `json:"refs,omitempty"`
+}
+
+// MarshalText encodes the severity as its String() name so JSON shows
+// "tampering" rather than a number.
+func (s Severity) MarshalText() ([]byte, error) {
+	if s < SevExplained || s > SevTampering {
+		return nil, fmt.Errorf("unknown severity %d", int(s))
+	}
+	return []byte(s.String()), nil
+}
+
+// UnmarshalText decodes a name produced by MarshalText and rejects any other.
+func (s *Severity) UnmarshalText(b []byte) error {
+	for v := SevExplained; v <= SevTampering; v++ {
+		if v.String() == string(b) {
+			*s = v
+			return nil
+		}
+	}
+	return fmt.Errorf("unknown severity %q", b)
 }
