@@ -18,7 +18,7 @@ import (
 const (
 	// tableSchema changes whenever DebFiles would produce a different table
 	// for the same .deb, so older tables are not reused.
-	tableSchema  = 1
+	tableSchema  = 2 // 2: ScriptModes
 	maxTableFile = 256 << 20
 )
 
@@ -52,8 +52,13 @@ func loadTable(dir, debSHA string) (map[string]DebFile, bool) {
 		return nil, false
 	}
 	for p, f := range t.Files {
-		if !validTablePath(p) || !isHexLen(f.SHA256, 64) || f.Mode > 0o7777 || len(f.Text) > maxConffileText || (f.Text != nil && !f.Conffile) {
+		if !validTablePath(p) || !isHexLen(f.SHA256, 64) || f.Mode > 0o7777 || len(f.Text) > maxConffileText || (f.Text != nil && !f.Conffile) || len(f.ScriptModes) > 16 {
 			return nil, false
+		}
+		for _, m := range f.ScriptModes {
+			if m > 0o7777 {
+				return nil, false
+			}
 		}
 	}
 	return t.Files, true
@@ -75,5 +80,5 @@ func storeTable(dir, debSHA string, files map[string]DebFile) {
 
 // validTablePath accepts what debPath produces.
 func validTablePath(p string) bool {
-	return len(p) > 1 && p[0] == '/' && path.Clean(p) == p && !strings.ContainsAny(p, "\x00\\")
+	return len(p) > 1 && p[0] == '/' && path.Clean(p) == p && !strings.ContainsRune(p, 0)
 }

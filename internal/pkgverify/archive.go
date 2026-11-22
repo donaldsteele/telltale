@@ -68,6 +68,21 @@ type Archive struct {
 	// Historical marks a snapshot of the archive at a past moment, whose
 	// Valid-Until has passed by design. Signatures are still checked.
 	Historical bool
+
+	// memo, when set, keeps each suite's verified Release for one run, so
+	// its InRelease is fetched once however many indexes are read.
+	memo *releaseMemo
+}
+
+type releaseMemo struct {
+	mu sync.Mutex
+	m  map[string]*memoRelease
+}
+
+type memoRelease struct {
+	once sync.Once
+	rel  *release
+	err  error
 }
 
 var (

@@ -112,10 +112,30 @@ type release struct {
 	sha256          map[string]fileHash
 }
 
-// release returns suite's verified Release. A fresh download is preferred;
-// the cached copy is used (verified again) when the archive cannot be
-// reached, and always for historical archives, whose indexes never change.
+// release returns suite's verified Release, once per run when the archive
+// has a memo.
 func (a *Archive) release(ctx context.Context, suite string) (*release, error) {
+	if a.memo == nil {
+		return a.fetchRelease(ctx, suite)
+	}
+	a.memo.mu.Lock()
+	if a.memo.m == nil {
+		a.memo.m = map[string]*memoRelease{}
+	}
+	e := a.memo.m[suite]
+	if e == nil {
+		e = &memoRelease{}
+		a.memo.m[suite] = e
+	}
+	a.memo.mu.Unlock()
+	e.once.Do(func() { e.rel, e.err = a.fetchRelease(ctx, suite) })
+	return e.rel, e.err
+}
+
+// fetchRelease returns suite's verified Release. A fresh download is
+// preferred; the cached copy is used (verified again) when the archive cannot
+// be reached, and always for historical archives, whose indexes never change.
+func (a *Archive) fetchRelease(ctx context.Context, suite string) (*release, error) {
 	url := a.base() + "/dists/" + suite + "/InRelease"
 	cache := a.cachePath("inrelease-" + hashHex([]byte(url)))
 	if a.Historical {

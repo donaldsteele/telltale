@@ -107,9 +107,18 @@ func arBytes(names []string, bodies [][]byte) []byte {
 
 func buildDeb(t *testing.T, comp string, conffiles []string, data []debEntry) []byte {
 	t.Helper()
+	return buildDebScript(t, comp, conffiles, "", data)
+}
+
+// buildDebScript is buildDeb with a postinst maintainer script.
+func buildDebScript(t *testing.T, comp string, conffiles []string, postinst string, data []debEntry) []byte {
+	t.Helper()
 	control := []debEntry{{name: "./", typ: tar.TypeDir, mode: 0o755}, {name: "./control", body: "Package: test\nVersion: 1\n", mode: 0o644}}
 	if len(conffiles) > 0 {
 		control = append(control, debEntry{name: "./conffiles", body: strings.Join(conffiles, "\n") + "\n", mode: 0o644})
+	}
+	if postinst != "" {
+		control = append(control, debEntry{name: "./postinst", body: postinst, mode: 0o755})
 	}
 	ext := ""
 	if comp != "" {
@@ -845,6 +854,9 @@ func TestThirdPartyUnverifiableWithoutKey(t *testing.T) {
 	opt.ExtraKeys = publicOnly(t, repoKey)
 	res = Verify(context.Background(), c, opt)
 	wantPaths(t, "Verified", res.Verified, "/usr/bin/thirdtool")
+	if len(res.Verified) == 1 && res.Verified[0].Source != SourceThirdParty {
+		t.Errorf("Source = %q, want %q", res.Verified[0].Source, SourceThirdParty)
+	}
 	wantPaths(t, "Unverifiable", res.Unverifiable)
 }
 
@@ -1137,5 +1149,347 @@ func TestLoadKeys(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "junk.asc"), []byte("not a key"), 0o644)
 	if _, err := LoadKeys(dir); err == nil {
 		t.Error("accepted a file that holds no key")
+	}
+}
+
+// withFile returns c with the collected entry for path replaced by e (or
+// added).
+func withFile(c *model.Collection, e model.FileEntry) *model.Collection {
+	for i := range c.Files {
+		if c.Files[i].Path == e.Path {
+			c.Files[i] = e
+			return c
+		}
+	}
+	c.Files = append(c.Files, e)
+	return c
+}
+
+func symlinkEntry(path, target string) model.FileEntry {
+	return model.FileEntry{Path: path, Type: "symlink", Target: target, Mode: 0o120777}
+}
+
+func TestVerifyConffileReplacedBySymlink(t *testing.T) {
+	f := toolFixture(t)
+	c := toolCollection(nil)
+	withFile(c, symlinkEntry("/etc/tool.conf", "/tmp/.x/conf"))
+	withFile(c, symlinkEntry("/etc/init.d/tool", "/tmp/.x/init"))
+	opt := f.opts()
+	opt.OnlyPaths = map[string]bool{"/etc/tool.conf": true, "/etc/init.d/tool": true}
+	res := Verify(context.Background(), c, opt)
+	wantPaths(t, "Mismatch", res.Mismatch)
+	if len(res.Conffiles) != 2 {
+		t.Fatalf("Conffiles = %+v", res.Conffiles)
+	}
+	for _, d := range res.Conffiles {
+		if !strings.HasPrefix(d.Actual, "symlink to /tmp/.x/") || d.Package != "tool" || d.Expected == "" {
+			t.Errorf("diff %+v", d)
+		}
+	}
+}
+
+func TestVerifyObsoleteConffile(t *testing.T) {
+	f := toolFixture(t)
+	pkg := toolPackage()
+	// Still on disk and in dpkg's lists from an older version; the current
+	// package no longer ships them.
+	pkg.Files = append(pkg.Files, "/etc/tool.d/old.sh", "/usr/lib/tool/old.sh")
+	pkg.ObsoleteConffiles = []string{"/etc/tool.d/old.sh", "/usr/lib/tool/old.sh"}
+	c := collectionOf(toolDisk(map[string]string{"/etc/tool.d/old.sh": "#!/bin/sh\n", "/usr/lib/tool/old.sh": "#!/bin/sh\n"}), pkg)
+	res := Verify(context.Background(), c, f.opts())
+	if len(res.Conffiles) != 1 || res.Conffiles[0].Path != "/etc/tool.d/old.sh" || res.Conffiles[0].Note != "obsolete conffile (no longer shipped by the package)" || res.Conffiles[0].Package != "tool" {
+		t.Errorf("Conffiles = %+v", res.Conffiles)
+	}
+	// Outside /etc the claim is not taken: the signed package lacks it.
+	wantPaths(t, "Mismatch", res.Mismatch, "/usr/lib/tool/old.sh")
+}
+
+func TestVerifyFileListsDoNotDecide(t *testing.T) {
+	f := toolFixture(t)
+	t.Run("trojan moved to a fake package's list", func(t *testing.T) {
+		pkg := toolPackage()
+		pkg.Files = slices.DeleteFunc(pkg.Files, func(s string) bool { return s == "/usr/bin/tool" })
+		helper := model.Package{Name: "aaa-helper", Version: "1.0", Arch: "amd64", Status: "install ok installed", Files: []string{"/usr/bin/tool"}}
+		c := collectionOf(toolDisk(map[string]string{"/usr/bin/tool": "evil\n"}), helper, pkg)
+		res := Verify(context.Background(), c, f.opts())
+		wantPaths(t, "Mismatch", res.Mismatch, "/usr/bin/tool")
+		if m, _ := find(res.Mismatch, "/usr/bin/tool"); m.Package != "tool" || m.Expected != sha256hex([]byte(toolBin)) {
+			t.Errorf("mismatch %+v, want tool's file as expected", m)
+		}
+		if _, ok := find(res.Unverifiable, "/usr/bin/tool"); ok {
+			t.Error("the trojan is also listed as unverifiable")
+		}
+	})
+	t.Run("file list trimmed to the README", func(t *testing.T) {
+		pkg := toolPackage()
+		pkg.Files = []string{"/usr/share/doc/tool/README"}
+		c := collectionOf(toolDisk(map[string]string{"/usr/bin/tool": "evil\n"}), pkg)
+		res := Verify(context.Background(), c, f.opts())
+		wantPaths(t, "Mismatch", res.Mismatch, "/usr/bin/tool")
+		wantPaths(t, "Verified", res.Verified, "/usr/bin/toolctl", libDir+"/libtool.so.1")
+	})
+}
+
+const (
+	manBin    = "\x7fELF man-db man\n"
+	manScript = "#!/bin/sh\necho 'This system has been minimized'\n"
+)
+
+func manFixture(t *testing.T, patchShipsScript bool) *fixture {
+	t.Helper()
+	mandb := buildDeb(t, "xz", nil, []debEntry{{name: "./usr/bin/man", body: manBin, mode: 0o755}})
+	var patch []debEntry
+	if patchShipsScript {
+		patch = append(patch, debEntry{name: "./usr/bin/man", body: manScript, mode: 0o755})
+	}
+	patch = append(patch, debEntry{name: "./usr/share/doc/manpatch/README", body: "x", mode: 0o644})
+	return newFixture(t, map[string][]fakePkg{"bookworm": {
+		{"man-db", "2.11-1", "amd64", mandb},
+		{"manpatch", "1", "all", buildDeb(t, "xz", nil, patch)},
+	}})
+}
+
+func manCollection(div model.Diversion) *model.Collection {
+	c := collectionOf(map[string]string{"/usr/bin/man": manScript, "/usr/bin/man.REAL": manBin},
+		model.Package{Name: "man-db", Version: "2.11-1", Arch: "amd64", Status: "install ok installed", Files: []string{"/usr/bin/man"}},
+		model.Package{Name: "manpatch", Version: "1", Arch: "all", Status: "install ok installed", Files: []string{"/usr/bin/man", "/usr/share/doc/manpatch/README"}},
+	)
+	c.Packages.Diversions = []model.Diversion{div}
+	return c
+}
+
+func TestVerifyDiversions(t *testing.T) {
+	t.Run("package diversion", func(t *testing.T) {
+		// manpatch diverts man-db's /usr/bin/man to /usr/bin/man.REAL and
+		// ships its own /usr/bin/man.
+		f := manFixture(t, true)
+		res := Verify(context.Background(), manCollection(model.Diversion{Path: "/usr/bin/man", DivertTo: "/usr/bin/man.REAL", Package: "manpatch"}), f.opts())
+		wantPaths(t, "Mismatch", res.Mismatch)
+		wantPaths(t, "Verified", res.Verified, "/usr/bin/man", "/usr/bin/man.REAL")
+		if v, _ := find(res.Verified, "/usr/bin/man"); v.Package != "manpatch" {
+			t.Errorf("/usr/bin/man verified as %+v", v)
+		}
+		if v, _ := find(res.Verified, "/usr/bin/man.REAL"); v.Package != "man-db" {
+			t.Errorf("/usr/bin/man.REAL verified as %+v", v)
+		}
+	})
+	t.Run("package diversion, file made by the diverting package's scripts", func(t *testing.T) {
+		f := manFixture(t, false)
+		res := Verify(context.Background(), manCollection(model.Diversion{Path: "/usr/bin/man", DivertTo: "/usr/bin/man.REAL", Package: "manpatch"}), f.opts())
+		wantPaths(t, "Mismatch", res.Mismatch)
+		wantPaths(t, "Verified", res.Verified, "/usr/bin/man.REAL")
+		if v, ok := find(res.Unverifiable, "/usr/bin/man"); !ok || !strings.Contains(v.Reason, "manpatch") {
+			t.Errorf("Unverifiable = %+v", res.Unverifiable)
+		}
+	})
+	t.Run("local diversion, as Ubuntu's minimised images make", func(t *testing.T) {
+		f := manFixture(t, true)
+		res := Verify(context.Background(), manCollection(model.Diversion{Path: "/usr/bin/man", DivertTo: "/usr/bin/man.REAL", Package: ":"}), f.opts())
+		wantPaths(t, "Mismatch", res.Mismatch)
+		wantPaths(t, "Verified", res.Verified, "/usr/bin/man.REAL")
+		if v, ok := find(res.Unverifiable, "/usr/bin/man"); !ok || v.Reason != "locally diverted (dpkg-divert)" {
+			t.Errorf("Unverifiable = %+v", res.Unverifiable)
+		}
+	})
+}
+
+func TestVerifyFileModes(t *testing.T) {
+	crontab := buildDeb(t, "xz", nil, []debEntry{{name: "./usr/bin/crontab", body: "crontab\n", mode: 0o755}})
+	f := newFixture(t, map[string][]fakePkg{"bookworm": {{"cron", "3.0", "amd64", crontab}, {"tool", "1.0-1", "amd64", toolDeb(t, "xz")}}})
+	c := collectionOf(toolDisk(map[string]string{"/usr/bin/crontab": "crontab\n"}), toolPackage(),
+		model.Package{Name: "cron", Version: "3.0", Arch: "amd64", Status: "install ok installed", Files: []string{"/usr/bin/crontab"}})
+	// cron's maintainer script makes crontab setgid through dpkg-statoverride.
+	withFile(c, model.FileEntry{Path: "/usr/bin/crontab", Type: "file", SHA256: sha256hex([]byte("crontab\n")), Mode: 0o102755})
+	c.Packages.StatOverrides = []model.StatOverride{{Path: "/usr/bin/crontab", Owner: "root", Group: "crontab", Mode: 0o2755}}
+	// Someone made tool setuid root.
+	withFile(c, model.FileEntry{Path: "/usr/bin/tool", Type: "file", SHA256: sha256hex([]byte(toolBin)), Mode: 0o104755})
+	// A data file's permissions do not matter.
+	withFile(c, model.FileEntry{Path: libDir + "/libtool.so.1", Type: "file", SHA256: sha256hex([]byte(toolLib)), Mode: 0o100640})
+
+	res := Verify(context.Background(), c, f.opts())
+	wantPaths(t, "Mismatch", res.Mismatch, "/usr/bin/tool")
+	if m, _ := find(res.Mismatch, "/usr/bin/tool"); m.Reason != "mode differs: deb 0755, disk 4755" {
+		t.Errorf("mismatch %+v", m)
+	}
+	wantPaths(t, "Verified", res.Verified, "/usr/bin/crontab", "/usr/bin/toolctl", libDir+"/libtool.so.1")
+
+	// Without the override the setgid bit is unexplained.
+	c.Packages.StatOverrides = nil
+	res = Verify(context.Background(), c, f.opts())
+	if m, ok := find(res.Mismatch, "/usr/bin/crontab"); !ok || m.Reason != "mode differs: deb 0755, disk 2755" {
+		t.Errorf("Mismatch = %+v", res.Mismatch)
+	}
+}
+
+func TestVerifyUnsupportedArchitectures(t *testing.T) {
+	f := toolFixture(t)
+	c := toolCollection(nil)
+	c.Packages.Installed = append(c.Packages.Installed, model.Package{Name: "odd", Version: "1", Arch: "../../x", Status: "install ok installed", Files: []string{"/usr/bin/odd"}})
+	withFile(c, regular("/usr/bin/odd", "odd\n", 0o755))
+	res := Verify(context.Background(), c, f.opts())
+	if v, ok := find(res.Unverifiable, "/usr/bin/odd"); !ok || !strings.Contains(v.Reason, "unsupported architecture") {
+		t.Errorf("Unverifiable = %+v", res.Unverifiable)
+	}
+	for _, p := range f.srv.hitPaths() {
+		if strings.Contains(p, "..") || strings.Contains(p, "odd") {
+			t.Errorf("requested %s", p)
+		}
+	}
+	wantPaths(t, "Verified", res.Verified, "/usr/bin/tool", "/usr/bin/toolctl", libDir+"/libtool.so.1")
+
+	c = toolCollection(nil)
+	c.Host.Arch = "s390x"
+	res = Verify(context.Background(), c, f.opts())
+	if len(res.Unverifiable) != 4 || !strings.Contains(strings.Join(res.Errors, "\n"), "architecture") {
+		t.Errorf("unverifiable %+v, errors %q", res.Unverifiable, res.Errors)
+	}
+}
+
+func TestVerifyFetchesEachReleaseOnce(t *testing.T) {
+	f := toolFixture(t)
+	// Components and architectures the Release does not list cost nothing
+	// more than the one InRelease download per suite.
+	f.archives[0].Components = []string{"main", "contrib", "non-free"}
+	c := toolCollection(nil)
+	c.Packages.Installed = append(c.Packages.Installed, model.Package{Name: "lib32", Version: "1", Arch: "i386", Status: "install ok installed", Files: []string{"/usr/lib/i386-linux-gnu/lib32.so.1"}})
+	withFile(c, regular("/usr/lib/i386-linux-gnu/lib32.so.1", "lib\n", 0o644))
+	Verify(context.Background(), c, f.opts())
+	for _, s := range []string{"bookworm", "bookworm-updates"} {
+		if n := f.srv.hitCount("/debian/dists/" + s + "/InRelease"); n != 1 {
+			t.Errorf("%s InRelease fetched %d times", s, n)
+		}
+	}
+}
+
+func TestVerifyProReasonOnlyForESMVersions(t *testing.T) {
+	f := toolFixture(t)
+	c := toolCollection(nil)
+	c.Packages.Installed[0].Version = "9.9"
+	c.Packages.Sources = []model.AptSource{{Types: []string{"deb"}, URIs: []string{"https://esm.ubuntu.com/infra/ubuntu"}, Suites: []string{"noble-infra-security"}, Components: []string{"main"}}}
+	res := Verify(context.Background(), c, f.opts())
+	if len(res.Unverifiable) == 0 || res.Unverifiable[0].Reason != "package not found in the official archive; source not trusted: https://esm.ubuntu.com/infra/ubuntu" {
+		t.Errorf("Unverifiable = %+v", res.Unverifiable)
+	}
+}
+
+func TestVerifyOfflineDoesNotFollowSymlinks(t *testing.T) {
+	root := t.TempDir()
+	elsewhere := t.TempDir()
+	disk := toolDisk(nil)
+	for p, body := range disk {
+		base := root
+		if strings.HasPrefix(p, "/usr/lib/") {
+			base = elsewhere // reached only through a symlinked directory
+		}
+		full := filepath.Join(base, p)
+		os.MkdirAll(filepath.Dir(full), 0o755)
+		os.WriteFile(full, []byte(body), 0o644)
+	}
+	os.MkdirAll(filepath.Join(root, "usr"), 0o755)
+	if err := os.Symlink(filepath.Join(elsewhere, "usr", "lib"), filepath.Join(root, "usr", "lib")); err != nil {
+		t.Fatal(err)
+	}
+	// A hostile collection naming a path that climbs out of the root.
+	pkg := toolPackage()
+	pkg.Files = append(pkg.Files, "/../../etc/passwd")
+	pkg.LocalMD5["/../../etc/passwd"] = md5hex("x")
+	c := withFile(collectionOf(disk, pkg), model.FileEntry{Path: "/../../etc/passwd", Type: "file", Mode: 0o100755})
+	res := Verify(context.Background(), c, Options{Offline: true, Root: root})
+	for _, p := range []string{libDir + "/libtool.so.1", "/../../etc/passwd"} {
+		if v, ok := find(res.Unverifiable, p); !ok || !strings.Contains(v.Reason, "could not read") {
+			t.Errorf("%s: Unverifiable = %+v", p, res.Unverifiable)
+		}
+	}
+	wantPaths(t, "Verified", res.Verified, "/usr/bin/tool", "/usr/bin/toolctl")
+}
+
+// postinstModes is the idiom Debian's fuse3 and openssh-client use: set the
+// mode in the maintainer script unless the admin has a statoverride.
+const postinstModes = `#!/bin/sh
+set -e
+if [ "$1" = configure ]; then
+	if ! dpkg-statoverride --list /usr/bin/agent >/dev/null; then
+		chgrp _ssh /usr/bin/agent
+		chmod 2755 /usr/bin/agent
+	fi
+	if ! dpkg-statoverride --list /bin/fusermount >/dev/null 2>&1; then chmod 4755 "/bin/fusermount"; fi
+	setcap cap_net_raw+ep /bin/ping || chmod u+s /bin/ping
+	chmod -R 0700 /var/lib/agent
+	chmod 4755 "$f"
+fi
+`
+
+func TestDebFilesScriptModes(t *testing.T) {
+	deb := buildDebScript(t, "xz", nil, postinstModes, []debEntry{
+		{name: "./usr/bin/agent", body: "agent\n", mode: 0o755},
+		{name: "./usr/bin/fusermount", body: "fuse\n", mode: 0o755},
+		{name: "./usr/bin/ping", body: "ping\n", mode: 0o755},
+		{name: "./usr/bin/other", body: "other\n", mode: 0o755},
+	})
+	files, err := DebFiles(bytes.NewReader(deb), int64(len(deb)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for p, want := range map[string][]uint32{
+		"/usr/bin/agent":      {0o2755},
+		"/usr/bin/fusermount": {0o4755}, // named by its merged-/usr alias
+		"/usr/bin/ping":       {0o4755}, // u+s on the packaged 0755
+		"/usr/bin/other":      nil,
+	} {
+		if got := files[p].ScriptModes; !slices.Equal(got, want) {
+			t.Errorf("%s: ScriptModes = %o, want %o", p, got, want)
+		}
+	}
+}
+
+func TestVerifyModeSetByMaintainerScript(t *testing.T) {
+	deb := buildDebScript(t, "xz", nil, postinstModes, []debEntry{{name: "./usr/bin/agent", body: "agent\n", mode: 0o755}})
+	f := newFixture(t, map[string][]fakePkg{"bookworm": {{"agent", "1", "amd64", deb}}})
+	pkg := model.Package{Name: "agent", Version: "1", Arch: "amd64", Status: "install ok installed", Files: []string{"/usr/bin/agent"}}
+	for _, c := range []struct {
+		mode     uint32
+		override uint32
+		want     string // "" verified, else the mismatch reason
+	}{
+		{0o2755, 0, ""},
+		{0o755, 0, ""}, // the packaged mode, before the script runs
+		{0o775, 0, "mode differs: deb 0755 (maintainer script sets 2755), disk 0775"},
+		{0o4755, 0, "mode differs: deb 0755 (maintainer script sets 2755), disk 4755"},
+		// A statoverride replaces what the script would set.
+		{0o755, 0o755, ""},
+		{0o2755, 0o755, "mode differs: statoverride 0755, disk 2755"},
+	} {
+		col := withFile(collectionOf(map[string]string{}, pkg), model.FileEntry{Path: "/usr/bin/agent", Type: "file", SHA256: sha256hex([]byte("agent\n")), Mode: 0o100000 | c.mode})
+		if c.override != 0 {
+			col.Packages.StatOverrides = []model.StatOverride{{Path: "/usr/bin/agent", Owner: "root", Group: "root", Mode: c.override}}
+		}
+		res := Verify(context.Background(), col, f.opts())
+		if c.want == "" {
+			if len(res.Verified) != 1 || len(res.Mismatch) != 0 {
+				t.Errorf("mode %o override %o: verified %+v, mismatch %+v", c.mode, c.override, res.Verified, res.Mismatch)
+			}
+		} else if len(res.Mismatch) != 1 || res.Mismatch[0].Reason != c.want {
+			t.Errorf("mode %o override %o: mismatch %+v, want %q", c.mode, c.override, res.Mismatch, c.want)
+		}
+	}
+}
+
+func TestDebFilesBackslashNames(t *testing.T) {
+	// systemd escapes unit names: Ubuntu's systemd ships
+	// system-systemd\x2dcryptsetup.slice with a literal backslash.
+	name := `/usr/lib/systemd/system/system-systemd\x2dcryptsetup.slice`
+	deb := buildDeb(t, "zst", nil, []debEntry{{name: "." + name, body: "[Unit]\n", mode: 0o644}})
+	files, err := DebFiles(bytes.NewReader(deb), int64(len(deb)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f, ok := files[name]; !ok || f.SHA256 != sha256hex([]byte("[Unit]\n")) {
+		t.Fatalf("files = %v", files)
+	}
+	// The cached table keeps such names too.
+	dir := t.TempDir()
+	storeTable(dir, strings.Repeat("ab", 32), files)
+	if got, ok := loadTable(dir, strings.Repeat("ab", 32)); !ok || got[name].SHA256 != files[name].SHA256 {
+		t.Errorf("cached table: %v %v", got, ok)
 	}
 }

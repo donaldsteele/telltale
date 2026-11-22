@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -54,6 +56,10 @@ type DebFile struct {
 	// Conffile is true when the package's own control data lists the file
 	// as a conffile.
 	Conffile bool `json:"conffile,omitempty"`
+	// ScriptModes are modes the package's own postinst sets on the file
+	// with a literal chmod, as Debian packages do for setuid and setgid
+	// helpers when no dpkg-statoverride exists.
+	ScriptModes []uint32 `json:"script_modes,omitempty"`
 }
 
 // DebFiles reads a .deb (an ar archive holding control.tar and data.tar,
@@ -94,11 +100,11 @@ func DebFiles(r io.ReaderAt, size int64) (map[string]DebFile, error) {
 	if control == nil || data == nil {
 		return nil, fmt.Errorf("%w: control.tar or data.tar missing", ErrMalformedDeb)
 	}
-	conffiles, err := readConffiles(r, control)
+	ctl, err := readControl(r, control)
 	if err != nil {
 		return nil, err
 	}
-	return readData(r, data, conffiles)
+	return readData(r, data, ctl)
 }
 
 type arMember struct {
@@ -179,8 +185,37 @@ func decompressor(r io.ReaderAt, m *arMember, base string) (io.ReadCloser, error
 	return nil, fmt.Errorf("%w: unsupported member %q", ErrMalformedDeb, m.name)
 }
 
-// readConffiles returns the conffiles the package's control.tar lists.
-func readConffiles(r io.ReaderAt, m *arMember) (map[string]bool, error) {
+// control is what DebFiles uses from a package's control.tar.
+type control struct {
+	conffiles map[string]bool
+	// modes set by the postinst: absolute ones, and bits added to the
+	// packaged mode ("chmod u+s").
+	setModes map[string][]uint32
+	addBits  map[string]uint32
+}
+
+// modesFor returns the modes the postinst gives p (or its merged-/usr
+// alias), whose packaged mode is mode.
+func (c *control) modesFor(p string, mode uint32) []uint32 {
+	var out []uint32
+	for _, q := range []string{p, usrAlias(p)} {
+		if q == "" {
+			continue
+		}
+		for _, m := range c.setModes[q] {
+			if !slices.Contains(out, m) {
+				out = append(out, m)
+			}
+		}
+		if b, ok := c.addBits[q]; ok && !slices.Contains(out, mode|b) {
+			out = append(out, mode|b)
+		}
+	}
+	return out
+}
+
+// readControl reads the conffiles list and the postinst of control.tar.
+func readControl(r io.ReaderAt, m *arMember) (*control, error) {
 	dec, err := decompressor(r, m, "control.tar")
 	if err != nil {
 		return nil, err
@@ -188,7 +223,7 @@ func readConffiles(r io.ReaderAt, m *arMember) (map[string]bool, error) {
 	defer dec.Close()
 	lr := &io.LimitedReader{R: dec, N: maxControlSize + 1}
 	tr := tar.NewReader(lr)
-	conffiles := map[string]bool{}
+	c := &control{conffiles: map[string]bool{}, setModes: map[string][]uint32{}, addBits: map[string]uint32{}}
 	for n := 0; ; n++ {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -203,15 +238,20 @@ func readConffiles(r io.ReaderAt, m *arMember) (map[string]bool, error) {
 		if n == 1000 {
 			return nil, fmt.Errorf("%w: control.tar has too many entries", ErrMalformedDeb)
 		}
-		if hdr.Typeflag != tar.TypeReg || strings.TrimPrefix(hdr.Name, "./") != "conffiles" {
+		name := strings.TrimPrefix(hdr.Name, "./")
+		if hdr.Typeflag != tar.TypeReg || (name != "conffiles" && name != "postinst") {
 			continue
 		}
 		b, err := io.ReadAll(io.LimitReader(tr, maxConffilesList+1))
 		if err != nil {
-			return nil, fmt.Errorf("%w: conffiles: %v", ErrMalformedDeb, err)
+			return nil, fmt.Errorf("%w: %s: %v", ErrMalformedDeb, name, err)
 		}
 		if len(b) > maxConffilesList {
-			return nil, fmt.Errorf("%w: conffiles list larger than %d bytes", ErrMalformedDeb, maxConffilesList)
+			return nil, fmt.Errorf("%w: %s larger than %d bytes", ErrMalformedDeb, name, maxConffilesList)
+		}
+		if name == "postinst" {
+			c.scriptChmods(string(b))
+			continue
 		}
 		for _, line := range strings.Split(string(b), "\n") {
 			// Newer dpkg prefixes flags: "remove-on-upgrade /etc/foo".
@@ -220,15 +260,73 @@ func readConffiles(r io.ReaderAt, m *arMember) (map[string]bool, error) {
 				continue
 			}
 			if p := f[len(f)-1]; strings.HasPrefix(p, "/") {
-				conffiles[p] = true
+				c.conffiles[p] = true
 			}
 		}
 	}
-	return conffiles, nil
+	return c, nil
+}
+
+var (
+	octalMode  = regexp.MustCompile(`^0?[0-7]{3,4}$`)
+	addSetBits = map[string]uint32{"u+s": 0o4000, "g+s": 0o2000, "ug+s": 0o6000, "+s": 0o6000}
+)
+
+// scriptChmods records the literal "chmod MODE PATH..." commands of a
+// maintainer script: an octal or u+s/g+s mode and absolute paths without
+// shell expansion. Recursive changes and anything computed are ignored.
+func (c *control) scriptChmods(script string) {
+	for _, line := range strings.Split(script, "\n") {
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			line = line[:i]
+		}
+		for _, cmd := range strings.FieldsFunc(line, func(r rune) bool { return r == ';' || r == '&' || r == '|' }) {
+			f := strings.Fields(cmd)
+			i := slices.IndexFunc(f, func(s string) bool { return s == "chmod" || strings.HasSuffix(s, "/chmod") })
+			if i < 0 {
+				continue
+			}
+			args := f[i+1:]
+			for len(args) > 0 && strings.HasPrefix(args[0], "-") {
+				if args[0] != "-f" && args[0] != "--" {
+					args = nil // -R and friends: not a single file's mode
+					break
+				}
+				args = args[1:]
+			}
+			if len(args) < 2 {
+				continue
+			}
+			var set uint32
+			add, isAdd := addSetBits[args[0]]
+			if !isAdd {
+				if !octalMode.MatchString(args[0]) {
+					continue
+				}
+				m, err := strconv.ParseUint(args[0], 8, 32)
+				if err != nil {
+					continue
+				}
+				set = uint32(m)
+			}
+			for _, p := range args[1:] {
+				p = strings.Trim(p, `"'`)
+				if !validTablePath(p) || strings.ContainsAny(p, "$`*?[") {
+					continue
+				}
+				if isAdd {
+					c.addBits[p] |= add
+				} else if !slices.Contains(c.setModes[p], set) {
+					c.setModes[p] = append(c.setModes[p], set)
+				}
+			}
+		}
+	}
 }
 
 // readData hashes every regular file in the data.tar member.
-func readData(r io.ReaderAt, m *arMember, conffiles map[string]bool) (map[string]DebFile, error) {
+func readData(r io.ReaderAt, m *arMember, ctl *control) (map[string]DebFile, error) {
+	conffiles := ctl.conffiles
 	dec, err := decompressor(r, m, "data.tar")
 	if err != nil {
 		return nil, err
@@ -273,6 +371,7 @@ func readData(r io.ReaderAt, m *arMember, conffiles map[string]bool) (map[string
 			if f.Conffile = conffiles[p]; !f.Conffile {
 				f.Text = nil
 			}
+			f.ScriptModes = ctl.modesFor(p, f.Mode)
 			files[p] = f
 			continue
 		default: // directories, symlinks, devices, FIFOs
@@ -285,6 +384,7 @@ func readData(r io.ReaderAt, m *arMember, conffiles map[string]bool) (map[string
 			return nil, fmt.Errorf("%w: %q occurs twice", ErrMalformedDeb, p)
 		}
 		f := DebFile{Mode: uint32(hdr.Mode) & 0o7777, Conffile: conffiles[p]}
+		f.ScriptModes = ctl.modesFor(p, f.Mode)
 		h := sha256.New()
 		if f.Conffile && hdr.Size <= maxConffileText {
 			b, err := io.ReadAll(io.LimitReader(tr, maxConffileText+1))
@@ -308,7 +408,7 @@ func debPath(name string) (string, error) {
 	bad := func(why string) (string, error) {
 		return "", fmt.Errorf("%w: member %q: %s", ErrMalformedDeb, name, why)
 	}
-	if name == "" || strings.ContainsAny(name, "\x00\\") {
+	if name == "" || strings.ContainsRune(name, 0) {
 		return bad("unusable name")
 	}
 	if strings.HasPrefix(name, "/") {

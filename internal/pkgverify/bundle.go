@@ -90,10 +90,11 @@ type BundleUnavailable struct {
 
 // WriteBundle builds a reference bundle in dir (which must be empty or not
 // exist) holding what Verify needs to check the collection's packages with
-// the same Options: the signed indexes and the .debs. Packages it cannot
-// include are listed in bundle.json with the reason. Only signed chains go
-// into a bundle; versions that only sources trusted through HTTPS alone have
-// are left out. It returns an error wrapping ErrBadSignature or
+// the same Options: the signed indexes and the .debs of every installed
+// package (with OnlyPaths, of the packages listing those paths). Packages it
+// cannot include are listed in bundle.json with the reason. Only signed
+// chains go into a bundle; versions that only sources trusted through HTTPS
+// alone have are left out. It returns an error wrapping ErrBadSignature or
 // ErrHashMismatch, after writing bundle.json, when it met evidence of
 // tampering.
 func WriteBundle(ctx context.Context, c *model.Collection, dir string, opt Options) error {
@@ -117,8 +118,14 @@ func WriteBundle(ctx context.Context, c *model.Collection, dir string, opt Optio
 		return err
 	}
 	if len(plans) > 0 {
+		results := newResults(plans)
 		s.loadIndexes(ctx, plans)
-		s.run(ctx, plans)
+		s.run(ctx, results)
+		for _, r := range results {
+			if r.reason != "" {
+				s.bw.addUnavailable(r.pkg, r.reason)
+			}
+		}
 	}
 	s.finish()
 	m := s.bw.manifest()
@@ -153,9 +160,10 @@ func checkBundleDir(dir string) error {
 }
 
 // bundleDeb downloads a package's .deb into the bundle, checking it.
-func (s *session) bundleDeb(ctx context.Context, p *model.Package, ref DebRef) {
-	if ref.Source != SourceArchive {
-		s.unverifiable(p, "only a source trusted through HTTPS alone has this version, and a bundle carries only signed indexes")
+func (s *session) bundleDeb(ctx context.Context, r *pkgResult, ref DebRef) {
+	p := r.pkg
+	if ref.Source != SourceArchive && ref.Source != SourceThirdParty {
+		r.reason = "only a source trusted through HTTPS alone has this version, and a bundle carries only signed indexes"
 		return
 	}
 	if err := downloadDeb(ctx, s.client, ref, io.Discard); err != nil {
@@ -164,7 +172,7 @@ func (s *session) bundleDeb(ctx context.Context, p *model.Package, ref DebRef) {
 		} else {
 			s.downloadFailed(err)
 		}
-		s.unverifiable(p, "could not download the package: "+err.Error())
+		r.reason = "could not download the package: " + err.Error()
 		return
 	}
 	s.bw.mu.Lock()

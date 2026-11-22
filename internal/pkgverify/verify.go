@@ -18,10 +18,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
+	"golang.org/x/sys/unix"
 
 	"github.com/donaldsteele/telltale/internal/model"
 )
@@ -40,23 +40,43 @@ const (
 	SourceRefs = "refs"
 	// SourceOfflineLocal: the machine's own md5sums, which root can edit.
 	SourceOfflineLocal = "offline-local"
+	// SourceThirdParty: a third-party repository's signed index, verified
+	// with a key the owner supplied.
+	SourceThirdParty = "thirdparty"
 )
 
 const (
 	// OfflineWarning heads Result.Errors in offline-local mode.
 	OfflineWarning = "Compared against the machine's own package checksums, which root can edit."
-	// ReasonPro marks files of Ubuntu Pro (ESM) packages. Verifying them
-	// needs a Pro token, which v1 does not support.
+	// ReasonPro marks files of Ubuntu Pro (ESM) packages, whose versions
+	// contain "+esm". Verifying them needs a Pro token, which v1 does not
+	// support.
 	ReasonPro = "Ubuntu Pro package: verification with a Pro token is planned"
 	// ReasonNotOfficial starts the reason for packages found in no official
 	// archive or snapshot of one.
 	ReasonNotOfficial = "package not found in the official archive"
+	// ReasonLocalDiversion marks the file at the original path of a local
+	// dpkg diversion: no package's version of it is expected there.
+	ReasonLocalDiversion = "locally diverted (dpkg-divert)"
+	// NoteObsoleteConffile marks a ConffileDiff for a conffile below /etc
+	// that dpkg keeps but the installed version no longer ships.
+	NoteObsoleteConffile = "obsolete conffile (no longer shipped by the package)"
 )
+
+// Limits on the work one collection can cause.
+const (
+	maxPackages         = 10_000
+	maxOldLookups       = 1_000
+	maxThirdPartySuites = 32
+)
+
+// knownArches are the architectures package verification reads indexes for.
+var knownArches = map[string]bool{"amd64": true, "arm64": true, "i386": true, "armhf": true, "all": true}
 
 // Options controls Verify and WriteBundle.
 type Options struct {
-	// Full checks every package-owned file, not only the security-relevant
-	// ones InScope selects.
+	// Full checks every package file, not only the security-relevant ones
+	// InScope selects.
 	Full bool
 	// Offline compares against the machine's own package checksums
 	// (Package.LocalMD5) instead of the archives. Ignored with RefsDir.
@@ -68,8 +88,9 @@ type Options struct {
 	// must not be on the machine being examined.
 	CacheDir string
 	// OnlyPaths, when not nil, limits the check to these collected paths
-	// (with a snapshot: the package-owned files that changed), regardless
-	// of Full and InScope.
+	// (with a snapshot: the files that changed), regardless of Full and
+	// InScope. Only the packages that list them, and packages whose cached
+	// signed table holds them, are fetched.
 	OnlyPaths map[string]bool
 	// ExtraKeys are owner-supplied keys for third-party repositories. A
 	// third-party source is consulted only when its signed index verifies
@@ -92,7 +113,7 @@ type Options struct {
 	Now func() time.Time
 }
 
-// Result is the outcome of verifying a collection's package-owned files.
+// Result is the outcome of verifying a collection's files.
 type Result struct {
 	Mode         string         `json:"mode"`
 	Verified     []FileVerdict  `json:"verified,omitempty"`
@@ -109,7 +130,7 @@ type Result struct {
 // FileVerdict is the outcome for one file. Path is the collected path.
 // Expected and Actual are SHA-256 hashes ("md5:<hex>" in offline-local mode).
 // Source says how the expected value was obtained: archive, snapshot,
-// launchpad, refs or offline-local.
+// launchpad, thirdparty, refs or offline-local.
 type FileVerdict struct {
 	Path     string `json:"path"`
 	Package  string `json:"package"`
@@ -123,7 +144,8 @@ type FileVerdict struct {
 // ConffileDiff is a configuration file that differs from its package's
 // default. Conffiles are expected to differ and are never a Mismatch.
 // Default is the package's default text when it is at most 256 KiB; the
-// on-disk text, redacted, is in the collection's persistence files.
+// on-disk text, redacted, is in the collection's persistence files. Note
+// explains special cases, such as an obsolete conffile.
 type ConffileDiff struct {
 	Path     string `json:"path"`
 	Package  string `json:"package"`
@@ -131,14 +153,18 @@ type ConffileDiff struct {
 	Expected string `json:"expected"`
 	Actual   string `json:"actual"`
 	Default  string `json:"default,omitempty"`
+	Note     string `json:"note,omitempty"`
 	Source   string `json:"source,omitempty"`
 }
 
-// Verify checks the collection's package-owned files against the files in
-// the distribution's signed packages. It never trusts the machine's own
-// package checksums except in offline-local mode, which says so. Problems
-// with sources never stop it: files that cannot be checked are Unverifiable
-// with the reason, and Verify always returns a Result.
+// Verify checks the collection's files against the files in the
+// distribution's signed packages. Every installed package's signed file
+// table is read, and every collected file a table installs is compared with
+// it, so the machine's dpkg file lists, which root can edit, never decide
+// what is checked. It never trusts the machine's own package checksums
+// except in offline-local mode, which says so. Problems with sources never
+// stop it: files that cannot be checked are Unverifiable with the reason,
+// and Verify always returns a Result.
 func Verify(ctx context.Context, c *model.Collection, opt Options) *Result {
 	res := &Result{Mode: ModeArchive}
 	switch {
@@ -161,26 +187,47 @@ func Verify(ctx context.Context, c *model.Collection, opt Options) *Result {
 	if len(plans) == 0 {
 		return res
 	}
+	results := newResults(plans)
 	if err := s.setup(); err != nil {
 		s.problem(err)
-		for _, p := range plans {
-			s.unverifiable(p, err.Error())
+		for _, r := range results {
+			r.reason = err.Error()
 		}
-		return res
+	} else {
+		s.loadIndexes(ctx, s.indexWanted(plans))
+		results = s.addCachedTables(results)
+		s.run(ctx, results)
 	}
-	s.loadIndexes(ctx, plans)
-	s.run(ctx, plans)
+	s.judge(results)
 	return res
+}
+
+// pkgResult is what became of one installed package.
+type pkgResult struct {
+	pkg    *model.Package
+	ref    DebRef
+	source string             // verdict Source for its files
+	table  map[string]DebFile // nil when the package could not be checked
+	reason string             // why not
+}
+
+func newResults(plans []*model.Package) []*pkgResult {
+	out := make([]*pkgResult, len(plans))
+	for i, p := range plans {
+		out[i] = &pkgResult{pkg: p}
+	}
+	return out
 }
 
 // session is one Verify or WriteBundle run.
 type session struct {
-	c      *model.Collection
-	opt    Options
-	res    *Result
-	files  map[string]*model.FileEntry
-	owners map[string]string
-	esm    bool // the machine has an Ubuntu Pro source
+	c         *model.Collection
+	opt       Options
+	res       *Result
+	files     map[string]*model.FileEntry
+	owners    map[string]string
+	divs      map[string]model.Diversion    // by original path
+	overrides map[string]model.StatOverride // by path
 
 	archives []*Archive
 	third    []thirdSource
@@ -198,6 +245,7 @@ type session struct {
 	trusted    map[string]bool // third-party URIs whose index verified
 
 	mu        sync.Mutex
+	oldUsed   int
 	warn      []string
 	alerts    []string
 	errs      []string
@@ -218,6 +266,8 @@ func newSession(c *model.Collection, opt Options, res *Result) *session {
 		c: c, opt: opt, res: res,
 		files:      make(map[string]*model.FileEntry, len(c.Files)),
 		owners:     c.Packages.Owners(),
+		divs:       map[string]model.Diversion{},
+		overrides:  map[string]model.StatOverride{},
 		found:      map[PkgKey]DebRef{},
 		thirdFound: map[PkgKey]DebRef{},
 		idxErr:     map[string]error{},
@@ -228,12 +278,11 @@ func newSession(c *model.Collection, opt Options, res *Result) *session {
 	for i := range c.Files {
 		s.files[c.Files[i].Path] = &c.Files[i]
 	}
-	for _, src := range c.Packages.Sources {
-		for _, u := range src.URIs {
-			if esmURI(u) {
-				s.esm = true
-			}
-		}
+	for _, d := range c.Packages.Diversions {
+		s.divs[d.Path] = d
+	}
+	for _, o := range c.Packages.StatOverrides {
+		s.overrides[o.Path] = o
 	}
 	return s
 }
@@ -278,13 +327,6 @@ func isRegular(e *model.FileEntry) bool {
 	return e.Type == "file" || (e.Type == "" && e.Err != "")
 }
 
-func diskMode(e *model.FileEntry, kind entryKind) uint32 {
-	if kind == regularFile {
-		return e.Mode
-	}
-	return 0
-}
-
 // filesInstalled reports whether a dpkg status means the package's files are
 // on disk as its Version.
 func filesInstalled(status string) bool {
@@ -299,30 +341,96 @@ func filesInstalled(status string) bool {
 	return true
 }
 
-// plan returns the packages that own at least one file to check.
+// plan returns the packages whose signed tables are read: every installed
+// package, whatever its file list says, or with OnlyPaths those that list a
+// changed path.
 func (s *session) plan() []*model.Package {
+	seen := map[PkgKey]bool{}
 	var out []*model.Package
 	for i := range s.c.Packages.Installed {
 		p := &s.c.Packages.Installed[i]
-		if !filesInstalled(p.Status) {
+		k := PkgKey{p.Name, p.Version, p.Arch}
+		if !filesInstalled(p.Status) || seen[k] {
 			continue
 		}
-		for _, f := range p.Files {
-			cp, e, kind := s.locate(f)
-			if kind == regularFile || (kind == otherFile && e.Type == "symlink") {
-				if s.opt.candidate(cp, f, diskMode(e, kind), nil) {
-					out = append(out, p)
-					break
-				}
-			}
+		if s.opt.OnlyPaths != nil && !s.listsChanged(p) {
+			continue
+		}
+		seen[k] = true
+		out = append(out, p)
+	}
+	return out
+}
+
+func (s *session) listsChanged(p *model.Package) bool {
+	for _, f := range p.Files {
+		if s.opt.OnlyPaths[f] {
+			return true
+		}
+		if a := usrAlias(f); a != "" && s.opt.OnlyPaths[a] {
+			return true
+		}
+	}
+	return false
+}
+
+// indexWanted returns the packages to look up in the indexes: the planned
+// ones, plus with OnlyPaths and a cache every installed package, whose
+// cached table may hold a changed path.
+func (s *session) indexWanted(plans []*model.Package) []*model.Package {
+	if s.opt.OnlyPaths == nil || s.opt.CacheDir == "" || s.bw != nil {
+		return plans
+	}
+	var out []*model.Package
+	for i := range s.c.Packages.Installed {
+		if p := &s.c.Packages.Installed[i]; filesInstalled(p.Status) {
+			out = append(out, p)
 		}
 	}
 	return out
 }
 
+// addCachedTables adds, with OnlyPaths, the installed packages not listing a
+// changed path whose signed table is already in the cache and holds one.
+func (s *session) addCachedTables(results []*pkgResult) []*pkgResult {
+	if s.opt.OnlyPaths == nil || s.opt.CacheDir == "" || s.bw != nil {
+		return results
+	}
+	planned := map[PkgKey]bool{}
+	for _, r := range results {
+		planned[PkgKey{r.pkg.Name, r.pkg.Version, r.pkg.Arch}] = true
+	}
+	for i := range s.c.Packages.Installed {
+		p := &s.c.Packages.Installed[i]
+		k := PkgKey{p.Name, p.Version, p.Arch}
+		if !filesInstalled(p.Status) || planned[k] || !knownArches[p.Arch] {
+			continue
+		}
+		planned[k] = true
+		ref, ok := s.lookup(p)
+		if !ok {
+			continue
+		}
+		t, ok := loadTable(s.opt.CacheDir, ref.SHA256)
+		if !ok {
+			continue
+		}
+		for dp := range t {
+			if s.opt.OnlyPaths[dp] || (usrAlias(dp) != "" && s.opt.OnlyPaths[usrAlias(dp)]) {
+				results = append(results, &pkgResult{pkg: p, ref: ref, source: s.sourceOf(ref), table: t})
+				break
+			}
+		}
+	}
+	return results
+}
+
 // setup chooses the archives, the snapshot finder and the download client
 // for the run's mode.
 func (s *session) setup() error {
+	if h := s.c.Host.Arch; h == "all" || !knownArches[h] {
+		return fmt.Errorf("host architecture %q is not supported for package verification", h)
+	}
 	refs := s.res.Mode == ModeRefs && s.bw == nil
 	cache := s.opt.CacheDir
 	if refs || s.bw != nil {
@@ -364,6 +472,7 @@ func (s *session) setup() error {
 	}
 	for _, a := range archives {
 		c := *a
+		c.memo = &releaseMemo{}
 		if wrap != nil {
 			c.Client, c.Cache = wrap(a.client()), ""
 		}
@@ -403,42 +512,49 @@ var safeSuite = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+~-]*$`)
 
 // setupThirdParty lists the machine's non-official APT sources and, when
 // the owner supplied keys, prepares to read their signed indexes. Without
-// keys no third-party source is ever contacted.
+// keys no third-party source is ever contacted, nor is an Ubuntu Pro source,
+// which needs a token.
 func (s *session) setupThirdParty(wrap func(*http.Client) *http.Client, cache string, refs bool) {
 	seen := map[string]bool{}
+	suites := 0
 	for _, src := range s.c.Packages.Sources {
 		if len(src.Types) > 0 && !slices.Contains(src.Types, "deb") {
 			continue
 		}
 		for _, uri := range src.URIs {
-			if officialURI(uri) || esmURI(uri) {
+			if officialURI(uri) {
 				continue
 			}
 			if !seen[uri] {
 				seen[uri] = true
 				s.thirdURIs = append(s.thirdURIs, uri)
 			}
-			if len(s.opt.ExtraKeys) == 0 {
+			if len(s.opt.ExtraKeys) == 0 || esmURI(uri) {
 				continue
 			}
 			u, err := url.Parse(uri)
 			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 				continue
 			}
-			var suites, comps []string
+			var sus, comps []string
 			for _, su := range src.Suites {
 				if safeSuite.MatchString(su) {
-					suites = append(suites, su)
+					sus = append(sus, su)
 				}
 			}
 			for _, co := range src.Components {
-				if componentName.MatchString(co) {
+				if componentName.MatchString(co) && len(comps) < 16 {
 					comps = append(comps, co)
 				}
 			}
-			if len(suites) == 0 || len(comps) == 0 {
+			if len(sus) == 0 || len(comps) == 0 {
 				continue // flat repositories are not supported
 			}
+			if suites+len(sus) > maxThirdPartySuites {
+				s.problem(fmt.Errorf("more than %d third-party suites; %s and later sources were not read", maxThirdPartySuites, uri))
+				return
+			}
+			suites += len(sus)
 			client := s.opt.Client
 			if client == nil {
 				client = defaultClient
@@ -447,8 +563,9 @@ func (s *session) setupThirdParty(wrap func(*http.Client) *http.Client, cache st
 				client = wrap(client)
 			}
 			s.third = append(s.third, thirdSource{uri: uri, a: &Archive{
-				BaseURL: strings.TrimRight(uri, "/"), Suites: suites, Components: comps,
+				BaseURL: strings.TrimRight(uri, "/"), Suites: sus, Components: comps,
 				Keyring: s.opt.ExtraKeys, Client: client, Cache: cache, Now: s.opt.Now, Historical: refs,
+				memo: &releaseMemo{},
 			}})
 		}
 	}
@@ -484,19 +601,24 @@ func (s *session) archOf(p *model.Package) string {
 	return p.Arch
 }
 
-// loadIndexes reads every signed index the planned packages may be in and
+// loadIndexes reads every signed index the wanted packages may be in and
 // keeps only their entries.
-func (s *session) loadIndexes(ctx context.Context, plans []*model.Package) {
+func (s *session) loadIndexes(ctx context.Context, wanted []*model.Package) {
 	arches := map[string]bool{}
 	want := map[[2]string]bool{}
-	for _, p := range plans {
-		arches[s.archOf(p)] = true
+	for _, p := range wanted {
+		if a := s.archOf(p); knownArches[a] && a != "all" {
+			arches[a] = true
+		}
 		want[[2]string{p.Name, p.Version}] = true
 	}
-	keep := func(idx map[PkgKey]DebRef, dst map[PkgKey]DebRef) {
+	keep := func(idx map[PkgKey]DebRef, dst map[PkgKey]DebRef, source string) {
 		for k, ref := range idx {
 			if want[[2]string{k.Name, k.Version}] {
 				if _, dup := dst[k]; !dup {
+					if source != "" {
+						ref.Source = source
+					}
 					dst[k] = ref
 				}
 			}
@@ -521,7 +643,7 @@ func (s *session) loadIndexes(ctx context.Context, plans []*model.Package) {
 						s.problem(err)
 					default:
 						s.addSource(a.base() + " " + suite)
-						keep(idx, s.found)
+						keep(idx, s.found, "")
 					}
 				}
 			}
@@ -540,7 +662,7 @@ func (s *session) loadIndexes(ctx context.Context, plans []*model.Package) {
 					default:
 						s.trusted[t.uri] = true
 						s.addSource(t.a.base() + " " + suite + " (owner-supplied key)")
-						keep(idx, s.thirdFound)
+						keep(idx, s.thirdFound, SourceThirdParty)
 					}
 				}
 			}
@@ -548,55 +670,95 @@ func (s *session) loadIndexes(ctx context.Context, plans []*model.Package) {
 	}
 }
 
-// run checks each planned package, a few at a time.
-func (s *session) run(ctx context.Context, plans []*model.Package) {
+// lookup finds a package in the signed indexes read so far.
+func (s *session) lookup(p *model.Package) (DebRef, bool) {
+	arch := p.Arch
+	if arch == "" {
+		arch = s.c.Host.Arch
+	}
+	if ref, ok := Lookup(s.found, p.Name, p.Version, arch); ok {
+		return ref, true
+	}
+	return Lookup(s.thirdFound, p.Name, p.Version, arch)
+}
+
+func (s *session) sourceOf(ref DebRef) string {
+	if s.source != "" {
+		return s.source
+	}
+	return ref.Source
+}
+
+// run checks the packages that still need it, a few at a time.
+func (s *session) run(ctx context.Context, results []*pkgResult) {
 	workers := 4
 	if s.bw != nil {
 		workers = 1 // a bundle records each URL once, in order
 	}
-	ch := make(chan *model.Package)
+	ch := make(chan *pkgResult)
 	var wg sync.WaitGroup
 	for range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for p := range ch {
-				s.onePackage(ctx, p)
+			for r := range ch {
+				s.onePackage(ctx, r)
 			}
 		}()
 	}
-	for _, p := range plans {
-		ch <- p
+	n := 0
+	for _, r := range results {
+		if r.table != nil || r.reason != "" {
+			continue
+		}
+		if n++; n > maxPackages {
+			r.reason = fmt.Sprintf("not checked: the collection lists more than %d packages", maxPackages)
+			continue
+		}
+		ch <- r
 	}
 	close(ch)
 	wg.Wait()
 }
 
-func (s *session) onePackage(ctx context.Context, p *model.Package) {
+var errOldBudget = fmt.Errorf("not looked up: more than %d installed packages are missing from the current archive", maxOldLookups)
+
+func (s *session) onePackage(ctx context.Context, r *pkgResult) {
+	p := r.pkg
 	defer func() {
-		if r := recover(); r != nil {
-			s.unverifiable(p, fmt.Sprintf("internal error while checking the package: %v", r))
+		if x := recover(); x != nil {
+			r.table = nil
+			r.reason = fmt.Sprintf("internal error while checking the package: %v", x)
 		}
 	}()
 	if err := ctx.Err(); err != nil {
-		s.unverifiable(p, "check stopped: "+err.Error())
+		r.reason = "check stopped: " + err.Error()
+		return
+	}
+	if p.Arch != "" && !knownArches[p.Arch] {
+		r.reason = fmt.Sprintf("unsupported architecture %q", p.Arch)
 		return
 	}
 	if strings.Contains(p.Version, "+esm") {
-		s.unverifiable(p, ReasonPro)
+		r.reason = ReasonPro
 		return
 	}
-	arch := p.Arch
-	if arch == "" {
-		arch = s.c.Host.Arch
-	}
-	ref, ok := Lookup(s.found, p.Name, p.Version, arch)
-	if !ok {
-		ref, ok = Lookup(s.thirdFound, p.Name, p.Version, arch)
-	}
+	ref, ok := s.lookup(p)
 	var oldErr error
 	if !ok && s.old != nil {
-		ref, oldErr = s.old.Find(ctx, PkgKey{p.Name, p.Version, arch}, s.c.Host.OSID)
+		s.mu.Lock()
+		s.oldUsed++
+		budget := s.oldUsed <= maxOldLookups
+		s.mu.Unlock()
+		if budget {
+			arch := p.Arch
+			if arch == "" {
+				arch = s.c.Host.Arch
+			}
+			ref, oldErr = s.old.Find(ctx, PkgKey{p.Name, p.Version, arch}, s.c.Host.OSID)
+		} else {
+			oldErr = errOldBudget
+		}
 		switch {
 		case oldErr == nil:
 			ok = true
@@ -606,11 +768,11 @@ func (s *session) onePackage(ctx context.Context, p *model.Package) {
 		}
 	}
 	if !ok {
-		s.unverifiable(p, s.notFound(p, oldErr))
+		r.reason = s.notFound(p, oldErr)
 		return
 	}
 	if s.bw != nil {
-		s.bundleDeb(ctx, p, ref)
+		s.bundleDeb(ctx, r, ref)
 		return
 	}
 	table, err := s.table(ctx, ref)
@@ -620,10 +782,10 @@ func (s *session) onePackage(ctx context.Context, p *model.Package) {
 		} else {
 			s.downloadFailed(err)
 		}
-		s.unverifiable(p, "could not check the package: "+s.explain(err))
+		r.reason = "could not check the package: " + s.explain(err)
 		return
 	}
-	s.compare(p, ref, table)
+	r.ref, r.table, r.source = ref, table, s.sourceOf(ref)
 }
 
 func oldSource(ref DebRef) string {
@@ -654,9 +816,6 @@ func (s *session) notFound(p *model.Package, oldErr error) string {
 	}
 	if oldErr != nil && !errors.Is(oldErr, ErrNotFound) {
 		return "not in the current archive, and the snapshot archives could not be checked: " + s.explain(oldErr)
-	}
-	if s.esm {
-		return ReasonPro
 	}
 	r := ReasonNotOfficial
 	if len(s.trusted) > 0 {
@@ -730,117 +889,266 @@ func downloadDeb(ctx context.Context, c *http.Client, ref DebRef, w io.Writer) e
 	return nil
 }
 
-// compare judges a package's files against its signed .deb's table. The
-// paths checked are the package's file list on the machine plus every file
-// in the .deb that no other package claims, so neither adding an implant to
-// the list nor removing a trojaned file from it hides anything.
-func (s *session) compare(p *model.Package, ref DebRef, table map[string]DebFile) {
-	src := ref.Source
-	if s.source != "" {
-		src = s.source
-	}
-	listed := make(map[string]bool, len(p.Files))
-	for _, f := range p.Files {
-		listed[f] = true
-	}
-	var extra []string
-	for dp := range table {
-		if listed[dp] || listed[usrAlias(dp)] {
-			continue
+// expect is one signed package's file, as installed at some path.
+type expect struct {
+	r    *pkgResult
+	path string // in the .deb
+	f    DebFile
+}
+
+// judge compares the collected files with the signed tables. Each table
+// file is placed where dpkg installs it, after diversions and under both
+// merged-/usr spellings; every collected file a table places is compared
+// with it. The machine's file lists only explain files no table places:
+// a file a package lists but no signed package ships, or one belonging to a
+// package that could not be checked.
+func (s *session) judge(results []*pkgResult) {
+	idx := map[string][]expect{}
+	place := func(at string, x expect) {
+		idx[at] = append(idx[at], x)
+		if a := usrAlias(at); a != "" {
+			idx[a] = append(idx[a], x)
 		}
-		if o := s.owners[dp]; o != "" && o != p.Name {
-			continue // another package took the file over
-		}
-		extra = append(extra, dp)
 	}
-	sort.Strings(extra)
+	for _, r := range results {
+		for p, f := range r.table {
+			at := p
+			if d, ok := s.divs[p]; ok && d.Package != r.pkg.Name {
+				at = d.DivertTo
+			}
+			place(at, expect{r: r, path: p, f: f})
+		}
+	}
+	for _, xs := range idx {
+		sort.Slice(xs, func(i, j int) bool {
+			if xs[i].r.pkg.Name != xs[j].r.pkg.Name {
+				return xs[i].r.pkg.Name < xs[j].r.pkg.Name
+			}
+			return xs[i].path < xs[j].path
+		})
+	}
+	listers := map[string][]*pkgResult{}
+	for _, r := range results {
+		for _, f := range r.pkg.Files {
+			listers[f] = append(listers[f], r)
+			if a := usrAlias(f); a != "" {
+				listers[a] = append(listers[a], r)
+			}
+		}
+	}
 
 	var verified, mismatch, unverifiable []FileVerdict
 	var diffs []ConffileDiff
 	seen := map[string]bool{}
-	for _, lp := range append(slices.Clone(p.Files), extra...) {
-		cp, e, kind := s.locate(lp)
-		if kind == absent {
+	for i := range s.c.Files {
+		e := &s.c.Files[i]
+		if seen[e.Path] || (s.opt.OnlyPaths != nil && !s.opt.OnlyPaths[e.Path]) {
 			continue
 		}
-		d, inDeb := table[lp]
-		if a := usrAlias(lp); !inDeb && a != "" {
-			d, inDeb = table[a]
-		}
-		var dm *DebFile
-		if inDeb {
-			dm = &d
-		}
-		if seen[cp] || !s.opt.candidate(cp, lp, diskMode(e, kind), dm) {
-			continue
-		}
-		seen[cp] = true
-		v := FileVerdict{Path: cp, Package: p.Name, Version: p.Version, Source: src}
-		switch {
-		case kind == otherFile && !inDeb:
-			// Not a regular file on either side.
-		case kind == otherFile:
-			v.Expected = d.SHA256
-			v.Actual = e.Type
-			if e.Type == "symlink" {
-				v.Actual = "symlink to " + e.Target
-			}
-			v.Reason = "the signed package installs a regular file here, the machine has a " + e.Type
-			mismatch = append(mismatch, v)
-		case !inDeb:
-			// The package ships nothing here, or a symlink or directory,
-			// and no merged-/usr alias resolves to one of its regular
-			// files.
-			v.Actual = e.SHA256
-			v.Reason = "the signed package has no regular file here, though the machine lists it as part of the package"
-			mismatch = append(mismatch, v)
-		case d.Conffile:
-			if e.SHA256 != "" && e.SHA256 != d.SHA256 {
-				diffs = append(diffs, ConffileDiff{Path: cp, Package: p.Name, Version: p.Version, Expected: d.SHA256, Actual: e.SHA256, Default: string(d.Text), Source: src})
-			}
-		case e.SHA256 == "":
-			v.Expected = d.SHA256
-			v.Reason = "the file on disk was not hashed"
-			if e.Err != "" {
-				v.Reason += ": " + e.Err
-			}
-			unverifiable = append(unverifiable, v)
-		case e.SHA256 == d.SHA256:
-			v.Expected, v.Actual = d.SHA256, e.SHA256
+		seen[e.Path] = true
+		v, d, kind := s.judgeFile(e, idx[e.Path], listers[e.Path])
+		switch kind {
+		case verdictVerified:
 			verified = append(verified, v)
-		default:
-			v.Expected, v.Actual = d.SHA256, e.SHA256
-			v.Reason = "differs from the file in the signed package"
+		case verdictMismatch:
 			mismatch = append(mismatch, v)
+		case verdictUnverifiable:
+			unverifiable = append(unverifiable, v)
+		case verdictConffile:
+			diffs = append(diffs, d)
 		}
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.res.Verified = append(s.res.Verified, verified...)
 	s.res.Mismatch = append(s.res.Mismatch, mismatch...)
 	s.res.Unverifiable = append(s.res.Unverifiable, unverifiable...)
 	s.res.Conffiles = append(s.res.Conffiles, diffs...)
 }
 
-// unverifiable marks the package's files that would have been checked.
-func (s *session) unverifiable(p *model.Package, reason string) {
-	if s.bw != nil {
-		s.bw.addUnavailable(p, reason)
-		return
+type verdictKind int
+
+const (
+	verdictNone verdictKind = iota
+	verdictVerified
+	verdictMismatch
+	verdictUnverifiable
+	verdictConffile
+)
+
+// judgeFile decides one collected entry e, given the signed files placed at
+// its path and the packages whose file lists name it.
+func (s *session) judgeFile(e *model.FileEntry, exp []expect, lst []*pkgResult) (FileVerdict, ConffileDiff, verdictKind) {
+	regular := isRegular(e)
+	var mode uint32
+	if regular {
+		mode = e.Mode
 	}
-	var vs []FileVerdict
-	seen := map[string]bool{}
-	for _, f := range p.Files {
-		cp, e, kind := s.locate(f)
-		if kind != regularFile || seen[cp] || !s.opt.candidate(cp, f, e.Mode, nil) {
+	if len(exp) == 0 {
+		return s.judgeUnshipped(e, regular, lst)
+	}
+	inScope := false
+	for i := range exp {
+		if s.opt.candidate(e.Path, exp[i].path, mode, &exp[i].f) {
+			inScope = true
+			break
+		}
+	}
+	if !inScope {
+		return FileVerdict{}, ConffileDiff{}, verdictNone
+	}
+	var conf *expect
+	for i := range exp {
+		if exp[i].f.Conffile {
+			conf = &exp[i]
+			break
+		}
+	}
+	diff := func(actual string) ConffileDiff {
+		return ConffileDiff{Path: e.Path, Package: conf.r.pkg.Name, Version: conf.r.pkg.Version, Expected: conf.f.SHA256, Actual: actual, Default: string(conf.f.Text), Source: conf.r.source}
+	}
+	verdict := func(x *expect) FileVerdict {
+		return FileVerdict{Path: e.Path, Package: x.r.pkg.Name, Version: x.r.pkg.Version, Expected: x.f.SHA256, Actual: e.SHA256, Source: x.r.source}
+	}
+	if !regular {
+		actual := e.Type
+		if e.Type == "symlink" {
+			actual = "symlink to " + e.Target
+		}
+		if conf != nil {
+			return FileVerdict{}, diff(actual), verdictConffile
+		}
+		v := verdict(&exp[0])
+		v.Actual = actual
+		v.Reason = "the signed package installs a regular file here, the machine has a " + e.Type
+		return v, ConffileDiff{}, verdictMismatch
+	}
+	if e.SHA256 == "" {
+		if conf != nil {
+			return FileVerdict{}, ConffileDiff{}, verdictNone
+		}
+		v := verdict(&exp[0])
+		v.Reason = "the file on disk was not hashed"
+		if e.Err != "" {
+			v.Reason += ": " + e.Err
+		}
+		return v, ConffileDiff{}, verdictUnverifiable
+	}
+	var modeV FileVerdict
+	matchedConf := false
+	for i := range exp {
+		x := &exp[i]
+		if x.f.SHA256 != e.SHA256 {
 			continue
 		}
-		seen[cp] = true
-		vs = append(vs, FileVerdict{Path: cp, Package: p.Name, Version: p.Version, Actual: e.SHA256, Reason: reason, Source: s.source})
+		if x.f.Conffile {
+			matchedConf = true
+			continue
+		}
+		if why := s.modeDiff(e.Path, e.Mode, x.f); why != "" {
+			if modeV.Reason == "" {
+				modeV = verdict(x)
+				modeV.Reason = why
+			}
+			continue
+		}
+		return verdict(x), ConffileDiff{}, verdictVerified
 	}
-	s.mu.Lock()
-	s.res.Unverifiable = append(s.res.Unverifiable, vs...)
-	s.mu.Unlock()
+	switch {
+	case modeV.Reason != "":
+		return modeV, ConffileDiff{}, verdictMismatch
+	case matchedConf:
+		return FileVerdict{}, ConffileDiff{}, verdictNone // an unchanged conffile
+	case conf != nil:
+		return FileVerdict{}, diff(e.SHA256), verdictConffile
+	}
+	v := verdict(&exp[0])
+	v.Reason = "differs from the file in the signed package"
+	var names []string
+	for _, x := range exp {
+		if n := x.r.pkg.Name + " " + x.r.pkg.Version; !slices.Contains(names, n) {
+			names = append(names, n)
+		}
+	}
+	if len(names) > 1 {
+		v.Reason += " (shipped by " + strings.Join(names, ", ") + ")"
+	}
+	return v, ConffileDiff{}, verdictMismatch
+}
+
+// judgeUnshipped decides a collected entry that no signed table places.
+func (s *session) judgeUnshipped(e *model.FileEntry, regular bool, lst []*pkgResult) (FileVerdict, ConffileDiff, verdictKind) {
+	none := func() (FileVerdict, ConffileDiff, verdictKind) { return FileVerdict{}, ConffileDiff{}, verdictNone }
+	if !regular || !s.opt.candidate(e.Path, e.Path, e.Mode, nil) {
+		return none()
+	}
+	v := FileVerdict{Path: e.Path, Actual: e.SHA256, Source: s.source}
+	if len(lst) > 0 {
+		v.Package, v.Version = lst[0].pkg.Name, lst[0].pkg.Version
+	}
+	d, diverted := s.divs[e.Path]
+	if a := usrAlias(e.Path); !diverted && a != "" {
+		d, diverted = s.divs[a]
+	}
+	if diverted {
+		if d.Package == model.LocalDiversion {
+			v.Reason = ReasonLocalDiversion
+		} else {
+			v.Package, v.Version = d.Package, ""
+			v.Reason = fmt.Sprintf("diverted by package %s (dpkg-divert), which ships no file here", d.Package)
+		}
+		return v, ConffileDiff{}, verdictUnverifiable
+	}
+	if len(lst) == 0 {
+		return none() // not a package file
+	}
+	for _, r := range lst {
+		if r.table == nil {
+			v.Package, v.Version, v.Reason = r.pkg.Name, r.pkg.Version, r.reason
+			return v, ConffileDiff{}, verdictUnverifiable
+		}
+	}
+	if strings.HasPrefix(e.Path, "/etc/") {
+		for _, r := range lst {
+			if slices.Contains(r.pkg.ObsoleteConffiles, e.Path) || (usrAlias(e.Path) != "" && slices.Contains(r.pkg.ObsoleteConffiles, usrAlias(e.Path))) {
+				return FileVerdict{}, ConffileDiff{Path: e.Path, Package: r.pkg.Name, Version: r.pkg.Version, Actual: e.SHA256, Note: NoteObsoleteConffile, Source: r.source}, verdictConffile
+			}
+		}
+	}
+	v.Source = lst[0].source
+	v.Reason = "the signed package has no regular file here, though the machine lists it as part of the package"
+	return v, ConffileDiff{}, verdictMismatch
+}
+
+// modeDiff compares a file's mode on disk with what is expected: a
+// dpkg-statoverride for the path if there is one, else the package's mode or
+// one its own postinst sets. An added setuid or setgid bit, or any
+// difference on an executable, is reported; permission changes on other
+// files are not.
+func (s *session) modeDiff(p string, diskMode uint32, f DebFile) string {
+	disk := diskMode & 0o7777
+	o, ok := s.overrides[p]
+	if a := usrAlias(p); !ok && a != "" {
+		o, ok = s.overrides[a]
+	}
+	expected := append([]uint32{f.Mode & 0o7777}, f.ScriptModes...)
+	if ok {
+		expected = []uint32{o.Mode & 0o7777}
+	}
+	for _, want := range expected {
+		if disk == want || (disk&^want&0o6000 == 0 && (disk|want)&0o111 == 0) {
+			return ""
+		}
+	}
+	switch {
+	case ok:
+		return fmt.Sprintf("mode differs: statoverride %04o, disk %04o", expected[0], disk)
+	case len(f.ScriptModes) > 0:
+		var sm []string
+		for _, m := range f.ScriptModes {
+			sm = append(sm, fmt.Sprintf("%04o", m))
+		}
+		return fmt.Sprintf("mode differs: deb %04o (maintainer script sets %s), disk %04o", expected[0], strings.Join(sm, " or "), disk)
+	}
+	return fmt.Sprintf("mode differs: deb %04o, disk %04o", expected[0], disk)
 }
 
 // explain words an error for a verdict, naming the bundle in refs mode.
@@ -1003,26 +1311,58 @@ func lookupPath(m map[string]string, p string) (string, bool) {
 	return "", false
 }
 
-// hashLocal returns the MD5 and SHA-256 of the regular file p below root,
-// never following a symlink in its last component.
+// hashLocal returns the MD5 and SHA-256 of the regular file p below root.
 func hashLocal(root, p string) (string, string, error) {
-	f, err := os.OpenFile(filepath.Join(root, filepath.FromSlash(p)), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	f, err := openBeneath(root, p)
 	if err != nil {
 		return "", "", err
 	}
 	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return "", "", err
-	}
-	if !st.Mode().IsRegular() {
-		return "", "", errors.New("not a regular file")
-	}
 	m, h := md5.New(), sha256.New()
 	if _, err := io.Copy(io.MultiWriter(m, h), f); err != nil {
 		return "", "", err
 	}
 	return hex.EncodeToString(m.Sum(nil)), hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// openBeneath opens the regular file at absolute path p below root one
+// component at a time, refusing "..", symlinks at any component and
+// anything but a regular file at the end, without blocking on a FIFO.
+func openBeneath(root, p string) (*os.File, error) {
+	rel := strings.TrimPrefix(p, "/")
+	parts := strings.Split(rel, "/")
+	if !strings.HasPrefix(p, "/") || rel == "" {
+		return nil, fmt.Errorf("%q: not an absolute path", p)
+	}
+	for _, seg := range parts {
+		if seg == "" || seg == "." || seg == ".." || strings.ContainsRune(seg, 0) {
+			return nil, fmt.Errorf("%q: unsafe path", p)
+		}
+	}
+	dfd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: root, Err: err}
+	}
+	for _, seg := range parts[:len(parts)-1] {
+		nfd, err := unix.Openat(dfd, seg, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		unix.Close(dfd)
+		if err != nil {
+			return nil, &os.PathError{Op: "open", Path: p, Err: err}
+		}
+		dfd = nfd
+	}
+	fd, err := unix.Openat(dfd, parts[len(parts)-1], unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	unix.Close(dfd)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: p, Err: err}
+	}
+	f := os.NewFile(uintptr(fd), p)
+	st, err := f.Stat()
+	if err != nil || !st.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("%q: not a regular file", p)
+	}
+	return f, nil
 }
 
 // LoadKeys reads the OpenPGP public keys (armored or binary) in the regular
