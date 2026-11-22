@@ -5,6 +5,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/internal/pkgverify"
@@ -102,6 +103,8 @@ func (j *judge) packages() {
 			j.verified[v.Path] = v
 		}
 		if p := j.pkgs[v.Package]; p != nil && (v.Version == "" || v.Version == p.Version) {
+			// Any file that matches the signed package of the version
+			// installed now confirms that version, a maintainer script too.
 			j.confirmed[v.Package] = true
 		}
 		if v.Source == pkgverify.SourceSnapshot || v.Source == pkgverify.SourceLaunchpad {
@@ -118,6 +121,9 @@ func (j *judge) packages() {
 		j.pkgPath[v.Path] = j.add(j.suspicious(v))
 	}
 	j.unverifiable(r.Unverifiable)
+	if r.ClockSkew != nil {
+		j.add(clockSkew(*r.ClockSkew))
+	}
 	if j.notRun != "" {
 		j.couldNot = append(j.couldNot, j.notRun)
 	}
@@ -207,10 +213,17 @@ func (j *judge) mismatch(v pkgverify.FileVerdict) *model.Finding {
 		why = "This file differs from the checksum the machine's own package database records for it (" + strings.TrimSpace(v.Package+" "+v.Version) + "). " +
 			"A routine update would update both; replacing system programs and libraries is how rootkits and backdoors hide. Root can edit those checksums, so a match would prove less than this mismatch does."
 	}
+	fix := fixReinstall(v.Path, v.Package, j.exists(v.Path))
+	if maintainerScript(v.Path) && j.exists(v.Path) {
+		title = fmt.Sprintf("The maintainer script %s does not match the signed %s package", v.Path, v.Package)
+		why = "dpkg runs this script as root the next time the package is upgraded, reconfigured, removed or purged, and it is not the script of the signed package (" +
+			strings.TrimSpace(v.Package+" "+v.Version) + "): " + v.Reason + ". A line planted here is a way back in that waits for routine maintenance."
+		fix = fixScript(v.Path, v.Package, j.pkgs[v.Package] != nil)
+	}
 	return &model.Finding{
 		Key: "pkg.mismatch:" + v.Path, ID: "TT-PKG-001", Source: srcPackage, Severity: model.SevTampering,
 		Title: title, Why: why,
-		Fix: fixReinstall(v.Path, v.Package, j.exists(v.Path)),
+		Fix: fix,
 		Evidence: []model.Evidence{{Path: v.Path, Before: v.Expected, After: v.Actual,
 			Detail: v.Reason + "; expected value from " + sourceWords(v.Source), When: j.whenFor(v.Path)}},
 		Refs: []string{"T1554"},
@@ -278,6 +291,10 @@ func (j *judge) unverifiable(vs []pkgverify.FileVerdict) {
 			j.notRun = "package verification did not run: " + v.Reason
 		case class == classStopped:
 			j.stopped[owner] = true
+		case class == classUnchecked && owner != "":
+			if _, ok := j.unreachable[owner]; !ok {
+				j.unreachable[owner] = v
+			}
 		}
 		if class == classHostLimit {
 			continue // stated once; nothing about this file was checked
@@ -344,6 +361,28 @@ func (j *judge) unverifiable(vs []pkgverify.FileVerdict) {
 		f.Evidence = append(f.Evidence, model.Evidence{Detail: fmt.Sprintf("%d %s: %s (e.g. %s)", c, plural(c, "file", "files"), b.reason, strings.Join(ex, ", "))})
 	}
 	j.add(f)
+}
+
+// clockSkew notes that the clock of the machine that ran package
+// verification disagrees with the archive's signed date. The clock decided
+// nothing in the verification.
+func clockSkew(s pkgverify.ClockSkew) *model.Finding {
+	d, dir := s.Clock.Sub(s.Signed), "ahead of"
+	if d < 0 {
+		d, dir = -d, "behind"
+	}
+	days := int((d + 12*time.Hour) / (24 * time.Hour))
+	by := fmt.Sprintf("%d %s %s", days, plural(days, "day", "days"), dir)
+	const layout = "2006-01-02 15:04 UTC"
+	return &model.Finding{
+		Key: "pkg.clock_skew", ID: "TT-PKG-009", Source: srcPackage, Severity: model.SevNote,
+		Title: "The machine's clock is " + by + " the package archive's signed date",
+		Why: "The clock of the machine that ran package verification said " + s.Clock.UTC().Format(layout) + ", while the newest index the archive signed is dated " + s.Signed.UTC().Format(layout) +
+			". Package verification took its time from the signed indexes, so the clock decided nothing there; but root can set the clock, and a wrong one breaks certificate checks, log times and scheduled jobs.",
+		Fix:      "timedatectl set-ntp true   # or set the clock by hand with: date -u -s 'YYYY-MM-DD HH:MM:SS'",
+		Evidence: []model.Evidence{{After: "clock " + by + " the signed date", Detail: "clock " + s.Clock.UTC().Format(layout) + "; newest signed index " + s.Signed.UTC().Format(layout)}},
+		Refs:     []string{"T1070.006"},
+	}
 }
 
 func plural(n int, one, many string) string {

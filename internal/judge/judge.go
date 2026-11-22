@@ -81,24 +81,28 @@ type judge struct {
 	reported         map[string]bool // every path package verification named
 
 	// From the snapshot comparison.
-	pkgChange     map[string]diff.Change      // package name -> its change
-	pkgFinding    map[string]*model.Finding   // package name -> finding about its change
-	pkgReasons    map[string][]string         // new package -> what raised it
-	unverIn       map[string][]model.Evidence // changed package -> its programs found in no trusted source
-	unchecked     map[string][]model.Evidence // changed package -> its programs that could not be checked
-	gshadowRisk   bool                        // a group change gives a group a password or a privileged group a member or admin
-	unconfirmed   map[string]bool             // changed package -> a changed file of it was not confirmed
-	listeners     []diff.Change
-	persistDone   map[string]*model.Finding  // persistence path -> its finding (nil: explained)
-	acctChanged   map[string]bool            // account database -> the account comparison found a change in it
-	acctDirty     map[string]bool            // account database -> it holds a duplicate name or a line glibc rejects
-	touched       map[string]map[string]bool // changed package -> paths shown with its change
-	privGID       map[int]bool               // ids of privileged groups on either side
-	budget        []string                   // reasons package verification stopped at a limit
-	notRun        string                     // why package verification did not run at all
-	stopped       map[string]bool            // packages a deadline left unchecked
-	confirmed     map[string]bool            // packages one of whose files matched the version installed now
-	extraInstalls []diff.Change              // a second architecture of a package that also changed
+	pkgChange   map[string]diff.Change      // package name -> its change
+	pkgFinding  map[string]*model.Finding   // package name -> finding about its change
+	pkgReasons  map[string][]string         // new package -> what raised it
+	unverIn     map[string][]model.Evidence // changed package -> its programs found in no trusted source
+	unchecked   map[string][]model.Evidence // changed package -> its programs that could not be checked
+	gshadowRisk bool                        // a group change gives a group a password or a privileged group a member or admin
+	unconfirmed map[string]bool             // changed package -> a changed file of it was not confirmed
+	listeners   []diff.Change
+	persistDone map[string]*model.Finding  // persistence path -> its finding (nil: explained)
+	acctChanged map[string]bool            // account database -> the account comparison found a change in it
+	acctDirty   map[string]bool            // account database -> it holds a duplicate name or a line glibc rejects
+	touched     map[string]map[string]bool // changed package -> paths shown with its change
+	privGID     map[int]bool               // ids of privileged groups on either side
+	budget      []string                   // reasons package verification stopped at a limit
+	notRun      string                     // why package verification did not run at all
+	stopped     map[string]bool            // packages a deadline left unchecked
+	confirmed   map[string]bool            // packages one of whose files matched the version installed now
+	residual    map[string][]string        // packages removed but not purged -> the versions dpkg records
+	// unreachable holds, per package, a verdict saying the host's own
+	// indexes could not be used, so nothing about the package was checked.
+	unreachable   map[string]pkgverify.FileVerdict
+	extraInstalls []diff.Change // a second architecture of a package that also changed
 	foldedMax     map[*model.Finding]model.Severity
 }
 
@@ -113,6 +117,10 @@ func newJudge(in Input, c *model.Collection) *judge {
 		acctChanged: map[string]bool{}, foldedMax: map[*model.Finding]model.Severity{},
 		acctDirty: map[string]bool{}, touched: map[string]map[string]bool{}, privGID: map[int]bool{},
 		stopped: map[string]bool{}, confirmed: map[string]bool{},
+		residual: map[string][]string{}, unreachable: map[string]pkgverify.FileVerdict{},
+	}
+	for _, p := range c.Packages.Residual {
+		j.residual[p.Name] = append(j.residual[p.Name], p.Version)
 	}
 	if in.Snapshot != nil && in.Snapshot.Collection != nil {
 		j.old = in.Snapshot.Collection
@@ -351,21 +359,39 @@ func (j *judge) accountAnomalies() {
 		file, rest := splitEntry(e)
 		line, note, _ := strings.Cut(rest, " ")
 		n, _ := strconv.Atoi(line)
+		// A line glibc cannot parse is skipped by it. A line with an empty
+		// name parses, and glibc uses it.
 		title := fmt.Sprintf("Line %s of %s is not a valid entry", line, file)
+		why := "glibc skips this line, but other programs that read the file may not. A line written so that tools disagree about it is a way to hide an account or a password."
+		detail := "rejected by glibc's parser"
 		if note != "" {
-			// glibc uses an empty-name line: getpwuid and initgroups match it.
 			title = fmt.Sprintf("Line %s of %s is an entry with no name %s", line, file, note)
+			why, detail = emptyNameWhy(file), "an entry with no name, which glibc uses"
 		}
 		j.add(&model.Finding{
 			Key: "acct.malformed:" + e, ID: "TT-JUDGE-002", Source: srcHeuristic, Severity: model.SevBackdoor,
-			Title: title,
-			Why: "glibc skips this line, but other programs that read the file may not. A line written so that tools disagree about it is a way to hide an account or a password. " +
-				"Its content is not shown, since it may hold a password hash.",
+			Title:    title,
+			Why:      why + " Its content is not shown, since it may hold a password hash.",
 			Fix:      fixKeepOnly(file, "then look at line "+line+" and remove or correct it with vipw -s, vigr or vigr -s as fits the file"),
-			Evidence: []model.Evidence{{Path: file, Line: n, After: e, Detail: "rejected by glibc's parser", When: j.whenFor(file)}},
+			Evidence: []model.Evidence{{Path: file, Line: n, After: e, Detail: detail, When: j.whenFor(file)}},
 			Refs:     []string{"T1136.001"},
 		})
 	}
+}
+
+// emptyNameWhy says what glibc does with a line whose name is empty, which
+// it accepts in every account database.
+func emptyNameWhy(file string) string {
+	const hidden = " Tools that list or look up accounts by name show nothing unusual, so the line is a way to hide one."
+	switch file {
+	case "/etc/passwd":
+		return "glibc uses this line: a lookup by user id (getpwuid) returns it, so its user id belongs to an account with no name, with this line's group, home directory and shell." + hidden
+	case "/etc/group":
+		return "glibc uses this line: group memberships are collected from every line (initgroups), so the accounts it lists are members of its group id at their next login, and a lookup by group id (getgrgid) returns it." + hidden
+	case "/etc/shadow":
+		return "glibc uses this line: it is the password entry of an account with an empty name, such as an /etc/passwd line with no name." + hidden
+	}
+	return "glibc uses this line: it is the entry of a group with an empty name, such as an /etc/group line with no name." + hidden
 }
 
 // splitEntry splits "<file>:<name or line>"; the files have no colon.

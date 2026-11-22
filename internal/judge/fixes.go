@@ -69,6 +69,18 @@ func fixReinstall(p, pkg string, exists bool) string {
 	})
 }
 
+// fixScript replaces a tampered dpkg maintainer script. A reinstall runs
+// the scripts dpkg holds for the package, so the script is moved away
+// first; dpkg skips a script that is not there.
+func fixScript(p, pkg string, installed bool) string {
+	return command([]string{p, pkg}, func(q []string) string {
+		if !installed {
+			return keep(q[0]) + " && rm -- " + q[0] + "   # the package is removed; dpkg would run this script when it is purged"
+		}
+		return keep(q[0]) + " && rm -- " + q[0] + " && apt-get install --reinstall -- " + q[1] + "   # removed first: the reinstall would otherwise run it"
+	})
+}
+
 // fixDeleteLines removes the given lines (numbers in the current file) in one
 // sed pass, after saving the file.
 func fixDeleteLines(p string, lines []int, note string) string {

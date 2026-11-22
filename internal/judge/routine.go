@@ -314,10 +314,10 @@ func (j *judge) changedNames() []string {
 }
 
 // changedPackage is the first changed package (in changedNames order) for
-// which match holds and whose change is confirmed (see rebuilderOK), or "".
-func (j *judge) changedPackage(match func(name string) bool) string {
+// which ok (see rebuilderOK) and match hold, or "".
+func (j *judge) changedPackage(ok, match func(name string) bool) string {
 	for _, n := range j.changedNames() {
-		if j.rebuilderOK(n) && match(n) {
+		if ok(n) && match(n) {
 			return n
 		}
 	}
@@ -353,11 +353,41 @@ func (j *judge) rebuilderOK(name string) bool {
 	return j.pkgChange[name].Kind == diff.PkgRemoved || j.confirmed[name]
 }
 
-// kernelPackageFor is the changed, confirmed kernel package of a kernel
-// release, or "".
-func (j *judge) kernelPackageFor(release string) string {
+// couldNotCheck reports whether a package changed and nothing could say
+// whether its new version is genuine, because the host's own indexes could
+// not be used (a real outage): not confirmed, but not contradicted either.
+func (j *judge) couldNotCheck(name string) bool {
+	_, down := j.unreachable[name]
+	return down && j.pkgChanged(name) && !j.confirmed[name]
+}
+
+// anyChange accepts every changed package, confirmed or not.
+func (j *judge) anyChange(string) bool { return true }
+
+// changeConfirmed reports whether a package change may carry its links,
+// directories and removed files quietly: a removal, a version one of whose
+// files matched the signed package, or a change an outage left unchecked
+// (which goes into the note on unchecked files). A version nothing
+// confirmed explains none of its files.
+func (j *judge) changeConfirmed(name string) bool {
+	return j.rebuilderOK(name) || j.couldNotCheck(name)
+}
+
+// foldWithChange shows a link, directory or removed file as part of its
+// package's change. When nothing confirmed that change, it stops being an
+// explained one: it becomes a finding that lists them.
+func (j *judge) foldWithChange(name string, e model.Evidence) {
+	if !j.changeConfirmed(name) {
+		j.unconfirmed[name] = true
+	}
+	j.foldIntoPackage(name, e, model.SevNote)
+}
+
+// kernelPackageFor is the changed kernel package of a kernel release for
+// which ok holds, or "".
+func (j *judge) kernelPackageFor(release string, ok func(name string) bool) string {
 	for _, name := range []string{"linux-image-" + release, "linux-image-unsigned-" + release, "linux-modules-" + release, "linux-modules-extra-" + release} {
-		if j.pkgChanged(name) && j.rebuilderOK(name) {
+		if j.pkgChanged(name) && ok(name) {
 			return name
 		}
 	}
@@ -373,32 +403,33 @@ func isGrub(name string) bool {
 // tools or a package with initramfs hooks or scripts; the boot menu for
 // GRUB, shim or a kernel image; GRUB's modules, fonts and EFI binaries only
 // for GRUB or shim; a module index for its kernel, a package with modules
-// for that kernel, or DKMS.
-func (j *judge) rebuiltBy(p string) string {
+// for that kernel, or DKMS. ok chooses among the changed packages: the
+// confirmed ones (rebuilderOK) explain the file.
+func (j *judge) rebuiltBy(p string, ok func(name string) bool) string {
 	switch {
 	case p == "/boot/initrd.img" || p == "/boot/initrd.img.old" || p == "/boot/vmlinuz" || p == "/boot/vmlinuz.old":
-		return j.changedPackage(func(n string) bool { return strings.HasPrefix(n, "linux-image") })
+		return j.changedPackage(ok, func(n string) bool { return strings.HasPrefix(n, "linux-image") })
 	case strings.HasPrefix(p, "/boot/initrd.img-"):
-		if k := j.kernelPackageFor(strings.TrimPrefix(p, "/boot/initrd.img-")); k != "" {
+		if k := j.kernelPackageFor(strings.TrimPrefix(p, "/boot/initrd.img-"), ok); k != "" {
 			return k
 		}
-		return j.changedPackage(func(n string) bool {
+		return j.changedPackage(ok, func(n string) bool {
 			return strings.HasPrefix(n, "initramfs-tools") || j.ships(n, "/usr/share/initramfs-tools/") ||
 				strings.HasPrefix(n, "linux-firmware") || strings.HasPrefix(n, "firmware-") || n == "intel-microcode" || n == "amd64-microcode"
 		})
 	case p == "/boot/grub/grub.cfg" || p == "/boot/grub/grubenv":
-		return j.changedPackage(func(n string) bool { return isGrub(n) || strings.HasPrefix(n, "linux-image") })
+		return j.changedPackage(ok, func(n string) bool { return isGrub(n) || strings.HasPrefix(n, "linux-image") })
 	case strings.HasPrefix(p, "/boot/grub/") || strings.HasPrefix(p, "/boot/efi/"):
-		return j.changedPackage(isGrub)
+		return j.changedPackage(ok, isGrub)
 	}
 	release := moduleRelease(p)
 	if release == "" {
 		return ""
 	}
-	if k := j.kernelPackageFor(release); k != "" {
+	if k := j.kernelPackageFor(release, ok); k != "" {
 		return k
 	}
-	return j.changedPackage(func(n string) bool {
+	return j.changedPackage(ok, func(n string) bool {
 		return strings.Contains(n, "dkms") || j.ships(n, "/lib/modules/"+release+"/") || j.ships(n, "/usr/lib/modules/"+release+"/")
 	})
 }
@@ -448,8 +479,8 @@ func (j *judge) finishPackages() {
 			}
 			if f.Severity < model.SevBackdoor && ch.Pkg != nil {
 				f.Severity = model.SevBackdoor
-				f.Title = fmt.Sprintf("New package %s %s since the snapshot, with %d %s no trusted source confirmed", name, ch.Pkg.New, len(unver), plural(len(unver), "file", "files"))
-				f.Why = unverifiedWhy(unver)
+				f.Title = fmt.Sprintf("New package %s %s since the snapshot, with %d %s %s", name, ch.Pkg.New, len(unver), plural(len(unver), "file", "files"), j.unconfirmedFiles())
+				f.Why = j.unverifiedWhy(unver)
 			}
 		}
 		if f != nil && len(unver) > 0 {
@@ -480,7 +511,33 @@ func (j *judge) finishPackages() {
 	j.uncheckedPkgs = unchecked
 }
 
-func unverifiedWhy(unver []model.Evidence) string {
+// offline reports whether package files were compared with the machine's
+// own checksums only.
+func (j *judge) offline() bool {
+	return j.in.Pkg != nil && j.in.Pkg.Mode == pkgverify.ModeOfflineLocal
+}
+
+// unconfirmedVersion words why a package's new version is unconfirmed.
+func (j *judge) unconfirmedVersion() string {
+	if j.notRun != "" {
+		return "nothing confirmed, because package verification did not run"
+	}
+	return "no trusted source confirmed"
+}
+
+// unconfirmedFiles words why a package's changed files are unconfirmed.
+func (j *judge) unconfirmedFiles() string {
+	if j.notRun != "" {
+		return "not checked because package verification did not run"
+	}
+	return "no trusted source confirmed"
+}
+
+func (j *judge) unverifiedWhy(unver []model.Evidence) string {
+	if j.notRun != "" {
+		return "Nothing confirmed the programs this package change brought, because " + j.notRun + ". /etc/os-release, which names the release, is a file root can edit, " +
+			"so a change that could not be checked counts as unexplained."
+	}
 	why := "Verification ran, and no trusted source (the signed archive, its snapshots or a reference bundle) has the version of the programs this package change brought"
 	if len(unver) > 0 && unver[0].Detail != "" {
 		why += " (" + unver[0].Detail + ")"
@@ -579,25 +636,29 @@ func (j *judge) unexplain(name string, ch diff.Change, g *model.Finding, unver [
 	if len(unver) > 0 {
 		n := len(unver)
 		f.Severity = model.SevBackdoor
-		f.Why = unverifiedWhy(unver)
+		f.Why = j.unverifiedWhy(unver)
 		if installed {
-			f.Title = fmt.Sprintf("New package %s %s since the snapshot, with %d %s no trusted source confirmed", name, pc.New, n, plural(n, "file", "files"))
+			f.Title = fmt.Sprintf("New package %s %s since the snapshot, with %d %s %s", name, pc.New, n, plural(n, "file", "files"), j.unconfirmedFiles())
 			f.Fix = fixPurge(name)
 		} else {
-			f.Title = fmt.Sprintf("%s changed from %s to %s, a version no trusted source confirmed; %d %s changed", name, pc.Old, pc.New, n, plural(n, "file", "files"))
+			f.Title = fmt.Sprintf("%s changed from %s to %s, a version %s; %d %s changed", name, pc.Old, pc.New, j.unconfirmedVersion(), n, plural(n, "file", "files"))
 			f.Fix = fixDowngrade(name, pc.Old)
 		}
 		for _, e := range unver {
 			j.attach(f, e, maxEvidence)
 		}
 	} else {
-		f.Why = "The package change itself may be routine, but files it changed could not be confirmed against the package for the version installed now; they are listed as their own findings."
+		f.Why = "The package change itself may be routine, but nothing confirmed the version installed now, or files it changed did not match it. " +
+			"A version that nothing confirmed explains none of the changes made with it: they are listed here or as their own findings."
 		f.Fix = command([]string{name}, func(q []string) string {
 			return "apt-get install --reinstall -- " + q[0] + "   # puts the package's own files back"
 		})
-		if installed {
+		switch {
+		case installed:
 			f.Title = fmt.Sprintf("New package %s %s since the snapshot; not all of its files match the package", name, pc.New)
-		} else {
+		case !j.confirmed[name]:
+			f.Title = fmt.Sprintf("%s changed from %s to %s, but nothing confirmed the new version", name, pc.Old, pc.New)
+		default:
 			f.Title = fmt.Sprintf("%s upgraded from %s to %s, but not all of the files it changed match the package", name, pc.Old, pc.New)
 		}
 	}

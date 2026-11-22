@@ -187,8 +187,12 @@ func (j *judge) verifiedNow(v pkgverify.FileVerdict, e *model.FileEntry) bool {
 	if v.Actual != e.SHA256 && !strings.HasPrefix(v.Actual, "md5:") { // offline mode compares MD5 at verification time
 		return false
 	}
-	p := j.pkgs[v.Package]
-	return p != nil && (v.Version == "" || v.Version == p.Version)
+	if p := j.pkgs[v.Package]; p != nil && (v.Version == "" || v.Version == p.Version) {
+		return true
+	}
+	// dpkg keeps the maintainer scripts of a package removed but not purged:
+	// they belong to the version it records as removed.
+	return maintainerScript(v.Path) && slices.Contains(j.residual[v.Package], v.Version)
 }
 
 // File change categories, which decide severity and wording.
@@ -385,8 +389,13 @@ func (j *judge) fileChange(ch diff.Change) {
 		why = "Programs, libraries, PAM modules, kernel modules and boot files run with the machine's full trust. A change that no package update explains is what a backdoored system file looks like."
 		refs = []string{"T1554"}
 	case catGenerated:
-		why = "This boot file or module index is rebuilt only when the packages that build it change (a kernel, GRUB, initramfs-tools or a package with initramfs hooks), and none of them changed since the snapshot. " +
-			"Boot-time backdoors hide in the initramfs, the boot loader and its modules."
+		why = "This boot file or module index is rebuilt only when the packages that build it change (a kernel, GRUB, initramfs-tools or a package with initramfs hooks), and "
+		if name := j.rebuiltBy(p, j.anyChange); name != "" {
+			why += "the one that did change, " + name + ", is at a version " + j.unconfirmedVersion() + ": a version written into dpkg's records explains nothing. "
+		} else {
+			why += "none of them changed since the snapshot. "
+		}
+		why += "Boot-time backdoors hide in the initramfs, the boot loader and its modules."
 		refs = []string{"T1542"}
 		if cur != nil {
 			fix = fixKeepOnly(p, "then rebuild it from the installed packages: update-initramfs -u -k all for an initramfs, update-grub for the boot menu, grub-install for GRUB's modules, depmod -a for module indexes (check /etc/initramfs-tools and /etc/grub.d first)")
@@ -431,27 +440,40 @@ func (j *judge) placed(ch diff.Change, e, old, cur *model.FileEntry, owner strin
 		return true
 	}
 	if generatedFile(p) {
-		name := j.rebuiltBy(p)
-		if name == "" {
-			return false
+		if name := j.rebuiltBy(p, j.rebuilderOK); name != "" {
+			ev.Detail += "; rebuilt by " + name
+			j.foldIntoPackage(name, ev, model.SevNote)
+			return true
 		}
-		ev.Detail += "; rebuilt by " + name
-		j.foldIntoPackage(name, ev, model.SevNote)
-		return true
+		// The package that rebuilds it changed, and an outage left that
+		// change unchecked: the file joins the note on unchecked files.
+		if name := j.rebuiltBy(p, j.couldNotCheck); name != "" {
+			j.uncheck(p, name, ev, "rebuilt when "+name+" changed, and that change could not be checked")
+			return true
+		}
+		return false
 	}
 	switch {
 	case e.Type == "dir" && j.pkgChanged(owner) && (old == nil || cur == nil || sameMeta(old, cur)):
-		j.foldIntoPackage(owner, ev, model.SevNote)
+		j.foldWithChange(owner, ev)
 		return true
 	case e.Type == "symlink" && j.pkgChanged(owner):
-		j.foldIntoPackage(owner, ev, model.SevNote)
+		j.foldWithChange(owner, ev)
 		return true
 	case ch.Kind == diff.FileRemoved && j.owned[p] == "" && j.pkgChanged(j.oldOwned[p]):
 		ev.Detail = "removed with the package change"
-		j.foldIntoPackage(j.oldOwned[p], ev, model.SevNote)
+		j.foldWithChange(j.oldOwned[p], ev)
 		return true
-	case j.pkgChanged(dpkgInfoPackage(p)) && (!maintainerScript(p) || ch.Kind == diff.FileRemoved || j.rebuilderOK(dpkgInfoPackage(p))):
-		// A maintainer script folds only into a confirmed change.
+	case maintainerScript(p) && cur != nil && j.unverified[p] && j.classify(j.unverKind[p]) == classUnchecked:
+		// A maintainer script an outage left unchecked.
+		j.uncheck(p, "", ev, "maintainer script; could not be checked: "+j.unverReason[p])
+		return true
+	case j.pkgChanged(dpkgInfoPackage(p)) && (!maintainerScript(p) || cur == nil || (j.offline() && j.confirmed[dpkgInfoPackage(p)])):
+		// A maintainer script that is there now is judged like any package
+		// file: package verification compares it with the signed package,
+		// and a match was placed above. Only the machine's own checksums
+		// (offline mode) do not cover scripts; there one folds into a
+		// package change those checksums confirm.
 		ev.Detail = "dpkg's record of the package"
 		j.foldIntoPackage(dpkgInfoPackage(p), ev, model.SevNote)
 		return true
@@ -491,6 +513,16 @@ func (j *judge) placed(ch diff.Change, e, old, cur *model.FileEntry, owner strin
 	return false
 }
 
+// uncheck puts a changed file into the one note on files that could not be
+// checked. name, when given, is the package whose unusable indexes are the
+// reason.
+func (j *judge) uncheck(p, name string, ev model.Evidence, detail string) {
+	if v, ok := j.unreachable[name]; ok && j.unverKind[p] == "" {
+		j.unverKind[p], j.unverReason[p] = v.Kind, v.Reason
+	}
+	j.uncheckedFiles = append(j.uncheckedFiles, model.Evidence{Path: p, Before: ev.Before, After: ev.After, Detail: detail, When: ev.When})
+}
+
 // unverifiedProgram records a changed program of a changed package that no
 // trusted source confirmed: found in none (a backdoor sign for the package)
 // or not checked at all because a source could not be used (one note for
@@ -500,6 +532,9 @@ func (j *judge) unverifiedProgram(pkg, p string, ev model.Evidence) {
 	j.touch(pkg, p)
 	if c := j.classify(j.unverKind[p]); c == classNotFound || c == classStopped {
 		ev.Detail = "changed; no trusted source confirmed this version: " + r
+		if j.unverKind[p] == pkgverify.KindRelease {
+			ev.Detail = "changed; not checked, because package verification did not run: " + r
+		}
 		j.unverIn[pkg] = append(j.unverIn[pkg], ev)
 		return
 	}
