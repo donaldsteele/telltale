@@ -215,6 +215,11 @@ func Codename(h model.Host) (string, error) {
 // release, -updates and -security suites, plus -backports when the host's
 // APT sources enable it. The host's configured mirrors are never used; srcs
 // only says which optional suites to add.
+//
+// The archives are read over plain HTTP, as apt does by default: what is
+// fetched is trusted through the signed InRelease and the hashes that
+// follow from it, not through TLS, and a certificate is checked against
+// the machine's clock, which root can set to make every fetch fail.
 func ArchiveFor(h model.Host, srcs []model.AptSource, cacheDir string) ([]*Archive, error) {
 	cn, err := Codename(h)
 	if err != nil {
@@ -247,8 +252,8 @@ func ArchiveFor(h model.Host, srcs []model.AptSource, cacheDir string) ([]*Archi
 	switch {
 	case debian:
 		return []*Archive{
-			mk("https://deb.debian.org/debian", suites),
-			mk("https://deb.debian.org/debian-security", []string{security}),
+			mk("http://deb.debian.org/debian", suites),
+			mk("http://deb.debian.org/debian-security", []string{security}),
 		}, nil
 	case h.Arch == "amd64" || h.Arch == "i386":
 		return []*Archive{

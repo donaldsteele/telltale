@@ -199,3 +199,15 @@ func TestDebFilesControlScripts(t *testing.T) {
 		t.Errorf("table = %v, want the file and the two scripts", files)
 	}
 }
+
+// A package in any state with files on disk is checked like an installed
+// one, whatever dpkg was asked to do with it next.
+func TestVerifyPackagesInEveryPresentState(t *testing.T) {
+	for _, status := range []string{"deinstall ok installed", "install ok half-configured", "install ok triggers-pending", "install ok unpacked", "install reinstreq half-installed"} {
+		f := toolFixture(t)
+		c := toolCollection(map[string]string{"/usr/bin/tool": "evil\n"})
+		c.Packages.Installed[0].Status = status
+		res := Verify(context.Background(), c, f.opts())
+		wantPaths(t, status+": Mismatch", res.Mismatch, "/usr/bin/tool")
+	}
+}

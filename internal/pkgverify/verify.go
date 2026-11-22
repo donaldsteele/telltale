@@ -518,14 +518,15 @@ func isRegular(e *model.FileEntry) bool {
 }
 
 // filesInstalled reports whether a dpkg status means the package's files are
-// on disk as its Version.
+// on disk as its Version: every state but not-installed and config-files,
+// whatever was asked of the package next (the first word).
 func filesInstalled(status string) bool {
 	f := strings.Fields(status)
 	if len(f) == 0 {
 		return true
 	}
 	switch f[len(f)-1] {
-	case "not-installed", "config-files", "half-installed":
+	case "not-installed", "config-files":
 		return false
 	}
 	return true

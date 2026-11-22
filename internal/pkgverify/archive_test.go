@@ -677,12 +677,12 @@ func TestArchiveForOfficialArchivesOnly(t *testing.T) {
 		fp   string
 	}{
 		{model.Host{OSID: "debian", OSVersionID: "12", Arch: "amd64"}, mirror, []arch{
-			{"https://deb.debian.org/debian", []string{"bookworm", "bookworm-updates"}},
-			{"https://deb.debian.org/debian-security", []string{"bookworm-security"}},
+			{"http://deb.debian.org/debian", []string{"bookworm", "bookworm-updates"}},
+			{"http://deb.debian.org/debian-security", []string{"bookworm-security"}},
 		}, "B8B80B5B623EAB6AD8775C45B7C5D7D6350947F8"},
 		{model.Host{OSID: "debian", OSVersionID: "13", Arch: "arm64"}, []model.AptSource{{Suites: []string{"trixie-backports", "sid", "bookworm-backports"}}}, []arch{
-			{"https://deb.debian.org/debian", []string{"trixie", "trixie-updates", "trixie-backports"}},
-			{"https://deb.debian.org/debian-security", []string{"trixie-security"}},
+			{"http://deb.debian.org/debian", []string{"trixie", "trixie-updates", "trixie-backports"}},
+			{"http://deb.debian.org/debian-security", []string{"trixie-security"}},
 		}, "04B54C3CDCA79751B16BC6B5225629DF75B188BD"},
 		{model.Host{OSID: "ubuntu", OSVersionID: "22.04", Arch: "amd64"}, nil, []arch{
 			{"http://archive.ubuntu.com/ubuntu", []string{"jammy", "jammy-updates"}},

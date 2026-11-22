@@ -149,10 +149,20 @@ func (a *Archive) signedDate(ctx context.Context, suite string) (date, until tim
 	if err != nil {
 		return date, until, false
 	}
-	text, err := verifyInReleaseAt(data, a.Keyring, func(created time.Time) (time.Time, error) { return created, nil })
+	var signedAt time.Time // of the signature that verified: the last one tried
+	text, err := verifyInReleaseAt(data, a.Keyring, func(created time.Time) (time.Time, error) {
+		signedAt = created
+		return created, nil
+	})
 	if err != nil {
 		return date, until, false
 	}
+	defer func() {
+		// A Date far after the signature that covers it witnesses nothing.
+		if ok && date.After(signedAt.Add(signatureSlack)) {
+			date, until, ok = time.Time{}, time.Time{}, false
+		}
+	}()
 	for _, line := range strings.Split(string(text), "\n") {
 		if v, found := strings.CutPrefix(line, "Date:"); found && !ok {
 			t, err := parseReleaseDate(strings.TrimSpace(v))

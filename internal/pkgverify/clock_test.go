@@ -117,3 +117,22 @@ func TestVerifyStaleIndexIsNoWitnessAgainstTheClock(t *testing.T) {
 		t.Errorf("clock skew %+v reported for a correct clock", res.ClockSkew)
 	}
 }
+
+// A signed Date far after the signature itself is no witness of the time:
+// it must not become the run's clock.
+func TestSignedDateBoundedBySignatureTime(t *testing.T) {
+	signer := readFakeKey(t)
+	rel := func(date time.Time) string {
+		return "Origin: Fake\nSuite: bookworm\nCodename: bookworm\nDate: " + date.Format(time.RFC1123) + "\nSHA256:\n " + sha256hex(nil) + " 0 main/binary-amd64/Packages\n"
+	}
+	for name, tc := range map[string]struct {
+		date time.Time
+		ok   bool
+	}{"date at the signature": {recordedNow.Add(-time.Minute), true}, "date a month after the signature": {recordedNow.Add(30 * 24 * time.Hour), false}} {
+		srv := newArchiveServer(t, map[string][]byte{"/debian/dists/bookworm/InRelease": clearsignWith(t, signer, []byte(rel(tc.date)), recordedNow)})
+		a := &Archive{BaseURL: srv.URL + "/debian", Suites: []string{"bookworm"}, Keyring: fakePublicKeyring(t), Client: srv.Client()}
+		if _, _, ok := a.signedDate(context.Background(), "bookworm"); ok != tc.ok {
+			t.Errorf("%s: accepted %v, want %v", name, ok, tc.ok)
+		}
+	}
+}

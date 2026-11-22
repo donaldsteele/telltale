@@ -75,14 +75,15 @@ func TestDpkgStatusInstalledOnly(t *testing.T) {
 	for _, p := range pk.Installed {
 		names = append(names, p.Name)
 	}
-	if want := []string{"held", "libc6", "zsh"}; !reflect.DeepEqual(names, want) {
+	// "half" is half-configured: its files are on disk, so it is listed.
+	if want := []string{"half", "held", "libc6", "zsh"}; !reflect.DeepEqual(names, want) {
 		t.Fatalf("got %v want %v", names, want)
 	}
-	if pk.Installed[0].Status != "hold ok installed" || pk.Installed[2].Status != "install ok installed" {
+	if pk.Installed[0].Status != "install ok half-configured" || pk.Installed[1].Status != "hold ok installed" || pk.Installed[3].Status != "install ok installed" {
 		t.Errorf("status not kept: %+v", pk.Installed)
 	}
-	if pk.Installed[2].Version != "5.9-1" || pk.Installed[2].Arch != "amd64" {
-		t.Errorf("bad fields: %+v", pk.Installed[2])
+	if pk.Installed[3].Version != "5.9-1" || pk.Installed[3].Arch != "amd64" {
+		t.Errorf("bad fields: %+v", pk.Installed[3])
 	}
 }
 
@@ -220,5 +221,44 @@ func TestDpkgStatusKeepsRemovedNotPurged(t *testing.T) {
 		if p.Name == "gone" {
 			t.Errorf("a removed package is listed as installed")
 		}
+	}
+}
+
+// Whether a package's files are on disk is the third word of its Status.
+// The first word is only what the administrator asked for next: a selection
+// of deinstall or purge (dpkg --set-selections, which root can run without
+// removing anything) must not make an installed package look removed, and a
+// package caught mid-configuration is still there.
+func TestDpkgStatusPresentWhateverTheSelection(t *testing.T) {
+	root := t.TempDir()
+	var st string
+	states := map[string]string{
+		"sel-deinstall": "deinstall ok installed", "sel-purge": "purge ok installed", "trig-pending": "install ok triggers-pending",
+		"trig-awaited": "install ok triggers-awaited", "half-conf": "install ok half-configured", "unpacked": "install ok unpacked",
+		"half-inst": "install reinstreq half-installed", "plain": "install ok installed",
+		"absent": "purge ok not-installed", "rc": "deinstall ok config-files",
+	}
+	for name, s := range states {
+		st += "Package: " + name + "\nStatus: " + s + "\nArchitecture: amd64\nVersion: 1.0\n\n"
+	}
+	writeTree(t, root, map[string]string{"var/lib/dpkg/status": st, "var/lib/dpkg/info/sel-deinstall.list": "/boot/vmlinuz-x\n"})
+	pk, _ := Packages(root)
+	got := map[string]model.Package{}
+	for _, p := range pk.Installed {
+		got[p.Name] = p
+	}
+	for name, s := range states {
+		p, ok := got[name]
+		if want := name != "absent" && name != "rc"; ok != want {
+			t.Errorf("%s (%s): listed as installed %v, want %v", name, s, ok, want)
+		} else if ok && p.Status != s {
+			t.Errorf("%s: status %q, want %q", name, p.Status, s)
+		}
+	}
+	if !reflect.DeepEqual(got["sel-deinstall"].Files, []string{"/boot/vmlinuz-x"}) {
+		t.Errorf("files of a package selected for removal: %v", got["sel-deinstall"].Files)
+	}
+	if len(pk.Residual) != 1 || pk.Residual[0].Name != "rc" {
+		t.Errorf("residual = %+v", pk.Residual)
 	}
 }

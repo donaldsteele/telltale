@@ -390,7 +390,9 @@ func (j *judge) fileChange(ch diff.Change) {
 		refs = []string{"T1554"}
 	case catGenerated:
 		why = "This boot file or module index is rebuilt only when the packages that build it change (a kernel, GRUB, initramfs-tools or a package with initramfs hooks), and "
-		if name := j.rebuiltBy(p, j.anyChange); name != "" {
+		if name := j.rebuiltBy(p, j.anyChange); name != "" && j.pkgChange[name].Kind == diff.PkgRemoved {
+			why += "the one that did change, " + name + ", was removed: removing a package does not explain a boot file that is still here and changed. "
+		} else if name != "" {
 			why += "the one that did change, " + name + ", is at a version " + j.unconfirmedVersion() + ": a version written into dpkg's records explains nothing. "
 		} else {
 			why += "none of them changed since the snapshot. "
@@ -440,7 +442,14 @@ func (j *judge) placed(ch diff.Change, e, old, cur *model.FileEntry, owner strin
 		return true
 	}
 	if generatedFile(p) {
-		if name := j.rebuiltBy(p, j.rebuilderOK); name != "" {
+		// A removal deletes a kernel's boot files and leaves the others
+		// alone, and dpkg's record of it is root's to edit: it explains no
+		// boot file that is still there and changed.
+		ok := j.rebuilderOK
+		if cur != nil && strings.HasPrefix(p, "/boot/") {
+			ok = func(name string) bool { return j.confirmed[name] }
+		}
+		if name := j.rebuiltBy(p, ok); name != "" {
 			ev.Detail += "; rebuilt by " + name
 			j.foldIntoPackage(name, ev, model.SevNote)
 			return true
@@ -464,8 +473,12 @@ func (j *judge) placed(ch diff.Change, e, old, cur *model.FileEntry, owner strin
 		ev.Detail = "removed with the package change"
 		j.foldWithChange(j.oldOwned[p], ev)
 		return true
-	case maintainerScript(p) && cur != nil && j.unverified[p] && j.classify(j.unverKind[p]) == classUnchecked:
-		// A maintainer script an outage left unchecked.
+	case maintainerScript(p) && cur != nil && j.unverified[p] && j.classify(j.unverKind[p]) == classUnchecked && j.broughtScripts(dpkgInfoPackage(p)):
+		// A maintainer script an outage left unchecked, of a package that
+		// was installed or upgraded: the script came with that change, as
+		// far as anyone can tell. The script of a package that did not
+		// change (or was removed: a removal changes no script) has no such
+		// excuse and is ranked below.
 		j.uncheck(p, "", ev, "maintainer script; could not be checked: "+j.unverReason[p])
 		return true
 	case j.pkgChanged(dpkgInfoPackage(p)) && (!maintainerScript(p) || cur == nil || (j.offline() && j.confirmed[dpkgInfoPackage(p)])):

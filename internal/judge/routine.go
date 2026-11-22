@@ -361,6 +361,14 @@ func (j *judge) couldNotCheck(name string) bool {
 	return down && j.pkgChanged(name) && !j.confirmed[name]
 }
 
+// broughtScripts reports whether a package change brings new maintainer
+// scripts: an install or an upgrade (a downgrade is ranked on its own, a
+// removal leaves the scripts as they were).
+func (j *judge) broughtScripts(name string) bool {
+	k := j.pkgChange[name].Kind
+	return k == diff.PkgUpgraded || k == diff.PkgInstalled
+}
+
 // anyChange accepts every changed package, confirmed or not.
 func (j *judge) anyChange(string) bool { return true }
 

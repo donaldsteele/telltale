@@ -38,7 +38,7 @@ func TestOnlineDebianBookwormIndex(t *testing.T) {
 	for k, ref := range idx {
 		if k.Name == "openssh-server" && k.Arch == "amd64" {
 			found = append(found, ref)
-			if !strings.HasPrefix(ref.URL, "https://deb.debian.org/debian/pool/main/o/openssh/openssh-server_") || len(ref.SHA256) != 64 || ref.Size <= 0 || ref.Source != SourceArchive {
+			if !strings.HasPrefix(ref.URL, "http://deb.debian.org/debian/pool/main/o/openssh/openssh-server_") || len(ref.SHA256) != 64 || ref.Size <= 0 || ref.Source != SourceArchive {
 				t.Errorf("openssh-server %s: %+v", k.Version, ref)
 			}
 		}

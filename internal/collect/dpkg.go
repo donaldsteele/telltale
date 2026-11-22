@@ -38,8 +38,21 @@ func scanLines(root, mp string, max int64, fn func(line string)) error {
 	return sc.Err()
 }
 
+// installedStatus reports whether a dpkg status means the package's files
+// are on disk. That is its third word, the package's state. The first word
+// is only what was last asked for (install, hold, deinstall, purge), which
+// dpkg --set-selections changes without touching a file, so it decides
+// nothing here; neither does a package being caught mid-configuration.
 func installedStatus(s string) bool {
-	return s == "install ok installed" || s == "hold ok installed"
+	f := strings.Fields(s)
+	if len(f) != 3 {
+		return false
+	}
+	switch f[2] {
+	case "installed", "triggers-pending", "triggers-awaited", "half-configured", "unpacked", "half-installed":
+		return true
+	}
+	return false
 }
 
 // residualStatus reports whether a dpkg status is that of a package removed
