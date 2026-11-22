@@ -1,0 +1,19 @@
+{
+  "requires": {},
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.proc_exe:deleted:/usr/local/bin/lab-ghost",
+        "severity": "backdoor sign"
+      }
+    ]
+  },
+  "without_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.proc_exe:deleted:/usr/local/bin/lab-ghost",
+        "severity": "backdoor sign"
+      }
+    ]
+  }
+}

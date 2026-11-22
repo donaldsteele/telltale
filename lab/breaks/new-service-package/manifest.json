@@ -1,0 +1,18 @@
+{
+  "requires": {
+    "network": true
+  },
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "snap.pkg_installed:lighttpd",
+        "severity": "note"
+      },
+      {
+        "key_prefix": "snap.listener:tcp",
+        "severity": "note"
+      }
+    ]
+  },
+  "without_snapshot": {}
+}

@@ -1,0 +1,19 @@
+{
+  "requires": {},
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "pkg.mismatch:/usr/bin/id",
+        "severity": "tampering"
+      }
+    ]
+  },
+  "without_snapshot": {
+    "must": [
+      {
+        "key_prefix": "pkg.mismatch:/usr/bin/id",
+        "severity": "tampering"
+      }
+    ]
+  }
+}

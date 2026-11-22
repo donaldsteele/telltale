@@ -1,0 +1,19 @@
+{
+  "requires": {},
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "snap.root_key:/root/.ssh/authorized_keys:",
+        "severity": "backdoor sign"
+      }
+    ]
+  },
+  "without_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.root_key:/root/.ssh/authorized_keys",
+        "severity": "note"
+      }
+    ]
+  }
+}

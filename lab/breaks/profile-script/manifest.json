@@ -1,0 +1,12 @@
+{
+  "requires": {},
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "snap.persist:/etc/profile.d/lab-motd.sh",
+        "severity": "backdoor sign"
+      }
+    ]
+  },
+  "without_snapshot": {}
+}

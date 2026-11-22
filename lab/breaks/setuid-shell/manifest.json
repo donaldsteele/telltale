@@ -1,0 +1,19 @@
+{
+  "requires": {},
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.unowned_setuid:/usr/lib/.s",
+        "severity": "backdoor sign"
+      }
+    ]
+  },
+  "without_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.unowned_setuid:/usr/lib/.s",
+        "severity": "backdoor sign"
+      }
+    ]
+  }
+}

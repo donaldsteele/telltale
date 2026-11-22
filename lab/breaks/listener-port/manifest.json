@@ -1,0 +1,23 @@
+{
+  "requires": {},
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.unowned_listener:/usr/local/sbin/lab-svcd",
+        "severity": "note"
+      },
+      {
+        "key_prefix": "snap.listener:tcp",
+        "severity": "note"
+      }
+    ]
+  },
+  "without_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.unowned_listener:/usr/local/sbin/lab-svcd",
+        "severity": "note"
+      }
+    ]
+  }
+}

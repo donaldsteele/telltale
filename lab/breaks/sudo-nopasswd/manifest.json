@@ -1,0 +1,23 @@
+{
+  "requires": {},
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "snap.persist:/etc/sudoers.d/90-lab-svc",
+        "severity": "backdoor sign"
+      },
+      {
+        "key_prefix": "check:TT-SUDO-001",
+        "severity": "tampering"
+      }
+    ]
+  },
+  "without_snapshot": {
+    "must": [
+      {
+        "key_prefix": "check:TT-SUDO-001",
+        "severity": "weak setting"
+      }
+    ]
+  }
+}

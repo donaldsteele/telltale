@@ -1,0 +1,12 @@
+{
+  "requires": {},
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "snap.persist:/etc/pam.d/common-auth",
+        "severity": "backdoor sign"
+      }
+    ]
+  },
+  "without_snapshot": {}
+}

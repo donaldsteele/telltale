@@ -1,0 +1,5 @@
+{
+  "requires": {"variant": "hardened"},
+  "with_snapshot": {"must_not_severity_above": "note"},
+  "without_snapshot": {"must_not_severity_above": "weak setting"}
+}

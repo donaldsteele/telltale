@@ -1,0 +1,30 @@
+# Builds the lab stand-ins for amd64 and arm64 (cross-compiled, so no emulation).
+#
+#   docker build -f lab/standins/Dockerfile.build -t telltale-lab/standins:dev lab/standins
+#
+# The image holds /standins/<arch>/{hider.so,pam_lab.so,listener,callback.sh}.
+# Extract with `docker create` and `docker cp`, then remove the container.
+FROM debian:bookworm-slim AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      gcc libc6-dev gcc-aarch64-linux-gnu libc6-dev-arm64-cross ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+# Go: the toolchain that builds telltale itself.
+ARG GO_VERSION=1.26.0
+RUN set -eu; a=$(dpkg --print-architecture); \
+    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${a}.tar.gz" | tar -C /usr/local -xz
+ENV PATH=/usr/local/go/bin:$PATH
+WORKDIR /src
+COPY hider.c pam_lab.c listener.go callback.sh ./
+RUN set -eu; \
+    mkdir -p /out/amd64 /out/arm64; \
+    gcc -shared -fPIC -O2 -Wall -Werror -o /out/amd64/hider.so hider.c -ldl; \
+    gcc -shared -fPIC -O2 -Wall -Werror -o /out/amd64/pam_lab.so pam_lab.c; \
+    aarch64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Werror -o /out/arm64/hider.so hider.c -ldl; \
+    aarch64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Werror -o /out/arm64/pam_lab.so pam_lab.c; \
+    for a in amd64 arm64; do \
+      GO111MODULE=off CGO_ENABLED=0 GOOS=linux GOARCH=$a go build -trimpath -ldflags=-s -o /out/$a/listener listener.go; \
+      cp callback.sh /out/$a/callback.sh; \
+    done
+
+FROM scratch
+COPY --from=build /out/ /standins/

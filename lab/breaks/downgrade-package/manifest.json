@@ -1,0 +1,15 @@
+{
+  "requires": {
+    "newer_snapshot": true,
+    "network": true
+  },
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "snap.pkg_downgraded:openssl",
+        "severity": "backdoor sign"
+      }
+    ]
+  },
+  "without_snapshot": {}
+}

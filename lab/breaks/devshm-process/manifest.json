@@ -1,0 +1,19 @@
+{
+  "requires": {},
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.proc_exe:tmp:/dev/shm/lab-dsleep",
+        "severity": "backdoor sign"
+      }
+    ]
+  },
+  "without_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.proc_exe:tmp:/dev/shm/lab-dsleep",
+        "severity": "backdoor sign"
+      }
+    ]
+  }
+}

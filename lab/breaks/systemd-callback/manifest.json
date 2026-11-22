@@ -1,0 +1,16 @@
+{
+  "requires": {},
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "snap.persist:/etc/systemd/system/lab-sync.service",
+        "severity": "backdoor sign"
+      },
+      {
+        "key_prefix": "snap.persist:/etc/systemd/system/lab-sync.timer",
+        "severity": "backdoor sign"
+      }
+    ]
+  },
+  "without_snapshot": {}
+}

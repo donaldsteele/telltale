@@ -1,0 +1,23 @@
+{
+  "requires": {},
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.ld_preload",
+        "severity": "backdoor sign"
+      },
+      {
+        "key_prefix": "snap.persist:/etc/ld.so.preload",
+        "severity": "backdoor sign"
+      }
+    ]
+  },
+  "without_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.ld_preload",
+        "severity": "backdoor sign"
+      }
+    ]
+  }
+}

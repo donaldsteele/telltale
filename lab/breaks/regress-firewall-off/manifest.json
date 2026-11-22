@@ -1,0 +1,21 @@
+{
+  "requires": {
+    "variant": "hardened"
+  },
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "check:TT-FW-001",
+        "severity": "tampering"
+      }
+    ]
+  },
+  "without_snapshot": {
+    "must": [
+      {
+        "key_prefix": "check:TT-FW-001",
+        "severity": "weak setting"
+      }
+    ]
+  }
+}

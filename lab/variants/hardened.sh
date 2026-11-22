@@ -27,3 +27,12 @@ chmod 700 /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cro
 echo root > /etc/cron.allow
 chmod 600 /etc/cron.allow
 echo "Authorized use only." > /etc/issue.net
+# A firewall that is on, so a later regression (ufw switched off) has something
+# to regress from. Docker cannot load the rules at build time, so the recorded
+# state is the setting in /etc/ufw/ufw.conf, which is what telltale reads.
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends ufw
+sed -i 's/^ENABLED=.*/ENABLED=yes/' /etc/ufw/ufw.conf
+grep -q '^ENABLED=yes' /etc/ufw/ufw.conf
+rm -rf /var/lib/apt/lists/*

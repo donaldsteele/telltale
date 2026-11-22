@@ -1,0 +1,25 @@
+{
+  "requires": {
+    "ext4": true,
+    "privileged": true,
+    "caps": [
+      "LINUX_IMMUTABLE"
+    ]
+  },
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.immutable:/usr/local/lib/lab-cache/.helper",
+        "severity": "backdoor sign"
+      }
+    ]
+  },
+  "without_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.immutable:/usr/local/lib/lab-cache/.helper",
+        "severity": "backdoor sign"
+      }
+    ]
+  }
+}

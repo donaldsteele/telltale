@@ -1,0 +1,31 @@
+{
+  "requires": {},
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.uid0:toor",
+        "severity": "backdoor sign"
+      },
+      {
+        "key_prefix": "snap.user_added:toor",
+        "severity": "backdoor sign"
+      },
+      {
+        "key_prefix": "check:TT-ACCT-001",
+        "severity": "tampering"
+      }
+    ]
+  },
+  "without_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.uid0:toor",
+        "severity": "backdoor sign"
+      },
+      {
+        "key_prefix": "check:TT-ACCT-001",
+        "severity": "weak setting"
+      }
+    ]
+  }
+}

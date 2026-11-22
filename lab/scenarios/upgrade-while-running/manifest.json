@@ -1,0 +1,5 @@
+{
+  "requires": {"variant": "thirdparty"},
+  "with_snapshot": {"must_not_severity_above": "weak setting"},
+  "without_snapshot": {"must_not_severity_above": "weak setting"}
+}

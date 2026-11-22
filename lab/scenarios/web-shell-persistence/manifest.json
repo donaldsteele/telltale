@@ -1,0 +1,14 @@
+{
+  "requires": {},
+  "with_snapshot": {
+    "must": [
+      {"key_prefix": "snap.persist:/etc/systemd/system/lab-sync.timer", "severity": "backdoor sign"},
+      {"key_prefix": "heur.unowned_setuid:/usr/lib/.s", "severity": "backdoor sign"}
+    ]
+  },
+  "without_snapshot": {
+    "must": [
+      {"key_prefix": "heur.unowned_setuid:/usr/lib/.s", "severity": "backdoor sign"}
+    ]
+  }
+}
