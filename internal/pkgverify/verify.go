@@ -184,6 +184,9 @@ type Options struct {
 	// InScope. Only the packages that list them, and packages whose cached
 	// signed table holds them, are fetched.
 	OnlyPaths map[string]bool
+	// ExtraPaths are collected paths checked in addition to the default
+	// scope, and also when OnlyPaths is set.
+	ExtraPaths []string
 	// ExtraKeys are owner-supplied keys for third-party repositories. A
 	// third-party source is consulted only when its signed index verifies
 	// with one of them.
@@ -604,10 +607,10 @@ func (s *session) hasScript(p *model.Package) bool {
 
 func (s *session) listsChanged(p *model.Package) bool {
 	for _, f := range p.Files {
-		if s.opt.OnlyPaths[f] {
+		if s.opt.OnlyPaths[f] || s.opt.isExtra(f) {
 			return true
 		}
-		if a := usrAlias(f); a != "" && s.opt.OnlyPaths[a] {
+		if a := usrAlias(f); a != "" && (s.opt.OnlyPaths[a] || s.opt.isExtra(a)) {
 			return true
 		}
 	}
@@ -661,7 +664,7 @@ func (s *session) addCachedTables(results []*pkgResult) []*pkgResult {
 			continue
 		}
 		for dp := range t {
-			if s.opt.OnlyPaths[dp] || (usrAlias(dp) != "" && s.opt.OnlyPaths[usrAlias(dp)]) {
+			if s.opt.OnlyPaths[dp] || s.opt.isExtra(dp) || (usrAlias(dp) != "" && (s.opt.OnlyPaths[usrAlias(dp)] || s.opt.isExtra(usrAlias(dp)))) {
 				results = append(results, &pkgResult{pkg: p, ref: ref, source: s.sourceOf(ref), table: t})
 				break
 			}
@@ -1246,7 +1249,7 @@ func (s *session) judge(results []*pkgResult) {
 	seen := map[string]bool{}
 	for i := range s.c.Files {
 		e := &s.c.Files[i]
-		if seen[e.Path] || (s.opt.OnlyPaths != nil && !s.opt.OnlyPaths[e.Path]) {
+		if seen[e.Path] || (s.opt.OnlyPaths != nil && !s.opt.OnlyPaths[e.Path] && !s.opt.isExtra(e.Path)) {
 			continue
 		}
 		seen[e.Path] = true

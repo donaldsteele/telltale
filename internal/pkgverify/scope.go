@@ -2,6 +2,7 @@ package pkgverify
 
 import (
 	"path"
+	"slices"
 	"strings"
 )
 
@@ -65,6 +66,9 @@ func usrAlias(p string) string {
 // disk or, once the package is at hand, by the mode the package gives it.
 // diskMode is 0 for entries that are not regular files.
 func (o *Options) candidate(cp, p string, diskMode uint32, deb *DebFile) bool {
+	if o.isExtra(cp) || o.isExtra(p) {
+		return true
+	}
 	if o.OnlyPaths != nil {
 		return o.OnlyPaths[cp] || o.OnlyPaths[p]
 	}
@@ -75,4 +79,9 @@ func (o *Options) candidate(cp, p string, diskMode uint32, deb *DebFile) bool {
 		return true
 	}
 	return deb != nil && InScope(p, deb.Mode)
+}
+
+// isExtra reports whether p is one of ExtraPaths.
+func (o *Options) isExtra(p string) bool {
+	return slices.Contains(o.ExtraPaths, p)
 }

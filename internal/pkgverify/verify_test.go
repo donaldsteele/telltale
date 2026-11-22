@@ -1936,3 +1936,24 @@ func TestVerifyUnverifiableKinds(t *testing.T) {
 		})
 	}
 }
+
+func TestPkgverifyExtraPaths(t *testing.T) {
+	f := toolFixture(t)
+	const readme = "/usr/share/doc/tool/README"
+	c := toolCollection(map[string]string{readme: "changed\n"})
+	opt := f.opts()
+
+	// Not executable, not a library: outside the default scope.
+	res := Verify(context.Background(), c, opt)
+	wantPaths(t, "default Mismatch", res.Mismatch)
+
+	// ExtraPaths adds it to the default scope.
+	opt.ExtraPaths = []string{readme}
+	res = Verify(context.Background(), c, opt)
+	wantPaths(t, "extra Mismatch", res.Mismatch, readme)
+
+	// And it is also checked when OnlyPaths limits the check.
+	opt.OnlyPaths = map[string]bool{}
+	res = Verify(context.Background(), c, opt)
+	wantPaths(t, "only+extra Mismatch", res.Mismatch, readme)
+}
