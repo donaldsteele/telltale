@@ -29,6 +29,10 @@ type Collection struct {
 	Firewall        Firewall          `json:"firewall"`
 	CrossView       []CrossViewResult `json:"cross_view,omitempty"`
 	Sysctl          map[string]string `json:"sysctl,omitempty"`
+	// LinkerCache lists every file the dynamic linker's cache
+	// (/etc/ld.so.cache) sends programs to, sorted; nil when there is no
+	// cache or it could not be parsed.
+	LinkerCache []string `json:"linker_cache,omitempty"`
 }
 
 // Host identifies the machine a collection came from.
@@ -52,6 +56,14 @@ type Skip struct {
 // deeper than sshd allows). The collected configuration is then incomplete
 // and must not be judged.
 const SkipCheckSSHDConfig = "sshd_config"
+
+// SkipCheckModules is the Skip.Check of the loaded kernel modules when they
+// were not examined (see Runtime.SharedKernel).
+const SkipCheckModules = "modules"
+
+// SkipCheckLinkerCache is the Skip.Check of a dynamic linker cache that could
+// not be read (see Collection.LinkerCache).
+const SkipCheckLinkerCache = "linker_cache"
 
 // FileEntry describes one path that was stat'ed during collection.
 // Type: file|dir|symlink|other. Caps: hex of security.capability or "".
@@ -178,8 +190,11 @@ type Runtime struct {
 	Processes []Process      `json:"processes"`
 	Sockets   []Socket       `json:"sockets"`
 	Modules   []KernelModule `json:"modules"`
-	Cmdline   string         `json:"cmdline"`
-	Mounts    []Mount        `json:"mounts"`
+	// SharedKernel is true when the machine is a container: the kernel and
+	// its modules belong to the host, so Modules is left empty.
+	SharedKernel bool    `json:"shared_kernel,omitempty"`
+	Cmdline      string  `json:"cmdline"`
+	Mounts       []Mount `json:"mounts"`
 }
 
 // Process is one running process as seen through /proc.

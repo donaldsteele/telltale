@@ -37,13 +37,14 @@ const (
 	// KernelLimit is in every report: no on-machine check can rule it out.
 	KernelLimit = "kernel-level rootkits (any on-machine check can be fooled)"
 	// OfflineReference names the reference of an offline-local scan.
-	OfflineReference = "the machine's own package checksums (root can edit these)"
-	noSnapshotLimit  = "changes made since the machine was last known to be clean (no snapshot to compare against)"
-	noPkgLimit       = "changed system files (package verification did not run)"
-	offlineLimit     = "system files changed together with the machine's own package checksums (offline mode trusts them)"
-	nonRootLimit     = "checks that need root were skipped (see Skipped); a scan as root is needed for a full answer"
-	nothingCollected = "anything at all: nothing was collected from the machine"
-	checkKeyPrefix   = "check:"
+	OfflineReference  = "the machine's own package checksums (root can edit these)"
+	noSnapshotLimit   = "changes made since the machine was last known to be clean (no snapshot to compare against)"
+	noPkgLimit        = "changed system files (package verification did not run)"
+	sharedKernelLimit = "kernel modules (this machine is a container on its host's kernel; scan the host)"
+	offlineLimit      = "system files changed together with the machine's own package checksums (offline mode trusts them)"
+	nonRootLimit      = "checks that need root were skipped (see Skipped); a scan as root is needed for a full answer"
+	nothingCollected  = "anything at all: nothing was collected from the machine"
+	checkKeyPrefix    = "check:"
 )
 
 type judge struct {
@@ -554,6 +555,9 @@ func (j *judge) report(checks []model.CheckResult, applied []model.Exception) *m
 		r.CouldNotRuleOut = append(r.CouldNotRuleOut, nothingCollected)
 	case !j.c.AsRoot:
 		r.CouldNotRuleOut = append(r.CouldNotRuleOut, nonRootLimit)
+	}
+	if j.in.Collection != nil && j.c.Runtime.SharedKernel {
+		r.CouldNotRuleOut = append(r.CouldNotRuleOut, sharedKernelLimit)
 	}
 	if j.old == nil {
 		r.CouldNotRuleOut = append(r.CouldNotRuleOut, noSnapshotLimit)

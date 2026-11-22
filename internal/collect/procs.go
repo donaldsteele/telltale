@@ -186,6 +186,18 @@ func hashExe(path string) (exeResult, error) {
 	return res, nil
 }
 
+// initPIDNamespace is what /proc/self/ns/pid reads in the first PID namespace,
+// the one the kernel boots into (PROC_PID_INIT_INO, fixed in the kernel ABI).
+const initPIDNamespace = "pid:[4026531836]"
+
+// sharedKernel reports whether the collector runs in a PID namespace other
+// than the first one: the machine is then a container on someone else's
+// kernel. An unreadable link means "not known", which counts as no.
+func sharedKernel(procRoot string) bool {
+	ns, err := readlinkFn(filepath.Join(procRoot, "self/ns/pid"))
+	return err == nil && strings.HasPrefix(ns, "pid:[") && ns != initPIDNamespace
+}
+
 func readModules(procRoot, root string, skip func(string, ...any)) []model.KernelModule {
 	b, err := readBounded(filepath.Join(procRoot, "modules"), 16<<20)
 	if err != nil {

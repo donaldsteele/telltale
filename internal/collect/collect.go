@@ -83,6 +83,8 @@ func All(opt Options) (*model.Collection, error) {
 	add(s)
 	c.Packages, s = Packages(opt.Root)
 	add(s)
+	c.LinkerCache, s = LinkerCache(opt.Root)
+	add(s)
 	c.Firewall, s = Firewall(opt.Root)
 	add(s)
 

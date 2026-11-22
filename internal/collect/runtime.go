@@ -111,7 +111,14 @@ func Runtime(procRoot, sysRoot, root string) (model.Runtime, map[string]string, 
 	}
 
 	// Modules, command line, mounts.
-	rt.Modules = readModules(procRoot, root, skip)
+	if sharedKernel(procRoot) {
+		// A container sees every module its host has loaded and has none
+		// of their files: they are the host's to check.
+		rt.SharedKernel = true
+		skips = append(skips, model.Skip{Check: model.SkipCheckModules, Reason: "this machine is a container, so the kernel and its modules belong to the host; scan the host to check them"})
+	} else {
+		rt.Modules = readModules(procRoot, root, skip)
+	}
 	if b, err := readBounded(filepath.Join(procRoot, "cmdline"), 1<<16); err == nil {
 		s := strings.ReplaceAll(strings.TrimRight(string(b), "\x00\n"), "\x00", " ")
 		rt.Cmdline = strings.TrimSpace(s)

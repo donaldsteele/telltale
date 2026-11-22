@@ -522,3 +522,33 @@ func TestCollectAllKeepsFileScanSkips(t *testing.T) {
 		t.Errorf("want exactly one 'not descending' skip, got %d: %+v", n, c.Skipped)
 	}
 }
+
+// In a container /proc/modules lists the host's modules and none of their
+// files exist: they must not be recorded as modules without a file.
+func TestRuntimeContainerLeavesModulesToTheHost(t *testing.T) {
+	for _, tc := range []struct {
+		ns     string
+		shared bool
+	}{
+		{"pid:[4026531836]", false}, // the first PID namespace: a real machine
+		{"pid:[4026532999]", true},
+		{"", false}, // unreadable: not known, so the modules are still checked
+	} {
+		old := readlinkFn
+		readlinkFn = func(p string) (string, error) {
+			if strings.HasSuffix(p, "self/ns/pid") {
+				if tc.ns == "" {
+					return "", fs.ErrNotExist
+				}
+				return tc.ns, nil
+			}
+			return os.Readlink(p)
+		}
+		rt, _, skips := Runtime("testdata/proc1", t.TempDir(), t.TempDir())
+		readlinkFn = old
+		said := slices.ContainsFunc(skips, func(s model.Skip) bool { return s.Check == model.SkipCheckModules })
+		if rt.SharedKernel != tc.shared || said != tc.shared || (len(rt.Modules) == 0) != tc.shared {
+			t.Errorf("ns %q: SharedKernel=%v, skip recorded=%v, %d modules; want shared=%v", tc.ns, rt.SharedKernel, said, len(rt.Modules), tc.shared)
+		}
+	}
+}

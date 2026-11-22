@@ -2769,3 +2769,101 @@ func TestAcceptedPackageLinkNoteDoesNotHideOverwrite(t *testing.T) {
 	must(t, r, "heur.persist_link:/etc/cron.daily/g", model.SevBackdoor)
 	absent(t, r, key)
 }
+
+func TestJudgeSaysContainerModulesBelongToTheHost(t *testing.T) {
+	c := &model.Collection{AsRoot: true}
+	if r := Judge(Input{Collection: c}); slices.Contains(r.CouldNotRuleOut, sharedKernelLimit) {
+		t.Fatalf("a machine with its own kernel is called a container: %q", r.CouldNotRuleOut)
+	}
+	c.Runtime.SharedKernel = true
+	if r := Judge(Input{Collection: c}); !slices.Contains(r.CouldNotRuleOut, sharedKernelLimit) {
+		t.Fatalf("could_not_rule_out does not say the modules were left to the host: %q", r.CouldNotRuleOut)
+	}
+}
+
+// ldconfig rewrites /etc/ld.so.cache on every library update. The change is
+// quiet only when the cache lists nothing but what the snapshot's cache
+// listed and files of installed packages.
+func TestJudgeLinkerCacheRebuild(t *testing.T) {
+	const cache = "/etc/ld.so.cache"
+	const key = "snap.file_modified:" + cache
+	base := func() *model.Collection {
+		c := clean()
+		c.Files = append(c.Files, file(cache, "cache 1", 0o644))
+		c.Packages.Installed = append(c.Packages.Installed, pkg("libssl3", "3.0.14-1~deb12u2", "/usr/lib/x86_64-linux-gnu/libssl.so.3"))
+		c.LinkerCache = []string{"/usr/lib/x86_64-linux-gnu/libssl.so.3"}
+		return c
+	}
+	rebuilt := func(listed ...string) *model.Collection {
+		c := base()
+		c.Files[len(c.Files)-1] = file(cache, "cache 2", 0o644)
+		c.LinkerCache = listed
+		return c
+	}
+
+	// Same libraries, new bytes (a newer ldconfig wrote it).
+	r := run(rebuilt("/usr/lib/x86_64-linux-gnu/libssl.so.3"), snapOf(base()), archive())
+	if f := find(r, key); f != nil {
+		t.Errorf("a rebuilt cache listing the same libraries is ranked %q", f.Severity)
+	}
+	if explained(r, "rebuilt:"+cache) == nil {
+		t.Errorf("the rebuilt cache is not shown among the explained items")
+	}
+
+	// A newly listed library that an installed package owns.
+	c := rebuilt("/usr/lib/x86_64-linux-gnu/libssl.so.3", "/usr/lib/x86_64-linux-gnu/libz.so.1")
+	c.Packages.Installed = append(c.Packages.Installed, pkg("zlib1g", "1:1.2.13.dfsg-1", "/usr/lib/x86_64-linux-gnu/libz.so.1"))
+	if f := find(run(c, snapOf(base()), archive()), key); f != nil {
+		t.Errorf("a cache that gained a packaged library is ranked %q", f.Severity)
+	}
+
+	// A newly listed library that no package owns: what a hijack looks like.
+	for name, c := range map[string]*model.Collection{
+		"unowned library":      rebuilt("/usr/lib/x86_64-linux-gnu/libssl.so.3", "/var/tmp/.x/libssl.so.3"),
+		"cache not parsed":     rebuilt(),
+		"only unowned entries": rebuilt("/usr/local/lib/libsync.so"),
+	} {
+		if name == "cache not parsed" {
+			c.LinkerCache = nil
+		}
+		f := find(run(c, snapOf(base()), archive()), key)
+		if f == nil || f.Severity != model.SevBackdoor {
+			t.Errorf("%s: want a backdoor sign for the changed cache, got %+v", name, f)
+		}
+	}
+
+	// A snapshot from before telltale recorded the cache: every listed
+	// library has to belong to a package.
+	old := base()
+	old.LinkerCache = nil
+	if f := find(run(rebuilt("/usr/lib/x86_64-linux-gnu/libssl.so.3"), snapOf(old), archive()), key); f != nil {
+		t.Errorf("old snapshot, packaged libraries only: ranked %q", f.Severity)
+	}
+	if f := find(run(rebuilt("/opt/x/libx.so"), snapOf(old), archive()), key); f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("old snapshot, unowned library: want a backdoor sign, got %+v", f)
+	}
+}
+
+// /etc/mtab re-pointed between the two names of the kernel's mount table is
+// what package upgrades do; pointed anywhere else it is still a bad link.
+func TestJudgeMtabLinkToTheMountTable(t *testing.T) {
+	link := func(target string) model.FileEntry {
+		return model.FileEntry{Path: "/etc/mtab", Type: "symlink", Target: target, Mode: 0o120777, MTime: taken, CTime: taken}
+	}
+	scan := func(from, to string) *model.Finding {
+		old, cur := clean(), clean()
+		old.Files = append(old.Files, link(from))
+		cur.Files = append(cur.Files, link(to))
+		return find(run(cur, snapOf(old), archive()), "snap.file_modified:/etc/mtab")
+	}
+	for _, to := range []string{"../proc/self/mounts", "/proc/self/mounts"} {
+		if f := scan("/proc/mounts", to); f == nil || f.Severity != model.SevNote {
+			t.Errorf("/etc/mtab -> %s: want a note, got %+v", to, f)
+		}
+	}
+	for _, to := range []string{"/proc/1/root/mounts", "/var/lib/x/mounts", "/tmp/m"} {
+		if f := scan("/proc/mounts", to); f == nil || f.Severity != model.SevBackdoor {
+			t.Errorf("/etc/mtab -> %s: want a backdoor sign, got %+v", to, f)
+		}
+	}
+}

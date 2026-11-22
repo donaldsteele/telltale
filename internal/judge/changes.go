@@ -281,6 +281,11 @@ func badLink(p string, old, cur *model.FileEntry) string {
 			return "it points into a hidden directory"
 		}
 	}
+	// /etc/mtab is a link to the kernel's own mount table on every current
+	// system; packages re-point it between the two spellings of that file.
+	if p == "/etc/mtab" && (t == "/proc/mounts" || t == "/proc/self/mounts") {
+		return ""
+	}
 	if old != nil && (old.Type != "symlink" || old.Target != cur.Target) &&
 		!slices.ContainsFunc(systemDirs, func(d string) bool { return t == d || strings.HasPrefix(t, d+"/") }) {
 		return "it was pointed outside the system directories"
@@ -354,6 +359,8 @@ func (j *judge) fileChange(ch diff.Change) {
 		cat = catAccount
 	case j.placed(ch, e, old, cur, owner, ev):
 		return
+	case p == linkerCachePath && j.linkerCacheRebuilt(ev):
+		return
 	case maintainerScript(p) && cur != nil:
 		cat = catMaintScript
 	case generatedFile(p):
@@ -426,6 +433,49 @@ func (j *judge) fileChange(ch diff.Change) {
 		Evidence: []model.Evidence{ev},
 		Refs:     refs,
 	})
+}
+
+const linkerCachePath = "/etc/ld.so.cache"
+
+// linkerCacheRebuilt shows a changed linker cache quietly, and reports
+// whether it did. ldconfig rewrites the cache whenever a package with
+// libraries is installed or upgraded, so its bytes change with ordinary
+// updates. What the cache can be abused for is sending programs to a library
+// of the attacker's, so the change is routine only when every file it lists
+// now was either listed in the snapshot's cache too or belongs to an
+// installed package (whose files are verified in their own right). One
+// listed file that is neither keeps the change a ranked finding.
+func (j *judge) linkerCacheRebuilt(ev model.Evidence) bool {
+	if j.c.LinkerCache == nil || j.old == nil || j.files[linkerCachePath] == nil || j.files[linkerCachePath].Type != "file" {
+		return false
+	}
+	before := make(map[string]bool, len(j.old.LinkerCache))
+	for _, p := range j.old.LinkerCache {
+		before[p] = true
+	}
+	added := 0
+	for _, p := range j.c.LinkerCache {
+		if before[p] {
+			continue
+		}
+		if j.owned[p] == "" {
+			return false
+		}
+		added++
+	}
+	const key = "rebuilt:" + linkerCachePath
+	g := j.groups[key]
+	if g == nil {
+		g = &model.Finding{
+			Key: key, ID: "TT-EXPL-003", Source: srcSnapshot, Severity: model.SevExplained,
+			Title: "The library cache " + linkerCachePath + " was rebuilt",
+			Why:   "ldconfig rewrites this cache whenever a package with libraries is installed or upgraded. Every library it lists now was listed in the snapshot too or belongs to an installed package, so it sends programs nowhere new.",
+		}
+		j.groups[key] = g
+	}
+	ev.Detail = fmt.Sprintf("rebuilt; %d %s, all from installed packages", added, plural(added, "library is newly listed", "libraries are newly listed"))
+	j.attach(g, ev, maxExplainedEvidence)
+	return true
 }
 
 // placed shows a file change as part of what explains it, and reports
