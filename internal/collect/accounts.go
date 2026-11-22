@@ -1,6 +1,7 @@
 package collect
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 
@@ -10,23 +11,29 @@ import (
 
 const accountsCheck = "accounts"
 
-// Accounts reads passwd, group and shadow under root. Shadow is reduced to a
-// PasswordState; the hash itself is never kept.
+// Accounts reads passwd, shadow, group and gshadow under root the way
+// glibc's files backend does (see nssfiles.go). Shadow and gshadow are
+// reduced to password states; the hashes themselves are never kept.
 func Accounts(root string, key []byte) (model.Accounts, []model.Skip) {
 	var acc model.Accounts
 	var skips []model.Skip
+	var rep accountsReport
 	skip := func(path, reason string) {
 		skips = append(skips, model.Skip{Check: accountsCheck, Reason: path + ": " + reason})
 	}
 
-	shadow := map[string][]string{}
+	shadow := map[string]spLine{}
 	sh, err := readRaw(root, "/etc/shadow", 4<<20)
 	switch {
 	case err == nil:
-		for _, line := range splitLines(sh) {
-			f := strings.Split(line, ":")
-			if len(f) >= 2 && f[0] != "" {
-				shadow[f[0]] = f
+		db := newAccountDB("/etc/shadow", &rep)
+		for _, l := range nssLines(sh) {
+			s, ok := parseShadow(l.text)
+			switch {
+			case !ok:
+				db.malformed(l.n)
+			case s.name != "" && db.first(s.name):
+				shadow[s.name] = s
 			}
 		}
 	case !isNotExist(err):
@@ -37,20 +44,23 @@ func Accounts(root string, key []byte) (model.Accounts, []model.Skip) {
 	if err != nil {
 		skip("/etc/passwd", err.Error())
 	}
-	for _, line := range splitLines(pw) {
-		f := strings.Split(line, ":")
-		if len(f) < 7 || strings.HasPrefix(line, "#") {
+	db := newAccountDB("/etc/passwd", &rep)
+	for _, l := range nssLines(pw) {
+		f, ok := parsePasswd(l.text)
+		if !ok {
+			db.malformed(l.n)
 			continue
 		}
-		u := model.User{Name: f[0], Home: f[5], Shell: f[6]}
-		u.UID, _ = strconv.Atoi(f[2])
-		u.GID, _ = strconv.Atoi(f[3])
+		if f.name == "" || !db.first(f.name) {
+			continue
+		}
+		u := model.User{Name: f.name, UID: f.uid, GID: f.gid, Home: f.home, Shell: f.shell}
 		u.Password = model.PasswordState{Algo: "none", LastChange: -1, MaxDays: -1}
-		if f[1] != "x" && !strings.HasPrefix(f[1], "##") {
+		if f.passwd != "x" && !strings.HasPrefix(f.passwd, "##") {
 			// The passwd field is not a shadow reference: it is the hash itself.
-			u.Password = reduceShadow(key, []string{f[0], f[1]})
-		} else if s, ok := shadow[f[0]]; ok {
-			u.Password = reduceShadow(key, s)
+			u.Password = reduceShadow(key, []string{f.name, f.passwd})
+		} else if s, ok := shadow[f.name]; ok {
+			u.Password = reduceShadow(key, []string{s.name, s.passwd, strconv.Itoa(s.lastChange), "", strconv.Itoa(s.maxDays)})
 		}
 		acc.Users = append(acc.Users, u)
 	}
@@ -62,16 +72,14 @@ func Accounts(root string, key []byte) (model.Accounts, []model.Skip) {
 	switch {
 	case err == nil:
 		gshadow = map[string]model.GroupShadow{}
-		for _, line := range splitLines(gs) {
-			f := strings.Split(line, ":")
-			if len(f) < 4 || f[0] == "" || strings.HasPrefix(line, "#") {
+		db := newAccountDB("/etc/gshadow", &rep)
+		for _, l := range nssLines(gs) {
+			s, _ := parseGShadow(l.text)
+			if s.name == "" || !db.first(s.name) {
 				continue
 			}
-			if _, dup := gshadow[f[0]]; dup {
-				continue // the first line counts, as for the group tools
-			}
-			pw := f[1] != "" && !strings.HasPrefix(f[1], "!") && !strings.HasPrefix(f[1], "*")
-			gshadow[f[0]] = model.GroupShadow{PasswordSet: pw, Admins: splitList(f[2]), Members: splitList(f[3])}
+			set := s.passwd != "" && !strings.HasPrefix(s.passwd, "!") && !strings.HasPrefix(s.passwd, "*")
+			gshadow[s.name] = model.GroupShadow{PasswordSet: set, Admins: s.admins, Members: s.members}
 		}
 	case !isNotExist(err):
 		skip("/etc/gshadow", err.Error())
@@ -81,30 +89,26 @@ func Accounts(root string, key []byte) (model.Accounts, []model.Skip) {
 	if err != nil {
 		skip("/etc/group", err.Error())
 	}
-	for _, line := range splitLines(gr) {
-		f := strings.Split(line, ":")
-		if len(f) < 4 || strings.HasPrefix(line, "#") {
+	db = newAccountDB("/etc/group", &rep)
+	for _, l := range nssLines(gr) {
+		f, ok := parseGroup(l.text)
+		if !ok {
+			db.malformed(l.n)
 			continue
 		}
-		g := model.Group{Name: f[0]}
-		g.GID, _ = strconv.Atoi(f[2])
-		if f[3] != "" {
-			g.Members = strings.Split(f[3], ",")
+		if f.name == "" || !db.first(f.name) {
+			continue
 		}
+		g := model.Group{Name: f.name, GID: f.gid, Members: f.members}
 		if gshadow != nil {
-			s := gshadow[f[0]]
+			s := gshadow[f.name]
 			g.Shadow = &s
 		}
 		acc.Groups = append(acc.Groups, g)
 	}
+	sort.Strings(rep.duplicates)
+	acc.Duplicates, acc.Malformed = rep.duplicates, rep.malformed
 	return acc, skips
-}
-
-func splitList(s string) []string {
-	if s == "" {
-		return nil
-	}
-	return strings.Split(s, ",")
 }
 
 func reduceShadow(key []byte, f []string) model.PasswordState {

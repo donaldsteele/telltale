@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -178,5 +179,76 @@ func TestAccountsGShadowReduced(t *testing.T) {
 	acc, _ = Accounts(dir, testKey)
 	if g, _ := groupByName(acc, "sudo"); g.Shadow != nil {
 		t.Fatalf("shadow without gshadow: %+v", g.Shadow)
+	}
+}
+
+// accountsRoot writes the four account files into a fresh root.
+func accountsRoot(t *testing.T, passwd, shadow, group, gshadow string) string {
+	t.Helper()
+	d := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(d, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{"passwd": passwd, "shadow": shadow, "group": group, "gshadow": gshadow} {
+		if err := os.WriteFile(filepath.Join(d, "etc", name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return d
+}
+
+// The account files are read the way glibc's files backend reads them
+// (checked against getent): the first line for a name counts, short lines
+// are accepted as glibc accepts them, and every duplicate name and rejected
+// line is recorded.
+func TestAccountsReadLikeGlibc(t *testing.T) {
+	pw := "root:x:0:0:root:/root:/bin/bash\n"
+	before, _ := Accounts(accountsRoot(t, pw, "root:$y$orig:20000:0:99999:7:::\n", "sudo:x:27:alice\n", "sudo:!::alice\n"), testKey)
+	after, _ := Accounts(accountsRoot(t,
+		pw+"toor:x:0:0\n  spaced:x:1001:1001::/home/spaced:/bin/sh\nbad:x:notanumber:0:::\nshort:x:5\n# comment\n\n",
+		"root:$6$attacker:20000:0:99999:7:::\nroot:$y$orig:20000:0:99999:7:::\nnoage:$y$x\n",
+		"sudo:x:27:alice\nsudo:x:27:eve\nnogid:x\n",
+		"sudo:$6$grouphash\n"), testKey)
+
+	// shadow: the prepended line is the one glibc uses.
+	root, _ := userByName(after, "root")
+	if b, _ := userByName(before, "root"); root.Password.Digest == b.Password.Digest {
+		t.Errorf("root's password read from the last shadow line, not the first")
+	}
+	// passwd: a 4-field line is a real account with uid 0.
+	if toor, ok := userByName(after, "toor"); !ok || toor.UID != 0 || toor.Shell != "" {
+		t.Errorf("toor = %+v (found %v)", toor, ok)
+	}
+	// Leading blanks are skipped, as glibc does.
+	if _, ok := userByName(after, "spaced"); !ok {
+		t.Errorf("leading blanks not skipped")
+	}
+	// group: the first sudo line counts; the duplicate is recorded.
+	sudo, _ := groupByName(after, "sudo")
+	if len(sudo.Members) != 1 || sudo.Members[0] != "alice" {
+		t.Errorf("sudo members = %v", sudo.Members)
+	}
+	// gshadow: a 2-field line gives sudo a group password.
+	if sudo.Shadow == nil || !sudo.Shadow.PasswordSet {
+		t.Errorf("sudo gshadow = %+v", sudo.Shadow)
+	}
+	for _, want := range []string{"/etc/shadow:root", "/etc/group:sudo"} {
+		if !slices.Contains(after.Duplicates, want) {
+			t.Errorf("duplicates %v lack %q", after.Duplicates, want)
+		}
+	}
+	for _, want := range []string{"/etc/passwd:4", "/etc/passwd:5", "/etc/shadow:3", "/etc/group:3"} {
+		if !slices.Contains(after.Malformed, want) {
+			t.Errorf("malformed %v lack %q", after.Malformed, want)
+		}
+	}
+	js, _ := json.Marshal(after)
+	for _, secret := range []string{"attacker", "grouphash", "orig"} {
+		if strings.Contains(string(js), secret) {
+			t.Errorf("result contains %q", secret)
+		}
+	}
+	if len(before.Duplicates) != 0 || len(before.Malformed) != 0 {
+		t.Errorf("clean files: duplicates %v malformed %v", before.Duplicates, before.Malformed)
 	}
 }

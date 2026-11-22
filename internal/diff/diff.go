@@ -234,13 +234,20 @@ func comparePersist(old, cur []model.PersistFile) []Change {
 }
 
 func compareAccounts(old, cur model.Accounts) []Change {
+	// The first entry for a name counts, as for glibc's lookups; later
+	// duplicates are reported by the collector, not compared here.
 	om := make(map[string]model.User, len(old.Users))
 	for _, u := range old.Users {
-		om[u.Name] = u
+		if _, dup := om[u.Name]; !dup {
+			om[u.Name] = u
+		}
 	}
 	seen := make(map[string]bool, len(cur.Users))
 	var out []Change
 	for _, n := range cur.Users {
+		if seen[n.Name] {
+			continue
+		}
 		seen[n.Name] = true
 		o, ok := om[n.Name]
 		if !ok {
@@ -276,8 +283,10 @@ func compareAccounts(old, cur model.Accounts) []Change {
 			out = append(out, Change{Kind: UserChanged, Subject: n.Name, Before: b, After: a})
 		}
 	}
+	gone := map[string]bool{}
 	for _, o := range old.Users {
-		if !seen[o.Name] {
+		if !seen[o.Name] && !gone[o.Name] {
+			gone[o.Name] = true
 			out = append(out, Change{Kind: UserRemoved, Subject: o.Name,
 				Before: fmt.Sprintf("uid %d gid %d shell %s home %s", o.UID, o.GID, o.Shell, o.Home)})
 		}
@@ -310,11 +319,16 @@ func sortedJoin(ss []string) string {
 func compareGroups(old, cur []model.Group) []Change {
 	om := make(map[string]model.Group, len(old))
 	for _, g := range old {
-		om[g.Name] = g
+		if _, dup := om[g.Name]; !dup {
+			om[g.Name] = g
+		}
 	}
 	seen := make(map[string]bool, len(cur))
 	var out []Change
 	for _, n := range cur {
+		if seen[n.Name] {
+			continue
+		}
 		seen[n.Name] = true
 		o, ok := om[n.Name]
 		if !ok {
@@ -326,8 +340,10 @@ func compareGroups(old, cur []model.Group) []Change {
 			out = append(out, Change{Kind: GroupChanged, Subject: n.Name, Before: b, After: a})
 		}
 	}
+	gone := map[string]bool{}
 	for _, o := range old {
-		if !seen[o.Name] {
+		if !seen[o.Name] && !gone[o.Name] {
+			gone[o.Name] = true
 			out = append(out, Change{Kind: GroupChanged, Subject: o.Name, Before: describeGroup(o, true), After: absent})
 		}
 	}

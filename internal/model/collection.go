@@ -68,10 +68,16 @@ type FileEntry struct {
 	CTime  time.Time `json:"ctime"`
 }
 
-// Accounts holds local users and groups.
+// Accounts holds local users and groups, read the way glibc's files
+// backend reads them: the first line for a name is the one that counts.
+// Duplicates lists "<file>:<name>" for every name that appears on more than
+// one line; Malformed lists "<file>:<line number>" for every line glibc
+// would reject (never the line's content, which may hold a password hash).
 type Accounts struct {
-	Users  []User  `json:"users"`
-	Groups []Group `json:"groups"`
+	Users      []User   `json:"users"`
+	Groups     []Group  `json:"groups"`
+	Duplicates []string `json:"duplicates,omitempty"`
+	Malformed  []string `json:"malformed,omitempty"`
 }
 
 // User is one passwd entry plus its password state.

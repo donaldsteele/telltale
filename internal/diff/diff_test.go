@@ -293,3 +293,21 @@ func TestCompareGroupShadow(t *testing.T) {
 		}
 	}
 }
+
+// The first entry for a name is the one that counts, as for glibc; later
+// duplicates neither hide nor fake a change.
+func TestCompareAccountsFirstEntryCounts(t *testing.T) {
+	old := &model.Collection{Accounts: model.Accounts{
+		Users:  []model.User{{Name: "root", UID: 0, Shell: "/bin/bash"}, {Name: "root", UID: 0, Shell: "/bin/sh"}},
+		Groups: []model.Group{{Name: "sudo", GID: 27, Members: []string{"alice"}}},
+	}}
+	cur := &model.Collection{Accounts: model.Accounts{
+		Users:  []model.User{{Name: "root", UID: 0, Shell: "/bin/bash"}},
+		Groups: []model.Group{{Name: "sudo", GID: 27, Members: []string{"alice"}}, {Name: "sudo", GID: 27, Members: []string{"alice", "eve"}}},
+	}}
+	for _, c := range Compare(snap(old), cur, nil) {
+		if c.Subject == "root" || c.Subject == "sudo" {
+			t.Errorf("a later duplicate line was compared: %+v", c)
+		}
+	}
+}
