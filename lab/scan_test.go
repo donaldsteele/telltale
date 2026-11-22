@@ -59,7 +59,7 @@ func machineFor(t *testing.T, distro string, c labCase) *labkit.Machine {
 	if variant == "" {
 		variant = "clean"
 	}
-	image := labkit.BuildWith(t, distro, variant, labkit.BuildOpts{Newer: req.NewerSnapshot})
+	image := labkit.BuildWith(t, distro, variant, labkit.BuildOpts{Newer: req.NewerSnapshot, Systemd: req.Systemd})
 	return start(t, image, labkit.Opts{
 		Noexec:     variant == "noexec",
 		Privileged: req.Privileged,
@@ -85,7 +85,7 @@ func runCase(t *testing.T, distro string, c labCase) (with, without *model.Repor
 		mustExec(t, m, "sh /lab/"+filepath.Base(filepath.Dir(c.dir))+"/"+c.id+"/apply.sh >/run/telltale-lab/apply.log 2>&1 || { cat /run/telltale-lab/apply.log; exit 1; }")
 	}
 	putSnapshot(t, m, snap)
-	refs := refsFor(t, m)
+	refs, _ := refsFor(t, m)
 
 	with, _ = scan(t, m, "--snapshot", snapInside, "--refs", refs)
 	saveReport(t, distro, c.id+".with-snapshot", with)
@@ -206,7 +206,7 @@ func TestUpdateNoiseIsExplained(t *testing.T) {
 			}
 			t.Logf("%s: the upgrade changed %d packages", distro, changed)
 			putSnapshot(t, m, snap)
-			refs := refsFor(t, m)
+			refs, col := refsFor(t, m)
 			r, code := scan(t, m, "--snapshot", snapInside, "--refs", refs)
 			saveReport(t, distro, "update-noise.with-snapshot", r)
 			if code != 0 && code != 1 {
@@ -223,8 +223,12 @@ func TestUpdateNoiseIsExplained(t *testing.T) {
 				}
 			}
 			// Every changed package-owned file has to be in the explained
-			// group, not in the ranked list under its own name.
-			owners := collectOwners(t, m)
+			// group, not in the ranked list under its own name. Owners knows
+			// both spellings of a merged-/usr path (/lib/x and /usr/lib/x).
+			owners := col.Packages.Owners()
+			if len(owners) < 1000 {
+				t.Fatalf("only %d package-owned paths in the collection", len(owners))
+			}
 			for _, f := range r.Findings {
 				for _, family := range []string{"snap.file_modified:", "snap.file_added:", "snap.file_removed:", "snap.persist:", "pkg.mismatch:", "pkg.unverifiable:"} {
 					if p, ok := strings.CutPrefix(f.Key, family); ok && owners[p] != "" {
@@ -240,19 +244,6 @@ func TestUpdateNoiseIsExplained(t *testing.T) {
 			}
 		})
 	})
-}
-
-// collectOwners maps each package-owned path of the machine to its package.
-func collectOwners(t *testing.T, m *labkit.Machine) map[string]string {
-	t.Helper()
-	out := mustExec(t, m, `for f in /var/lib/dpkg/info/*.list; do p=$(basename "$f" .list); sed "s|\$| ${p%%:*}|" "$f"; done`)
-	owners := map[string]string{}
-	for _, l := range strings.Split(out, "\n") {
-		if i := strings.LastIndexByte(l, ' '); i > 0 {
-			owners[l[:i]] = l[i+1:]
-		}
-	}
-	return owners
 }
 
 // TestOfflineFallbackWarns scans a clean machine with --offline, the one case
@@ -320,7 +311,7 @@ func TestSystemdLiveUnit(t *testing.T) {
 				t.Fatalf("the unit never called the sink; sink log:\n%s", sink.Log(t))
 			}
 			putSnapshot(t, m, snap)
-			refs := refsFor(t, m)
+			refs, _ := refsFor(t, m)
 			with, _ := scan(t, m, "--snapshot", snapInside, "--refs", refs)
 			saveReport(t, distro, "systemd-live.with-snapshot", with)
 			checkReport(t, man, with, true)

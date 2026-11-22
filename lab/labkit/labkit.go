@@ -151,17 +151,15 @@ func ensureEgressNetwork(t testing.TB) {
 	egressReady = true
 }
 
-// createNetwork makes a labelled lab network. One left from before the lab
-// labelled its networks is replaced when nothing is attached to it.
+// createNetwork makes a labelled lab network. A network of that name without
+// the label is not the lab's to use or to remove: the test fails and says so.
 func createNetwork(t testing.TB, name string, internal bool) {
 	t.Helper()
 	if lbl, _, code := docker("network", "inspect", "--format", `{{index .Labels "telltale-lab"}}`, name); code == 0 {
 		if strings.TrimSpace(lbl) == "1" {
 			return
 		}
-		if _, _, code := docker("network", "rm", name); code != 0 {
-			return // in use: keep it as it is
-		}
+		t.Fatalf("a Docker network named %s exists without the label %s, so the lab did not create it and will not touch it; remove or rename it (docker network rm %s) and run again", name, Label, name)
 	}
 	args := []string{"network", "create", "--label", Label}
 	if internal {
@@ -270,12 +268,14 @@ func BuildWith(t testing.TB, distro, variant string, bo BuildOpts) string {
 	return tag
 }
 
-// RemoveImages removes every telltale-lab image of one distro and forgets
-// that they were built. Images of other projects are never touched.
+// RemoveImages removes every image of one distro that is both named
+// telltale-lab/<distro>-* and labelled telltale-lab=1, and forgets that they
+// were built. Images of other projects are never touched.
 func RemoveImages(distro string) {
 	buildMu.Lock()
 	defer buildMu.Unlock()
-	out, _, _ := docker("image", "ls", "--format", "{{.Repository}}:{{.Tag}}", "--filter", "reference=telltale-lab/"+distro+"-*")
+	out, _, _ := docker("image", "ls", "--format", "{{.Repository}}:{{.Tag}}",
+		"--filter", "reference=telltale-lab/"+distro+"-*", "--filter", "label="+Label)
 	for _, tag := range strings.Fields(out) {
 		if strings.HasPrefix(tag, "telltale-lab/"+distro+"-") {
 			docker("image", "rm", tag)

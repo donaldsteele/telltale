@@ -64,6 +64,11 @@ fi
 # LAB_SYSTEMD=1: systemd as PID 1 (labkit Opts.Systemd), for the live unit test.
 if [ "${LAB_SYSTEMD:-0}" = 1 ]; then
   apt-get install -y --no-install-recommends systemd systemd-sysv dbus
+  # The systemd machine runs privileged. No login prompts on consoles: it must
+  # never open the host's virtual terminals.
+  for u in getty@.service serial-getty@.service console-getty.service getty.target; do
+    ln -sf /dev/null "/etc/systemd/system/$u"
+  done
 fi
 apt-get clean
 rm -rf /var/lib/apt/lists/*

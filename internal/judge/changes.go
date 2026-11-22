@@ -442,9 +442,10 @@ const linkerCachePath = "/etc/ld.so.cache"
 // libraries is installed or upgraded, so its bytes change with ordinary
 // updates. What the cache can be abused for is sending programs to a library
 // of the attacker's, so the change is routine only when every file it lists
-// now was either listed in the snapshot's cache too or belongs to an
-// installed package (whose files are verified in their own right). One
-// listed file that is neither keeps the change a ranked finding.
+// now was either listed in the snapshot's cache too, or is a package's file
+// that this scan verified (see loadsVerified). Being owned by a package is
+// not enough. One listed file that is neither keeps the change a ranked
+// finding.
 func (j *judge) linkerCacheRebuilt(ev model.Evidence) bool {
 	if j.c.LinkerCache == nil || j.old == nil || j.files[linkerCachePath] == nil || j.files[linkerCachePath].Type != "file" {
 		return false
@@ -458,7 +459,7 @@ func (j *judge) linkerCacheRebuilt(ev model.Evidence) bool {
 		if before[p] {
 			continue
 		}
-		if j.owned[p] == "" {
+		if !j.loadsVerified(p) {
 			return false
 		}
 		added++
@@ -469,13 +470,42 @@ func (j *judge) linkerCacheRebuilt(ev model.Evidence) bool {
 		g = &model.Finding{
 			Key: key, ID: "TT-EXPL-003", Source: srcSnapshot, Severity: model.SevExplained,
 			Title: "The library cache " + linkerCachePath + " was rebuilt",
-			Why:   "ldconfig rewrites this cache whenever a package with libraries is installed or upgraded. Every library it lists now was listed in the snapshot too or belongs to an installed package, so it sends programs nowhere new.",
+			Why:   "ldconfig rewrites this cache whenever a package with libraries is installed or upgraded. Every library it lists now was listed in the snapshot too or is a package file that matches " + j.refWords() + ", so it sends programs nowhere new.",
 		}
 		j.groups[key] = g
 	}
-	ev.Detail = fmt.Sprintf("rebuilt; %d %s, all from installed packages", added, plural(added, "library is newly listed", "libraries are newly listed"))
+	ev.Detail = fmt.Sprintf("rebuilt; %d %s, all verified package files", added, plural(added, "library is newly listed", "libraries are newly listed"))
 	j.attach(g, ev, maxExplainedEvidence)
 	return true
+}
+
+// loadsVerified reports whether the file the linker would load for a cache
+// entry is a package's file that this scan verified as it is now. Links are
+// followed to the file itself (most entries are a package's link to its
+// library). A configuration file never counts: package verification does not
+// compare those, so one overwritten with a library would pass.
+func (j *judge) loadsVerified(p string) bool {
+	for hop := 0; hop < 8; hop++ {
+		e := j.files[p]
+		if e == nil {
+			if p = usrAlias(p); p == "" {
+				return false
+			}
+			if e = j.files[p]; e == nil {
+				return false
+			}
+		}
+		if e.Type == "symlink" {
+			p = linkTarget(p, e.Target)
+			continue
+		}
+		if conffileOwner(j.c.Packages.Installed, p) != "" {
+			return false
+		}
+		v, ok := j.verified[p]
+		return ok && j.verifiedNow(v, e) && (v.Source != pkgverify.SourceOfflineLocal || j.pkgChanged(v.Package))
+	}
+	return false
 }
 
 // placed shows a file change as part of what explains it, and reports

@@ -98,6 +98,18 @@ func buildBundle(bin, key string, collectionJSON []byte) error {
 	if _, err := os.Stat(filepath.Join(dst, "bundle.json")); err == nil {
 		return nil
 	}
+	// A directory without bundle.json is what a killed run left: it would
+	// block the rename below for ever. The same goes for old build
+	// directories of this bundle (the lab lock means no one else is
+	// building it now).
+	if err := os.RemoveAll(dst); err != nil {
+		return err
+	}
+	if stale, err := filepath.Glob(filepath.Join(RefsRoot(), ".building-"+key+"-*")); err == nil {
+		for _, d := range stale {
+			_ = os.RemoveAll(d)
+		}
+	}
 	fetchSlots <- struct{}{}
 	defer func() { <-fetchSlots }()
 	tmp, err := os.MkdirTemp(RefsRoot(), ".building-"+key+"-")

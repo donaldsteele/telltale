@@ -18,8 +18,9 @@ import (
 const MinFreeBytes = 3 << 30
 
 // Main runs a lab test binary. It holds a host-wide lock (lab packages never
-// run side by side, so the clean-up below cannot hit a running test), skips
-// everything when the Docker root is short of space, removes what an earlier
+// run side by side, so the clean-up below cannot hit a running test), fails
+// when Docker cannot be used, skips everything when the Docker root is short
+// of space, removes what an earlier
 // killed run left behind, runs the tests, and leaves no container or network.
 // Only objects labelled telltale-lab=1 are ever removed.
 func Main(m *testing.M) int {
@@ -31,8 +32,9 @@ func Main(m *testing.M) int {
 	defer unlock()
 	free, root, err := DockerFree()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "lab: SKIP: Docker is not usable here:", err)
-		return 0
+		// Not a skip: a lab run that tested nothing must not look like a pass.
+		fmt.Fprintln(os.Stderr, "lab: FAIL: Docker is not usable here, so no lab test ran:", err)
+		return 1
 	}
 	if free < MinFreeBytes {
 		fmt.Fprintf(os.Stderr, "lab: SKIP: %s has %.1f GB free; the lab needs at least %d GB. Nothing was run.\n",

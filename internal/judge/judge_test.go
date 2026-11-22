@@ -2783,64 +2783,125 @@ func TestJudgeSaysContainerModulesBelongToTheHost(t *testing.T) {
 
 // ldconfig rewrites /etc/ld.so.cache on every library update. The change is
 // quiet only when the cache lists nothing but what the snapshot's cache
-// listed and files of installed packages.
+// listed and package files this scan verified.
 func TestJudgeLinkerCacheRebuild(t *testing.T) {
 	const cache = "/etc/ld.so.cache"
 	const key = "snap.file_modified:" + cache
+	const ssl, zlink, zfile = "/usr/lib/x86_64-linux-gnu/libssl.so.3", "/usr/lib/x86_64-linux-gnu/libz.so.1", "/usr/lib/x86_64-linux-gnu/libz.so.1.2.13"
 	base := func() *model.Collection {
 		c := clean()
-		c.Files = append(c.Files, file(cache, "cache 1", 0o644))
-		c.Packages.Installed = append(c.Packages.Installed, pkg("libssl3", "3.0.14-1~deb12u2", "/usr/lib/x86_64-linux-gnu/libssl.so.3"))
-		c.LinkerCache = []string{"/usr/lib/x86_64-linux-gnu/libssl.so.3"}
+		c.Files = append(c.Files, file(cache, "cache 1", 0o644), file(ssl, "libssl", 0o644))
+		c.Packages.Installed = append(c.Packages.Installed, pkg("libssl3", "3.0.14-1~deb12u2", ssl))
+		c.LinkerCache = []string{ssl}
 		return c
 	}
+	// rebuilt is base with new cache bytes listing these paths.
 	rebuilt := func(listed ...string) *model.Collection {
 		c := base()
-		c.Files[len(c.Files)-1] = file(cache, "cache 2", 0o644)
+		for i := range c.Files {
+			if c.Files[i].Path == cache {
+				c.Files[i] = file(cache, "cache 2", 0o644)
+			}
+		}
 		c.LinkerCache = listed
 		return c
 	}
+	// withZlib installs zlib1g: the library and the link to it the cache lists.
+	withZlib := func(c *model.Collection, content string) pkgverify.FileVerdict {
+		lib := file(zfile, content, 0o644)
+		c.Files = append(c.Files, lib, model.FileEntry{Path: zlink, Type: "symlink", Target: "libz.so.1.2.13", Mode: 0o120777, MTime: taken, CTime: taken})
+		c.Packages.Installed = append(c.Packages.Installed, pkg("zlib1g", "1:1.2.13.dfsg-1", zlink, zfile))
+		return pkgverify.FileVerdict{Path: zfile, Package: "zlib1g", Version: "1:1.2.13.dfsg-1", Expected: lib.SHA256, Actual: lib.SHA256, Source: "archive"}
+	}
+	ranked := func(r *model.Report) *model.Finding { return find(r, key) }
 
 	// Same libraries, new bytes (a newer ldconfig wrote it).
-	r := run(rebuilt("/usr/lib/x86_64-linux-gnu/libssl.so.3"), snapOf(base()), archive())
-	if f := find(r, key); f != nil {
+	r := run(rebuilt(ssl), snapOf(base()), archive())
+	if f := ranked(r); f != nil {
 		t.Errorf("a rebuilt cache listing the same libraries is ranked %q", f.Severity)
 	}
 	if explained(r, "rebuilt:"+cache) == nil {
 		t.Errorf("the rebuilt cache is not shown among the explained items")
 	}
 
-	// A newly listed library that an installed package owns.
-	c := rebuilt("/usr/lib/x86_64-linux-gnu/libssl.so.3", "/usr/lib/x86_64-linux-gnu/libz.so.1")
-	c.Packages.Installed = append(c.Packages.Installed, pkg("zlib1g", "1:1.2.13.dfsg-1", "/usr/lib/x86_64-linux-gnu/libz.so.1"))
-	if f := find(run(c, snapOf(base()), archive()), key); f != nil {
-		t.Errorf("a cache that gained a packaged library is ranked %q", f.Severity)
+	// A newly listed library, reached through its package's link, that this
+	// scan verified. The cache spells the path the pre-merge way.
+	c := rebuilt(ssl, "/lib/x86_64-linux-gnu/libz.so.1")
+	v := withZlib(c, "libz")
+	if f := ranked(run(c, snapOf(base()), archive(v))); f != nil {
+		t.Errorf("a cache that gained a verified packaged library is ranked %q", f.Severity)
 	}
 
-	// A newly listed library that no package owns: what a hijack looks like.
-	for name, c := range map[string]*model.Collection{
-		"unowned library":      rebuilt("/usr/lib/x86_64-linux-gnu/libssl.so.3", "/var/tmp/.x/libssl.so.3"),
-		"cache not parsed":     rebuilt(),
-		"only unowned entries": rebuilt("/usr/local/lib/libsync.so"),
-	} {
-		if name == "cache not parsed" {
-			c.LinkerCache = nil
+	// The same library owned by the package but not verified in this scan,
+	// and verified as something other than what is there now.
+	c = rebuilt(ssl, zlink)
+	withZlib(c, "libz")
+	if f := ranked(run(c, snapOf(base()), archive())); f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("owned but unverified library: want a backdoor sign, got %+v", f)
+	}
+	c = rebuilt(ssl, zlink)
+	v = withZlib(c, "libz, replaced")
+	v.Actual = h("libz")
+	if f := ranked(run(c, snapOf(base()), archive(v))); f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("library changed after verification: want a backdoor sign, got %+v", f)
+	}
+
+	// A package's configuration file overwritten with a library and listed in
+	// the cache: package verification never compares conffiles, so owning the
+	// path explains nothing, whichever way the path is spelled.
+	for _, listed := range []string{"/etc/openssl/libevil.so", "/usr/lib/ssl/libevil.so", "/lib/ssl/libevil.so"} {
+		conf := listed
+		if conf == "/lib/ssl/libevil.so" {
+			conf = "/usr/lib/ssl/libevil.so"
 		}
-		f := find(run(c, snapOf(base()), archive()), key)
+		c = rebuilt(ssl, listed)
+		lib := file(conf, "elf", 0o644)
+		c.Files = append(c.Files, lib)
+		for i := range c.Packages.Installed {
+			if c.Packages.Installed[i].Name == "openssl" {
+				c.Packages.Installed[i].Files = append(c.Packages.Installed[i].Files, conf)
+				c.Packages.Installed[i].Conffiles = map[string]string{conf: "0123"}
+			}
+		}
+		// Even a verdict that calls the file verified does not count.
+		cv := pkgverify.FileVerdict{Path: conf, Package: "openssl", Version: "3.0.14-1~deb12u2", Expected: lib.SHA256, Actual: lib.SHA256, Source: "archive"}
+		rep := run(c, snapOf(base()), archive(cv))
+		if f := ranked(rep); f == nil || f.Severity != model.SevBackdoor {
+			t.Errorf("conffile %s listed in the cache: want a backdoor sign, got %+v", listed, f)
+		}
+		if explained(rep, "rebuilt:"+cache) != nil {
+			t.Errorf("conffile %s listed in the cache: the rebuild is explained", listed)
+		}
+	}
+
+	// A newly listed library that no package owns, a link that leads to one,
+	// and a cache that could not be parsed.
+	loop := rebuilt(ssl, zlink)
+	loop.Files = append(loop.Files, model.FileEntry{Path: zlink, Type: "symlink", Target: "/var/tmp/.x/libz.so.1", Mode: 0o120777})
+	unparsed := rebuilt()
+	unparsed.LinkerCache = nil
+	for name, c := range map[string]*model.Collection{
+		"unowned library":      rebuilt(ssl, "/var/tmp/.x/libssl.so.3"),
+		"only unowned entries": rebuilt("/usr/local/lib/libsync.so"),
+		"link to an unowned":   loop,
+		"cache not parsed":     unparsed,
+	} {
+		f := ranked(run(c, snapOf(base()), archive()))
 		if f == nil || f.Severity != model.SevBackdoor {
 			t.Errorf("%s: want a backdoor sign for the changed cache, got %+v", name, f)
 		}
 	}
 
 	// A snapshot from before telltale recorded the cache: every listed
-	// library has to belong to a package.
+	// library has to be verified now.
 	old := base()
 	old.LinkerCache = nil
-	if f := find(run(rebuilt("/usr/lib/x86_64-linux-gnu/libssl.so.3"), snapOf(old), archive()), key); f != nil {
-		t.Errorf("old snapshot, packaged libraries only: ranked %q", f.Severity)
+	sslv := pkgverify.FileVerdict{Path: ssl, Package: "libssl3", Version: "3.0.14-1~deb12u2", Expected: h("libssl"), Actual: h("libssl"), Source: "archive"}
+	if f := ranked(run(rebuilt(ssl), snapOf(old), archive(sslv))); f != nil {
+		t.Errorf("old snapshot, verified libraries only: ranked %q", f.Severity)
 	}
-	if f := find(run(rebuilt("/opt/x/libx.so"), snapOf(old), archive()), key); f == nil || f.Severity != model.SevBackdoor {
-		t.Errorf("old snapshot, unowned library: want a backdoor sign, got %+v", f)
+	if f := ranked(run(rebuilt(ssl), snapOf(old), archive())); f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("old snapshot, library not verified: want a backdoor sign, got %+v", f)
 	}
 }
 

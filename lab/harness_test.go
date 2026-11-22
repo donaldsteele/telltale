@@ -7,12 +7,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +25,10 @@ import (
 )
 
 var binPath string
+
+// minParallel is the lowest -parallel the lab runs with; machineSlots is what
+// really bounds the load.
+const minParallel = 16
 
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "telltale-lab-bin")
@@ -37,6 +43,18 @@ func TestMain(m *testing.M) {
 		os.RemoveAll(dir)
 		println("build telltale:", err.Error(), string(out))
 		os.Exit(1)
+	}
+	// The tests that go over the distros all have to be running at once for
+	// the gate to move on (see distroGate), and each also needs room for its
+	// parallel machines. A low -parallel (the default on a small machine)
+	// would leave them waiting for each other until the timeout.
+	flag.Parse()
+	if f := flag.Lookup("test.parallel"); f != nil {
+		if n, err := strconv.Atoi(f.Value.String()); err == nil && n < minParallel {
+			if err := flag.Set("test.parallel", strconv.Itoa(minParallel)); err == nil {
+				fmt.Fprintf(os.Stderr, "lab: -parallel raised from %d to %d: the distro gate needs every lab test running at once\n", n, minParallel)
+			}
+		}
 	}
 	code := labkit.Main(m)
 	labGate.report()
@@ -298,8 +316,8 @@ func putSnapshot(t *testing.T, m *labkit.Machine, host string) {
 }
 
 // refsFor collects the machine as it is now and returns the path, inside the
-// machine, of the reference bundle for it.
-func refsFor(t *testing.T, m *labkit.Machine) string {
+// machine, of the reference bundle for it, and the collection.
+func refsFor(t *testing.T, m *labkit.Machine) (string, *model.Collection) {
 	t.Helper()
 	out, code := m.Exec(t, "sh", "-c", "telltale collect 2>"+errInside)
 	if code != 0 {
@@ -310,7 +328,11 @@ func refsFor(t *testing.T, m *labkit.Machine) string {
 	if err != nil {
 		t.Fatalf("%s: reference bundle: %v", m.Name, err)
 	}
-	return dir
+	var c model.Collection
+	if err := json.Unmarshal([]byte(out), &c); err != nil {
+		t.Fatalf("%s: parse collection: %v", m.Name, err)
+	}
+	return dir, &c
 }
 
 // scan runs "telltale scan ARGS --json -" in the machine.

@@ -22,7 +22,8 @@ The lab is careful with the Docker disk, which it usually shares:
 
 - It works through one distro at a time and removes that distro's images when its tests are done. Set `TELLTALE_LAB_KEEP_IMAGES=1` to keep them for the next run.
 - It skips everything, with a message, when Docker's root directory has less than 3 GB free.
-- Every container, network, volume and image it creates carries the label `telltale-lab=1`. A run starts by removing containers, volumes and networks with that label that a killed run left behind, and ends the same way. Nothing without the label is touched, and nothing is pruned.
+- Every container, network, volume and image it creates carries the label `telltale-lab=1`. A run starts by removing containers, volumes and networks with that label that a killed run left behind, and ends the same way. Nothing without the label is touched, and nothing is pruned. If a network named `telltale-lab` or `telltale-lab-egress` exists without the label, the lab fails and asks you to remove it.
+- A run fails, not skips, when Docker cannot be used. It raises `-parallel` to 16 when it is lower, because the tests have to move through the distros together.
 - Lab test binaries take a lock in the cache directory, so two never run side by side.
 
 `TELLTALE_LAB_DISTROS=debian12,ubuntu2404` limits a run to some distros. `TELLTALE_LAB_REPORTS=DIR` keeps every report as JSON under `DIR/<distro>/`.
@@ -46,7 +47,7 @@ Hostnames default to `<distro>-<variant>`; set `Opts.Hostname` for the made-up n
 ## Notes
 
 - The `noexec` variant is the plain image run with `--tmpfs /tmp:noexec --tmpfs /dev/shm:noexec`; `labkit.Start` adds those flags for it.
-- `Opts.Systemd` runs `/sbin/init` as PID 1 in a private cgroup namespace (the container is privileged so that systemd can manage its own cgroup tree; the host's tree is not mounted). It needs an image with systemd: `BuildWith(..., BuildOpts{Systemd: true})`.
+- `Opts.Systemd` runs `/sbin/init` as PID 1 in a private cgroup namespace (the container is privileged so that systemd can manage its own cgroup tree; the host's tree is not mounted, and the image masks the getty units so that it never opens the host's virtual terminals). It needs an image with systemd: `BuildWith(..., BuildOpts{Systemd: true})`.
 - `BuildOpts{Newer: true}` builds an image at the newer pinned snapshot, upgraded. The downgrade break runs on it and goes back to the older openssl .debs the build kept.
 - Machines get `CAP_SYS_PTRACE`, so that root in the container can see the programs of other accounts' processes, as root on a real machine can.
 - `Opts.ExecShm` (manifest `requires.exec_shm`) mounts `/dev/shm` without `noexec`. Docker's own `/dev/shm` is `noexec`; a real machine's is not.
@@ -59,7 +60,7 @@ Hostnames default to `<distro>-<variant>`; set `Opts.Hostname` for the made-up n
 
 - `standins/`: inert stand-ins, built at lab time (no binaries in git): `docker build -f lab/standins/Dockerfile.build -t telltale-lab/standins:dev lab/standins`. The image holds `/standins/<amd64|arm64>/{hider.so,pam_lab.so,listener,callback.sh}`. `callback.sh` connects to `sink:4444` once and exits (the callback breaks inline the same `/dev/tcp/sink/4444` command in the cron line, unit or profile script, so the entry itself shows the callback); `listener PORT` accepts and closes; `pam_lab.so` returns `PAM_IGNORE` from every hook; `hider.so` only hides the process named `lab-hidden` and TCP port 31337 from `ps`, `ss` and `/proc/net/tcp*`.
 - `breaks/<id>/apply.sh` plants one technique and `breaks/<id>/manifest.json` says what telltale must report. `scenarios/<id>/` does the same for a whole story (and `upgrade-while-running`, a legitimate event that must not alarm). Scripts run as root inside the machine and expect `lab/breaks`, `lab/scenarios` and the right-architecture stand-ins copied to `/lab/breaks`, `/lab/scenarios` and `/lab/standins`.
-- `variants/<variant>.manifest.json` is each variant's baseline: nothing above "weak setting" without a snapshot, nothing above "note" with a snapshot of the same machine.
+- `variants/<variant>.manifest.json` is each variant's baseline: nothing above "weak setting", with or without a snapshot. Against a snapshot of the same machine the only things above a note may be checklist items that were not met when the snapshot was taken either; `TestCleanMachinesAreClean` checks that.
 - Manifest: `{"requires":{...}, "with_snapshot":{"must":[{"key_prefix","severity"}], "must_not_severity_above"}, "without_snapshot":{...}}`. Both sections are required (an empty `{}` means nothing is expected). `lab.Check(m, report, withSnapshot)` returns the mismatches. A `must` entry is met by a finding whose key starts with the prefix and whose severity is exactly the given one.
-- `downgrade-package` and `new-service-package` install offline from .debs the image build fetched into `/var/cache/telltale-lab/debs/{openssl,lighttpd}` (see `images/common/setup.sh`). `downgrade-package` needs a machine at the newer snapshot. The tests use an image built there (`BuildOpts{Newer: true}`); by hand, `prepare.sh` brings a machine there and needs network access, so run it on a networked bridge before the clean snapshot is taken and before anything is planted.
+- `downgrade-package` and `new-service-package` install offline from .debs the image build fetched into `/var/cache/telltale-lab/debs/{openssl,lighttpd}` (see `images/common/setup.sh`). `downgrade-package` needs a machine at the newer snapshot (manifest `requires.newer_snapshot`): an image built with `BuildOpts{Newer: true}`, or by hand `docker build --build-arg LAB_NEWER=1`.
 - Manifest sections may carry a `comment` (ignored by the matcher) saying why they are empty or unusual.
