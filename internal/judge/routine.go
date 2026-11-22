@@ -440,6 +440,8 @@ func (j *judge) finishPackages() {
 			}
 		case f == nil && g != nil && ch.Kind != diff.PkgRemoved && j.unconfirmed[name]:
 			f = j.unexplain(name, ch, g, nil)
+		case f == nil && g != nil && ch.Kind == diff.PkgUpgraded && !j.confirmed[name] && !j.filesChanged(name):
+			f = j.versionOnly(name, ch, g)
 		case f != nil && len(unver) > 0:
 			for _, e := range unver {
 				j.attach(f, e, maxEvidence)
@@ -471,7 +473,7 @@ func (j *judge) finishPackages() {
 		// Package findings accept exactly the files they showed: the value names
 		// a digest of every (path, content) pair, so other content at the
 		// same version is a finding again.
-		if f != nil && len(f.Evidence) > 0 && (strings.HasPrefix(f.Key, "snap.pkg_upgraded:") || strings.HasPrefix(f.Key, "snap.pkg_installed:") || strings.HasPrefix(f.Key, "snap.pkg_downgraded:")) {
+		if f != nil && len(f.Evidence) > 0 && (strings.HasPrefix(f.Key, "snap.pkg_upgraded:") || strings.HasPrefix(f.Key, "snap.pkg_installed:") || strings.HasPrefix(f.Key, "snap.pkg_downgraded:") || strings.HasPrefix(f.Key, "snap.pkg_version_only:")) {
 			f.Evidence[0].After += "; files " + j.pkgDigest(name, ch.Kind == diff.PkgInstalled)
 		}
 	}
@@ -834,4 +836,36 @@ func (j *judge) contentDigest(paths []string) string {
 		fmt.Fprintf(h, "%s\x00%s\n", p, content)
 	}
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}
+
+// filesChanged reports whether any file the package owns (beyond dpkg's own
+// records of it) is shown with its change.
+func (j *judge) filesChanged(name string) bool {
+	for p := range j.touched[name] {
+		if !strings.HasPrefix(p, "/var/lib/dpkg/info/") {
+			return true
+		}
+	}
+	return false
+}
+
+// versionOnly turns an upgrade that changed no files, and whose new version
+// nothing confirmed, into a note: only dpkg's record of the version moved.
+func (j *judge) versionOnly(name string, ch diff.Change, g *model.Finding) *model.Finding {
+	delete(j.groups, g.Key)
+	f := &model.Finding{
+		Key: "snap.pkg_version_only:" + name, ID: "TT-SNAP-013", Source: srcSnapshot, Severity: model.SevNote,
+		Title: fmt.Sprintf("The recorded version of %s changed from %s to %s, but no files changed and the new version could not be confirmed", name, ch.Pkg.Old, ch.Pkg.New),
+		Why: "dpkg's record says this package was upgraded, but none of its files changed and nothing confirmed the new version. A version typed into dpkg status changes nothing by itself, " +
+			"but it can make other changes look like part of an update.",
+		Fix: command([]string{name}, func(q []string) string {
+			return "apt-get install --reinstall -- " + q[0] + "   # puts the package's own files and record back; /var/log/dpkg.log shows whether dpkg made the upgrade"
+		}),
+	}
+	for _, e := range g.Evidence {
+		j.attach(f, e, maxEvidence)
+	}
+	f = j.add(f)
+	j.pkgFinding[name] = f
+	return f
 }
