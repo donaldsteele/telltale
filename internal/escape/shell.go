@@ -5,8 +5,8 @@ import (
 	"unicode/utf8"
 )
 
-// ShellQuote returns s as one word for bash. A value that is valid UTF-8 in
-// which every rune is printable (NeedsEscape is false for it) is
+// ShellQuote returns s as one word for bash. A value made only of printable
+// ASCII (0x20 to 0x7e) is
 // single-quoted, which every POSIX shell reads the same way. Any other value
 // uses $'...' with every control, format, odd-space, invalid, non-ASCII byte
 // and every quote or backslash written as \xNN, so the word holds only
@@ -35,11 +35,8 @@ func ShellQuote(s string) string {
 }
 
 func plain(s string) bool {
-	if !utf8.ValidString(s) {
-		return false
-	}
-	for _, r := range s {
-		if NeedsEscape(r) {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] > 0x7e {
 			return false
 		}
 	}

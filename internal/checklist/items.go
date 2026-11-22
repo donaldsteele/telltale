@@ -499,7 +499,7 @@ func sshdItem(id, name, want string, ok func(v string) bool, title, why string) 
 				case s.Path == cmdlineSource:
 					return cmdlineFix(v, name)
 				}
-				return sshdLineFix(v.cfg, s, name, want) + reloadSSH
+				return withReload(sshdLineFix(v.cfg, s, name, want))
 			}
 			return ""
 		},
@@ -739,16 +739,45 @@ func perUserCmd(names []string, cmd string) (string, []string) {
 	return strings.Join(cmds, " && "), notes
 }
 
-// andThen chains two command texts; a text that is only comment lines is
-// put on its own line, since "&& # ..." would not parse.
+// splitNotes separates a fix text into its command lines and its comment
+// lines. Commands are never extended on a comment's line.
+func splitNotes(s string) (cmd string, notes []string) {
+	var cmds []string
+	for _, l := range strings.Split(s, "\n") {
+		switch {
+		case l == "":
+		case strings.HasPrefix(l, "#"):
+			notes = append(notes, l)
+		default:
+			cmds = append(cmds, l)
+		}
+	}
+	return strings.Join(cmds, "\n"), notes
+}
+
+// andThen chains two fix texts with && and puts every comment line after the
+// command, so nothing is ever appended to a comment.
 func andThen(a, b string) string {
-	if b == "" {
-		return a
+	ca, na := splitNotes(a)
+	cb, nb := splitNotes(b)
+	cmd := ca
+	switch {
+	case ca == "":
+		cmd = cb
+	case cb != "":
+		cmd = ca + " && " + cb
 	}
-	if a == "" || strings.HasPrefix(b, "#") {
-		return joinNotes(a, []string{b})
+	return joinNotes(cmd, append(na, nb...))
+}
+
+// withReload appends the sshd reload to the command of a fix text, leaving
+// any comment lines after it; a text with no command gets no reload.
+func withReload(s string) string {
+	c, notes := splitNotes(s)
+	if c == "" {
+		return s
 	}
-	return a + " && " + b
+	return joinNotes(c+reloadSSH, notes)
 }
 
 func fixUID0(c *model.Collection, _ model.ScanContext) string {

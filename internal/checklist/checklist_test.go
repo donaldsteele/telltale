@@ -806,3 +806,63 @@ func TestNoPasswdUserLists(t *testing.T) {
 		t.Errorf("ALL rule: fix = %q", fix)
 	}
 }
+
+func nulSudoers(names ...string) *model.Collection {
+	c := hardened()
+	var lines []string
+	for _, n := range names {
+		c.Accounts.Users = append(c.Accounts.Users, model.User{Name: n, UID: 1001, GID: 1001, Shell: "/bin/bash", Password: model.PasswordState{Locked: true, LastChange: 19000}})
+		lines = append(lines, n+" ALL=(ALL) NOPASSWD: <redacted h:0123456789abcdef01234567>")
+	}
+	c.Persist = append(c.Persist, model.PersistFile{Path: "/etc/sudoers.d/90", Kind: model.PersistKindSudoers, Mode: 0o100440, Lines: lines})
+	c.Files = append(c.Files, fileEntry("/etc/sudoers.d/90", 0o440, 0, 0))
+	return c
+}
+
+func TestNoPasswdFixKeepsItsCommandWhenANameHasNUL(t *testing.T) {
+	it, _ := ByID("TT-SUDO-001")
+	fix := it.FixFor(nulSudoers("ubuntu", "root\x00x"), model.ScanContext{})
+	var cmdLine string
+	for _, l := range strings.Split(fix, "\n") {
+		if strings.HasPrefix(l, "passwd ubuntu") {
+			cmdLine = l
+		}
+	}
+	if cmdLine != "passwd ubuntu && sed -i 's/NOPASSWD[[:space:]]*:/PASSWD:/g' /etc/sudoers.d/90 && visudo -c" {
+		t.Fatalf("command line %q in\n%s", cmdLine, fix)
+	}
+	if !strings.Contains("\n"+fix+"\n", "\n# root\\x00x contains a NUL byte and cannot be typed safely; inspect it by hand\n") {
+		t.Errorf("no note on its own line:\n%s", fix)
+	}
+	// All names unusable: notes and the sed, never a dangling &&.
+	fix = it.FixFor(nulSudoers("root\x00x"), model.ScanContext{})
+	for _, l := range strings.Split(fix, "\n") {
+		if strings.HasPrefix(l, "#") && strings.Contains(l, "&&") && !strings.Contains(l, "NUL") && !strings.Contains(l, "NOPASSWD") {
+			t.Errorf("command text on a comment line: %q", l)
+		}
+		if strings.HasSuffix(l, "&&") || strings.HasPrefix(l, "&&") {
+			t.Errorf("dangling &&: %q", l)
+		}
+	}
+	if !strings.Contains(fix, "\nsed -i 's/NOPASSWD") || !strings.Contains(fix, "NUL byte") {
+		t.Errorf("fix:\n%s", fix)
+	}
+}
+
+func TestAndThenAndWithReloadNeverExtendAComment(t *testing.T) {
+	if got := andThen("# note", "cmd"); got != "cmd\n# note" {
+		t.Errorf("%q", got)
+	}
+	if got := andThen("a\n# n1", "b\n# n2"); got != "a && b\n# n1\n# n2" {
+		t.Errorf("%q", got)
+	}
+	if got := andThen("# only", "# notes"); got != "# only\n# notes" {
+		t.Errorf("%q", got)
+	}
+	if got := withReload("sed x\n# n"); got != "sed x"+reloadSSH+"\n# n" {
+		t.Errorf("%q", got)
+	}
+	if got := withReload("# n"); got != "# n" {
+		t.Errorf("%q", got)
+	}
+}

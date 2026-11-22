@@ -134,13 +134,15 @@ func runScan(ctx *Context) int {
 	}
 	if *refs == "" && !*offline {
 		// Never leave a package cache on the machine being examined.
+		// Written before the directory exists: a closed stderr (SIGPIPE) then
+		// leaves nothing behind.
+		fmt.Fprintln(ctx.Stderr, "Verifying packages against the archive (this can take a while)...")
 		dir, err := os.MkdirTemp("", "telltale-cache-")
 		if err != nil {
 			return fail(err)
 		}
 		defer os.RemoveAll(dir)
 		opt.CacheDir = dir
-		fmt.Fprintln(ctx.Stderr, "Verifying packages against the archive (this can take a while)...")
 	}
 	pkg := verifyPackages(runCtx, c, opt)
 	// The cache is not needed any more: remove it before anything is written,

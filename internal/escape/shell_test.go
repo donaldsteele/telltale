@@ -82,3 +82,12 @@ func TestNeedsEscapeOneRule(t *testing.T) {
 		t.Errorf("%s", Terminal("a b c"))
 	}
 }
+
+func TestShellQuoteNonASCIIUsesHexForm(t *testing.T) {
+	if got := ShellQuote("/srv/café"); got != `$'/srv/caf\xc3\xa9'` {
+		t.Errorf("%s", got)
+	}
+	if got := ShellQuote("/srv/cafe"); got != `'/srv/cafe'` {
+		t.Errorf("%s", got)
+	}
+}
