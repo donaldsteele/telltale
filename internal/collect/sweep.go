@@ -32,16 +32,22 @@ var sweepSkipFS = map[string]bool{
 	"securityfs": true, "debugfs": true, "tracefs": true, "bpf": true, "pstore": true, "configfs": true,
 	"autofs": true, "efivarfs": true, "mqueue": true, "binfmt_misc": true, "nfs": true, "nfs4": true,
 	"cifs": true, "smb3": true, "sshfs": true, "fusectl": true, "rpc_pipefs": true, "nsfs": true,
-	"selinuxfs": true, "hugetlbfs": true,
+	"selinuxfs": true, "hugetlbfs": true, "fuseblk": true,
 	// Read-only or layered images of other systems: their setuid files belong
 	// to the image, not to this machine's packages.
 	"squashfs": true, "erofs": true, "iso9660": true,
 }
 
-// sweepSkipDirs hold other systems' file trees (container and VM images, snap
-// and flatpak runtimes). Their setuid files are the image's own, so a sweep
-// that looked there would call every one a stranger.
-var sweepSkipDirs = []string{"/var/lib/docker", "/var/lib/containerd", "/var/lib/containers", "/var/lib/snapd", "/snap", "/var/lib/flatpak", "/var/lib/lxc", "/var/lib/lxd", "/var/lib/incus", "/var/lib/machines"}
+// sweepSkipDirs hold other systems' file trees (container, VM, snapshot and chroot
+// copies, flatpak runtimes). Their setuid files are the copy's own, and their
+// paths change between scans, so a sweep that looked there would call every one
+// a stranger. Each entry matches itself and everything below it.
+var sweepSkipDirs = []string{"/var/lib/docker", "/var/lib/containerd", "/var/lib/containers", "/var/lib/flatpak", "/var/lib/lxc", "/var/lib/lxd", "/var/lib/incus", "/var/lib/machines",
+	"/run/containerd", "/run/docker", "/var/lib/kubelet/pods", "/var/snap/lxd/common/lxd", "/var/lib/rancher", "/timeshift", "/.snapshots", "/var/cache/pbuilder", "/srv/chroot"}
+
+// sweepFirstBudget is the entry budget of each directory in sweepFirst, so
+// that a flood in one cannot starve the others.
+var sweepFirstBudget = 500_000
 
 // userImageDir is a per-user container image store (~/.local/share/containers).
 const userImageDir = "/.local/share/containers"
@@ -49,10 +55,10 @@ const userImageDir = "/.local/share/containers"
 // sweepFirst are walked before everything else, so that a bounded walk never
 // runs out before reaching them: the world-writable and service-owned places
 // an intruder uses.
-var sweepFirst = []string{"/tmp", "/var/tmp", "/dev/shm", "/run", "/var/www", "/srv", "/opt", "/mnt", "/media"}
+var sweepFirst = []string{"/tmp", "/var/tmp", "/dev/shm", "/run", "/var/www", "/srv", "/opt"}
 
 // sweepLast are walked after everything else: large, and mostly the users' own.
-var sweepLast = []string{"/home"}
+var sweepLast = []string{"/home", "/mnt", "/media"}
 
 func sweepSkipType(t string) bool {
 	return sweepSkipFS[t] || t == "fuse" || strings.HasPrefix(t, "fuse.")
@@ -120,6 +126,8 @@ func Sweep(root string, mounts []model.Mount, have []model.FileEntry, opt FileOp
 
 	visited := 0
 	stopped := false
+	// A directory in sweepFirst has its own entry budget.
+	phaseCap, phaseStop, phaseDir := int(^uint(0)>>1), false, ""
 	dirSkips, droppedSkips := 0, 0
 	dirSkip := func(mp string, err error) {
 		if dirSkips >= maxSweepDirSkips {
@@ -186,10 +194,15 @@ func Sweep(root string, mounts []model.Mount, have []model.FileEntry, opt FileOp
 			return
 		}
 		for _, d := range des {
-			if stopped {
+			if stopped || phaseStop {
 				return
 			}
-			if visited++; visited > sweepMaxEntries {
+			if visited++; visited > phaseCap {
+				phaseStop = true
+				skips = append(skips, model.Skip{Check: checkName, Reason: fmt.Sprintf("sweep: %s: stopped after %d entries; the rest of it was not looked at", phaseDir, sweepFirstBudget)})
+				return
+			}
+			if visited > sweepMaxEntries {
 				stopped = true
 				skips = append(skips, model.Skip{Check: checkName, Reason: fmt.Sprintf("sweep: stopped after %d entries; setuid, setgid and capability files beyond this point were not looked for", sweepMaxEntries)})
 				return
@@ -261,8 +274,10 @@ func Sweep(root string, mounts []model.Mount, have []model.FileEntry, opt FileOp
 			continue
 		}
 		done[p] = true
+		phaseCap, phaseStop, phaseDir = visited+sweepFirstBudget, false, p
 		walk(p)
 	}
+	phaseCap, phaseStop = int(^uint(0)>>1), false
 	// 2. every local mount
 	for _, s := range starts {
 		if stopped {

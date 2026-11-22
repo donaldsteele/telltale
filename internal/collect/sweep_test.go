@@ -207,7 +207,6 @@ func TestSweepUnreadableDirIsOneSkip(t *testing.T) {
 func TestSweepSkipsImageStoresAndImageFilesystems(t *testing.T) {
 	root := t.TempDir()
 	plant(t, root, "var/lib/docker/overlay2/abc/diff/usr/bin/su", os.ModeSetuid|0o755)
-	plant(t, root, "snap/core/1/usr/bin/sudo", os.ModeSetuid|0o755)
 	plant(t, root, "mnt/img/usr/bin/su", os.ModeSetuid|0o755)
 	plant(t, root, "srv/real", os.ModeSetuid|0o755)
 	mounts := []model.Mount{{Path: "/", FSType: "ext4"}, {Path: "/mnt/img", FSType: "squashfs"}, {Path: "/var/lib/docker", FSType: "ext4"}}
@@ -277,5 +276,85 @@ func TestSweepSkipsOverlayUnderImageStoreAndSquashfsUnderSnap(t *testing.T) {
 	got, _ = Sweep(root, append(mounts, model.Mount{Path: "/srv/ov", FSType: "overlay"}), nil, FileOptions{})
 	if _, ok := byPath(got)["/srv/ov/.s"]; !ok {
 		t.Errorf("ordinary overlay mount skipped: %v", got)
+	}
+}
+
+func TestSweepSkipsSnapshotAndChrootStores(t *testing.T) {
+	root := t.TempDir()
+	for _, p := range []string{
+		"run/containerd/io.containerd.runtime.v2.task/k8s.io/abc/rootfs/usr/bin/su",
+		"run/docker/netns/x",
+		"var/lib/kubelet/pods/p1/volumes/v/su",
+		"var/snap/lxd/common/lxd/storage-pools/default/containers/c1/rootfs/usr/bin/su",
+		"var/lib/rancher/k3s/agent/containerd/snapshots/1/fs/usr/bin/su",
+		"timeshift/snapshots/2026-11-01_00-00-01/localhost/usr/bin/sudo",
+		".snapshots/1/snapshot/usr/bin/su",
+		"var/cache/pbuilder/base.cow/usr/bin/su",
+		"srv/chroot/sid/usr/bin/su",
+	} {
+		plant(t, root, p, os.ModeSetuid|0o755)
+	}
+	// /snap and /var/lib/snapd are not hiding places
+	plant(t, root, "snap/.s", os.ModeSetuid|0o755)
+	plant(t, root, "var/lib/snapd/.s", os.ModeSetuid|0o755)
+	plant(t, root, "srv/real", os.ModeSetuid|0o755)
+	plant(t, root, "media/u/Win/x", os.ModeSetuid|0o755)
+	mounts := []model.Mount{
+		{Path: "/", FSType: "ext4"},
+		{Path: "/run", FSType: "tmpfs"},
+		{Path: "/run/containerd/io.containerd.runtime.v2.task/k8s.io/abc/rootfs", FSType: "overlay"},
+		{Path: "/.snapshots", FSType: "btrfs"},
+		{Path: "/media/u/Win", FSType: "fuseblk"},
+	}
+	got, _ := Sweep(root, mounts, nil, FileOptions{})
+	m := byPath(got)
+	for _, p := range []string{"/snap/.s", "/var/lib/snapd/.s", "/srv/real"} {
+		if _, ok := m[p]; !ok {
+			t.Errorf("%s missing: %v", p, got)
+		}
+	}
+	if len(m) != 3 {
+		t.Errorf("stores were searched: %v", got)
+	}
+	if !sweepSkipType("fuseblk") {
+		t.Error("fuseblk not skipped by type")
+	}
+}
+
+func TestSweepEachPriorityDirHasItsOwnBudget(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < 40; i++ {
+		plant(t, root, fmt.Sprintf("tmp/.x/f%02d", i), 0o644)
+	}
+	plant(t, root, "tmp/.x/zz", os.ModeSetuid|0o755)
+	plant(t, root, "var/tmp/.s", os.ModeSetuid|0o755)
+	old, oldMax := sweepFirstBudget, sweepMaxEntries
+	sweepFirstBudget = 10
+	defer func() { sweepFirstBudget, sweepMaxEntries = old, oldMax }()
+	got, skips := Sweep(root, []model.Mount{{Path: "/", FSType: "ext4"}}, nil, FileOptions{})
+	if _, ok := byPath(got)["/var/tmp/.s"]; !ok {
+		t.Errorf("/var/tmp starved by /tmp: %v", got)
+	}
+	noted := false
+	for _, s := range skips {
+		noted = noted || (strings.Contains(s.Reason, "/tmp: stopped after 10 entries"))
+	}
+	if !noted {
+		t.Errorf("budget skip not recorded: %v", skips)
+	}
+}
+
+func TestSweepMountsAndMediaAreWalkedLast(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < 30; i++ {
+		plant(t, root, fmt.Sprintf("mnt/d/f%02d", i), 0o644)
+	}
+	plant(t, root, "var/tmp/.s", os.ModeSetuid|0o755)
+	old := sweepMaxEntries
+	sweepMaxEntries = 15
+	defer func() { sweepMaxEntries = old }()
+	got, _ := Sweep(root, []model.Mount{{Path: "/", FSType: "ext4"}}, nil, FileOptions{})
+	if _, ok := byPath(got)["/var/tmp/.s"]; !ok {
+		t.Errorf("late group walked early: %v", got)
 	}
 }

@@ -354,23 +354,37 @@ func authorizedKeys(c *model.Collection, ctx model.ScanContext) []model.Finding 
 
 func files(c *model.Collection, owned map[string]string) []model.Finding {
 	var out []model.Finding
+	packaged := packagedSetuid(c, owned)
 	for _, f := range c.Files {
 		if f.Type == "file" && f.Mode&0o6000 != 0 {
 			if _, ok := owned[f.Path]; !ok {
-				sev := model.SevBackdoor
-				if strings.HasPrefix(f.Path, "/usr/local/") {
-					sev = model.SevNote
+				if orig := packaged[f.SHA256+fmt.Sprintf(":%o", f.Mode&0o6000)]; f.SHA256 != "" && f.Err == "" && orig != "" {
+					out = append(out, model.Finding{
+						Key: "heur.setuid_packaged_copy:" + f.Path, ID: idSetuid, Source: source, Severity: model.SevNote,
+						Title: fmt.Sprintf("%s is a copy of the setuid program %s from a package", f.Path, orig),
+						Why:   "The file is identical to a package's own setuid or setgid file, so it grants nothing the original does not. It may be a backup or a second install; check that you put it there.",
+						Fix: fix([]string{f.Path, orig}, func(q []string) string {
+							return "cmp -- " + q[0] + " " + q[1] + "   # identical means a plain copy; remove it only if you do not need it"
+						}),
+						Evidence: []model.Evidence{{Path: f.Path, Detail: fmt.Sprintf("mode=%o uid=%d, same content as %s", f.Mode&0o7777, f.UID, orig)}},
+						Refs:     []string{"T1548.001"},
+					})
+				} else {
+					sev := model.SevBackdoor
+					if strings.HasPrefix(f.Path, "/usr/local/") {
+						sev = model.SevNote
+					}
+					out = append(out, model.Finding{
+						Key: "heur.unowned_setuid:" + f.Path, ID: idSetuid, Source: source, Severity: sev,
+						Title: fmt.Sprintf("%s runs with its owner's rights but belongs to no package", f.Path),
+						Why:   "A setuid/setgid program lets any user run it with the owner's (often root's) rights. One no package installed may be a planted privilege-escalation shell.",
+						Fix: fix([]string{f.Path}, func(q []string) string {
+							return keep(q[0]) + " && chmod u-s,g-s " + q[0] + "   # removes the privilege bit, keeps the file; delete it only after investigating"
+						}),
+						Evidence: []model.Evidence{{Path: f.Path, Detail: fmt.Sprintf("mode=%o uid=%d", f.Mode&0o7777, f.UID)}},
+						Refs:     []string{"T1548.001"},
+					})
 				}
-				out = append(out, model.Finding{
-					Key: "heur.unowned_setuid:" + f.Path, ID: idSetuid, Source: source, Severity: sev,
-					Title: fmt.Sprintf("%s runs with its owner's rights but belongs to no package", f.Path),
-					Why:   "A setuid/setgid program lets any user run it with the owner's (often root's) rights. One no package installed may be a planted privilege-escalation shell.",
-					Fix: fix([]string{f.Path}, func(q []string) string {
-						return keep(q[0]) + " && chmod u-s,g-s " + q[0] + "   # removes the privilege bit, keeps the file; delete it only after investigating"
-					}),
-					Evidence: []model.Evidence{{Path: f.Path, Detail: fmt.Sprintf("mode=%o uid=%d", f.Mode&0o7777, f.UID)}},
-					Refs:     []string{"T1548.001"},
-				})
 			}
 		}
 		if f.Type == "file" && f.Caps != "" {
@@ -547,4 +561,20 @@ func noLogin(shell string) bool {
 		return true
 	}
 	return false
+}
+
+// packagedSetuid maps "<sha256>:<setuid/setgid bits>" to the lowest path of a
+// package-owned file with that content and those bits.
+func packagedSetuid(c *model.Collection, owned map[string]string) map[string]string {
+	m := map[string]string{}
+	for _, f := range c.Files {
+		if f.Type != "file" || f.Mode&0o6000 == 0 || f.SHA256 == "" || f.Err != "" || owned[f.Path] == "" {
+			continue
+		}
+		k := f.SHA256 + fmt.Sprintf(":%o", f.Mode&0o6000)
+		if old, ok := m[k]; !ok || f.Path < old {
+			m[k] = f.Path
+		}
+	}
+	return m
 }

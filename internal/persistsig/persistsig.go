@@ -6,6 +6,7 @@
 package persistsig
 
 import (
+	"path"
 	"regexp"
 	"strings"
 
@@ -23,36 +24,118 @@ const (
 	DownloadSubst  = "download_run_by_shell"
 	Base64Shell    = "base64_decode_to_shell"
 	ScriptSockExec = "script_socket_and_spawn"
+	DownloadExec   = "download_then_run"
 )
+
+// wrapper programs that may sit in front of a shell.
+const wrap = `(?:sudo\s+(?:-\S+\s+)*)?(?:busybox\s+|env\s+(?:\S+=\S+\s+|-\S+\s+)*)?`
 
 // shellName matches a shell program name after an optional directory.
 const shellName = `(?:\S*/)?(?:ba|z|da|k|c|tc|a)?sh\b`
 
-const ncWord = `(?:^|[\s/;|&(` + "`" + `])(?:nc|ncat|netcat)(?:\.\w+)?\s`
+// ncWord is a netcat program name at the start of a command word; quotes,
+// braces, "=" and "," may precede it (`sh -c 'nc ...'`, `X=nc`).
+const ncWord = `(?:^|[\s/;|&(` + "`" + `"'{=,])(?:nc|ncat|netcat)(?:\.\w+)?\s`
 
 type named struct {
 	id string
 	re *regexp.Regexp
 }
 
-// Every pattern is case-insensitive.
+// Patterns are case-insensitive unless noted.
 var patterns = []named{
-	{DevTCP, regexp.MustCompile(`(?i)/dev/(?:tcp|udp)/`)},
+	{DevTCP, regexp.MustCompile(`(?i)/dev/(?:tcp|udp)\b`)},
 	{ShellRedirect, regexp.MustCompile(`(?i)\b(?:ba|z|da|k)?sh\s+-[a-z]*i[a-z]*\b.*(?:>&|&>|<>|<&|>\s*/dev/)`)},
-	{NetcatExec, regexp.MustCompile(`(?i)` + ncWord + `(?:.*\s)?(?:-[a-z]*[ec][a-z]*|--(?:sh-)?exec)(?:\s|$)`)},
+	// The program name is case-insensitive; the flags are not (OpenBSD's -C
+	// is CRLF, not -c), and the flag scan stops at the next command.
+	{NetcatExec, regexp.MustCompile(`(?i:` + ncWord + `)(?:[^|;&]*\s)?(?:-[a-zA-Z]*[ec][a-zA-Z]*|--(?:sh-)?exec)(?:\s|$|["'])`)},
 	{SocatExec, regexp.MustCompile(`(?i)\bsocat\b.*\b(?:exec|system):`)},
 	{FifoNetcat, regexp.MustCompile(`(?i)\bmkfifo\b.*` + ncWord)},
 	{FifoNetcat, regexp.MustCompile(`(?i)` + ncWord + `.*\bmkfifo\b`)},
-	{DownloadPipe, regexp.MustCompile(`(?i)\b(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+(?:-\S+\s+)*)?` + shellName)},
+	{DownloadPipe, regexp.MustCompile(`(?i)\b(?:curl|wget)\b[^|]*(?:\|\s*tee\b[^|]*)*\|\s*` + wrap + shellName)},
 	{DownloadSubst, regexp.MustCompile("(?i)(?:" + shellName + `\s+(?:-[a-z]+\s+)*|\beval\s+|\bsource\s+|(?:^|\s)\.\s+)["']?(?:\$\(|<\(|` + "`" + `)\s*(?:curl|wget)\b`)},
-	{Base64Shell, regexp.MustCompile(`(?i)\bbase64\s+(?:-[a-z]*d[a-z]*|--decode)\b[^|]*\|\s*(?:sudo\s+)?` + shellName)},
+	{Base64Shell, regexp.MustCompile(`(?i)\bbase64\s+(?:-[a-z]*d[a-z]*|--decode)\b[^|]*\|\s*` + wrap + shellName)},
 }
 
 var (
 	scriptInterp = regexp.MustCompile(`(?i)\b(?:python[\d.]*|perl|ruby|php)\s+(?:-\S+\s+)*-[a-z]*[cer]`)
 	socketToken  = regexp.MustCompile(`(?i)socket|fsockopen`)
 	spawnToken   = regexp.MustCompile(`(?i)\b(?:pty|subprocess|exec\w*|system|dup2|spawn\w*|popen)\b`)
+
+	fetcher     = regexp.MustCompile(`(?i)\b(?:curl|wget)\b`)
+	outFlag     = regexp.MustCompile(`(?:^|\s)(?:-[a-zA-Z]*[oO]|--output|--output-document)(?:\s+|=)("[^"]+"|'[^']+'|[^\s;&|<>]+)`)
+	redirOut    = regexp.MustCompile(`>\s*("[^"]+"|'[^']+'|[^\s;&|<>]+)`)
+	cmdSplit    = regexp.MustCompile(`&&|\|\||[;&|(){}]`)
+	runPrefixes = map[string]bool{"sudo": true, "nohup": true, "exec": true, "setsid": true, "time": true, "env": true, "nice": true}
+	runWith     = map[string]bool{"sh": true, "bash": true, "dash": true, "zsh": true, "ksh": true, "ash": true, ".": true, "source": true}
 )
+
+func unquote(s string) string {
+	if len(s) >= 2 && (s[0] == '"' || s[0] == '\'') && s[len(s)-1] == s[0] {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// downloadThenRun reports a line in which curl or wget writes a file and a
+// later command on the same line runs that file.
+func downloadThenRun(l string) bool {
+	loc := fetcher.FindStringIndex(l)
+	if loc == nil {
+		return false
+	}
+	rest := l[loc[0]:]
+	var files []string
+	for _, m := range outFlag.FindAllStringSubmatch(rest, -1) {
+		files = append(files, unquote(m[1]))
+	}
+	for _, m := range redirOut.FindAllStringSubmatch(rest, -1) {
+		files = append(files, unquote(m[1]))
+	}
+	for _, f := range files {
+		if f == "" || f == "-" || strings.HasPrefix(f, "&") || f == "/dev/null" {
+			continue
+		}
+		if i := strings.Index(rest, f); i >= 0 && runsFile(rest[i+len(f):], f) {
+			return true
+		}
+	}
+	return false
+}
+
+// runsFile reports whether any command in after (the text following the
+// download's output name) runs f.
+func runsFile(after, f string) bool {
+	norm := func(s string) string { return strings.TrimPrefix(strings.Trim(s, `"'`), "./") }
+	want := norm(f)
+	for _, seg := range cmdSplit.Split(after, -1) {
+		toks := strings.Fields(seg)
+		for len(toks) > 0 && runPrefixes[toks[0]] {
+			toks = toks[1:]
+		}
+		if len(toks) == 0 {
+			continue
+		}
+		if norm(toks[0]) == want && (strings.Contains(toks[0], "/") || strings.HasPrefix(toks[0], "./")) {
+			return true // the file itself as the command
+		}
+		if toks[0] == want && toks[0] == f && strings.HasPrefix(f, "/") {
+			return true
+		}
+		if runWith[path.Base(toks[0])] {
+			for _, t := range toks[1:] {
+				if strings.HasPrefix(t, "-") {
+					continue
+				}
+				if norm(t) == want {
+					return true
+				}
+				break
+			}
+		}
+	}
+	return false
+}
 
 // MatchLine returns the id of the first pattern that matches one logical
 // line, or "".
@@ -67,6 +150,9 @@ func MatchLine(l string) string {
 		if socketToken.MatchString(arg) && spawnToken.MatchString(arg) {
 			return ScriptSockExec
 		}
+	}
+	if downloadThenRun(l) {
+		return DownloadExec
 	}
 	return ""
 }
@@ -107,15 +193,16 @@ func Join(lines []string) []Logical {
 	return out
 }
 
-var unitExecKeys = []string{"ExecStart=", "ExecStartPre=", "ExecStartPost=", "ExecStop=", "ExecStopPost=", "ExecReload=", "ExecCondition="}
+var unitExecKeys = map[string]bool{"ExecStart": true, "ExecStartPre": true, "ExecStartPost": true, "ExecStop": true, "ExecStopPre": true, "ExecStopPost": true, "ExecReload": true, "ExecCondition": true}
 
+// unitExecValue returns the value of an Exec* assignment, with the "=" split
+// at its first occurrence and spaces around key and value ignored.
 func unitExecValue(s string) (string, bool) {
-	for _, k := range unitExecKeys {
-		if strings.HasPrefix(s, k) {
-			return s[len(k):], true
-		}
+	k, v, ok := strings.Cut(s, "=")
+	if !ok || !unitExecKeys[strings.TrimSpace(k)] {
+		return "", false
 	}
-	return "", false
+	return strings.TrimSpace(v), true
 }
 
 // Detect scans the raw lines of a persistence file of the given kind and

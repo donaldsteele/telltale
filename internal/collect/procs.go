@@ -364,6 +364,21 @@ func underSkippedMount(p string, mounts []model.Mount) bool {
 // /proc, /sys and /dev, and under mounts the file scan skips, are never
 // opened.
 func ensureEntries(root string, files []model.FileEntry, paths []string, mounts []model.Mount, maxHash int64) ([]model.FileEntry, []model.Skip) {
+	return ensureEntriesIn(root, files, paths, mounts, maxHash, underNeverRead)
+}
+
+// underNeverRead reports whether p is in a tree that is never opened.
+func underNeverRead(p string) bool {
+	for _, d := range neverRead {
+		if p == d || strings.HasPrefix(p, d+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureEntriesIn is ensureEntries with the rule for never-opened paths given.
+func ensureEntriesIn(root string, files []model.FileEntry, paths []string, mounts []model.Mount, maxHash int64, never func(string) bool) ([]model.FileEntry, []model.Skip) {
 	var skips []model.Skip
 	have := make(map[string]bool, len(files))
 	for _, e := range files {
@@ -376,12 +391,7 @@ func ensureEntries(root string, files []model.FileEntry, paths []string, mounts 
 		}
 		p = filepath.Clean(p)
 		have[p] = true
-		refused := underSkippedMount(p, mounts)
-		for _, d := range neverRead {
-			if p == d || strings.HasPrefix(p, d+"/") {
-				refused = true
-			}
-		}
+		refused := underSkippedMount(p, mounts) || never(p)
 		if refused {
 			skips = append(skips, model.Skip{Check: checkName, Reason: p + ": not opened (kernel, device or skipped mount)"})
 			continue

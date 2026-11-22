@@ -26,14 +26,21 @@ func persistCallbacks(c *model.Collection) []model.Finding {
 		}
 		first := p.Signals[0]
 		logical := persistsig.Logical{First: first.Line, Last: first.Line}
-		after := ""
+		byLine := map[int]persistsig.Logical{}
 		for _, l := range persistsig.Join(p.Lines) {
-			if l.First == first.Line {
-				logical, after = l, l.Text
-				break
-			}
+			byLine[l.First] = l
 		}
-		ev := []model.Evidence{{Path: p.Path, Line: first.Line, After: after, Detail: "matched: " + first.Pattern}}
+		if l, ok := byLine[first.Line]; ok {
+			logical = l
+		}
+		// Evidence[0].After is every matched line (redacted), so accepting
+		// one callback never covers a line added later: accept stores key
+		// plus this text.
+		var all []string
+		for _, s := range p.Signals {
+			all = append(all, byLine[s.Line].Text)
+		}
+		ev := []model.Evidence{{Path: p.Path, Line: first.Line, After: strings.Join(all, "\n"), Detail: "matched: " + first.Pattern}}
 		if len(p.Signals) > 1 {
 			ev[0].Detail += fmt.Sprintf("; %d more matching line(s) in this file, first at line %d", len(p.Signals)-1, p.Signals[1].Line)
 		}

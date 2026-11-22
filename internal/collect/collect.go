@@ -78,6 +78,9 @@ func All(opt Options) (*model.Collection, error) {
 	// behind a deleted exe, the targets of startup links.
 	c.Files, s = ensureEntries(opt.Root, c.Files, append(exePaths(c.Runtime.Processes), linkTargets(c.Persist)...), c.Runtime.Mounts, defaultMaxHash)
 	add(s)
+	// Modules the PAM configuration loads from outside the system paths.
+	c.Files, s = ensurePAMEntries(opt.Root, c.Files, c.Runtime.Mounts, c.Persist, defaultMaxHash)
+	add(s)
 	c.Packages, s = Packages(opt.Root)
 	add(s)
 	c.Firewall, s = Firewall(opt.Root)

