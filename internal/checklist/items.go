@@ -102,10 +102,10 @@ var items = []Item{
 	{
 		ID:     "TT-SUDO-001",
 		Title:  "No sudo rule skips the password (NOPASSWD)",
-		Why:    "A NOPASSWD rule turns anyone who gets into that account, even without its password, into root.",
+		Why:    "A NOPASSWD rule turns anyone who gets into that account, even without its password, into root. Before removing it, give each account it covers a password, or nobody may be able to become root.",
 		Fix:    `grep -rl NOPASSWD /etc/sudoers /etc/sudoers.d | xargs -r sed -i 's/NOPASSWD[[:space:]]*:/PASSWD:/g' && visudo -c`,
 		Check:  sudoRuleCheck(noPasswdRe, "NOPASSWD"),
-		fixFor: sudoRuleFix(noPasswdRe, `s/NOPASSWD[[:space:]]*:/PASSWD:/g`),
+		fixFor: fixNoPasswd,
 	},
 	{
 		ID:     "TT-SUDO-002",
@@ -160,11 +160,12 @@ var items = []Item{
 
 	// Firewall.
 	{
-		ID:    "TT-FW-001",
-		Title: "A firewall is active",
-		Why:   "Without a firewall, every service that listens on the network can be reached, including one an attacker starts.",
-		Fix:   "apt-get install -y ufw && ufw allow ssh && ufw --force enable",
-		Check: checkFirewall,
+		ID:     "TT-FW-001",
+		Title:  "A firewall is active",
+		Why:    "Without a firewall, every service that listens on the network can be reached, including one an attacker starts.",
+		Fix:    "apt-get install -y ufw && ufw allow ssh && ufw --force enable",
+		Check:  checkFirewall,
+		fixFor: fixFirewall,
 	},
 
 	// Kernel.
@@ -256,10 +257,6 @@ func sedSSHD(name, value string) string {
 	return fmt.Sprintf(`sed -i '0,/^[[:space:]]*[Mm][Aa][Tt][Cc][Hh][[:space:]]/s/^#\?%s.*/%s %s/' /etc/ssh/sshd_config`, name, name, value) + reloadSSH
 }
 
-func sshdOf(c *model.Collection) (*sshdConfig, string) {
-	return parseSSHD(c.Persist)
-}
-
 func firstWord(s string) string {
 	if f := strings.Fields(s); len(f) > 0 {
 		return strings.ToLower(f[0])
@@ -269,9 +266,13 @@ func firstWord(s string) string {
 
 func redacted(v string) bool { return strings.HasPrefix(v, "<redacted") }
 
-func defaultNote(s sshdSetting) string {
-	if s.Path == "" {
+// sourceNote says where a value came from when it is not a config line.
+func sourceNote(s sshdSetting) string {
+	switch s.Path {
+	case "":
 		return " (default)"
+	case cmdlineSource:
+		return " " + cmdlineSource
 	}
 	return ""
 }
@@ -305,6 +306,14 @@ func sshdLineFix(cfg *sshdConfig, s sshdSetting, name, value string) string {
 	return fmt.Sprintf("sed -i%s '%ds/.*/%s %s/' %s", followFlag(cfg.links[s.Path]), s.Line, name, value, shellQuote(s.Path))
 }
 
+// cmdlineFix is for a value set with -o on a running sshd's command line,
+// which overrides sshd_config: the option has to go where that sshd is
+// started.
+func cmdlineFix(v sshdView, name string) string {
+	return fmt.Sprintf("# sshd (pid %d) is started with -o %s=..., which overrides sshd_config: remove it where that sshd is started, then restart it\n"+
+		"grep -rn -i -- %s /etc/default/ssh /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system 2>/dev/null", v.pid, name, name)
+}
+
 func followFlag(link bool) string {
 	if link {
 		return " --follow-symlinks"
@@ -312,48 +321,89 @@ func followFlag(link bool) string {
 	return ""
 }
 
-func checkRootLogin(c *model.Collection, ctx model.ScanContext) (bool, string, string) {
-	cfg, why := sshdOf(c)
-	if why != "" {
-		return false, "", why
-	}
-	g := cfg.effective("")["permitrootlogin"]
+// rootLoginIn judges root login in one view.
+func rootLoginIn(v sshdView, ctx model.ScanContext) (bool, string) {
+	g := v.effective("")["permitrootlogin"]
 	gv := rootLoginValue(g.Value)
-	obs := "PermitRootLogin " + gv + defaultNote(g)
+	obs := "PermitRootLogin " + gv + sourceNote(g)
 	pass := gv == "no"
 	if ctx.ServerAddr != "" {
-		sv := rootLoginValue(cfg.effective(ctx.ServerAddr)["permitrootlogin"].Value)
+		sv := rootLoginValue(v.effective(ctx.ServerAddr)["permitrootlogin"].Value)
 		obs += "; from the telltale server " + ctx.ServerAddr + ": " + sv
 		pass = pass && (sv == "prohibit-password" || sv == "no")
 	}
-	return pass, obs, ""
+	return pass, obs
+}
+
+func checkRootLogin(c *model.Collection, ctx model.ScanContext) (bool, string, string) {
+	views, why := sshdViews(c)
+	if why != "" {
+		return false, "", why
+	}
+	_, firstObs := rootLoginIn(views[0], ctx)
+	for _, v := range views {
+		if pass, obs := rootLoginIn(v, ctx); !pass {
+			return false, obs, ""
+		}
+	}
+	return true, firstObs, ""
+}
+
+// serverBlockFix appends the enrolment block that lets the telltale server
+// log in as root by key from its own address.
+func serverBlockFix(addr string) string {
+	return `printf '\nMatch Address %s\n    PermitRootLogin prohibit-password\n' ` + shellQuote(addr) + " >> " + mainSSHDConfig
 }
 
 func fixRootLogin(c *model.Collection, ctx model.ScanContext) string {
-	cfg, why := sshdOf(c)
+	views, why := sshdViews(c)
 	if why != "" {
 		return ""
 	}
-	var cmds []string
-	insert := ""
-	g := cfg.effective("")["permitrootlogin"]
-	if rootLoginValue(g.Value) != "no" {
-		if g.Path == "" {
-			insert = sshdLineFix(cfg, g, "PermitRootLogin", "no")
-		} else {
-			cmds = append(cmds, sshdLineFix(cfg, g, "PermitRootLogin", "no"))
+	for _, v := range views {
+		if pass, _ := rootLoginIn(v, ctx); !pass {
+			return fixRootLoginIn(v, ctx)
+		}
+	}
+	return ""
+}
+
+// fixRootLoginIn turns root login off for everyone, keeps or restores key
+// login from the telltale server, and never cuts the server off: when the
+// server's value is the global one, its Match block is added.
+func fixRootLoginIn(v sshdView, ctx model.ScanContext) string {
+	var edits []string
+	insert, block := "", ""
+	g := v.effective("")["permitrootlogin"]
+	globalBad := rootLoginValue(g.Value) != "no"
+	if globalBad {
+		switch g.Path {
+		case cmdlineSource:
+			return cmdlineFix(v, "PermitRootLogin")
+		case "":
+			insert = sshdLineFix(v.cfg, g, "PermitRootLogin", "no")
+		default:
+			edits = append(edits, sshdLineFix(v.cfg, g, "PermitRootLogin", "no"))
 		}
 	}
 	if ctx.ServerAddr != "" {
-		s := cfg.effective(ctx.ServerAddr)["permitrootlogin"]
+		s := v.effective(ctx.ServerAddr)["permitrootlogin"]
 		sv := rootLoginValue(s.Value)
-		if sv != "no" && sv != "prohibit-password" && s.Path != "" && (s.Path != g.Path || s.Line != g.Line) {
-			cmds = append(cmds, sshdLineFix(cfg, s, "PermitRootLogin", "prohibit-password"))
+		fromGlobal := s.Path == g.Path && s.Line == g.Line
+		switch {
+		case fromGlobal && globalBad:
+			block = serverBlockFix(ctx.ServerAddr)
+		case !fromGlobal && sv != "no" && sv != "prohibit-password" && s.Path != cmdlineSource:
+			edits = append(edits, sshdLineFix(v.cfg, s, "PermitRootLogin", "prohibit-password"))
 		}
 	}
-	// Inserting a line shifts the ones below it, so line edits go first.
-	if insert != "" {
-		cmds = append(cmds, insert)
+	// Inserting a line shifts the ones below it, so line edits go first;
+	// appending moves nothing.
+	cmds := edits
+	for _, c := range []string{insert, block} {
+		if c != "" {
+			cmds = append(cmds, c)
+		}
 	}
 	if len(cmds) == 0 {
 		return ""
@@ -362,7 +412,7 @@ func fixRootLogin(c *model.Collection, ctx model.ScanContext) string {
 }
 
 // sshdItem checks one keyword's effective value for clients that no Match
-// block names.
+// block names, in every running sshd.
 func sshdItem(id, name, want string, ok func(v string) bool, title, why string) Item {
 	key := strings.ToLower(name)
 	return Item{
@@ -371,26 +421,42 @@ func sshdItem(id, name, want string, ok func(v string) bool, title, why string) 
 		Why:   why,
 		Fix:   sedSSHD(name, want),
 		Check: func(c *model.Collection, _ model.ScanContext) (bool, string, string) {
-			cfg, skip := sshdOf(c)
+			views, skip := sshdViews(c)
 			if skip != "" {
 				return false, "", skip
 			}
-			s := cfg.effective("")[key]
-			if redacted(s.Value) {
-				return false, "", name + " was redacted in the collected text, so its value is unknown"
+			var firstObs string
+			for i, v := range views {
+				s := v.effective("")[key]
+				if redacted(s.Value) {
+					return false, "", name + " was redacted in the collected text, so its value is unknown"
+				}
+				obs := name + " " + s.Value + sourceNote(s)
+				if !ok(firstWord(s.Value)) {
+					return false, obs, ""
+				}
+				if i == 0 {
+					firstObs = obs
+				}
 			}
-			return ok(firstWord(s.Value)), name + " " + s.Value + defaultNote(s), ""
+			return true, firstObs, ""
 		},
 		fixFor: func(c *model.Collection, _ model.ScanContext) string {
-			cfg, skip := sshdOf(c)
+			views, skip := sshdViews(c)
 			if skip != "" {
 				return ""
 			}
-			s := cfg.effective("")[key]
-			if ok(firstWord(s.Value)) {
-				return ""
+			for _, v := range views {
+				s := v.effective("")[key]
+				switch {
+				case ok(firstWord(s.Value)):
+					continue
+				case s.Path == cmdlineSource:
+					return cmdlineFix(v, name)
+				}
+				return sshdLineFix(v.cfg, s, name, want) + reloadSSH
 			}
-			return sshdLineFix(cfg, s, name, want) + reloadSSH
+			return ""
 		},
 	}
 }
@@ -439,6 +505,9 @@ func persistMeta(c *model.Collection, p, why string) (model.FileEntry, string) {
 }
 
 func checkSSHDFiles(c *model.Collection, _ model.ScanContext) (bool, string, string) {
+	if why := sshdBlocked(c); why != "" {
+		return false, "", why
+	}
 	paths := sshdPaths(c)
 	if len(paths) == 0 {
 		return false, "", "no sshd configuration collected"
@@ -504,19 +573,20 @@ func isServerBlock(crit []string, serverAddr string) bool {
 	return err == nil && got.Unmap() == want
 }
 
-// looseMatchSettings lists loosening settings in Match blocks other than
-// "Match all" (whose values the per-keyword items already judge), excepting
-// root key login in the telltale server's own block.
+// looseMatchSettings lists loosening settings in Match blocks that do not
+// apply to every connection (those are judged with the global values),
+// excepting root key login in the telltale server's own block. Keywords not
+// allowed in Match blocks are left out: sshd refuses to start with one there.
 func looseMatchSettings(cfg *sshdConfig, ctx model.ScanContext) []looseSetting {
 	var out []looseSetting
 	for _, b := range cfg.blocks() {
-		if matchApplies(b.Criteria, "") {
+		if b.Everyone {
 			continue
 		}
 		server := isServerBlock(b.Criteria, ctx.ServerAddr)
 		for i, k := range b.Keys {
 			s := b.Settings[i]
-			if !loosens(k, s.Value) {
+			if !matchAllowed[k] || !loosens(k, s.Value) {
 				continue
 			}
 			if server && k == "permitrootlogin" && rootLoginValue(s.Value) == "prohibit-password" {
@@ -529,11 +599,11 @@ func looseMatchSettings(cfg *sshdConfig, ctx model.ScanContext) []looseSetting {
 }
 
 func checkMatchBlocks(c *model.Collection, ctx model.ScanContext) (bool, string, string) {
-	cfg, why := sshdOf(c)
+	views, why := sshdViews(c)
 	if why != "" {
 		return false, "", why
 	}
-	loose := looseMatchSettings(cfg, ctx)
+	loose := looseMatchSettings(views[0].cfg, ctx)
 	if len(loose) == 0 {
 		return true, "no Match block loosens a checked setting", ""
 	}
@@ -547,10 +617,11 @@ func checkMatchBlocks(c *model.Collection, ctx model.ScanContext) (bool, string,
 // fixMatchBlocks comments out each loosening line; one sed per file so line
 // numbers stay valid.
 func fixMatchBlocks(c *model.Collection, ctx model.ScanContext) string {
-	cfg, why := sshdOf(c)
+	views, why := sshdViews(c)
 	if why != "" {
 		return ""
 	}
+	cfg := views[0].cfg
 	var order []string
 	lines := map[string][]int{}
 	for _, l := range looseMatchSettings(cfg, ctx) {
@@ -801,6 +872,109 @@ func sudoRuleFix(re *regexp.Regexp, script string) func(*model.Collection, model
 	}
 }
 
+// noPasswdUsers returns the local accounts named first on NOPASSWD rules:
+// users, and members of %groups. ALL, negations, #uids and aliases are not
+// expanded; root is left out (it needs no sudo).
+func noPasswdUsers(c *model.Collection) []model.User {
+	names := map[string]bool{}
+	for _, pf := range sudoFiles(c) {
+		lines, ok := persistText(pf)
+		if !ok {
+			continue
+		}
+		for _, l := range lines {
+			t := sudoContent(l)
+			f := strings.Fields(t)
+			if !noPasswdRe.MatchString(t) || len(f) == 0 || strings.HasPrefix(f[0], "Defaults") {
+				continue
+			}
+			for _, who := range strings.Split(f[0], ",") {
+				switch {
+				case strings.HasPrefix(who, "%"):
+					for _, u := range groupMembers(c, strings.TrimPrefix(strings.TrimPrefix(who, "%:"), "%")) {
+						names[u] = true
+					}
+				case who == "" || who == "ALL" || who[0] == '!' || who[0] == '#' || isSudoAlias(who):
+				default:
+					names[who] = true
+				}
+			}
+		}
+	}
+	var out []model.User
+	for _, u := range accounts(c) {
+		if names[u.Name] && u.Name != "root" {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// isSudoAlias reports whether a sudoers name is an alias (upper case,
+// digits and underscores, starting with a letter).
+func isSudoAlias(s string) bool {
+	for i, r := range s {
+		if !(r >= 'A' && r <= 'Z' || i > 0 && (r >= '0' && r <= '9' || r == '_')) {
+			return false
+		}
+	}
+	return true
+}
+
+// groupMembers returns the listed members of group name plus the accounts
+// whose primary group it is.
+func groupMembers(c *model.Collection, name string) []string {
+	var out []string
+	for _, g := range c.Accounts.Groups {
+		if g.Name != name {
+			continue
+		}
+		out = append(out, g.Members...)
+		for _, u := range accounts(c) {
+			if u.GID == g.GID {
+				out = append(out, u.Name)
+			}
+		}
+	}
+	return out
+}
+
+// fixNoPasswd turns NOPASSWD into PASSWD, first setting a password for each
+// covered account that has none (a cloud image's default user is often
+// locked, as is root, and would otherwise lose its only way to root).
+func fixNoPasswd(c *model.Collection, ctx model.ScanContext) string {
+	base := sudoRuleFix(noPasswdRe, `s/NOPASSWD[[:space:]]*:/PASSWD:/g`)(c, ctx)
+	if base == "" {
+		return ""
+	}
+	users := noPasswdUsers(c)
+	if shadowMissing(c) != "" {
+		var names []string
+		for _, u := range users {
+			names = append(names, u.Name)
+		}
+		if len(names) == 0 {
+			return base
+		}
+		return "# check that " + strings.Join(names, ", ") + " can give sudo a password before running this, or nobody may be able to become root\n" + base
+	}
+	var need []string
+	for _, u := range users {
+		if !u.Password.Set || u.Password.Locked {
+			need = append(need, u.Name)
+		}
+	}
+	if len(need) == 0 {
+		return base
+	}
+	verb := "has"
+	if len(need) > 1 {
+		verb = "have"
+	}
+	return fmt.Sprintf("# %s %s no usable password: without NOPASSWD sudo asks for one, so set it first or nobody may be able to become root\n", strings.Join(need, ", "), verb) +
+		perUser(need, "passwd") + " && " + base
+}
+
 func sudoPaths(c *model.Collection) []string {
 	var ps []string
 	for _, pf := range sudoFiles(c) {
@@ -966,6 +1140,29 @@ func checkFirewall(c *model.Collection, _ model.ScanContext) (bool, string, stri
 		parts = append(parts, "ufw disabled")
 	}
 	return pass, strings.Join(parts, "; "), ""
+}
+
+// fixFirewall enables ufw without locking anyone out: it allows every port
+// sshd listens on first, and lists the other ports reachable from the network
+// for the person to decide on before the firewall goes up.
+func fixFirewall(c *model.Collection, _ model.ScanContext) string {
+	ssh := sshPorts(c)
+	var b strings.Builder
+	if other := otherTCPPorts(c, ssh); len(other) > 0 {
+		s := make([]string, len(other))
+		for i, p := range other {
+			s[i] = strconv.Itoa(p)
+		}
+		fmt.Fprintf(&b, "# also listening on TCP: %s (allow the ones that must stay reachable before enabling)\n", strings.Join(s, ", "))
+	}
+	if c.Firewall.UFWEnabled == nil {
+		b.WriteString("apt-get install -y ufw && ")
+	}
+	for _, p := range ssh {
+		fmt.Fprintf(&b, "ufw allow %d/tcp && ", p)
+	}
+	b.WriteString("ufw --force enable")
+	return b.String()
 }
 
 // --- Kernel ---

@@ -494,3 +494,146 @@ func TestSSHDFileModeFallsBackToPersistMeta(t *testing.T) {
 		t.Errorf("0666 include outside the inventory: %+v", r)
 	}
 }
+
+func TestSSHItemsSkipWhenConfigIncomplete(t *testing.T) {
+	c := hardened()
+	c.Skipped = append(c.Skipped, model.Skip{Check: model.SkipCheckSSHDConfig, Reason: "/etc/ssh/d17.conf: Include nested deeper than 16 levels, not read"})
+	for _, id := range []string{"TT-SSH-001", "TT-SSH-004", "TT-SSH-008", "TT-SSH-009"} {
+		if r := result(t, c, model.ScanContext{}, id); r.Skipped == "" || !strings.Contains(r.Skipped, "d17.conf") {
+			t.Errorf("%s with incomplete config: %+v", id, r)
+		}
+	}
+}
+
+func TestSudoSymlinkContentNotKeptSkips(t *testing.T) {
+	c := hardened()
+	c.Persist = append(c.Persist, model.PersistFile{Path: "/etc/sudoers.d/zz", Kind: model.PersistKindSudoers,
+		Mode: 0o120777, SHA256: "0f0e", Lines: []string{"/var/tmp/x"}})
+	if r := result(t, c, model.ScanContext{}, "TT-SUDO-001"); r.Skipped == "" {
+		t.Errorf("unknown sudoers symlink content: %+v", r)
+	}
+	// A NOPASSWD seen elsewhere is still a certain failure.
+	c.Persist[1].Lines = append(c.Persist[1].Lines, "bob ALL=(ALL) NOPASSWD: ALL")
+	if r := result(t, c, model.ScanContext{}, "TT-SUDO-001"); r.Pass || r.Skipped != "" {
+		t.Errorf("NOPASSWD with an unknown file: %+v", r)
+	}
+}
+
+func TestRootLoginFixKeepsServerAccess(t *testing.T) {
+	c := hardened()
+	ctx := model.ScanContext{ServerAddr: "10.0.0.5"}
+	it, _ := ByID("TT-SSH-001")
+	block := `printf '\nMatch Address %s\n    PermitRootLogin prohibit-password\n' 10.0.0.5 >> /etc/ssh/sshd_config`
+	setSSHD(c, "PermitRootLogin prohibit-password")
+	if fix := it.FixFor(c, ctx); fix != `sed -i '1s/.*/PermitRootLogin no/' /etc/ssh/sshd_config && `+block+` && systemctl reload ssh` {
+		t.Errorf("fix = %q", fix)
+	}
+	setSSHD(c, "# PermitRootLogin prohibit-password")
+	if fix := it.FixFor(c, ctx); fix != `sed -i '1i PermitRootLogin no' /etc/ssh/sshd_config && `+block+` && systemctl reload ssh` {
+		t.Errorf("fix for unset = %q", fix)
+	}
+	// Carry mode: no server to keep.
+	if fix := it.FixFor(c, model.ScanContext{}); fix != `sed -i '1i PermitRootLogin no' /etc/ssh/sshd_config && systemctl reload ssh` {
+		t.Errorf("carry-mode fix = %q", fix)
+	}
+}
+
+func TestFirewallFixAllowsSSHPorts(t *testing.T) {
+	c := hardened()
+	c.Firewall = model.Firewall{Backend: "nftables", InputPolicy: "accept", UFWEnabled: boolp(false)}
+	setSSHD(c, "Port 22", "Port 2222", "PermitRootLogin no")
+	c.Runtime.Processes = []model.Process{{PID: 900, Comm: "sshd", Exe: "/usr/sbin/sshd", Cmdline: "sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups"}}
+	c.Runtime.Sockets = []model.Socket{
+		{Proto: "tcp", Local: "0.0.0.0:2222", Listening: true, PID: 900},
+		{Proto: "tcp", Local: "0.0.0.0:80", Listening: true, PID: 1},
+		{Proto: "tcp", Local: "127.0.0.1:5432", Listening: true, PID: 2},
+		{Proto: "tcp6", Local: "[::]:443", Listening: true, PID: 3},
+		{Proto: "tcp6", Local: "[::1]:631", Listening: true, PID: 4},
+		{Proto: "udp", Local: "0.0.0.0:53", Listening: true, PID: 5},
+		{Proto: "tcp", Local: "10.0.0.9:8080", Remote: "10.0.0.1:5000", PID: 6},
+	}
+	it, _ := ByID("TT-FW-001")
+	want := "# also listening on TCP: 80, 443 (allow the ones that must stay reachable before enabling)\nufw allow 22/tcp && ufw allow 2222/tcp && ufw --force enable"
+	if fix := it.FixFor(c, model.ScanContext{}); fix != want {
+		t.Errorf("fix = %q", fix)
+	}
+	// ufw not installed yet; sshd on a command-line port only.
+	c.Firewall.UFWEnabled = nil
+	setSSHD(c, "PermitRootLogin no")
+	c.Runtime.Processes[0].Cmdline = "sshd: /usr/sbin/sshd -D -p 2200 [listener] 0 of 10-100 startups"
+	c.Runtime.Sockets = nil
+	if fix := it.FixFor(c, model.ScanContext{}); fix != "apt-get install -y ufw && ufw allow 2200/tcp && ufw --force enable" {
+		t.Errorf("fix = %q", fix)
+	}
+}
+
+func TestNoPasswdFixSetsPasswordFirst(t *testing.T) {
+	c := hardened()
+	c.Accounts.Users = append(c.Accounts.Users,
+		model.User{Name: "ubuntu", UID: 1001, GID: 1001, Shell: "/bin/bash", Password: model.PasswordState{Locked: true, LastChange: 19000}},
+		model.User{Name: "carol", UID: 1002, GID: 1002, Shell: "/bin/bash", Password: model.PasswordState{Set: true, Algo: "yescrypt", LastChange: 19000}},
+	)
+	c.Accounts.Groups = append(c.Accounts.Groups, model.Group{Name: "admins", GID: 2000, Members: []string{"carol"}})
+	c.Persist = append(c.Persist, model.PersistFile{Path: "/etc/sudoers.d/90-cloud-init-users", Kind: model.PersistKindSudoers, Mode: 0o100440,
+		Lines: []string{"ubuntu ALL=(ALL) NOPASSWD:<redacted h:0123456789abcdef01234567>", "%admins ALL=(ALL) NOPASSWD: <redacted h:0123456789abcdef01234567>"}})
+	c.Files = append(c.Files, fileEntry("/etc/sudoers.d/90-cloud-init-users", 0o440, 0, 0))
+	it, _ := ByID("TT-SUDO-001")
+	want := "# ubuntu has no usable password: without NOPASSWD sudo asks for one, so set it first or nobody may be able to become root\n" +
+		"passwd ubuntu && sed -i 's/NOPASSWD[[:space:]]*:/PASSWD:/g' /etc/sudoers.d/90-cloud-init-users && visudo -c"
+	if fix := it.FixFor(c, model.ScanContext{}); fix != want {
+		t.Errorf("fix = %q", fix)
+	}
+	if !strings.Contains(it.Why, "password") {
+		t.Errorf("Why does not warn about passwords: %q", it.Why)
+	}
+}
+
+func TestSSHDCommandLineOptions(t *testing.T) {
+	c := hardened()
+	setSSHD(c, "PermitRootLogin no", "Match Address 10.0.0.5", "  PermitRootLogin prohibit-password")
+	c.Runtime.Processes = []model.Process{
+		{PID: 900, Comm: "sshd", Exe: "/usr/sbin/sshd", Cmdline: "sshd: /usr/sbin/sshd -D -o PermitRootLogin=yes -oX11Forwarding=yes [listener] 0 of 10-100 startups"},
+		// A per-connection child of an older sshd is not a listener.
+		{PID: 901, Comm: "sshd", Exe: "/usr/sbin/sshd", Cmdline: "sshd: alice [priv]"},
+	}
+	ctx := model.ScanContext{ServerAddr: "10.0.0.5"}
+	r := result(t, c, ctx, "TT-SSH-001")
+	// -o acts as the first global value; a matching Match block still
+	// overrides it (sshd -T: prohibit-password from 10.0.0.5, yes otherwise).
+	if r.Pass || r.Observed != "PermitRootLogin yes (sshd command line); from the telltale server 10.0.0.5: prohibit-password" {
+		t.Errorf("TT-SSH-001 with -o: %+v", r)
+	}
+	if r := result(t, c, ctx, "TT-SSH-004"); r.Pass {
+		t.Errorf("TT-SSH-004 with -oX11Forwarding=yes: %+v", r)
+	}
+	// The config file alone still evaluates as written.
+	wantSSHD(t, EffectiveSSHD(c.Persist, ""), "permitrootlogin", "no")
+
+	// A second, plain listener does not hide the loose one.
+	c.Runtime.Processes = append(c.Runtime.Processes, model.Process{PID: 902, Comm: "sshd", Exe: "/usr/sbin/sshd", Cmdline: "/usr/sbin/sshd -D"})
+	if r := result(t, c, ctx, "TT-SSH-001"); r.Pass {
+		t.Errorf("loose listener hidden by a plain one: %+v", r)
+	}
+
+	// A listener reading another config file: the collected one is not what
+	// runs, so SSH items are skipped.
+	c.Runtime.Processes = []model.Process{{PID: 903, Comm: "sshd", Exe: "/tmp/.x/sshd", Cmdline: "/tmp/.x/sshd -f /tmp/.x/cfg -D"}}
+	for _, id := range []string{"TT-SSH-001", "TT-SSH-002", "TT-SSH-008", "TT-SSH-009"} {
+		if r := result(t, c, ctx, id); r.Skipped == "" || !strings.Contains(r.Skipped, "/tmp/.x/cfg") {
+			t.Errorf("%s with -f: %+v", id, r)
+		}
+	}
+	// -f naming the usual file changes nothing.
+	c.Runtime.Processes = []model.Process{{PID: 904, Comm: "sshd", Exe: "/usr/sbin/sshd", Cmdline: "/usr/sbin/sshd -D -f /etc/ssh/sshd_config"}}
+	if r := result(t, c, ctx, "TT-SSH-001"); !r.Pass {
+		t.Errorf("-f /etc/ssh/sshd_config: %+v", r)
+	}
+}
+
+func TestDroppedStigRefs(t *testing.T) {
+	for _, id := range []string{"TT-ACCT-001", "TT-ACCT-004"} {
+		if it, _ := ByID(id); len(it.Refs) != 0 {
+			t.Errorf("%s refs = %v", id, it.Refs)
+		}
+	}
+}

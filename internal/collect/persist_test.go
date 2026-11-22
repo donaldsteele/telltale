@@ -2,6 +2,7 @@ package collect
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -229,5 +230,58 @@ func TestPersistenceHugeFileNotRead(t *testing.T) {
 	f, ok := findPersist(pf, "/home/u/.bashrc")
 	if !ok || f.SHA256 != "" || f.Lines != nil || f.Mode == 0 || len(skips) != 1 {
 		t.Fatalf("f=%+v ok=%v skips=%+v", f, ok, skips)
+	}
+}
+
+func TestPersistenceSSHDIncludeNegatedGlob(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "etc/ssh/sshd_config", "Include /etc/ssh/evil/[!a]*\n")
+	writeFile(t, root, "etc/ssh/evil/a.conf", "PermitRootLogin no\n")
+	writeFile(t, root, "etc/ssh/evil/b.conf", "PermitRootLogin yes\n")
+	pf, _ := Persistence(root, nil, testKey)
+	if _, ok := findPersist(pf, "/etc/ssh/evil/b.conf"); !ok {
+		t.Error("[!a]* did not collect b.conf (sshd reads it)")
+	}
+	if _, ok := findPersist(pf, "/etc/ssh/evil/a.conf"); ok {
+		t.Error("[!a]* collected a.conf")
+	}
+}
+
+func TestPersistenceSSHDIncludeDepth(t *testing.T) {
+	// sshd follows Include 16 levels deep; one more and it refuses to start.
+	root := t.TempDir()
+	writeFile(t, root, "etc/ssh/sshd_config", "Include /etc/ssh/d01.conf\n")
+	for i := 1; i <= 17; i++ {
+		writeFile(t, root, fmt.Sprintf("etc/ssh/d%02d.conf", i), fmt.Sprintf("Include /etc/ssh/d%02d.conf\n", i+1))
+	}
+	pf, skips := Persistence(root, nil, testKey)
+	if _, ok := findPersist(pf, "/etc/ssh/d16.conf"); !ok {
+		t.Error("depth 16 not collected")
+	}
+	if _, ok := findPersist(pf, "/etc/ssh/d17.conf"); ok {
+		t.Error("depth 17 collected")
+	}
+	var found bool
+	for _, s := range skips {
+		found = found || (s.Check == model.SkipCheckSSHDConfig && strings.Contains(s.Reason, "/etc/ssh/d17.conf"))
+	}
+	if !found {
+		t.Errorf("no %s skip for the over-deep Include: %+v", model.SkipCheckSSHDConfig, skips)
+	}
+}
+
+func TestPersistenceSSHDUnreadableIncludeIsSkipped(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "etc/ssh/sshd_config", "Include /etc/ssh/sshd_config.d/*.conf\n")
+	if err := os.MkdirAll(filepath.Join(root, "etc/ssh/sshd_config.d/x.conf"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, skips := Persistence(root, nil, testKey)
+	var found bool
+	for _, s := range skips {
+		found = found || (s.Check == model.SkipCheckSSHDConfig && strings.Contains(s.Reason, "x.conf"))
+	}
+	if !found {
+		t.Errorf("unreadable sshd include not recorded as %s: %+v", model.SkipCheckSSHDConfig, skips)
 	}
 }

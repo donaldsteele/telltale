@@ -48,16 +48,17 @@ const maxBytes = 64 << 20
 // with no matching rule are absent: this STIG has no rule for SSH root login,
 // MaxAuthTries, host-based login, .rhosts, sshd_config permissions, the
 // mode of /etc/shadow and friends, cron directories, most sysctls, TFTP,
-// NIS or unattended-upgrades.
+// NIS or unattended-upgrades. Deliberately not mapped: TT-ACCT-001 to
+// V-260543 (that rule is about duplicate UIDs in general, not UID 0) and
+// TT-ACCT-004 to V-260572 (its check requires SHA-512; telltale also accepts
+// yescrypt, the stronger Debian and Ubuntu default).
 var mapping = map[string][]string{
 	"TT-SSH-002": {"V-260526"}, // no unattended SSH login: PermitEmptyPasswords no
 	"TT-SSH-004": {"V-260529"}, // X11Forwarding no
 	"TT-SSH-010": {"V-260526"}, // no unattended SSH login: PermitUserEnvironment no
 
-	"TT-ACCT-001": {"V-260543"}, // no duplicate UIDs (a second UID 0 duplicates root)
 	"TT-ACCT-002": {"V-260571"}, // no blank passwords in /etc/shadow
 	"TT-ACCT-003": {"V-288817"}, // no interactive shell for system accounts
-	"TT-ACCT-004": {"V-260572"}, // stored passwords use an approved hash (STIG wants SHA-512)
 
 	"TT-SUDO-001": {"V-274860"}, // no NOPASSWD in sudoers
 	"TT-SUDO-002": {"V-260558"}, // no !authenticate in sudoers

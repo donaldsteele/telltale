@@ -1,12 +1,15 @@
 package collect
 
 import (
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/sshglob"
 	"golang.org/x/sys/unix"
 )
 
@@ -14,7 +17,9 @@ import (
 var defaultAuthorizedKeysFile = []string{".ssh/authorized_keys", ".ssh/authorized_keys2"}
 
 const (
-	maxSSHDIncludeDepth = 8
+	// maxSSHDIncludeDepth is sshd's own limit (SERVCONF_MAX_DEPTH): deeper
+	// nesting makes sshd refuse to start.
+	maxSSHDIncludeDepth = 16
 	maxSSHDParseBytes   = 16 << 20
 )
 
@@ -61,6 +66,8 @@ func (s *sshdState) readable(mp string) ([]byte, error) {
 
 func (s *sshdState) read(mp string, depth int) {
 	if depth > maxSSHDIncludeDepth {
+		s.c.skips = append(s.c.skips, model.Skip{Check: model.SkipCheckSSHDConfig,
+			Reason: fmt.Sprintf("%s: Include nested deeper than %d levels, not read (sshd would refuse to start)", mp, maxSSHDIncludeDepth)})
 		return
 	}
 	if s.visited == nil {
@@ -77,7 +84,7 @@ func (s *sshdState) read(mp string, depth int) {
 	s.files = append(s.files, mp)
 	b, err := s.readable(mp)
 	if err != nil {
-		s.c.skip(mp, "sshd config not parsed for AuthorizedKeysFile: "+err.Error())
+		s.c.skips = append(s.c.skips, model.Skip{Check: model.SkipCheckSSHDConfig, Reason: mp + ": sshd configuration file not read: " + err.Error()})
 		return
 	}
 	for _, line := range splitLines(b) {
@@ -91,7 +98,7 @@ func (s *sshdState) read(mp string, depth int) {
 				if !path.IsAbs(pat) {
 					pat = path.Join("/etc/ssh", pat)
 				}
-				matches, _ := filepath.Glob(filepath.Join(s.c.root, pat))
+				matches, _ := filepath.Glob(filepath.Join(s.c.root, sshglob.Pattern(pat)))
 				sort.Strings(matches)
 				for _, m := range matches {
 					s.read(path.Join("/", filepath.ToSlash(strings.TrimPrefix(m, s.c.root))), depth+1)

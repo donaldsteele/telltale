@@ -4,9 +4,11 @@ import (
 	"net/netip"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/sshglob"
 )
 
 // mainSSHDConfig is the file sshd reads first.
@@ -78,10 +80,17 @@ type sshdConfig struct {
 //
 // It reads the sshd-kind files among files the way sshd does: starting at
 // /etc/ssh/sshd_config, expanding Include in place (relative patterns are
-// relative to /etc/ssh, matches in sorted order, an Include that matches no
-// collected file is ignored), first value wins in the global section, and a
-// Match block that applies to the client overrides the global value for the
-// keywords it sets (first value wins among applying blocks).
+// relative to /etc/ssh, glob(3) rules, matches in sorted order, an Include
+// that matches no collected file is ignored), first value wins in the global
+// section and "Match all", and a Match block that applies to the client
+// overrides the global value for the keywords it sets (first value wins
+// among applying blocks), except keywords not allowed in Match blocks
+// (StrictModes, PermitUserEnvironment, ...), which keep their global value.
+// A file included from inside a Match block that does not apply cannot
+// activate any of its own Match blocks, as in sshd.
+//
+// Only the files are read; options on a running sshd's command line are
+// applied by the checklist items, not here.
 //
 // Match criteria: "all" applies to every client; "Address" takes a
 // comma-separated list of addresses, CIDR ranges and */? wildcards, each
@@ -107,14 +116,24 @@ func EffectiveSSHD(files []model.PersistFile, clientAddr string) map[string]stri
 	return out
 }
 
-// persistText returns the content lines of a collected file. For a symlink,
-// Lines[0] is the link target and the target's content follows. ok is false
-// when the text was not kept.
+// emptySHA256 is the SHA-256 of no content.
+const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// persistText returns the content lines of a collected file. ok is false
+// when the text was not kept: Lines is nil (too large), or the file is a
+// symlink whose target content was not kept. For a symlink, Lines[0] is the
+// link target and the target's content follows; when only the target is
+// there, the content was read only if SHA256 is that of an empty file (the
+// collector otherwise hashes the target text: target is another symlink,
+// too large, or a secret file).
 func persistText(pf model.PersistFile) (lines []string, ok bool) {
 	if pf.Lines == nil {
 		return nil, false
 	}
 	if isSymlinkMode(pf.Mode) {
+		if len(pf.Lines) == 0 || (len(pf.Lines) == 1 && pf.SHA256 != emptySHA256) {
+			return nil, false
+		}
 		return pf.Lines[1:], true
 	}
 	return pf.Lines, true
@@ -178,7 +197,7 @@ func (p *sshdParser) read(file string, depth int) {
 	pf := p.files[file]
 	lines, ok := persistText(pf)
 	if !ok {
-		p.problem = file + ": text not kept (too large or unreadable), so the sshd configuration cannot be evaluated"
+		p.problem = file + ": content not kept (too large, or a symlink to a secret, oversized or symlinked file), so the sshd configuration cannot be evaluated"
 		return
 	}
 	if isSymlinkMode(pf.Mode) {
@@ -197,12 +216,12 @@ func (p *sshdParser) read(file string, depth int) {
 		case "match":
 			p.emit(sshdEvent{Kind: evMatch, Args: args[1:], Path: file, Line: i + 1})
 		case "include":
-			if depth+1 > maxSSHDDepth {
-				p.problem = file + ": Include nested deeper than sshd allows (sshd would not start)"
-				return
-			}
 			for _, pat := range args[1:] {
 				for _, m := range p.glob(pat) {
+					if depth+1 > maxSSHDDepth {
+						p.problem = file + ": Include nested deeper than sshd allows (sshd would not start)"
+						return
+					}
 					if !p.emit(sshdEvent{Kind: evEnter, Path: m}) {
 						return
 					}
@@ -219,8 +238,7 @@ func (p *sshdParser) read(file string, depth int) {
 }
 
 // glob returns the collected sshd files matching an Include pattern, sorted,
-// with glob(3) rules: relative patterns are under /etc/ssh, and a wildcard
-// does not match a leading dot.
+// with glob(3) rules (relative patterns are under /etc/ssh).
 func (p *sshdParser) glob(pat string) []string {
 	if strings.HasPrefix(pat, "~") {
 		return nil
@@ -230,22 +248,11 @@ func (p *sshdParser) glob(pat string) []string {
 	}
 	var out []string
 	for _, f := range p.paths {
-		if ok, err := path.Match(pat, f); err == nil && ok && !dotHidden(pat, f) {
+		if sshglob.Match(pat, f) {
 			out = append(out, f)
 		}
 	}
 	return out
-}
-
-// dotHidden reports whether a wildcard in pat matched a leading dot in f.
-func dotHidden(pat, f string) bool {
-	pc, fc := strings.Split(pat, "/"), strings.Split(f, "/")
-	for i := range fc {
-		if i < len(pc) && strings.HasPrefix(fc[i], ".") && !strings.HasPrefix(pc[i], ".") {
-			return true
-		}
-	}
-	return false
 }
 
 // sshdArgs splits one config line the way sshd does: the keyword ends at
@@ -292,13 +299,65 @@ func sshdArgs(line string) []string {
 	return out
 }
 
-// effective evaluates the configuration for clientAddr as sshd does: a
-// global pass (Match blocks inactive except "Match all"), then a pass over
-// the Match blocks that apply to the client, whose values override.
+// matchAllowed lists the keywords sshd accepts after a Match line
+// (sshd_config(5), OpenSSH 10.0). Every other keyword is global-only: the
+// match pass never overrides it, and sshd refuses to start if one appears in
+// a Match block that does not apply to every connection.
+var matchAllowed = func() map[string]bool {
+	m := map[string]bool{}
+	for _, k := range strings.Fields(`AcceptEnv AllowAgentForwarding AllowGroups
+		AllowStreamLocalForwarding AllowTcpForwarding AllowUsers AuthenticationMethods
+		AuthorizedKeysCommand AuthorizedKeysCommandUser AuthorizedKeysFile
+		AuthorizedPrincipalsCommand AuthorizedPrincipalsCommandUser AuthorizedPrincipalsFile
+		Banner CASignatureAlgorithms ChannelTimeout ChrootDirectory ClientAliveCountMax
+		ClientAliveInterval DenyGroups DenyUsers DisableForwarding ExposeAuthInfo ForceCommand
+		GatewayPorts GSSAPIAuthentication HostbasedAcceptedAlgorithms HostbasedAuthentication
+		HostbasedUsesNameFromPacketOnly IgnoreRhosts Include IPQoS KbdInteractiveAuthentication
+		KerberosAuthentication LogLevel MaxAuthTries MaxSessions PAMServiceName
+		PasswordAuthentication PermitEmptyPasswords PermitListen PermitOpen PermitRootLogin
+		PermitTTY PermitTunnel PermitUserRC PubkeyAcceptedAlgorithms PubkeyAuthentication
+		PubkeyAuthOptions RefuseConnection RekeyLimit RevokedKeys SetEnv StreamLocalBindMask
+		StreamLocalBindUnlink TrustedUserCAKeys UnusedConnectionTimeout X11DisplayOffset
+		X11Forwarding X11UseLocalhost`) {
+		m[strings.ToLower(k)] = true
+	}
+	return m
+}()
+
+// cmdlineSource is the sshdSetting.Path of a value given with -o on a
+// running sshd's command line.
+const cmdlineSource = "(sshd command line)"
+
+// sshdOption is one -o Keyword=value from a running sshd's command line.
+type sshdOption struct{ Key, Value string }
+
+// effective evaluates the configuration files alone for clientAddr.
 func (c *sshdConfig) effective(clientAddr string) map[string]sshdSetting {
-	out := c.pass(false, "")
+	return c.effectiveWith(nil, clientAddr)
+}
+
+// effectiveWith evaluates the configuration for clientAddr as sshd does:
+// command-line -o values come first (first value wins, so they beat the
+// files' global values), then the global pass over the files (global section
+// and "Match all", first value wins), then the Match blocks that apply to the
+// client override the keywords allowed in Match blocks, including -o values
+// (checked with sshd -T).
+func (c *sshdConfig) effectiveWith(opts []sshdOption, clientAddr string) map[string]sshdSetting {
+	out := map[string]sshdSetting{}
+	for _, o := range opts {
+		if _, set := out[o.Key]; !set {
+			out[o.Key] = sshdSetting{Value: o.Value, Path: cmdlineSource}
+		}
+	}
+	for k, v := range c.pass(false, "") {
+		if _, set := out[k]; !set {
+			out[k] = v
+		}
+	}
 	for k, v := range c.pass(true, clientAddr) {
-		out[k] = v
+		if matchAllowed[k] {
+			out[k] = v
+		}
 	}
 	for k, v := range sshdDefaults {
 		if _, ok := out[k]; !ok {
@@ -308,35 +367,104 @@ func (c *sshdConfig) effective(clientAddr string) map[string]sshdSetting {
 	return out
 }
 
-// pass replays the events once. In the global pass (addr "") the global
-// section and "Match all" blocks are active; in the match pass only the Match
-// blocks that apply to addr are. An included file starts in its includer's
-// state and never changes it.
+// replay walks the events for one pass and calls f with the index of every
+// Match line and setting and whether it is active. The global pass
+// (matchPass false, addr "") starts active and activates only "Match all";
+// the match pass starts inactive and activates the Match blocks that apply
+// to addr.
 //
-// sshd also stops an Include read from inside an inactive Match block from
-// activating its own Match blocks, but only in the global pass. That cannot
-// change the result: such a block can only be "Match all", which is active in
-// the match pass too, where its values override.
-func (c *sshdConfig) pass(matchPass bool, addr string) map[string]sshdSetting {
-	out := map[string]sshdSetting{}
-	active := !matchPass
-	var stack []bool
-	for _, e := range c.events {
+// Include follows sshd's servconf.c. An included file starts in its
+// includer's active state and never changes it. Each file also has two
+// flags: matchOnly (match pass, and the file is not yet past its first Match
+// line) and never (none of the file's Match blocks can apply). An included
+// file inherits matchOnly while its includer still has it; otherwise it gets
+// never when the includer is not active at the Include.
+func (c *sshdConfig) replay(matchPass bool, addr string, f func(i int, active bool)) {
+	type state struct{ active, matchOnly, never bool }
+	st := state{active: !matchPass, matchOnly: matchPass}
+	var stack []state
+	for i, e := range c.events {
 		switch e.Kind {
 		case evEnter:
-			stack = append(stack, active)
+			stack = append(stack, st)
+			st = state{active: st.active, matchOnly: st.matchOnly, never: !st.matchOnly && !st.active}
 		case evLeave:
-			active = stack[len(stack)-1]
+			st = stack[len(stack)-1]
 			stack = stack[:len(stack)-1]
 		case evMatch:
-			active = matchApplies(e.Args, addr)
+			st.active = !st.never && matchApplies(e.Args, addr)
+			st.matchOnly = false
+			f(i, st.active)
 		case evSet:
-			if _, set := out[e.Key]; active && !set {
-				out[e.Key] = sshdSetting{Value: strings.Join(e.Args, " "), Path: e.Path, Line: e.Line}
-			}
+			f(i, st.active)
 		}
 	}
+}
+
+func eventSetting(e sshdEvent) sshdSetting {
+	return sshdSetting{Value: strings.Join(e.Args, " "), Path: e.Path, Line: e.Line}
+}
+
+// pass returns the first active value of every keyword in one pass.
+func (c *sshdConfig) pass(matchPass bool, addr string) map[string]sshdSetting {
+	out := map[string]sshdSetting{}
+	c.replay(matchPass, addr, func(i int, active bool) {
+		e := c.events[i]
+		if _, set := out[e.Key]; e.Kind == evSet && active && !set {
+			out[e.Key] = eventSetting(e)
+		}
+	})
 	return out
+}
+
+// ports returns the TCP ports the files make sshd listen on: every Port value
+// in the global pass (Port adds up and is global-only), or 22 when there is
+// none, and separately the explicit ports of ListenAddress host:port lines.
+func (c *sshdConfig) ports() (ports, listen []int) {
+	c.replay(false, "", func(i int, active bool) {
+		e := c.events[i]
+		if e.Kind != evSet || !active {
+			return
+		}
+		switch e.Key {
+		case "port":
+			for _, a := range e.Args {
+				if n := parsePort(a); n > 0 {
+					ports = append(ports, n)
+				}
+			}
+		case "listenaddress":
+			if n := listenPort(e.Args[0]); n > 0 {
+				listen = append(listen, n)
+			}
+		}
+	})
+	if len(ports) == 0 {
+		ports = []int{22}
+	}
+	return ports, listen
+}
+
+func parsePort(s string) int {
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 1 || n > 65535 {
+		return 0
+	}
+	return n
+}
+
+// listenPort returns the port of "host:port" or "[v6]:port", 0 when none.
+func listenPort(s string) int {
+	if strings.HasPrefix(s, "[") {
+		if i := strings.LastIndex(s, "]:"); i >= 0 {
+			return parsePort(s[i+2:])
+		}
+		return 0
+	}
+	if strings.Count(s, ":") == 1 {
+		return parsePort(s[strings.IndexByte(s, ':')+1:])
+	}
+	return 0
 }
 
 // matchApplies evaluates one Match line's criteria for addr ("" = no
@@ -422,10 +550,14 @@ func wildMatch(pat, s string) bool {
 }
 
 // matchBlock is one Match block and the first value it sets per keyword.
+// Everyone is set when the block applies to every connection (it is active
+// when evaluated for no particular client), so its values are judged with
+// the global ones.
 type matchBlock struct {
 	Criteria []string
 	Path     string
 	Line     int
+	Everyone bool
 	Settings []sshdSetting
 	Keys     []string
 }
@@ -434,11 +566,17 @@ type matchBlock struct {
 // inside it (an included file's leading lines belong to the block that was
 // open at the Include).
 func (c *sshdConfig) blocks() []matchBlock {
+	everyone := map[int]bool{}
+	c.replay(true, "", func(i int, active bool) {
+		if c.events[i].Kind == evMatch && active {
+			everyone[i] = true
+		}
+	})
 	var out []matchBlock
 	cur := -1
 	var stack []int
 	seen := map[int]map[string]bool{}
-	for _, e := range c.events {
+	for i, e := range c.events {
 		switch e.Kind {
 		case evEnter:
 			stack = append(stack, cur)
@@ -446,7 +584,7 @@ func (c *sshdConfig) blocks() []matchBlock {
 			cur = stack[len(stack)-1]
 			stack = stack[:len(stack)-1]
 		case evMatch:
-			out = append(out, matchBlock{Criteria: e.Args, Path: e.Path, Line: e.Line})
+			out = append(out, matchBlock{Criteria: e.Args, Path: e.Path, Line: e.Line, Everyone: everyone[i]})
 			cur = len(out) - 1
 			seen[cur] = map[string]bool{}
 		case evSet:
@@ -454,7 +592,7 @@ func (c *sshdConfig) blocks() []matchBlock {
 				seen[cur][e.Key] = true
 				b := &out[cur]
 				b.Keys = append(b.Keys, e.Key)
-				b.Settings = append(b.Settings, sshdSetting{Value: strings.Join(e.Args, " "), Path: e.Path, Line: e.Line})
+				b.Settings = append(b.Settings, eventSetting(e))
 			}
 		}
 	}

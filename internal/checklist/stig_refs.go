@@ -14,10 +14,6 @@ package checklist
 // stigRefs maps a checklist item ID to the DISA STIG rules that require
 // the same setting.
 var stigRefs = map[string][]string{
-	"TT-ACCT-001": {
-		// SV-260543r958482_rule medium: Ubuntu 22.04 LTS must uniquely identify interactive users.
-		"STIG V-260543 (UBTU-22-411015)",
-	},
 	"TT-ACCT-002": {
 		// SV-260571r1268251_rule high: Ubuntu 22.04 LTS must not have accounts configured with blank or null passwords.
 		"STIG V-260571 (UBTU-22-611065)",
@@ -25,10 +21,6 @@ var stigRefs = map[string][]string{
 	"TT-ACCT-003": {
 		// SV-288817r1261441_rule medium: Ubuntu 22.04 LTS must not assign an interactive login shell for system accounts.
 		"STIG V-288817 (UBTU-22-412040)",
-	},
-	"TT-ACCT-004": {
-		// SV-260572r1268232_rule medium: Ubuntu 22.04 LTS must encrypt all stored passwords with a FIPS 140-3-approved cryptographic hashing algorithm.
-		"STIG V-260572 (UBTU-22-611070)",
 	},
 	"TT-FILE-005": {
 		// SV-260485r991559_rule medium: Ubuntu 22.04 LTS must have directories that contain system commands set to a mode of "755" or less permissive.

@@ -40,6 +40,12 @@ type Skip struct {
 	Reason string `json:"reason"`
 }
 
+// SkipCheckSSHDConfig is the Skip.Check of a part of the sshd configuration
+// the collector could not read or follow (an unreadable file, Include nested
+// deeper than sshd allows). The collected configuration is then incomplete
+// and must not be judged.
+const SkipCheckSSHDConfig = "sshd_config"
+
 // FileEntry describes one path that was stat'ed during collection.
 // Type: file|dir|symlink|other. Caps: hex of security.capability or "".
 // Flags: inode flags from FS_IOC_GETFLAGS.

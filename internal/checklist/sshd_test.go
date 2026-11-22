@@ -196,3 +196,97 @@ func TestEffectiveSSHDIncludeFanOutIsBounded(t *testing.T) {
 		t.Errorf("fan-out evaluated: %v", got["permitrootlogin"])
 	}
 }
+
+// The expected values in the tests below were checked with sshd -T from
+// OpenSSH 10.0p2.
+
+func TestEffectiveSSHDIncludeInsideMatch(t *testing.T) {
+	// Included from inside a Match block that does not apply: none of the
+	// included file's Match blocks can apply, in either pass.
+	files := []model.PersistFile{
+		sshdFile("/etc/ssh/sshd_config", "PermitRootLogin yes", "Match User nobody", "    Include /etc/ssh/hardening.conf"),
+		sshdFile("/etc/ssh/hardening.conf", "Match all", "PermitRootLogin no"),
+	}
+	for _, addr := range []string{"", "10.0.0.5"} {
+		wantSSHD(t, EffectiveSSHD(files, addr), "permitrootlogin", "yes")
+	}
+
+	// Included from inside a block that applies: its lines and Match blocks
+	// work for that client only.
+	files = []model.PersistFile{
+		sshdFile("/etc/ssh/sshd_config", "PermitRootLogin no", "Match Address 10.0.0.5", "  Include /etc/ssh/m.conf"),
+		sshdFile("/etc/ssh/m.conf", "X11Forwarding yes", "Match all", "  PermitRootLogin yes"),
+	}
+	got := EffectiveSSHD(files, "10.0.0.5")
+	wantSSHD(t, got, "x11forwarding", "yes")
+	wantSSHD(t, got, "permitrootlogin", "yes")
+	got = EffectiveSSHD(files, "10.0.0.6")
+	wantSSHD(t, got, "x11forwarding", "no")
+	wantSSHD(t, got, "permitrootlogin", "no")
+
+	// An included file's first Match line ends its match-only part: an
+	// Include after it, inside a block that does not apply, is inert.
+	files = []model.PersistFile{
+		sshdFile("/etc/ssh/sshd_config", "Include /etc/ssh/x.conf", "PermitRootLogin no"),
+		sshdFile("/etc/ssh/x.conf", "Match User nobody", "  Include /etc/ssh/y.conf"),
+		sshdFile("/etc/ssh/y.conf", "Match all", "  PermitRootLogin yes"),
+	}
+	for _, addr := range []string{"", "10.0.0.5"} {
+		wantSSHD(t, EffectiveSSHD(files, addr), "permitrootlogin", "no")
+	}
+
+	// A chain of Includes before any Match keeps Match blocks working.
+	files = []model.PersistFile{
+		sshdFile("/etc/ssh/sshd_config", "Include /etc/ssh/z.conf", "X11Forwarding no"),
+		sshdFile("/etc/ssh/z.conf", "MaxAuthTries 3", "Include /etc/ssh/w.conf"),
+		sshdFile("/etc/ssh/w.conf", "Match Address 10.0.0.5", "  X11Forwarding yes"),
+	}
+	wantSSHD(t, EffectiveSSHD(files, "10.0.0.5"), "x11forwarding", "yes")
+	wantSSHD(t, EffectiveSSHD(files, "10.0.0.6"), "x11forwarding", "no")
+	wantSSHD(t, EffectiveSSHD(files, ""), "maxauthtries", "3")
+}
+
+func TestEffectiveSSHDGlobalOnlyKeywords(t *testing.T) {
+	// PermitUserEnvironment and StrictModes are not allowed in Match blocks:
+	// a later Match all cannot override them, but may set other keywords.
+	files := []model.PersistFile{sshdFile("/etc/ssh/sshd_config",
+		"PermitUserEnvironment yes", "StrictModes no",
+		"Match all", "  PermitUserEnvironment no", "  StrictModes yes", "  X11Forwarding yes")}
+	got := EffectiveSSHD(files, "")
+	wantSSHD(t, got, "permituserenvironment", "yes")
+	wantSSHD(t, got, "strictmodes", "no")
+	wantSSHD(t, got, "x11forwarding", "yes")
+
+	// A Match all read before the global value sets it in the global pass.
+	files = []model.PersistFile{
+		sshdFile("/etc/ssh/sshd_config", "Include /etc/ssh/i.conf", "StrictModes yes"),
+		sshdFile("/etc/ssh/i.conf", "Match all", "  StrictModes no"),
+	}
+	wantSSHD(t, EffectiveSSHD(files, ""), "strictmodes", "no")
+}
+
+func TestEffectiveSSHDNegatedGlob(t *testing.T) {
+	files := []model.PersistFile{
+		sshdFile("/etc/ssh/sshd_config", "Include /etc/ssh/evil/[!a]*", "PermitRootLogin no"),
+		sshdFile("/etc/ssh/evil/a.conf", "PermitRootLogin no"),
+		sshdFile("/etc/ssh/evil/b.conf", "PermitRootLogin yes"),
+	}
+	wantSSHD(t, EffectiveSSHD(files, ""), "permitrootlogin", "yes")
+}
+
+func TestEffectiveSSHDSymlinkContentNotKept(t *testing.T) {
+	// The collector keeps only the target path when the target is another
+	// symlink, too large, or a secret file: the content is unknown.
+	link := model.PersistFile{Path: "/etc/ssh/sshd_config.d/00-x.conf", Kind: model.PersistKindSSHD, Mode: 0o120777,
+		SHA256: "5c1e4cd27bf0f4e5c4f2d2e0d4b5a0a1c7f6b8e9d0a1b2c3d4e5f60718293a4b", Lines: []string{"/etc/ssh/l"}}
+	files := []model.PersistFile{
+		sshdFile("/etc/ssh/sshd_config", "Include /etc/ssh/sshd_config.d/*.conf", "PermitRootLogin no"),
+		link,
+	}
+	if got := EffectiveSSHD(files, ""); got != nil {
+		t.Errorf("unknown symlink content evaluated: %v", got["permitrootlogin"])
+	}
+	// A symlink to an empty file is read: its hash is that of no content.
+	files[1].SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	wantSSHD(t, EffectiveSSHD(files, ""), "permitrootlogin", "no")
+}
