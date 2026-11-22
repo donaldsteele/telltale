@@ -524,7 +524,7 @@ func persistLinks(c *model.Collection) []model.Finding {
 			Title: fmt.Sprintf("%s is a link to %s, outside the system directories", p.Path, target),
 			Why:   "Startup entries that point at files in temporary or user-writable places (as `systemctl link` can create) run whatever sits there, and the real code is not in the usual locations.",
 			Fix: fix([]string{p.Path, target}, func(q []string) string {
-				return keep(q[0], q[1]) + " && rm " + q[0] + "   # inspect the saved copies first; rm only runs if the copy succeeded"
+				return keep(q[0]) + " && { cp -a --parents " + q[1] + " " + evidenceDir + "/ 2>/dev/null || echo 'link target not saved (missing or unreadable)'; } && rm " + q[0] + "   # inspect the saved copies first; rm only runs once the link itself is saved"
 			}),
 			Evidence: ev, Refs: []string{"T1543.002", "T1053.003"},
 		})

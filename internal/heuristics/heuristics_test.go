@@ -1,6 +1,9 @@
 package heuristics
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -317,4 +320,26 @@ func TestHeuristicHiddenDirInOwnHome(t *testing.T) {
 	want(t, c, "heur.proc_exe:21", model.SevBackdoor)
 	want(t, c, "heur.proc_exe:22", model.SevBackdoor)
 	want(t, c, "heur.proc_exe:23", model.SevBackdoor)
+}
+
+func TestPersistLinkFixRemovesDanglingLink(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "x.service")
+	if err := os.Symlink("/nonexistent/evil.service", link); err != nil {
+		t.Fatal(err)
+	}
+	c := cleanCollection()
+	c.Persist = append(c.Persist, model.PersistFile{Path: link, Kind: model.PersistKindSystemdUnit, Mode: 0o120777, Lines: []string{"/nonexistent/evil.service"}})
+	f := want(t, c, "heur.persist_link:"+link, model.SevBackdoor)
+	ev := filepath.Join(dir, "evidence")
+	script := strings.ReplaceAll(f.Fix, "/root/telltale-evidence", ev)
+	if out, err := exec.Command("sh", "-c", script).CombinedOutput(); err != nil {
+		t.Fatalf("fix failed: %v\n%s", err, out)
+	}
+	if _, err := os.Lstat(link); err == nil {
+		t.Error("link not removed")
+	}
+	if _, err := os.Lstat(filepath.Join(ev, link)); err != nil {
+		t.Errorf("link not saved: %v", err)
+	}
 }
