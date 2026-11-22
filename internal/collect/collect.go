@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/donaldsteele/telltale/internal/crossview"
@@ -72,7 +73,11 @@ func All(opt Options) (*model.Collection, error) {
 	add(s)
 
 	if opt.CrossView {
-		c.CrossView = crossview.Collect(c.Runtime, opt.Root, nil)
+		if filepath.Clean(opt.Root) != "/" || filepath.Clean(opt.ProcRoot) != "/proc" {
+			c.CrossView = crossview.SkipAll("cross-view needs the live system (root / and /proc)", nil)
+		} else {
+			c.CrossView = crossview.Collect(c.Runtime, opt.Root, nil)
+		}
 	}
 	return c, nil
 }

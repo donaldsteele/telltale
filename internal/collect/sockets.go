@@ -1,55 +1,14 @@
 package collect
 
 import (
-	"encoding/binary"
-	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/procnet"
 )
-
-var tcpStates = map[string]string{
-	"01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV", "04": "FIN_WAIT1",
-	"05": "FIN_WAIT2", "06": "TIME_WAIT", "07": "CLOSE", "08": "CLOSE_WAIT",
-	"09": "LAST_ACK", "0A": "LISTEN", "0B": "CLOSING", "0C": "NEW_SYN_RECV",
-}
-
-// parseAddr decodes a /proc/net hex "ADDR:PORT". The address words are in host
-// (little-endian) order. zero reports an all-zero address.
-func parseAddr(s string) (text string, port int, zero bool, err error) {
-	i := strings.LastIndexByte(s, ':')
-	if i < 0 {
-		return "", 0, false, fmt.Errorf("bad address %q", s)
-	}
-	p, err := strconv.ParseUint(s[i+1:], 16, 16)
-	if err != nil {
-		return "", 0, false, err
-	}
-	h := s[:i]
-	if len(h) != 8 && len(h) != 32 {
-		return "", 0, false, fmt.Errorf("bad address %q", s)
-	}
-	ip := make(net.IP, len(h)/2)
-	zero = true
-	for w := 0; w < len(h)/8; w++ {
-		v, err := strconv.ParseUint(h[w*8:w*8+8], 16, 32)
-		if err != nil {
-			return "", 0, false, err
-		}
-		if v != 0 {
-			zero = false
-		}
-		binary.LittleEndian.PutUint32(ip[w*4:], uint32(v))
-	}
-	if len(ip) == 4 {
-		return fmt.Sprintf("%s:%d", ip, p), int(p), zero, nil
-	}
-	return fmt.Sprintf("[%s]:%d", ip, p), int(p), zero, nil
-}
 
 // parseSockets reads one /proc/net table. Unparseable lines are skipped.
 func parseSockets(procRoot, proto string, owners map[uint64]int, skips *[]model.Skip) []model.Socket {
@@ -61,24 +20,11 @@ func parseSockets(procRoot, proto string, owners map[uint64]int, skips *[]model.
 		return nil
 	}
 	var out []model.Socket
-	lines := strings.Split(string(data), "\n")
-	for _, ln := range lines[min(1, len(lines)):] {
-		f := strings.Fields(ln)
-		if len(f) < 10 {
-			continue
-		}
-		local, lport, _, err1 := parseAddr(f[1])
-		remote, _, rzero, err2 := parseAddr(f[2])
-		inode, err3 := strconv.ParseUint(f[9], 10, 64)
-		if err1 != nil || err2 != nil || err3 != nil {
-			continue
-		}
-		st := strings.ToUpper(f[3])
-		s := model.Socket{Proto: proto, Local: local, Remote: remote, State: tcpStates[st], Inode: inode, PID: owners[inode]}
-		if strings.HasPrefix(proto, "tcp") {
-			s.Listening = st == "0A"
-		} else {
-			s.Listening = rzero && lport != 0
+	for _, r := range procnet.Parse(string(data)) {
+		st := r.State
+		s := model.Socket{Proto: proto, Local: r.Local, Remote: r.Remote, State: procnet.States[st], Inode: r.Inode, PID: owners[r.Inode]}
+		s.Listening = r.Listening(proto)
+		if !strings.HasPrefix(proto, "tcp") {
 			if s.Listening && st == "07" {
 				s.State = "UNCONN"
 			} else if s.State == "CLOSE" {

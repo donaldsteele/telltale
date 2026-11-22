@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/donaldsteele/telltale/internal/model"
 )
@@ -36,16 +37,17 @@ func TestParsePSOutput(t *testing.T) {
 func TestParseSSOutput(t *testing.T) {
 	for _, d := range distros {
 		p, err := parseSSOutput(readFixture(t, d, "ss-tcp.txt"))
-		if err != nil || !reflect.DeepEqual(p, []int{31337}) {
+		if err != nil || !reflect.DeepEqual(p, []ssListener{{"4", 31337}}) {
 			t.Errorf("%s tcp: %v %v", d, p, err)
 		}
 		p, err = parseSSOutput(readFixture(t, d, "ss-udp.txt"))
-		if err != nil || !reflect.DeepEqual(p, []int{31338}) {
+		if err != nil || !reflect.DeepEqual(p, []ssListener{{"4", 31338}}) {
 			t.Errorf("%s udp: %v %v", d, p, err)
 		}
 	}
-	p, err := parseSSOutput("LISTEN 0 4096 [::]:22 [::]:*\nLISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*\nESTAB 0 0 1.2.3.4:80 5.6.7.8:9\n")
-	if err != nil || !reflect.DeepEqual(p, []int{22, 53}) {
+	p, err := parseSSOutput("LISTEN 0 4096 [::]:22 [::]:*\nLISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*\nLISTEN 0 1 *:80 *:*\nLISTEN 0 1 :::81 :::*\nESTAB 0 0 1.2.3.4:80 5.6.7.8:9\n")
+	want := []ssListener{{"6", 22}, {"4", 53}, {"", 80}, {"6", 81}}
+	if err != nil || !reflect.DeepEqual(p, want) {
 		t.Errorf("ipv6/zone: %v %v", p, err)
 	}
 }
@@ -69,9 +71,9 @@ func TestParseLsmod(t *testing.T) {
 
 func TestParseLs(t *testing.T) {
 	for _, d := range distros {
-		n := parseLs(readFixture(t, d, "ls-etc.txt"))
-		if len(n) < 10 {
-			t.Fatalf("%s: %d names", d, len(n))
+		n, err := parseLs(readFixture(t, d, "ls-etc.txt"))
+		if err != nil || len(n) < 10 {
+			t.Fatalf("%s: %d names, %v", d, len(n), err)
 		}
 		for _, x := range n {
 			if x == "." || x == ".." {
@@ -81,52 +83,105 @@ func TestParseLs(t *testing.T) {
 	}
 }
 
-func TestCompareHiddenProcess(t *testing.T) {
-	before := []model.Process{{PID: 1, Comm: "init"}, {PID: 4242, Comm: "evil"}}
-	hidden, extra := comparePIDs(before, []int{1}, map[int]bool{1: true, 4242: true}, 999)
-	if !reflect.DeepEqual(hidden, []string{"pid 4242 (evil)"}) || len(extra) != 0 {
-		t.Errorf("hidden=%v extra=%v", hidden, extra)
+func TestParseLsHostileNames(t *testing.T) {
+	for _, d := range []string{"debian12", "ubuntu2404"} {
+		n, err := parseLs(readFixture(t, d, "ls-hostile.txt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := toSet(n)
+		for _, w := range []string{"x\ny", "a b", `back\slash`, "hi\xff", "plain"} {
+			if !got[w] {
+				t.Errorf("%s: missing %q in %q", d, w, n)
+			}
+		}
+		if len(n) != 5 {
+			t.Errorf("%s: %q", d, n)
+		}
+	}
+	if _, err := parseLs("bad\\q\n"); err == nil {
+		t.Error("undecodable name accepted")
+	}
+	if _, err := parseLs("bad\\\n"); err == nil {
+		t.Error("trailing backslash accepted")
 	}
 }
 
-func TestCompareIgnoresRaces(t *testing.T) {
-	before := []model.Process{{PID: 1, Comm: "init"}, {PID: 4242, Comm: "gone"}}
-	// 4242 exited before the second read; 77 appeared and exited unseen
-	// by telltale; 78 is the tool's own pid.
-	hidden, extra := comparePIDs(before, []int{1, 77, 78}, map[int]bool{1: true, 77: true}, 78)
+func TestCompareListeners(t *testing.T) {
+	before := map[string]bool{"tcp 22": true, "tcp6 22": true, "tcp 99": true}
+	after := map[string]bool{"tcp 22": true, "tcp6 22": true}
+	// ss shows only the v4 listener on 22; 99 closed during the run.
+	hidden, extra := compareListeners("tcp", before, after, []ssListener{{"4", 22}})
+	if !reflect.DeepEqual(hidden, []string{"tcp6 port 22"}) || len(extra) != 0 {
+		t.Errorf("hidden=%v extra=%v", hidden, extra)
+	}
+	// wildcard satisfies both families; unknown port is extra
+	hidden, extra = compareListeners("tcp", before, after, []ssListener{{"", 22}, {"4", 7000}})
+	if len(hidden) != 0 || !reflect.DeepEqual(extra, []string{"tcp port 7000"}) {
+		t.Errorf("hidden=%v extra=%v", hidden, extra)
+	}
+	// a listener that appeared during the run is not extra
+	hidden, extra = compareListeners("udp", map[string]bool{}, map[string]bool{"udp 53": true}, []ssListener{{"4", 53}})
 	if len(hidden) != 0 || len(extra) != 0 {
 		t.Errorf("hidden=%v extra=%v", hidden, extra)
 	}
-	// A pid only the tool knows and that is gone everywhere is extra.
-	_, extra = comparePIDs(before, []int{1, 5000}, map[int]bool{1: true}, 78)
-	if !reflect.DeepEqual(extra, []string{"pid 5000"}) {
-		t.Errorf("extra=%v", extra)
+}
+
+func TestDiffSetsRaces(t *testing.T) {
+	id := func(s string) string { return s }
+	// present before only (exited): not hidden; tool-only but in after: not extra
+	h, e := diffSets(map[string]bool{"1": true, "2": true}, map[string]bool{"1": true, "5": true},
+		map[string]bool{"1": true, "5": true}, id)
+	if len(h) != 0 || len(e) != 0 {
+		t.Errorf("h=%v e=%v", h, e)
+	}
+	h, e = diffSets(map[string]bool{"1": true, "2": true}, map[string]bool{"1": true, "2": true},
+		map[string]bool{"1": true, "9": true}, id)
+	if !reflect.DeepEqual(h, []string{"2"}) || !reflect.DeepEqual(e, []string{"9"}) {
+		t.Errorf("h=%v e=%v", h, e)
 	}
 }
 
-func fakeTools(t *testing.T, root string, scripts map[string]string) string {
+func fakeTools(t *testing.T, scripts map[string]string) {
 	t.Helper()
-	dir := filepath.Join(root, "fakebin")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	dir := t.TempDir()
 	for n, body := range scripts {
 		if err := os.WriteFile(filepath.Join(dir, n), []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
 	old := toolDirs
-	toolDirs = []string{"/fakebin"}
+	toolDirs = []string{dir}
 	t.Cleanup(func() { toolDirs = old })
-	return dir
+}
+
+func fakeProc(t *testing.T, pids map[string]string, modules, tcp string) {
+	t.Helper()
+	proc := t.TempDir()
+	for p, comm := range pids {
+		must(t, os.Mkdir(filepath.Join(proc, p), 0o755))
+		must(t, os.WriteFile(filepath.Join(proc, p, "comm"), []byte(comm+"\n"), 0o644))
+	}
+	must(t, os.WriteFile(filepath.Join(proc, "modules"), []byte(modules), 0o644))
+	must(t, os.Mkdir(filepath.Join(proc, "net"), 0o755))
+	must(t, os.WriteFile(filepath.Join(proc, "net", "tcp"), []byte(tcp), 0o644))
+	old := procRoot
+	procRoot = proc
+	t.Cleanup(func() { procRoot = old })
+}
+
+func must(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestMissingToolSkipped(t *testing.T) {
-	root := t.TempDir()
-	fakeTools(t, root, nil)
-	res := Collect(model.Runtime{}, root, []string{})
-	if len(res) == 0 {
-		t.Fatal("no results")
+	fakeTools(t, nil)
+	res := Collect(model.Runtime{}, t.TempDir(), []string{"/etc"})
+	if len(res) != 5 {
+		t.Fatalf("%d results", len(res))
 	}
 	for _, r := range res {
 		if r.Ran || !strings.HasSuffix(r.SkipReason, "not installed") {
@@ -138,79 +193,90 @@ func TestMissingToolSkipped(t *testing.T) {
 	}
 }
 
+func TestSkipAll(t *testing.T) {
+	res := SkipAll("why", []string{"/etc"})
+	if len(res) != 5 {
+		t.Fatalf("%d", len(res))
+	}
+	for _, r := range res {
+		if r.Ran || r.SkipReason != "why" || r.Tool == "" {
+			t.Errorf("%+v", r)
+		}
+	}
+}
+
 func TestEnvironmentIsClean(t *testing.T) {
-	root := t.TempDir()
-	fakeTools(t, root, map[string]string{"ps": "env"})
+	fakeTools(t, map[string]string{"ps": "cat /proc/$$/environ"})
 	t.Setenv("LD_PRELOAD", "/nonexistent.so")
 	t.Setenv("SECRET_TOKEN", "x")
-	out, _, reason := runTool(root, "ps")
+	out, _, reason := runTool("ps")
 	if reason != "" {
 		t.Fatal(reason)
 	}
-	got := strings.Fields(out)
-	// Some shells add PWD/SHLVL/_ themselves; those are not ours.
-	for _, l := range got {
-		if strings.HasPrefix(l, "LD_PRELOAD") || strings.HasPrefix(l, "SECRET") || strings.HasPrefix(l, "HOME") {
-			t.Errorf("leaked %q", l)
-		}
-	}
-	joined := "\n" + strings.Join(got, "\n") + "\n"
-	for _, w := range []string{"\nPATH=/usr/sbin:/usr/bin:/sbin:/bin\n", "\nLC_ALL=C\n"} {
-		if !strings.Contains(joined, w) {
-			t.Errorf("missing %q in %q", w, got)
-		}
+	got := strings.Split(strings.TrimRight(out, "\x00"), "\x00")
+	want := []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("environment %q, want %q", got, want)
 	}
 }
 
 func TestToolFailureAndOutputCap(t *testing.T) {
-	root := t.TempDir()
-	fakeTools(t, root, map[string]string{"ps": "echo 1; exit 3", "lsmod": "yes | head -c 40000000"})
-	if _, _, r := runTool(root, "ps"); !strings.Contains(r, "exit status 3") {
+	fakeTools(t, map[string]string{"ps": "echo 1; exit 3", "lsmod": "yes | head -c 40000000"})
+	if _, _, r := runTool("ps"); !strings.Contains(r, "exit status 3") {
 		t.Errorf("reason %q", r)
 	}
-	if _, _, r := runTool(root, "lsmod"); !strings.Contains(r, "32 MiB") {
+	if _, _, r := runTool("lsmod"); !strings.Contains(r, "32 MiB") {
 		t.Errorf("reason %q", r)
 	}
 }
 
+func TestToolTimeoutKillsGroup(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "child-alive")
+	fakeTools(t, map[string]string{"ps": "(sleep 2; touch " + marker + ") &\nsleep 30"})
+	old := toolTimeout
+	toolTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { toolTimeout = old })
+	start := time.Now()
+	_, _, r := runTool("ps")
+	if !strings.Contains(r, "timed out") {
+		t.Errorf("reason %q", r)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Errorf("took %s", time.Since(start))
+	}
+	time.Sleep(2500 * time.Millisecond)
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("child survived the timeout")
+	}
+}
+
+const tcpHeader = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+
+// 0.0.0.0:22 and 0.0.0.0:31337 (0x7A69) listening.
+const tcpRows = "   0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1 1 0000000000000000 100 0 0 10 0\n" +
+	"   1: 00000000:7A69 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 2 1 0000000000000000 100 0 0 10 0\n"
+
 func TestCollectEndToEnd(t *testing.T) {
 	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	must(t, os.MkdirAll(filepath.Join(root, "etc"), 0o755))
 	for _, n := range []string{"a", "hidden-by-rootkit"} {
-		if err := os.WriteFile(filepath.Join(root, "etc", n), nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
+		must(t, os.WriteFile(filepath.Join(root, "etc", n), nil, 0o644))
 	}
-	proc := t.TempDir()
-	for _, n := range []string{"1", "4242"} {
-		os.Mkdir(filepath.Join(proc, n), 0o755)
-	}
-	oldProc := procRoot
-	procRoot = proc
-	t.Cleanup(func() { procRoot = oldProc })
-	fakeTools(t, root, map[string]string{
+	fakeProc(t, map[string]string{"1": "init", "4242": "evil"},
+		"nf_tables 1 0 - Live 0x0\nrk 1 0 - Live 0x0\n", tcpHeader+tcpRows)
+	fakeTools(t, map[string]string{
 		"ps":    "echo 1",
 		"ss":    "echo 'LISTEN 0 5 0.0.0.0:22 0.0.0.0:*'",
 		"lsmod": "echo 'Module Size Used by'; echo nf_tables 1 0",
-		"ls":    `printf '.\n..\na\n'`,
+		"ls":    `printf '.\n..\na\nx\\ny\n'`,
 	})
-	rt := model.Runtime{
-		Processes: []model.Process{{PID: 1, Comm: "init"}, {PID: 4242, Comm: "evil"}},
-		Sockets: []model.Socket{
-			{Proto: "tcp", Local: "0.0.0.0:22", Listening: true},
-			{Proto: "tcp", Local: "0.0.0.0:31337", Listening: true},
-		},
-		Modules: []model.KernelModule{{Name: "nf_tables"}, {Name: "rk"}},
-	}
-	res := Collect(rt, root, []string{"/etc"})
+	res := Collect(model.Runtime{}, root, []string{"/etc"})
 	want := map[string][2][]string{
 		"ps":      {{"pid 4242 (evil)"}, nil},
+		"lsmod":   {{"module rk"}, nil},
 		"ss -t":   {{"tcp port 31337"}, nil},
 		"ss -u":   {nil, {"udp port 22"}},
-		"lsmod":   {{"module rk"}, nil},
-		"ls /etc": {{"/etc/hidden-by-rootkit"}, nil},
+		"ls /etc": {{"/etc/hidden-by-rootkit"}, {"/etc/x\ny"}},
 	}
 	if len(res) != len(want) {
 		t.Fatalf("%d results: %+v", len(res), res)
@@ -220,5 +286,18 @@ func TestCollectEndToEnd(t *testing.T) {
 		if !r.Ran || !reflect.DeepEqual(r.HiddenFromTool, w[0]) || !reflect.DeepEqual(r.ExtraInTool, w[1]) {
 			t.Errorf("%s: %+v", r.Tool, r)
 		}
+	}
+}
+
+func TestLsChurnNotHidden(t *testing.T) {
+	root := t.TempDir()
+	must(t, os.MkdirAll(filepath.Join(root, "d"), 0o755))
+	f := filepath.Join(root, "d", "moved")
+	must(t, os.WriteFile(f, nil, 0o644))
+	// The fake ls renames the file away and back (changes ctime) and lists nothing.
+	fakeTools(t, map[string]string{"ls": "mv " + f + " " + f + ".x; sleep 0.05; mv " + f + ".x " + f + "; echo ."})
+	res := crossLs(root, "/d")
+	if !res.Ran || len(res.HiddenFromTool) != 0 {
+		t.Errorf("%+v", res)
 	}
 }

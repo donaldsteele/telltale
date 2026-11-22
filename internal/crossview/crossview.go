@@ -2,6 +2,10 @@
 // from the kernel) with what the machine's own tools report. A userland rootkit
 // hides things from ps, ss, lsmod and ls but not from telltale. This is the
 // only place the collector runs the machine's programs.
+//
+// Every comparison reads telltale's view immediately before and after the tool
+// runs: a thing counts as hidden only if present in both reads and absent from
+// the tool, and as extra only if absent from both reads.
 package crossview
 
 import (
@@ -15,46 +19,67 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/procnet"
 )
 
-const (
-	toolTimeout = 10 * time.Second
-	maxOutput   = 32 << 20
-)
+const maxOutput = 32 << 20
 
 var (
-	// toolDirs is where the tools are looked up, under root. Never PATH.
+	// toolDirs is where the tools are looked up. Absolute, never under a
+	// scan root and never via PATH.
 	toolDirs = []string{"/usr/sbin", "/usr/bin", "/sbin", "/bin"}
-	// procRoot is where the pid list is re-read after a tool ran.
+	// procRoot is where telltale's own view is read.
 	procRoot = "/proc"
 	// toolEnv is the complete environment given to every tool.
 	toolEnv = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C"}
+	// toolTimeout bounds each tool run.
+	toolTimeout = 10 * time.Second
 
 	defaultDirs = []string{"/etc", "/usr/bin", "/usr/sbin", "/tmp", "/dev/shm", "/var/tmp", "/root"}
 )
 
-// Collect runs ps, ss, lsmod and ls and compares each with rt and the
-// directory contents under root. dirs nil means the default directories.
+// Collect runs ps, lsmod, ss and ls and compares each with telltale's own
+// reading of /proc and of the directories under root. dirs nil means the
+// default directories. rt is only used to name processes that vanish.
 func Collect(rt model.Runtime, root string, dirs []string) []model.CrossViewResult {
 	if dirs == nil {
 		dirs = defaultDirs
 	}
 	var res []model.CrossViewResult
-	res = append(res, crossPS(rt, root))
-	res = append(res, crossSS(rt, root, "tcp", "-Htanl"), crossSS(rt, root, "udp", "-Huanl"))
-	res = append(res, crossLsmod(rt, root))
+	res = append(res, crossPS(rt))
+	// lsmod before ss: ss's sock_diag requests may autoload inet_diag modules.
+	res = append(res, crossLsmod())
+	res = append(res, crossSS("tcp", "-Htanl"), crossSS("udp", "-Huanl"))
 	for _, d := range dirs {
 		res = append(res, crossLs(root, d))
 	}
 	return res
 }
 
+// SkipAll returns one not-run result per tool and directory, for callers that
+// cannot run the comparison. dirs nil means the default directories.
+func SkipAll(reason string, dirs []string) []model.CrossViewResult {
+	if dirs == nil {
+		dirs = defaultDirs
+	}
+	tools := []string{"ps", "lsmod", "ss -t", "ss -u"}
+	for _, d := range dirs {
+		tools = append(tools, "ls "+d)
+	}
+	res := make([]model.CrossViewResult, 0, len(tools))
+	for _, t := range tools {
+		res = append(res, skipped(t, reason))
+	}
+	return res
+}
+
 type capWriter struct {
-	big bool
 	buf bytes.Buffer
+	big bool
 }
 
 var errTooBig = errors.New("output larger than 32 MiB")
@@ -67,10 +92,10 @@ func (w *capWriter) Write(p []byte) (int, error) {
 	return w.buf.Write(p)
 }
 
-// findTool returns the path of name in the fixed tool directories under root.
-func findTool(root, name string) (string, bool) {
+// findTool returns the path of name in the fixed tool directories.
+func findTool(name string) (string, bool) {
 	for _, d := range toolDirs {
-		p := filepath.Join(root, d, name)
+		p := filepath.Join(d, name)
 		if st, err := os.Stat(p); err == nil && st.Mode().IsRegular() && st.Mode()&0o111 != 0 {
 			return p, true
 		}
@@ -80,8 +105,8 @@ func findTool(root, name string) (string, bool) {
 
 // runTool runs one tool and returns its stdout and its own pid. A failure
 // is returned as a human-readable reason.
-func runTool(root, name string, args ...string) (out string, pid int, reason string) {
-	path, ok := findTool(root, name)
+func runTool(name string, args ...string) (out string, pid int, reason string) {
+	path, ok := findTool(name)
 	if !ok {
 		return "", 0, name + " not installed"
 	}
@@ -89,12 +114,18 @@ func runTool(root, name string, args ...string) (out string, pid int, reason str
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Env = append([]string(nil), toolEnv...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		// Kill the whole group so no child outlives the timeout.
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	var w capWriter
 	cmd.Stdout = &w
 	cmd.WaitDelay = time.Second
 	err := cmd.Run()
 	if cmd.Process != nil {
 		pid = cmd.Process.Pid
+		_ = syscall.Kill(-pid, syscall.SIGKILL) // stragglers in the group
 	}
 	switch {
 	case ctx.Err() != nil:
@@ -117,24 +148,71 @@ func ran(tool string, hidden, extra []string) model.CrossViewResult {
 	return model.CrossViewResult{Tool: tool, Ran: true, HiddenFromTool: hidden, ExtraInTool: extra}
 }
 
-// readProcPIDs lists the numeric entries of procRoot.
-func readProcPIDs() (map[int]bool, error) {
+// diffSets returns the keys of own missing from tool (hidden, only when also
+// in after) and the keys of tool missing from own and after (extra). label
+// formats a key for the result.
+func diffSets(own, after, tool map[string]bool, label func(string) string) (hidden, extra []string) {
+	for k := range own {
+		if !tool[k] && after[k] {
+			hidden = append(hidden, label(k))
+		}
+	}
+	for k := range tool {
+		if !own[k] && !after[k] {
+			extra = append(extra, label(k))
+		}
+	}
+	return hidden, extra
+}
+
+func ident(s string) string { return s }
+
+// --- ps ---
+
+type procSnap map[int]string // pid -> comm
+
+func readProcs(rt model.Runtime) (procSnap, error) {
 	ents, err := os.ReadDir(procRoot)
 	if err != nil {
 		return nil, err
 	}
-	m := make(map[int]bool)
+	known := make(map[int]string, len(rt.Processes))
+	for _, p := range rt.Processes {
+		known[p.PID] = p.Comm
+	}
+	m := make(procSnap)
 	for _, e := range ents {
-		if n, err := strconv.Atoi(e.Name()); err == nil && n > 0 {
-			m[n] = true
+		n, err := strconv.Atoi(e.Name())
+		if err != nil || n <= 0 {
+			continue
 		}
+		comm := known[n]
+		if b, err := os.ReadFile(filepath.Join(procRoot, e.Name(), "comm")); err == nil {
+			comm = strings.TrimSpace(string(b))
+		}
+		m[n] = comm
 	}
 	return m, nil
 }
 
-func crossPS(rt model.Runtime, root string) model.CrossViewResult {
+func (s procSnap) set() map[string]bool {
+	m := make(map[string]bool, len(s))
+	for p := range s {
+		m[strconv.Itoa(p)] = true
+	}
+	return m
+}
+
+func crossPS(rt model.Runtime) model.CrossViewResult {
 	const tool = "ps"
-	out, self, reason := runTool(root, "ps", "-eo", "pid=")
+	if _, ok := findTool("ps"); !ok {
+		return skipped(tool, "ps not installed")
+	}
+	before, err := readProcs(rt)
+	if err != nil {
+		return skipped(tool, "read /proc: "+err.Error())
+	}
+	out, self, reason := runTool("ps", "-eo", "pid=")
 	if reason != "" {
 		return skipped(tool, reason)
 	}
@@ -142,85 +220,55 @@ func crossPS(rt model.Runtime, root string) model.CrossViewResult {
 	if err != nil {
 		return skipped(tool, err.Error())
 	}
-	after, err := readProcPIDs()
+	after, err := readProcs(rt)
 	if err != nil {
-		return skipped(tool, "re-read /proc: "+err.Error())
+		return skipped(tool, "read /proc: "+err.Error())
 	}
-	hidden, extra := comparePIDs(rt.Processes, toolPIDs, after, self)
+	inTool := make(map[string]bool)
+	for _, p := range toolPIDs {
+		if p != self {
+			inTool[strconv.Itoa(p)] = true
+		}
+	}
+	bs := before.set()
+	delete(bs, strconv.Itoa(self))
+	label := func(k string) string {
+		n, _ := strconv.Atoi(k)
+		if c, ok := before[n]; ok {
+			return fmt.Sprintf("pid %d (%s)", n, c)
+		}
+		return "pid " + k
+	}
+	hidden, extra := diffSets(bs, after.set(), inTool, label)
 	return ran(tool, hidden, extra)
 }
 
-// comparePIDs compares telltale's process list (before) with the tool's pids.
-// A pid is hidden only if it was in before and after the tool ran and is not
-// in the tool output; it is extra only if it was in neither. self is the
-// tool's own pid, which is ignored.
-func comparePIDs(before []model.Process, toolPIDs []int, after map[int]bool, self int) (hidden, extra []string) {
-	inTool := make(map[int]bool, len(toolPIDs))
-	for _, p := range toolPIDs {
-		inTool[p] = true
-	}
-	inBefore := make(map[int]bool, len(before))
-	for _, p := range before {
-		inBefore[p.PID] = true
-		if after[p.PID] && !inTool[p.PID] && p.PID != self {
-			hidden = append(hidden, fmt.Sprintf("pid %d (%s)", p.PID, p.Comm))
-		}
-	}
-	for _, p := range toolPIDs {
-		if !inBefore[p] && !after[p] && p != self {
-			extra = append(extra, fmt.Sprintf("pid %d", p))
-		}
-	}
-	return hidden, extra
-}
+// --- lsmod ---
 
-func crossSS(rt model.Runtime, root, proto, flags string) model.CrossViewResult {
-	tool := "ss -" + proto[:1]
-	out, _, reason := runTool(root, "ss", flags)
-	if reason != "" {
-		return skipped(tool, reason)
-	}
-	ports, err := parseSSOutput(out)
+func readModules() (map[string]bool, error) {
+	b, err := os.ReadFile(filepath.Join(procRoot, "modules"))
 	if err != nil {
-		return skipped(tool, err.Error())
+		return nil, err
 	}
-	hidden, extra := comparePorts(rt.Sockets, proto, ports)
-	return ran(tool, hidden, extra)
+	m := make(map[string]bool)
+	for _, ln := range strings.Split(string(b), "\n") {
+		if f := strings.Fields(ln); len(f) > 0 {
+			m[normModule(f[0])] = true
+		}
+	}
+	return m, nil
 }
 
-func comparePorts(socks []model.Socket, proto string, toolPorts []int) (hidden, extra []string) {
-	inTool := make(map[int]bool)
-	for _, p := range toolPorts {
-		inTool[p] = true
-	}
-	own := make(map[int]bool)
-	for _, s := range socks {
-		if !s.Listening || !strings.HasPrefix(s.Proto, proto) {
-			continue
-		}
-		i := strings.LastIndexByte(s.Local, ':')
-		p, err := strconv.Atoi(s.Local[i+1:])
-		if i < 0 || err != nil {
-			continue
-		}
-		own[p] = true
-	}
-	for p := range own {
-		if !inTool[p] {
-			hidden = append(hidden, fmt.Sprintf("%s port %d", proto, p))
-		}
-	}
-	for p := range inTool {
-		if !own[p] {
-			extra = append(extra, fmt.Sprintf("%s port %d", proto, p))
-		}
-	}
-	return hidden, extra
-}
-
-func crossLsmod(rt model.Runtime, root string) model.CrossViewResult {
+func crossLsmod() model.CrossViewResult {
 	const tool = "lsmod"
-	out, _, reason := runTool(root, "lsmod")
+	if _, ok := findTool("lsmod"); !ok {
+		return skipped(tool, "lsmod not installed")
+	}
+	before, err := readModules()
+	if err != nil {
+		return skipped(tool, "read /proc/modules: "+err.Error())
+	}
+	out, _, reason := runTool("lsmod")
 	if reason != "" {
 		return skipped(tool, reason)
 	}
@@ -228,36 +276,12 @@ func crossLsmod(rt model.Runtime, root string) model.CrossViewResult {
 	if err != nil {
 		return skipped(tool, err.Error())
 	}
-	own := make([]string, 0, len(rt.Modules))
-	for _, m := range rt.Modules {
-		own = append(own, normModule(m.Name))
+	after, err := readModules()
+	if err != nil {
+		return skipped(tool, "read /proc/modules: "+err.Error())
 	}
-	hidden, extra := diffNames(own, names, nil, "module ")
+	hidden, extra := diffSets(before, after, toSet(names), func(k string) string { return "module " + k })
 	return ran(tool, hidden, extra)
-}
-
-// diffNames returns the items of own missing from tool (hidden) and the items
-// of tool missing from own (extra). When after is non-nil it is the second
-// read of own: an item is hidden only if also in after, extra only if also
-// absent from after.
-func diffNames(own, tool, after []string, prefix string) (hidden, extra []string) {
-	inTool := toSet(tool)
-	inOwn := toSet(own)
-	var inAfter map[string]bool
-	if after != nil {
-		inAfter = toSet(after)
-	}
-	for _, n := range own {
-		if !inTool[n] && (inAfter == nil || inAfter[n]) {
-			hidden = append(hidden, prefix+n)
-		}
-	}
-	for _, n := range tool {
-		if !inOwn[n] && (inAfter == nil || !inAfter[n]) {
-			extra = append(extra, prefix+n)
-		}
-	}
-	return hidden, extra
 }
 
 func toSet(s []string) map[string]bool {
@@ -268,33 +292,160 @@ func toSet(s []string) map[string]bool {
 	return m
 }
 
-func readDirNames(path string) ([]string, error) {
+// --- ss ---
+
+// readListeners returns the listening sockets as "proto port" keys, with proto
+// one of tcp, tcp6, udp, udp6, restricted to the given family prefix.
+func readListeners(prefix string) (map[string]bool, error) {
+	m := make(map[string]bool)
+	for _, proto := range []string{prefix, prefix + "6"} {
+		b, err := os.ReadFile(filepath.Join(procRoot, "net", proto))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // e.g. no IPv6
+			}
+			return nil, err
+		}
+		for _, r := range procnet.Parse(string(b)) {
+			if r.Listening(proto) {
+				m[fmt.Sprintf("%s %d", proto, r.LocalPort)] = true
+			}
+		}
+	}
+	return m, nil
+}
+
+func crossSS(proto, flags string) model.CrossViewResult {
+	tool := "ss -" + proto[:1]
+	if _, ok := findTool("ss"); !ok {
+		return skipped(tool, "ss not installed")
+	}
+	before, err := readListeners(proto)
+	if err != nil {
+		return skipped(tool, "read /proc/net: "+err.Error())
+	}
+	out, _, reason := runTool("ss", flags)
+	if reason != "" {
+		return skipped(tool, reason)
+	}
+	ls, err := parseSSOutput(out)
+	if err != nil {
+		return skipped(tool, err.Error())
+	}
+	after, err := readListeners(proto)
+	if err != nil {
+		return skipped(tool, "read /proc/net: "+err.Error())
+	}
+	hidden, extra := compareListeners(proto, before, after, ls)
+	return ran(tool, hidden, extra)
+}
+
+// compareListeners compares two /proc/net reads with ss's listeners. An ss
+// wildcard entry ("*") satisfies either family.
+func compareListeners(proto string, before, after map[string]bool, ls []ssListener) (hidden, extra []string) {
+	v4, v6 := proto, proto+"6"
+	inTool := make(map[string]bool)
+	for _, l := range ls {
+		if l.Family != "6" {
+			inTool[fmt.Sprintf("%s %d", v4, l.Port)] = true
+		}
+		if l.Family != "4" {
+			inTool[fmt.Sprintf("%s %d", v6, l.Port)] = true
+		}
+	}
+	label := func(k string) string {
+		f := strings.Fields(k)
+		return f[0] + " port " + f[1]
+	}
+	hidden, _ = diffSets(before, after, inTool, label)
+	// Extra: a tool entry matching neither read. A wildcard entry is only
+	// extra if it matches no family at all.
+	for _, l := range ls {
+		var keys []string
+		if l.Family != "6" {
+			keys = append(keys, fmt.Sprintf("%s %d", v4, l.Port))
+		}
+		if l.Family != "4" {
+			keys = append(keys, fmt.Sprintf("%s %d", v6, l.Port))
+		}
+		seen := false
+		for _, k := range keys {
+			if before[k] || after[k] {
+				seen = true
+			}
+		}
+		if !seen {
+			extra = append(extra, label(keys[0]))
+		}
+	}
+	return hidden, extra
+}
+
+// --- ls ---
+
+type fileID struct {
+	dev, ino uint64
+	ctime    syscall.Timespec
+}
+
+func readDirIDs(path string) (map[string]fileID, error) {
 	ents, err := os.ReadDir(path)
 	if err != nil {
 		return nil, err
 	}
-	names := make([]string, 0, len(ents))
+	m := make(map[string]fileID, len(ents))
 	for _, e := range ents {
-		names = append(names, e.Name())
+		fi, err := os.Lstat(filepath.Join(path, e.Name()))
+		m[e.Name()] = fileID{} // listed, but not stat-able: kept so it is not "extra"
+		if err != nil {
+			continue
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			m[e.Name()] = fileID{dev: uint64(st.Dev), ino: st.Ino, ctime: st.Ctim}
+		}
 	}
-	return names, nil
+	return m, nil
 }
 
 func crossLs(root, dir string) model.CrossViewResult {
 	tool := "ls " + dir
+	if _, ok := findTool("ls"); !ok {
+		return skipped(tool, "ls not installed")
+	}
 	full := filepath.Join(root, dir)
-	before, err := readDirNames(full)
+	before, err := readDirIDs(full)
 	if err != nil {
 		return skipped(tool, "read directory: "+err.Error())
 	}
-	out, _, reason := runTool(root, "ls", "-a1f", full)
+	out, _, reason := runTool("ls", "-a1fb", "--", full)
 	if reason != "" {
 		return skipped(tool, reason)
 	}
-	after, err := readDirNames(full)
+	names, err := parseLs(out)
+	if err != nil {
+		return skipped(tool, err.Error())
+	}
+	after, err := readDirIDs(full)
 	if err != nil {
 		return skipped(tool, "read directory: "+err.Error())
 	}
-	hidden, extra := diffNames(before, parseLs(out), after, strings.TrimRight(dir, "/")+"/")
+	// A name counts as hidden only if it kept its device, inode and ctime
+	// across the run (any rename, link or unlink changes ctime) and is absent
+	// from ls. It counts as extra only if absent from both reads.
+	inTool := toSet(names)
+	prefix := strings.TrimRight(dir, "/") + "/"
+	var hidden, extra []string
+	for n, id := range before {
+		if a, ok := after[n]; ok && a == id && id != (fileID{}) && !inTool[n] {
+			hidden = append(hidden, prefix+n)
+		}
+	}
+	for n := range inTool {
+		_, b := before[n]
+		_, a := after[n]
+		if !b && !a {
+			extra = append(extra, prefix+n)
+		}
+	}
 	return ran(tool, hidden, extra)
 }

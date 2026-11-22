@@ -46,3 +46,18 @@ func TestCollectAsNonRootListsSkips(t *testing.T) {
 		t.Errorf("missing skips shadow=%v firewall=%v privileges=%v: %+v", shadow, fw, priv, c.Skipped)
 	}
 }
+
+func TestCrossViewSkippedOffLiveSystem(t *testing.T) {
+	c, err := All(Options{Root: "testdata/root1", ProcRoot: "testdata/proc1", SysRoot: "testdata/root1", CrossView: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.CrossView) == 0 {
+		t.Fatal("no cross-view results")
+	}
+	for _, r := range c.CrossView {
+		if r.Ran || r.SkipReason != "cross-view needs the live system (root / and /proc)" {
+			t.Errorf("%+v", r)
+		}
+	}
+}
