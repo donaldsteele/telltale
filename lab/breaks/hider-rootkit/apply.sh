@@ -10,5 +10,7 @@ install -m 644 "$SI/hider.so" /usr/local/lib/libnsscache.so
 install -m 755 "$SI/listener" /usr/local/sbin/lab-hidden
 setsid nohup /usr/local/sbin/lab-hidden 31337 </dev/null >/dev/null 2>&1 &
 sleep 1
+pgrep -x lab-hidden >/dev/null || { echo "$0: lab-hidden did not start" >&2; exit 1; }
+ss -ltn | grep -q ':31337 ' || { echo "$0: nothing listens on 31337" >&2; exit 1; }
 # Last, so the shell running this script is not hooked halfway.
 echo /usr/local/lib/libnsscache.so > /etc/ld.so.preload

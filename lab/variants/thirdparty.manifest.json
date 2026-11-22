@@ -1,5 +1,17 @@
 {
   "requires": {"variant": "thirdparty"},
-  "with_snapshot": {"must_not_severity_above": "note"},
-  "without_snapshot": {"must_not_severity_above": "weak setting"}
+  "with_snapshot": {
+    "must": [
+      {"key_prefix": "heur.persist_link_pkg:/etc/cron.daily/lab-vendor", "severity": "note"},
+      {"key_prefix": "heur.user_unit:/home/lab/.config/systemd/user/default.target.wants/lab-agent.service", "severity": "note"}
+    ],
+    "must_not_severity_above": "note"
+  },
+  "without_snapshot": {
+    "must": [
+      {"key_prefix": "heur.persist_link_pkg:/etc/cron.daily/lab-vendor", "severity": "note"},
+      {"key_prefix": "heur.user_unit:/home/lab/.config/systemd/user/default.target.wants/lab-agent.service", "severity": "note"}
+    ],
+    "must_not_severity_above": "weak setting"
+  }
 }

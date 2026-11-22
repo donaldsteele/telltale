@@ -31,7 +31,10 @@ apt-get install -y --no-install-recommends \
 # lacks, for the new-service break.
 D=/var/cache/telltale-lab/debs
 mkdir -p $D/openssl $D/lighttpd
-(cd $D/openssl && apt-get download openssl $(dpkg-query -W -f '${Package} ' 'libssl3*'))
+# The library is libssl3 or libssl3t64 by release: take the installed one.
+ssl=$(dpkg-query -W -f '${db:Status-Abbrev} ${Package}\n' 'libssl3*' | awk '$1 == "ii" {print $2}')
+[ -n "$ssl" ]
+(cd $D/openssl && apt-get download openssl $ssl)
 apt-get install -y --download-only lighttpd
 cp /var/cache/apt/archives/*.deb $D/lighttpd/
 apt-get clean

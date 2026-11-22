@@ -1,8 +1,6 @@
 #!/bin/sh
 # A setuid copy of bash in /var/tmp.
-# Runs as root inside a lab machine. Stand-ins are expected in /lab/standins.
+# Runs as root inside a lab machine.
 set -eu
-SI=/lab/standins
-need() { [ -e "$SI/$1" ] || { echo "$0: $SI/$1 is missing (copy the stand-ins in first)" >&2; exit 1; }; }
 cp /bin/bash /var/tmp/.s
 chmod 4755 /var/tmp/.s

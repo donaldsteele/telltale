@@ -1,10 +1,8 @@
 {
   "requires": {"variant": "thirdparty"},
   "with_snapshot": {
-    "comment": "lab-vendor is a local .deb: no trusted source has version 2.0, so under the judge's rules (an unconfirmed version explains none of its changed files) the upgrade is ranked as a backdoor sign. If a scan can only compare with the machine's own checksums (offline-local mode) it is explained instead; Task 21 confirms which mode the lab scans run in.",
-    "must": [
-      {"key_prefix": "snap.pkg_upgraded:lab-vendor", "severity": "backdoor sign"}
-    ]
+    "comment": "without an owner key, a third-party upgrade after a snapshot is unconfirmed (R60) and shown for the owner to accept; tightened once the lab has a signed third-party repo",
+    "must_not_severity_above": "backdoor sign"
   },
   "without_snapshot": {
     "comment": "The running lab-vendord was replaced by the upgrade: a stale program from a package, a note. Nothing above a weak setting.",
