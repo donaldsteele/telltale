@@ -31,6 +31,7 @@ const (
 	idCrossView    = "TT-HEUR-012"
 	idPersistLink  = "TT-HEUR-013"
 	idDiversion    = "TT-HEUR-014"
+	idPAM          = "TT-HEUR-016"
 	evidenceDir    = "/root/telltale-evidence"
 	saveEvidence   = "mkdir -p " + evidenceDir
 	flagImmutable  = 0x10
@@ -50,6 +51,8 @@ func Run(c *model.Collection, ctx model.ScanContext, owned map[string]string) []
 	out = append(out, listeners(c, ctx, owned)...)
 	out = append(out, crossView(c)...)
 	out = append(out, persistLinks(c, owned)...)
+	out = append(out, persistCallbacks(c)...)
+	out = append(out, pamModules(c, owned)...)
 	out = append(out, localDiversions(c)...)
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out
@@ -367,6 +370,24 @@ func files(c *model.Collection, owned map[string]string) []model.Finding {
 					}),
 					Evidence: []model.Evidence{{Path: f.Path, Detail: fmt.Sprintf("mode=%o uid=%d", f.Mode&0o7777, f.UID)}},
 					Refs:     []string{"T1548.001"},
+				})
+			}
+		}
+		if f.Type == "file" && f.Caps != "" {
+			if _, ok := owned[f.Path]; !ok {
+				sev := model.SevBackdoor
+				if strings.HasPrefix(f.Path, "/usr/local/") {
+					sev = model.SevNote
+				}
+				out = append(out, model.Finding{
+					Key: "heur.unowned_caps:" + f.Path, ID: idSetuid, Source: source, Severity: sev,
+					Title: fmt.Sprintf("%s carries file capabilities but belongs to no package", f.Path),
+					Why:   "A file capability gives a program some of root's powers without the setuid bit (for example raw network access or reading any file). One no package installed may be a planted way to escalate.",
+					Fix: fix([]string{f.Path}, func(q []string) string {
+						return keep(q[0]) + " && setcap -r " + q[0] + "   # removes the capabilities, keeps the file; delete it only after investigating"
+					}),
+					Evidence: []model.Evidence{{Path: f.Path, Detail: "capabilities=" + f.Caps}},
+					Refs:     []string{"T1548"},
 				})
 			}
 		}
