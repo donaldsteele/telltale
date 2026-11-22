@@ -67,29 +67,37 @@ const (
 // verified, for callers that must not depend on the wording of Reason.
 const (
 	// KindNotFound: verification ran and no trusted source (the official
-	// archive, its snapshots, a trusted third-party source) has this
-	// version.
+	// archive, its snapshots, a trusted third-party source, the reference
+	// bundle) confirmed this version: it is in none of them, its version
+	// string is not a valid Debian version, or looking it up failed while the
+	// host's own indexes were read.
 	KindNotFound = "not_found"
 	// KindUntrusted: the package comes from a third-party source whose key
 	// was not given.
 	KindUntrusted = "untrusted_source"
-	// KindUnreachable: a source could not be read (network, HTTP error,
-	// timeout).
+	// KindUnreachable: the host's own signed indexes (or the reference
+	// bundle, or telltale's keys) could not be read, so nothing could be
+	// checked. Whether the archive could be reached is decided once per scan:
+	// with the indexes read, a failure for one package is KindNotFound.
 	KindUnreachable = "unreachable"
 	// KindBadSignature: a signed index or a package failed its signature or
 	// hash check, so nothing that depends on it was verified.
 	KindBadSignature = "bad_signature"
-	// KindNotInBundle: the reference bundle does not cover the package.
-	KindNotInBundle = "not_in_bundle"
 	// KindNotChecked: telltale did not check it because of an internal error.
 	KindNotChecked = "not_checked"
 	// KindUnsupportedArch: the package's own architecture (from dpkg status,
 	// which root can edit) is not one telltale reads indexes for.
 	KindUnsupportedArch = "unsupported_arch"
-	// KindScanLimit: package verification could not run for this scan at all
-	// (an unsupported host architecture, distribution or release, keys that
-	// would not load, a reference bundle that was rejected).
-	KindScanLimit = "scan_limit"
+	// KindHostArch: telltale reads no indexes for the host's architecture
+	// (the running binary's), so verification did not run.
+	KindHostArch = "host_arch"
+	// KindRelease: /etc/os-release (which root can edit) names a
+	// distribution or release telltale does not verify, so verification did
+	// not run.
+	KindRelease = "release"
+	// KindStopped: the scan's deadline stopped verification before this
+	// package was checked.
+	KindStopped = "stopped"
 	// KindBudget: not checked because the collection exceeded a limit (more
 	// than maxPackages packages, or more than maxOldLookups versions missing
 	// from the current archive).
@@ -281,9 +289,12 @@ func Verify(ctx context.Context, c *model.Collection, opt Options) *Result {
 	results := newResults(plans)
 	if err := s.setup(); err != nil {
 		s.problem(err)
-		kind := KindScanLimit
-		if tampered(err) || errors.Is(err, ErrNoValidSignature) {
+		kind := s.setupKind
+		switch {
+		case tampered(err) || errors.Is(err, ErrNoValidSignature):
 			kind = KindBadSignature
+		case kind == "":
+			kind = KindUnreachable // the bundle, keys or cache could not be used
 		}
 		for _, r := range results {
 			r.fail(err.Error(), kind)
@@ -372,6 +383,7 @@ func newResults(plans []*model.Package) []*pkgResult {
 
 // session is one Verify or WriteBundle run.
 type session struct {
+	setupKind string // the Kind of a setup failure, if any
 	c         *model.Collection
 	opt       Options
 	res       *Result
@@ -588,7 +600,14 @@ func (s *session) addCachedTables(results []*pkgResult) []*pkgResult {
 // for the run's mode.
 func (s *session) setup() error {
 	if h := s.c.Host.Arch; h == "all" || !knownArches[h] {
+		s.setupKind = KindHostArch
 		return fmt.Errorf("host architecture %q is not supported for package verification", h)
+	}
+	if s.opt.Archives == nil {
+		if _, err := Codename(s.c.Host); err != nil {
+			s.setupKind = KindRelease
+			return err
+		}
 	}
 	refs := s.res.Mode == ModeRefs && s.bw == nil
 	cache := s.opt.CacheDir
@@ -891,7 +910,11 @@ func (s *session) onePackage(ctx context.Context, r *pkgResult) {
 		}
 	}()
 	if err := ctx.Err(); err != nil {
-		r.fail("check stopped: "+err.Error(), KindUnreachable)
+		r.fail("check stopped: "+err.Error(), KindStopped)
+		return
+	}
+	if !validVersion(p.Version) {
+		r.fail("the version in dpkg status is not a valid Debian version, so no source was asked", KindNotFound)
 		return
 	}
 	if p.Arch != "" && !knownArches[p.Arch] {
@@ -941,7 +964,7 @@ func (s *session) onePackage(ctx context.Context, r *pkgResult) {
 		} else {
 			s.downloadFailed(err)
 		}
-		r.fail("could not check the package: "+s.explain(err), problemKind(err))
+		r.fail("could not check the package: "+s.explain(err), KindNotFound) // its index was read: see notFound
 		return
 	}
 	r.ref, r.table, r.source = ref, table, s.sourceOf(ref)
@@ -969,22 +992,16 @@ func (s *session) notFound(p *model.Package, oldErr error) (string, string) {
 	}
 	if s.bundle != nil {
 		if u, ok := s.bundle.unavailable[PkgKey{p.Name, p.Version, p.Arch}]; ok {
-			kind := u.Kind
-			if kind == "" {
-				kind = KindNotInBundle // a bundle written before kinds were recorded
-			}
-			return "not in the reference bundle: " + u.Reason, kind
+			return "not in the reference bundle: " + u.Reason, KindNotFound
 		}
-		return "package not in the reference bundle", KindNotInBundle
+		return "package not in the reference bundle", KindNotFound
 	}
 	if oldErr != nil && !errors.Is(oldErr, ErrNotFound) {
-		kind := problemKind(oldErr)
-		var so *signedOnlyErr
-		switch {
-		case errors.Is(oldErr, errOldBudget):
+		// The host's own indexes were read (see above), so a failure for
+		// this one package is not "the archive could not be reached".
+		kind := KindNotFound
+		if errors.Is(oldErr, errOldBudget) {
 			kind = KindBudget
-		case errors.As(oldErr, &so) && so.last == nil:
-			kind = KindNotInBundle // only a source a bundle cannot carry has it
 		}
 		return "not in the current archive, and the snapshot archives could not be checked: " + s.explain(oldErr), kind
 	}
@@ -1699,4 +1716,35 @@ func readSmallFile(p string, max int64) ([]byte, error) {
 		return nil, fmt.Errorf("%s: larger than %d bytes", p, max)
 	}
 	return b, nil
+}
+
+// maxVersionLen bounds a version string before any lookup; Debian versions
+// are far shorter, and a long one only makes the lookups fail.
+const maxVersionLen = 256
+
+// validVersion reports whether v is a Debian version ([epoch:]upstream
+// [-revision], as Debian policy allows) no longer than maxVersionLen. A
+// version from dpkg status, which root can edit, that is not one is never
+// looked up.
+func validVersion(v string) bool {
+	if v == "" || len(v) > maxVersionLen {
+		return false
+	}
+	if i := strings.IndexByte(v, ':'); i >= 0 {
+		if i == 0 || strings.Trim(v[:i], "0123456789") != "" {
+			return false
+		}
+		v = v[i+1:]
+	}
+	upstream, revision := v, ""
+	if i := strings.LastIndexByte(v, '-'); i >= 0 {
+		upstream, revision = v[:i], v[i+1:]
+		if revision == "" || strings.Trim(revision, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.+~") != "" {
+			return false
+		}
+	}
+	if upstream == "" || upstream[0] < '0' || upstream[0] > '9' {
+		return false
+	}
+	return strings.Trim(upstream, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.+~-") == ""
 }

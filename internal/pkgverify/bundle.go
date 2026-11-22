@@ -166,7 +166,7 @@ func checkBundleDir(dir string) error {
 func (s *session) bundleDeb(ctx context.Context, r *pkgResult, ref DebRef) {
 	p := r.pkg
 	if ref.Source != SourceArchive && ref.Source != SourceThirdParty {
-		r.fail("only a source trusted through HTTPS alone has this version, and a bundle carries only signed indexes", KindNotInBundle)
+		r.fail("only a source trusted through HTTPS alone has this version, and a bundle carries only signed indexes", KindNotFound)
 		return
 	}
 	if err := downloadDeb(ctx, s.client, ref, io.Discard); err != nil {
@@ -175,7 +175,7 @@ func (s *session) bundleDeb(ctx context.Context, r *pkgResult, ref DebRef) {
 		} else {
 			s.downloadFailed(err)
 		}
-		r.fail("could not download the package: "+err.Error(), problemKind(err))
+		r.fail("could not download the package: "+err.Error(), KindNotFound)
 		return
 	}
 	s.bw.mu.Lock()

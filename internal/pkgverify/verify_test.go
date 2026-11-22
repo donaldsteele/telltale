@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -946,7 +948,7 @@ func TestBundleRoundTrip(t *testing.T) {
 	c.Packages.Installed = append(c.Packages.Installed, model.Package{Name: "extra", Version: "1", Arch: "amd64", Status: "install ok installed", Files: []string{"/usr/bin/extra"}})
 	c.Files = append(c.Files, regular("/usr/bin/extra", "extra\n", 0o755))
 	res = Verify(context.Background(), c, opt)
-	if v, ok := find(res.Unverifiable, "/usr/bin/extra"); !ok || !strings.Contains(v.Reason, "reference bundle") || v.Kind != KindNotInBundle {
+	if v, ok := find(res.Unverifiable, "/usr/bin/extra"); !ok || !strings.Contains(v.Reason, "reference bundle") || v.Kind != KindNotFound {
 		t.Errorf("extra: %+v", res.Unverifiable)
 	}
 }
@@ -1831,9 +1833,15 @@ func TestVerifyUnverifiableKinds(t *testing.T) {
 		check(t, Verify(context.Background(), toolCollection(nil), f.opts()), KindUnreachable)
 	})
 	t.Run("package hash mismatch", func(t *testing.T) {
+		// The index was read, so this package is unconfirmed; the HASH
+		// MISMATCH itself is reported in Errors.
 		f := toolFixture(t)
 		f.srv.set("/debian/"+poolName(fakePkg{"tool", "1.0-1", "amd64", nil}), []byte("not the signed package"))
-		check(t, Verify(context.Background(), toolCollection(nil), f.opts()), KindBadSignature)
+		res := Verify(context.Background(), toolCollection(nil), f.opts())
+		check(t, res, KindNotFound)
+		if len(res.Errors) == 0 || !strings.HasPrefix(res.Errors[0], "HASH MISMATCH") {
+			t.Errorf("Errors = %q", res.Errors)
+		}
 	})
 	t.Run("pro", func(t *testing.T) {
 		f := toolFixture(t)
@@ -1850,7 +1858,7 @@ func TestVerifyUnverifiableKinds(t *testing.T) {
 	t.Run("unsupported release", func(t *testing.T) {
 		c := toolCollection(nil)
 		c.Host.OSVersionID = "10"
-		check(t, Verify(context.Background(), c, Options{}), KindScanLimit)
+		check(t, Verify(context.Background(), c, Options{}), KindRelease)
 	})
 	t.Run("package architecture", func(t *testing.T) {
 		f := toolFixture(t)
@@ -1858,10 +1866,46 @@ func TestVerifyUnverifiableKinds(t *testing.T) {
 		c.Packages.Installed[0].Arch = "mips64el"
 		check(t, Verify(context.Background(), c, f.opts()), KindUnsupportedArch)
 	})
-	t.Run("check stopped", func(t *testing.T) {
+	t.Run("cancelled before it started", func(t *testing.T) {
 		f := toolFixture(t)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		check(t, Verify(ctx, toolCollection(nil), f.opts()), KindUnreachable)
+		check(t, Verify(ctx, toolCollection(nil), f.opts()), KindStopped)
 	})
+	t.Run("deadline during the package checks", func(t *testing.T) {
+		f := toolFixture(t)
+		c := toolCollection(nil)
+		s := newSession(c, f.opts(), &Result{})
+		r := &pkgResult{pkg: &c.Packages.Installed[0]}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		s.onePackage(ctx, r)
+		if r.kind != KindStopped {
+			t.Errorf("kind %q, want %q", r.kind, KindStopped)
+		}
+	})
+	// With the host's own signed indexes read, any per-package lookup
+	// failure is "no trusted source has it": the snapshot service's errors
+	// (a root-written 9 KB version gets HTTP 414) never fold.
+	for _, tc := range []struct {
+		name, version string
+		status        int
+	}{
+		{"snapshot service error", "1.0-9", http.StatusServiceUnavailable},
+		{"snapshot service 414 for a long version", "1.0-9" + strings.Repeat("a", 9000), http.StatusRequestURITooLong},
+		{"version with characters Debian does not allow", "1.0-9;$(id)", http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "no", tc.status)
+			}))
+			defer snap.Close()
+			f := toolFixture(t)
+			f.old.DebianSnapshot = snap.URL
+			f.old.Client = snap.Client()
+			c := toolCollection(nil)
+			c.Packages.Installed[0].Version = tc.version
+			check(t, Verify(context.Background(), c, f.opts()), KindNotFound)
+		})
+	}
 }
