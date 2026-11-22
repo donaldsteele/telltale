@@ -3,6 +3,7 @@ package pkgverify
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	"github.com/ulikunitz/xz"
@@ -30,8 +32,8 @@ import (
 // testdata/debian was recorded from https://deb.debian.org/debian on
 // 2026-11-22: dists/{bookworm,trixie}-updates/InRelease, each suite's
 // main/binary-amd64/Packages.xz, and one small .deb from the bookworm-updates
-// index. testdata/fake-archive-key*.asc is an ed25519 key pair generated for
-// these tests and trusted nowhere else.
+// index. The fake archive key that signs test indexes is generated at test
+// time (readFakeKey).
 //
 // recordedNow is shortly after the recorded indexes were published
 // (Date: Sun, 22 Nov 2026 08:11:14 UTC).
@@ -146,30 +148,36 @@ func (s *archiveServer) setDown(down bool) {
 	s.down = down
 }
 
+var (
+	fakeKeyOnce sync.Once
+	fakeEntity  *openpgp.Entity
+	fakeKeyErr  error
+)
+
+// readFakeKey returns an ed25519 archive key generated once per test run and
+// trusted nowhere but in these tests. It is generated rather than stored so
+// that no private key block sits in the tree.
 func readFakeKey(t *testing.T) *openpgp.Entity {
 	t.Helper()
-	f, err := os.Open("testdata/fake-archive-key.asc")
-	if err != nil {
-		t.Fatal(err)
+	fakeKeyOnce.Do(func() {
+		fakeEntity, fakeKeyErr = openpgp.NewEntity("telltale fake archive key", "test only, not trusted", "fake-archive@example.invalid",
+			&packet.Config{Algorithm: packet.PubKeyAlgoEdDSA, Time: fixedClock(recordedNow.Add(-24 * time.Hour))})
+	})
+	if fakeKeyErr != nil {
+		t.Fatal(fakeKeyErr)
 	}
-	defer f.Close()
-	el, err := openpgp.ReadArmoredKeyRing(f)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return el[0]
+	return fakeEntity
 }
 
-// fakePublicKeyring is the fake key pair's public half, trusted the way the
-// built-in keyrings are.
-func fakePublicKeyring(t *testing.T) openpgp.EntityList {
+// publicOnly serialises the public half of e and reads it back, the way the
+// embedded keyrings are read.
+func publicOnly(t *testing.T, e *openpgp.Entity) openpgp.EntityList {
 	t.Helper()
-	f, err := os.Open("testdata/fake-archive-key.pub.asc")
-	if err != nil {
+	var buf bytes.Buffer
+	if err := e.Serialize(&buf); err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	el, err := openpgp.ReadArmoredKeyRing(f)
+	el, err := openpgp.ReadKeyRing(&buf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,6 +185,13 @@ func fakePublicKeyring(t *testing.T) openpgp.EntityList {
 		t.Fatal("public keyring holds a private key")
 	}
 	return el
+}
+
+// fakePublicKeyring is the public half of the fake key, trusted the way the
+// built-in keyrings are.
+func fakePublicKeyring(t *testing.T) openpgp.EntityList {
+	t.Helper()
+	return publicOnly(t, readFakeKey(t))
 }
 
 func clearsignWith(t *testing.T, e *openpgp.Entity, text []byte, at time.Time) []byte {
@@ -489,11 +504,10 @@ func TestIndexRejectsWrongSuite(t *testing.T) {
 	files["/debian/dists/bookworm-updates/InRelease"] = files["/debian/dists/trixie-updates/InRelease"]
 	srv := newArchiveServer(t, files)
 	a := &Archive{BaseURL: srv.URL + "/debian", Suites: []string{"bookworm-updates"}, Keyring: debianKeyring(t), Client: srv.Client(), Now: fixedClock(recordedNow)}
-	_, err := a.Index(context.Background(), "bookworm-updates", "main", "amd64")
-	if err == nil || !strings.Contains(err.Error(), "suite") {
-		t.Fatalf("err = %v, want a suite mismatch", err)
+	if _, err := a.Index(context.Background(), "bookworm-updates", "main", "amd64"); !errors.Is(err, ErrWrongSuite) {
+		t.Fatalf("err = %v, want ErrWrongSuite", err)
 	}
-	if _, err := a.Index(context.Background(), "trixie-updates", "main", "amd64"); err == nil {
+	if _, err := a.Index(context.Background(), "trixie-updates", "main", "amd64"); !errors.Is(err, ErrWrongSuite) {
 		t.Fatal("Index accepted a suite the archive does not list")
 	}
 }
@@ -701,6 +715,186 @@ func TestArchiveForOfficialArchivesOnly(t *testing.T) {
 	} {
 		if _, err := ArchiveFor(h, nil, ""); err == nil || !strings.Contains(err.Error(), "release not supported for package verification") {
 			t.Errorf("%+v: err = %v", h, err)
+		}
+	}
+}
+
+// releaseText is a minimal Release file for the signature and suite checks.
+func releaseText(suite, codename string) []byte {
+	return []byte(fmt.Sprintf("Origin: Fake\nSuite: %s\nCodename: %s\nDate: Thu, 01 Jan 2026 00:00:00 UTC\nSHA256:\n %s 1 main/binary-amd64/Packages.xz\n", suite, codename, sha256hex([]byte("x"))))
+}
+
+func signWith(t *testing.T, pk *packet.PrivateKey, text []byte, cfg *packet.Config) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w, err := clearsign.Encode(&buf, pk, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(text); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestVerifyReleaseSuiteAndPocket(t *testing.T) {
+	// Ubuntu gives every pocket of a release the same Codename; Debian puts
+	// the pocket in Codename and names stable's proposed-updates Suite
+	// "proposed-updates".
+	cases := []struct {
+		suite, codename, asked string
+		ok                     bool
+	}{
+		{"noble", "noble", "noble", true},
+		{"noble-updates", "noble", "noble-updates", true},
+		{"noble-security", "noble", "noble-security", true},
+		{"noble-proposed", "noble", "noble", false},
+		{"noble-proposed", "noble", "noble-updates", false},
+		{"noble-backports", "noble", "noble-security", false},
+		{"oldstable", "bookworm", "bookworm", true},
+		{"oldstable-updates", "bookworm-updates", "bookworm-updates", true},
+		{"oldstable-security", "bookworm-security", "bookworm-security", true},
+		{"proposed-updates", "bookworm-proposed-updates", "bookworm-proposed-updates", true},
+		{"oldstable-proposed-updates", "bookworm-proposed-updates", "bookworm-proposed-updates", true},
+		{"unstable", "sid", "unstable", true},
+		{"stable-updates", "trixie-updates", "trixie", false},
+		{"stable", "trixie", "bookworm", false},
+	}
+	fake := readFakeKey(t)
+	a := &Archive{Keyring: fakePublicKeyring(t), Now: fixedClock(recordedNow)}
+	for _, c := range cases {
+		_, err := a.verifyRelease(signWith(t, fake.PrivateKey, releaseText(c.suite, c.codename), &packet.Config{Time: fixedClock(recordedNow)}), c.asked)
+		if c.ok && err != nil {
+			t.Errorf("Suite %q Codename %q asked as %q: %v", c.suite, c.codename, c.asked, err)
+		}
+		if !c.ok && !errors.Is(err, ErrWrongSuite) {
+			t.Errorf("Suite %q Codename %q asked as %q: err = %v, want ErrWrongSuite", c.suite, c.codename, c.asked, err)
+		}
+	}
+}
+
+func TestVerifyInReleaseRevokedPrimaryKey(t *testing.T) {
+	created := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	e, err := openpgp.NewEntity("revoked", "", "revoked@example.invalid", &packet.Config{Algorithm: packet.PubKeyAlgoEdDSA, Time: fixedClock(created)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed := signWith(t, e.PrivateKey, releaseText("stable", "stable"), &packet.Config{Time: fixedClock(created.Add(time.Hour))})
+	if _, err := verifyInRelease(signed, publicOnly(t, e), created.Add(2*time.Hour)); err != nil {
+		t.Fatalf("before revocation: %v", err)
+	}
+	if err := e.RevokeKey(packet.KeyCompromised, "test", &packet.Config{Time: fixedClock(created.Add(3 * time.Hour))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifyInRelease(signed, publicOnly(t, e), created.Add(4*time.Hour)); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("revoked primary key: err = %v, want ErrBadSignature", err)
+	}
+}
+
+func TestVerifyInReleaseSubkeys(t *testing.T) {
+	// Debian and Ubuntu sign with subkeys of the archive keys.
+	created := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	e, err := openpgp.NewEntity("sub", "", "sub@example.invalid", &packet.Config{Algorithm: packet.PubKeyAlgoEdDSA, Time: fixedClock(created)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.AddSigningSubkey(&packet.Config{Algorithm: packet.PubKeyAlgoEdDSA, Time: fixedClock(created), KeyLifetimeSecs: 10 * 86400}); err != nil {
+		t.Fatal(err)
+	}
+	var sub *openpgp.Subkey
+	for i := range e.Subkeys {
+		if e.Subkeys[i].Sig.FlagSign {
+			sub = &e.Subkeys[i]
+		}
+	}
+	if sub == nil {
+		t.Fatal("no signing subkey")
+	}
+	signed := signWith(t, sub.PrivateKey, releaseText("stable", "stable"), &packet.Config{Time: fixedClock(created.Add(time.Hour))})
+	if _, err := verifyInRelease(signed, publicOnly(t, e), created.Add(2*time.Hour)); err != nil {
+		t.Fatalf("valid subkey: %v", err)
+	}
+	if _, err := verifyInRelease(signed, publicOnly(t, e), created.Add(11*24*time.Hour)); !errors.Is(err, ErrNoValidSignature) {
+		t.Fatalf("expired subkey: err = %v, want ErrNoValidSignature", err)
+	}
+	if err := e.RevokeSubkey(sub, packet.KeyCompromised, "test", &packet.Config{Time: fixedClock(created.Add(3 * time.Hour))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifyInRelease(signed, publicOnly(t, e), created.Add(4*time.Hour)); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("revoked subkey: err = %v, want ErrBadSignature", err)
+	}
+}
+
+// clearsignWithHash clearsigns text with an explicit hash algorithm, which
+// clearsign.Encode will not do for hashes weaker than SHA-256.
+func clearsignWithHash(t *testing.T, e *openpgp.Entity, text []byte, h crypto.Hash, at time.Time) []byte {
+	t.Helper()
+	names := map[crypto.Hash]string{crypto.SHA1: "SHA1", crypto.SHA224: "SHA224", crypto.SHA256: "SHA256", crypto.SHA512: "SHA512"}
+	lines := strings.Split(strings.TrimSuffix(string(text), "\n"), "\n")
+	noSalt := false // the salt notation only supports SHA-256 and stronger
+	cfg := &packet.Config{Time: fixedClock(at), NonDeterministicSignaturesViaNotation: &noSalt}
+	sig := &packet.Signature{SigType: packet.SigTypeText, PubKeyAlgo: e.PrivateKey.PubKeyAlgo, Hash: h, CreationTime: at, IssuerKeyId: &e.PrivateKey.KeyId}
+	hasher, err := sig.PrepareSign(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasher.Write([]byte(strings.Join(lines, "\r\n")))
+	if err := sig.Sign(hasher, e.PrivateKey, cfg); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	fmt.Fprintf(&out, "-----BEGIN PGP SIGNED MESSAGE-----\nHash: %s\n\n%s\n", names[h], strings.Join(lines, "\n"))
+	w, err := armor.Encode(&out, "PGP SIGNATURE", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sig.Serialize(w); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out.WriteString("\n")
+	return out.Bytes()
+}
+
+func TestVerifyInReleaseRejectsWeakHash(t *testing.T) {
+	fake := readFakeKey(t)
+	text := releaseText("stable", "stable")
+	for _, c := range []struct {
+		hash crypto.Hash
+		ok   bool
+	}{
+		{crypto.SHA1, false},
+		{crypto.SHA224, false},
+		{crypto.SHA256, true},
+		{crypto.SHA512, true},
+	} {
+		signed := clearsignWithHash(t, fake, text, c.hash, recordedNow)
+		block, _ := clearsign.Decode(signed)
+		if block == nil {
+			t.Fatalf("%v: built message does not decode", c.hash)
+		}
+		var sigs bytes.Buffer
+		if _, err := sigs.ReadFrom(block.ArmoredSignature.Body); err != nil {
+			t.Fatal(err)
+		}
+		p, err := packet.Read(&sigs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := p.(*packet.Signature).Hash; got != c.hash {
+			t.Fatalf("signed with %v, want %v", got, c.hash)
+		}
+		_, err = verifyInRelease(signed, fakePublicKeyring(t), recordedNow)
+		if c.ok && err != nil {
+			t.Errorf("%v signature: %v", c.hash, err)
+		}
+		if !c.ok && !errors.Is(err, ErrNoValidSignature) {
+			t.Errorf("%v signature: err = %v, want ErrNoValidSignature", c.hash, err)
 		}
 	}
 }

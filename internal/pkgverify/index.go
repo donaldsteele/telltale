@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -38,7 +39,7 @@ var maxPackagesSize int64 = 256 << 20
 // are keyed with Arch "all".
 func (a *Archive) Index(ctx context.Context, suite, component, arch string) (map[PkgKey]DebRef, error) {
 	if !slices.Contains(a.Suites, suite) {
-		return nil, fmt.Errorf("suite %q is not one of %s's suites %v", suite, a.BaseURL, a.Suites)
+		return nil, fmt.Errorf("%w: %q is not one of %s's suites %v", ErrWrongSuite, suite, a.BaseURL, a.Suites)
 	}
 	rel, err := a.release(ctx, suite)
 	if err != nil {
@@ -138,8 +139,8 @@ func (a *Archive) verifyRelease(data []byte, suite string) (*release, error) {
 	if err != nil {
 		return nil, err
 	}
-	if rel.suite != suite && rel.codename != suite {
-		return nil, fmt.Errorf("signed index is for suite %q (codename %q), not %q", rel.suite, rel.codename, suite)
+	if !suiteMatches(rel, suite) {
+		return nil, fmt.Errorf("%w: signed index is for suite %q (codename %q), not %q", ErrWrongSuite, rel.suite, rel.codename, suite)
 	}
 	if rel.validUntil != "" && !a.Historical {
 		until, err := parseReleaseDate(rel.validUntil)
@@ -153,9 +154,58 @@ func (a *Archive) verifyRelease(data []byte, suite string) (*release, error) {
 	return rel, nil
 }
 
+// suiteMatches accepts a Release for suite when its Suite is suite, or when
+// its Codename is suite and its Suite names the same pocket. Ubuntu gives
+// every pocket of a release the same Codename ("noble"), so a Codename match
+// alone would let a signed noble-proposed index stand in for noble. Debian
+// puts the pocket in Codename ("bookworm-updates") and Suite carries it too
+// ("oldstable-updates", or plain "proposed-updates" for stable's).
+func suiteMatches(rel *release, suite string) bool {
+	if rel.suite == suite {
+		return true
+	}
+	if rel.codename != suite {
+		return false
+	}
+	_, pocket, ok := strings.Cut(suite, "-")
+	if !ok {
+		return !strings.Contains(rel.suite, "-")
+	}
+	return rel.suite == pocket || strings.HasSuffix(rel.suite, "-"+pocket)
+}
+
+// strongHashes are the signature hash algorithms accepted on an InRelease:
+// SHA-256 and stronger, as apt requires.
+var strongHashes = map[crypto.Hash]bool{
+	crypto.SHA256:   true,
+	crypto.SHA384:   true,
+	crypto.SHA512:   true,
+	crypto.SHA3_256: true,
+	crypto.SHA3_512: true,
+}
+
+// checkSignature verifies one signature packet over signed with the keys in
+// kr, refusing hash algorithms weaker than SHA-256.
+func checkSignature(kr openpgp.EntityList, signed, pkt []byte, cfg *packet.Config) error {
+	p, err := packet.Read(bytes.NewReader(pkt))
+	if err != nil {
+		return err
+	}
+	sig, ok := p.(*packet.Signature)
+	if !ok {
+		return errors.New("not a signature packet")
+	}
+	if !strongHashes[sig.Hash] {
+		return fmt.Errorf("signature hash %v is weaker than SHA-256", sig.Hash)
+	}
+	_, err = openpgp.CheckDetachedSignature(kr, bytes.NewReader(signed), bytes.NewReader(pkt), cfg)
+	return err
+}
+
 // verifyInRelease checks that data is exactly one clearsigned message with at
-// least one signature by a key in kr that is valid at now, and returns the
-// signed text. Nothing outside the signed text is ever returned.
+// least one signature, hashed with SHA-256 or stronger, by a key in kr that is
+// valid at now, and returns the signed text. Nothing outside the signed text
+// is ever returned.
 func verifyInRelease(data []byte, kr openpgp.EntityList, now time.Time) ([]byte, error) {
 	data = bytes.TrimLeft(data, " \t\r\n")
 	if !bytes.HasPrefix(data, []byte("-----BEGIN PGP SIGNED MESSAGE-----")) {
@@ -184,7 +234,7 @@ func verifyInRelease(data []byte, kr openpgp.EntityList, now time.Time) ([]byte,
 	// Every signature covers the same text, so the first good signature by
 	// a built-in key settles it; failures only explain why none was good.
 	for _, p := range pkts {
-		_, err := openpgp.CheckDetachedSignature(kr, bytes.NewReader(block.Bytes), bytes.NewReader(p), cfg)
+		err := checkSignature(kr, block.Bytes, p, cfg)
 		if err == nil {
 			return block.Plaintext, nil
 		}

@@ -88,6 +88,9 @@ var (
 	ErrHashMismatch = errors.New("hash mismatch")
 	// ErrNotFound means the package version is not known to the source.
 	ErrNotFound = errors.New("not found")
+	// ErrWrongSuite means a validly signed index is for another suite or
+	// pocket than the one asked for, or the archive does not carry the suite.
+	ErrWrongSuite = errors.New("index is for another suite")
 )
 
 var (
