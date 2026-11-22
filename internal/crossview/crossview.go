@@ -53,7 +53,7 @@ func Collect(rt model.Runtime, root string, dirs []string) []model.CrossViewResu
 	res = append(res, crossPS(rt))
 	// lsmod before ss: ss's sock_diag requests may autoload inet_diag modules.
 	res = append(res, crossLsmod())
-	res = append(res, crossSS("tcp", "-Htanl"), crossSS("udp", "-Huanl"))
+	res = append(res, crossSS("tcp", "4"), crossSS("tcp", "6"), crossSS("udp", "4"), crossSS("udp", "6"))
 	for _, d := range dirs {
 		res = append(res, crossLs(root, d))
 	}
@@ -66,7 +66,7 @@ func SkipAll(reason string, dirs []string) []model.CrossViewResult {
 	if dirs == nil {
 		dirs = defaultDirs
 	}
-	tools := []string{"ps", "lsmod", "ss -t", "ss -u"}
+	tools := []string{"ps", "lsmod", "ss -t -4", "ss -t -6", "ss -u -4", "ss -u -6"}
 	for _, d := range dirs {
 		tools = append(tools, "ls "+d)
 	}
@@ -294,91 +294,71 @@ func toSet(s []string) map[string]bool {
 
 // --- ss ---
 
-// readListeners returns the listening sockets as "proto port" keys, with proto
-// one of tcp, tcp6, udp, udp6, restricted to the given family prefix.
-func readListeners(prefix string) (map[string]bool, error) {
-	m := make(map[string]bool)
-	for _, proto := range []string{prefix, prefix + "6"} {
-		b, err := os.ReadFile(filepath.Join(procRoot, "net", proto))
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue // e.g. no IPv6
-			}
-			return nil, err
+// readListeners returns the listening local ports of one /proc/net table
+// (tcp, tcp6, udp or udp6).
+func readListeners(table string) (map[int]bool, error) {
+	m := make(map[int]bool)
+	b, err := os.ReadFile(filepath.Join(procRoot, "net", table))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return m, nil // e.g. no IPv6
 		}
-		for _, r := range procnet.Parse(string(b)) {
-			if r.Listening(proto) {
-				m[fmt.Sprintf("%s %d", proto, r.LocalPort)] = true
-			}
+		return nil, err
+	}
+	for _, r := range procnet.Parse(string(b)) {
+		if r.Listening(table) {
+			m[r.LocalPort] = true
 		}
 	}
 	return m, nil
 }
 
-func crossSS(proto, flags string) model.CrossViewResult {
-	tool := "ss -" + proto[:1]
+// crossSS runs ss for one protocol ("tcp" or "udp") and one family ("4" or
+// "6"). The family comes from the invocation, never from the address text,
+// because ss prints device-bound dual-stack sockets as "*%lo:port".
+func crossSS(proto, fam string) model.CrossViewResult {
+	tool := "ss -" + proto[:1] + " -" + fam
 	if _, ok := findTool("ss"); !ok {
 		return skipped(tool, "ss not installed")
 	}
-	before, err := readListeners(proto)
+	table := proto
+	if fam == "6" {
+		table += "6"
+	}
+	before, err := readListeners(table)
 	if err != nil {
 		return skipped(tool, "read /proc/net: "+err.Error())
 	}
-	out, _, reason := runTool("ss", flags)
+	out, _, reason := runTool("ss", "-H"+proto[:1]+"anl", "-"+fam)
 	if reason != "" {
 		return skipped(tool, reason)
 	}
-	ls, err := parseSSOutput(out)
+	ports, err := parseSSOutput(out)
 	if err != nil {
 		return skipped(tool, err.Error())
 	}
-	after, err := readListeners(proto)
+	after, err := readListeners(table)
 	if err != nil {
 		return skipped(tool, "read /proc/net: "+err.Error())
 	}
-	hidden, extra := compareListeners(proto, before, after, ls)
+	hidden, extra := compareListeners(table, before, after, ports)
 	return ran(tool, hidden, extra)
 }
 
-// compareListeners compares two /proc/net reads with ss's listeners. An ss
-// wildcard entry ("*") satisfies either family.
-func compareListeners(proto string, before, after map[string]bool, ls []ssListener) (hidden, extra []string) {
-	v4, v6 := proto, proto+"6"
-	inTool := make(map[string]bool)
-	for _, l := range ls {
-		if l.Family != "6" {
-			inTool[fmt.Sprintf("%s %d", v4, l.Port)] = true
+// compareListeners compares two /proc/net reads with ss's listening ports.
+func compareListeners(table string, before, after map[int]bool, ports []int) (hidden, extra []string) {
+	conv := func(m map[int]bool) map[string]bool {
+		s := make(map[string]bool, len(m))
+		for p := range m {
+			s[strconv.Itoa(p)] = true
 		}
-		if l.Family != "4" {
-			inTool[fmt.Sprintf("%s %d", v6, l.Port)] = true
-		}
+		return s
 	}
-	label := func(k string) string {
-		f := strings.Fields(k)
-		return f[0] + " port " + f[1]
+	tool := make(map[string]bool, len(ports))
+	for _, p := range ports {
+		tool[strconv.Itoa(p)] = true
 	}
-	hidden, _ = diffSets(before, after, inTool, label)
-	// Extra: a tool entry matching neither read. A wildcard entry is only
-	// extra if it matches no family at all.
-	for _, l := range ls {
-		var keys []string
-		if l.Family != "6" {
-			keys = append(keys, fmt.Sprintf("%s %d", v4, l.Port))
-		}
-		if l.Family != "4" {
-			keys = append(keys, fmt.Sprintf("%s %d", v6, l.Port))
-		}
-		seen := false
-		for _, k := range keys {
-			if before[k] || after[k] {
-				seen = true
-			}
-		}
-		if !seen {
-			extra = append(extra, label(keys[0]))
-		}
-	}
-	return hidden, extra
+	return diffSets(conv(before), conv(after), tool, func(k string) string { return table + " port " + k })
 }
 
 // --- ls ---

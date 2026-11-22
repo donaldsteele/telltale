@@ -23,17 +23,10 @@ func parsePSOutput(out string) ([]int, error) {
 	return pids, nil
 }
 
-// ssListener is one listening socket from ss. Family is "" when ss printed a
-// wildcard ("*") that could be either.
-type ssListener struct {
-	Family string // "4", "6" or ""
-	Port   int
-}
-
 // parseSSOutput reads `ss -H...` output and returns the listening sockets
 // (state LISTEN for tcp, UNCONN for udp).
-func parseSSOutput(out string) ([]ssListener, error) {
-	var ls []ssListener
+func parseSSOutput(out string) ([]int, error) {
+	var ports []int
 	for _, ln := range strings.Split(out, "\n") {
 		f := strings.Fields(ln)
 		if len(f) == 0 {
@@ -45,6 +38,9 @@ func parseSSOutput(out string) ([]ssListener, error) {
 		if f[0] != "LISTEN" && f[0] != "UNCONN" {
 			continue
 		}
+		// ss prints "host%ifname:port"; the port follows the last colon, so the
+		// interface suffix needs no special handling. The family is never taken
+		// from the address text: ss is run once per family.
 		local := f[3]
 		i := strings.LastIndexByte(local, ':')
 		if i < 0 {
@@ -54,17 +50,9 @@ func parseSSOutput(out string) ([]ssListener, error) {
 		if err != nil || p < 0 || p > 65535 {
 			return nil, fmt.Errorf("unexpected ss local port %q", truncate(local))
 		}
-		host := local[:i]
-		fam := "4"
-		switch {
-		case host == "*":
-			fam = ""
-		case strings.Contains(host, ":"):
-			fam = "6"
-		}
-		ls = append(ls, ssListener{Family: fam, Port: p})
+		ports = append(ports, p)
 	}
-	return ls, nil
+	return ports, nil
 }
 
 // parseLsmod reads `lsmod` output and returns module names, normalised to

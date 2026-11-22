@@ -37,18 +37,26 @@ func TestParsePSOutput(t *testing.T) {
 func TestParseSSOutput(t *testing.T) {
 	for _, d := range distros {
 		p, err := parseSSOutput(readFixture(t, d, "ss-tcp.txt"))
-		if err != nil || !reflect.DeepEqual(p, []ssListener{{"4", 31337}}) {
+		if err != nil || !reflect.DeepEqual(p, []int{31337}) {
 			t.Errorf("%s tcp: %v %v", d, p, err)
 		}
 		p, err = parseSSOutput(readFixture(t, d, "ss-udp.txt"))
-		if err != nil || !reflect.DeepEqual(p, []ssListener{{"4", 31338}}) {
+		if err != nil || !reflect.DeepEqual(p, []int{31338}) {
 			t.Errorf("%s udp: %v %v", d, p, err)
 		}
 	}
-	p, err := parseSSOutput("LISTEN 0 4096 [::]:22 [::]:*\nLISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*\nLISTEN 0 1 *:80 *:*\nLISTEN 0 1 :::81 :::*\nESTAB 0 0 1.2.3.4:80 5.6.7.8:9\n")
-	want := []ssListener{{"6", 22}, {"4", 53}, {"", 80}, {"6", 81}}
+	in := "UNCONN 0 0 *%lo:53 *:*\n" +
+		"UNCONN 0 0 [::]%eth0:546 [::]:*\n" +
+		"LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*\n" +
+		"LISTEN 0 1 0.0.0.0%vrf0:22 0.0.0.0:*\n" +
+		"LISTEN 0 1 *:80 *:*\n" +
+		"LISTEN 0 1 :::81 :::*\n" +
+		"LISTEN 0 1 [fe80::1]%eth0:82 [::]:*\n" +
+		"ESTAB 0 0 1.2.3.4:80 5.6.7.8:9\n"
+	p, err := parseSSOutput(in)
+	want := []int{53, 546, 53, 22, 80, 81, 82}
 	if err != nil || !reflect.DeepEqual(p, want) {
-		t.Errorf("ipv6/zone: %v %v", p, err)
+		t.Errorf("host forms: %v %v", p, err)
 	}
 }
 
@@ -108,22 +116,50 @@ func TestParseLsHostileNames(t *testing.T) {
 }
 
 func TestCompareListeners(t *testing.T) {
-	before := map[string]bool{"tcp 22": true, "tcp6 22": true, "tcp 99": true}
-	after := map[string]bool{"tcp 22": true, "tcp6 22": true}
-	// ss shows only the v4 listener on 22; 99 closed during the run.
-	hidden, extra := compareListeners("tcp", before, after, []ssListener{{"4", 22}})
-	if !reflect.DeepEqual(hidden, []string{"tcp6 port 22"}) || len(extra) != 0 {
+	// 31337 is in both reads and not in ss: hidden. 99 closed and 7 opened
+	// mid-run: neither is reported.
+	hidden, extra := compareListeners("tcp6", map[int]bool{22: true, 31337: true, 99: true},
+		map[int]bool{22: true, 31337: true, 7: true}, []int{22, 7})
+	if !reflect.DeepEqual(hidden, []string{"tcp6 port 31337"}) || len(extra) != 0 {
 		t.Errorf("hidden=%v extra=%v", hidden, extra)
 	}
-	// wildcard satisfies both families; unknown port is extra
-	hidden, extra = compareListeners("tcp", before, after, []ssListener{{"", 22}, {"4", 7000}})
-	if len(hidden) != 0 || !reflect.DeepEqual(extra, []string{"tcp port 7000"}) {
+	hidden, extra = compareListeners("udp", map[int]bool{22: true}, map[int]bool{22: true}, []int{22, 7000})
+	if len(hidden) != 0 || !reflect.DeepEqual(extra, []string{"udp port 7000"}) {
 		t.Errorf("hidden=%v extra=%v", hidden, extra)
 	}
-	// a listener that appeared during the run is not extra
-	hidden, extra = compareListeners("udp", map[string]bool{}, map[string]bool{"udp 53": true}, []ssListener{{"4", 53}})
-	if len(hidden) != 0 || len(extra) != 0 {
-		t.Errorf("hidden=%v extra=%v", hidden, extra)
+}
+
+func TestCompareHiddenProcess(t *testing.T) {
+	fakeProc(t, map[string]string{"1": "init", "4242": "evil"}, "", "")
+	fakeTools(t, map[string]string{"ps": "echo 1"})
+	r := crossPS(model.Runtime{})
+	if !r.Ran || !reflect.DeepEqual(r.HiddenFromTool, []string{"pid 4242 (evil)"}) || len(r.ExtraInTool) != 0 {
+		t.Errorf("%+v", r)
+	}
+}
+
+func TestCompareIgnoresRaces(t *testing.T) {
+	// 4242 is only in the first /proc read; 4243 appears only in the second.
+	fakeProc(t, map[string]string{"1": "init", "4242": "gone"}, "", "")
+	fakeTools(t, map[string]string{"ps": "echo 1; rm -r " + procRoot + "/4242; mkdir " + procRoot + "/4243; echo 4243"})
+	r := crossPS(model.Runtime{})
+	if !r.Ran || len(r.HiddenFromTool) != 0 || len(r.ExtraInTool) != 0 {
+		t.Errorf("%+v", r)
+	}
+}
+
+func TestUDP6DeviceBoundNotFlagged(t *testing.T) {
+	// A dual-stack socket bound to lo prints as "*%lo:53237" and lives only
+	// in udp6; it must be neither hidden nor extra.
+	fakeProc(t, map[string]string{"1": "init"}, "", "")
+	row := "   0: 00000000000000000000000000000000:CFF5 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 3 2 0000000000000000 0\n"
+	must(t, os.WriteFile(filepath.Join(procRoot, "net", "udp6"), []byte(tcpHeader+row), 0o644))
+	fakeTools(t, map[string]string{"ss": `[ "$*" = "-Huanl -6" ] && echo "UNCONN 0 0 *%lo:53237 *:*"; exit 0`})
+	for _, fam := range []string{"4", "6"} {
+		r := crossSS("udp", fam)
+		if !r.Ran || len(r.HiddenFromTool) != 0 || len(r.ExtraInTool) != 0 {
+			t.Errorf("udp -%s: %+v", fam, r)
+		}
 	}
 }
 
@@ -180,7 +216,7 @@ func must(t *testing.T, err error) {
 func TestMissingToolSkipped(t *testing.T) {
 	fakeTools(t, nil)
 	res := Collect(model.Runtime{}, t.TempDir(), []string{"/etc"})
-	if len(res) != 5 {
+	if len(res) != 7 {
 		t.Fatalf("%d results", len(res))
 	}
 	for _, r := range res {
@@ -195,7 +231,7 @@ func TestMissingToolSkipped(t *testing.T) {
 
 func TestSkipAll(t *testing.T) {
 	res := SkipAll("why", []string{"/etc"})
-	if len(res) != 5 {
+	if len(res) != 7 {
 		t.Fatalf("%d", len(res))
 	}
 	for _, r := range res {
@@ -266,17 +302,19 @@ func TestCollectEndToEnd(t *testing.T) {
 		"nf_tables 1 0 - Live 0x0\nrk 1 0 - Live 0x0\n", tcpHeader+tcpRows)
 	fakeTools(t, map[string]string{
 		"ps":    "echo 1",
-		"ss":    "echo 'LISTEN 0 5 0.0.0.0:22 0.0.0.0:*'",
+		"ss":    `[ "$*" = "-Htanl -4" ] && echo "LISTEN 0 5 0.0.0.0:22 0.0.0.0:*"; exit 0`,
 		"lsmod": "echo 'Module Size Used by'; echo nf_tables 1 0",
 		"ls":    `printf '.\n..\na\nx\\ny\n'`,
 	})
 	res := Collect(model.Runtime{}, root, []string{"/etc"})
 	want := map[string][2][]string{
-		"ps":      {{"pid 4242 (evil)"}, nil},
-		"lsmod":   {{"module rk"}, nil},
-		"ss -t":   {{"tcp port 31337"}, nil},
-		"ss -u":   {nil, {"udp port 22"}},
-		"ls /etc": {{"/etc/hidden-by-rootkit"}, {"/etc/x\ny"}},
+		"ps":       {{"pid 4242 (evil)"}, nil},
+		"lsmod":    {{"module rk"}, nil},
+		"ss -t -4": {{"tcp port 31337"}, nil},
+		"ss -t -6": {nil, nil},
+		"ss -u -4": {nil, nil},
+		"ss -u -6": {nil, nil},
+		"ls /etc":  {{"/etc/hidden-by-rootkit"}, {"/etc/x\ny"}},
 	}
 	if len(res) != len(want) {
 		t.Fatalf("%d results: %+v", len(res), res)
