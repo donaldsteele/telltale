@@ -124,7 +124,7 @@ func (j *judge) fileChange(ch diff.Change) {
 	if volatileRootFile(p) && ch.Kind != diff.FileRemoved {
 		return
 	}
-	ev := model.Evidence{Path: p, Before: ch.Before, After: ch.After, Detail: changeWord(ch.Kind), When: j.changeWhen(cur)}
+	ev := model.Evidence{Path: p, Before: fullHash(ch.Before, old), After: fullHash(ch.After, cur), Detail: changeWord(ch.Kind), When: j.changeWhen(cur)}
 
 	// A persistence file: its persistence change carries it.
 	if f, ok := j.persistDone[p]; ok {
@@ -255,6 +255,16 @@ func (j *judge) kernelPackageFor(p string) string {
 		}
 	}
 	return ""
+}
+
+// fullHash puts the entry's whole hash in place of the shortened one diff
+// shows. An exception accepts this text, so a later file only needs to
+// share a hash prefix to slip past it otherwise.
+func fullHash(s string, e *model.FileEntry) string {
+	if e == nil || len(e.SHA256) <= 12 {
+		return s
+	}
+	return strings.Replace(s, e.SHA256[:12]+"…", e.SHA256, 1)
 }
 
 // changeWhen dates a file change by the file as it is now.

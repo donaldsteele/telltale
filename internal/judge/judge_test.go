@@ -857,6 +857,11 @@ func TestJudgeFileChangeRankedByLocation(t *testing.T) {
 	if !strings.HasPrefix(f.Fix, evidenceCopy+"'/usr/bin/ls' /root/telltale-evidence/ && apt-get install --reinstall 'coreutils'") {
 		t.Errorf("fix %q", f.Fix)
 	}
+	// An exception accepts the first evidence's After, so it must name the
+	// new content exactly, not by a short hash prefix.
+	if after := f.Evidence[0].After; !strings.Contains(after, h("ls trojan")) {
+		t.Errorf("evidence does not carry the full new hash: %q", after)
+	}
 	must(t, r, "snap.file_modified:/etc/security/limits.conf", model.SevBackdoor)
 	must(t, r, "snap.file_modified:/usr/share/doc/openssl/README", model.SevNote)
 	must(t, r, "snap.file_modified:/etc/hostname", model.SevNote)
