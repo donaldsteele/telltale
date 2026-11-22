@@ -1,2 +1,3 @@
 dist/
 *.test
+lab/sink/sink

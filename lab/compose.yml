@@ -1,0 +1,16 @@
+# Isolated lab network plus the sink. Machines are started by labkit (Go tests) or by hand with
+# `docker run --network telltale-lab ...`. Build the sink binary first:
+#   CGO_ENABLED=0 go build -tags lab -o lab/sink/sink ./lab/sink
+name: telltale-lab
+services:
+  sink:
+    build: ./sink
+    image: telltale-lab/sink:compose
+    container_name: telltale-lab-sink
+    networks:
+      lab:
+        aliases: [sink]
+networks:
+  lab:
+    name: telltale-lab
+    internal: true
