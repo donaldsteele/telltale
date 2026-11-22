@@ -5,6 +5,7 @@ package pamconf
 
 import (
 	"path"
+	"sort"
 	"strings"
 
 	"github.com/donaldsteele/telltale/internal/model"
@@ -87,8 +88,29 @@ func Candidates(module string, extra []string) []string {
 		return []string{path.Clean(module)}
 	}
 	var out []string
-	for _, d := range append(append([]string{}, Dirs...), extra...) {
+	for _, d := range append(append([]string{}, extra...), Dirs...) {
 		out = append(out, path.Clean(d+"/"+module))
 	}
+	return out
+}
+
+// MultiarchDirs lists the /lib/<x>/security and /usr/lib/<x>/security
+// directories that hold files in the inventory, sorted.
+func MultiarchDirs(files []model.FileEntry) []string {
+	seen := map[string]bool{}
+	for _, f := range files {
+		d := path.Dir(f.Path)
+		if path.Base(d) != "security" {
+			continue
+		}
+		if p := path.Dir(path.Dir(d)); p == "/lib" || p == "/usr/lib" {
+			seen[d] = true
+		}
+	}
+	var out []string
+	for d := range seen {
+		out = append(out, d)
+	}
+	sort.Strings(out)
 	return out
 }

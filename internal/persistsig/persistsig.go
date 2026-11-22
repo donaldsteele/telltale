@@ -37,6 +37,10 @@ const shellName = `(?:\S*/)?(?:ba|z|da|k|c|tc|a)?sh\b`
 // braces, "=" and "," may precede it (`sh -c 'nc ...'`, `X=nc`).
 const ncWord = `(?:^|[\s/;|&(` + "`" + `"'{=,])(?:nc|ncat|netcat)(?:\.\w+)?\s`
 
+// sameCommand is one character of the same command: anything but | ; and a
+// lone &; an & next to < or > is a redirection (2>&1, 0<&1, &>).
+const sameCommand = `(?:[^|;&]|[<>]&|&[<>])`
+
 type named struct {
 	id string
 	re *regexp.Regexp
@@ -48,7 +52,7 @@ var patterns = []named{
 	{ShellRedirect, regexp.MustCompile(`(?i)\b(?:ba|z|da|k)?sh\s+-[a-z]*i[a-z]*\b.*(?:>&|&>|<>|<&|>\s*/dev/)`)},
 	// The program name is case-insensitive; the flags are not (OpenBSD's -C
 	// is CRLF, not -c), and the flag scan stops at the next command.
-	{NetcatExec, regexp.MustCompile(`(?i:` + ncWord + `)(?:[^|;&]*\s)?(?:-[a-zA-Z]*[ec][a-zA-Z]*|--(?:sh-)?exec)(?:\s|$|["'])`)},
+	{NetcatExec, regexp.MustCompile(`(?i:` + ncWord + `)(?:` + sameCommand + `*\s)?(?:-[a-zA-Z]*[ec][a-zA-Z]*(?:\s|$|["'/])|--(?:sh-)?exec(?:=|\s|$|["']))`)},
 	{SocatExec, regexp.MustCompile(`(?i)\bsocat\b.*\b(?:exec|system):`)},
 	{FifoNetcat, regexp.MustCompile(`(?i)\bmkfifo\b.*` + ncWord)},
 	{FifoNetcat, regexp.MustCompile(`(?i)` + ncWord + `.*\bmkfifo\b`)},
@@ -202,7 +206,7 @@ func unitExecValue(s string) (string, bool) {
 	if !ok || !unitExecKeys[strings.TrimSpace(k)] {
 		return "", false
 	}
-	return strings.TrimSpace(v), true
+	return strings.TrimLeft(strings.TrimSpace(v), "-@+!:"), true
 }
 
 // Detect scans the raw lines of a persistence file of the given kind and

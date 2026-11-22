@@ -6,6 +6,7 @@ package heuristics
 import (
 	"fmt"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -358,7 +359,7 @@ func files(c *model.Collection, owned map[string]string) []model.Finding {
 	for _, f := range c.Files {
 		if f.Type == "file" && f.Mode&0o6000 != 0 {
 			if _, ok := owned[f.Path]; !ok {
-				if orig := packaged[f.SHA256+fmt.Sprintf(":%o", f.Mode&0o6000)]; f.SHA256 != "" && f.Err == "" && orig != "" {
+				if orig := packaged[setuidKey(f)]; f.SHA256 != "" && f.Err == "" && orig != "" {
 					out = append(out, model.Finding{
 						Key: "heur.setuid_packaged_copy:" + f.Path, ID: idSetuid, Source: source, Severity: model.SevNote,
 						Title: fmt.Sprintf("%s is a copy of the setuid program %s from a package", f.Path, orig),
@@ -563,7 +564,20 @@ func noLogin(shell string) bool {
 	return false
 }
 
-// packagedSetuid maps "<sha256>:<setuid/setgid bits>" to the lowest path of a
+// setuidKey identifies a file by content, full mode and owner: a copy must be
+// the same in every respect that grants rights.
+func setuidKey(f model.FileEntry) string {
+	return fmt.Sprintf("%s:%o:%d:%d", f.SHA256, f.Mode&0o7777, f.UID, f.GID)
+}
+
+var interpreterNames = regexp.MustCompile(`^(?:ba|z|da|k|c|tc|a|fi)?sh$|^busybox|^python[\d.]*$|^perl[\d.]*$|^ruby[\d.]*$|^php[\d.]*$|^node(?:js)?$|^lua[\d.]*$`)
+
+// shellOrInterpreter reports a program that can run arbitrary code. Offline
+// mode cannot confirm that a package ships it setuid, so no copy of it is
+// excused as a packaged copy.
+func shellOrInterpreter(base string) bool { return interpreterNames.MatchString(base) }
+
+// packagedSetuid maps setuidKey to the lowest path of a
 // package-owned file with that content and those bits.
 func packagedSetuid(c *model.Collection, owned map[string]string) map[string]string {
 	m := map[string]string{}
@@ -571,7 +585,10 @@ func packagedSetuid(c *model.Collection, owned map[string]string) map[string]str
 		if f.Type != "file" || f.Mode&0o6000 == 0 || f.SHA256 == "" || f.Err != "" || owned[f.Path] == "" {
 			continue
 		}
-		k := f.SHA256 + fmt.Sprintf(":%o", f.Mode&0o6000)
+		if shellOrInterpreter(path.Base(f.Path)) {
+			continue
+		}
+		k := setuidKey(f)
 		if old, ok := m[k]; !ok || f.Path < old {
 			m[k] = f.Path
 		}

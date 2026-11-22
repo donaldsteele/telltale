@@ -50,11 +50,7 @@ func pamNever(p string) bool {
 // opened (modules are often planted there); the descriptor-level kernel
 // filesystem check still applies.
 func ensurePAMEntries(root string, files []model.FileEntry, mounts []model.Mount, persist []model.PersistFile, maxHash int64) ([]model.FileEntry, []model.Skip) {
-	var local []model.Mount
-	for _, m := range mounts {
-		if m.FSType != "tmpfs" {
-			local = append(local, m)
-		}
-	}
-	return ensureEntriesIn(root, files, pamModulePaths(persist), local, maxHash, pamNever)
+	// tmpfs is allowed, judged by the nearest mount
+	skip := func(t string) bool { return t != "tmpfs" && skipFS(t) }
+	return ensureEntriesIn(root, files, pamModulePaths(persist), mounts, maxHash, pamNever, skip)
 }

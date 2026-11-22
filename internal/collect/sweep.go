@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -43,14 +44,15 @@ var sweepSkipFS = map[string]bool{
 // paths change between scans, so a sweep that looked there would call every one
 // a stranger. Each entry matches itself and everything below it.
 var sweepSkipDirs = []string{"/var/lib/docker", "/var/lib/containerd", "/var/lib/containers", "/var/lib/flatpak", "/var/lib/lxc", "/var/lib/lxd", "/var/lib/incus", "/var/lib/machines",
-	"/run/containerd", "/run/docker", "/var/lib/kubelet/pods", "/var/snap/lxd/common/lxd", "/var/lib/rancher", "/timeshift", "/.snapshots", "/var/cache/pbuilder", "/srv/chroot"}
+	"/run/containerd", "/run/k3s/containerd", "/run/docker", "/var/lib/kubelet/pods", "/var/snap/lxd/common/lxd", "/var/lib/rancher", "/timeshift", "/.snapshots", "/var/cache/pbuilder", "/srv/chroot"}
 
 // sweepFirstBudget is the entry budget of each directory in sweepFirst, so
 // that a flood in one cannot starve the others.
 var sweepFirstBudget = 500_000
 
-// userImageDir is a per-user container image store (~/.local/share/containers).
-const userImageDir = "/.local/share/containers"
+// userImageDirs are per-user container image stores (~/.local/share/containers,
+// rootless Docker).
+var userImageDirs = []string{"/.local/share/containers", "/.local/share/docker"}
 
 // sweepFirst are walked before everything else, so that a bounded walk never
 // runs out before reaching them: the world-writable and service-owned places
@@ -76,6 +78,14 @@ func hasPathPrefix(p, dir string) bool {
 // candidates themselves, through the same guarded open as the system-path
 // walk. Mounts holds machine paths.
 func Sweep(root string, mounts []model.Mount, have []model.FileEntry, opt FileOptions) ([]model.FileEntry, []model.Skip) {
+	e, s, _ := sweepFull(root, mounts, have, opt)
+	return e, s
+}
+
+// sweepFull is Sweep that also returns the path prefixes where the walk stopped
+// early (the entry bound or a directory budget ran out): files there were not
+// all looked at, so a snapshot comparison must not call them added or removed.
+func sweepFull(root string, mounts []model.Mount, have []model.FileEntry, opt FileOptions) ([]model.FileEntry, []model.Skip, []string) {
 	var entries []model.FileEntry
 	var skips []model.Skip
 	root = strings.TrimRight(root, "/")
@@ -124,10 +134,21 @@ func Sweep(root string, mounts []model.Mount, have []model.FileEntry, opt FileOp
 		return false
 	}
 
-	visited := 0
-	stopped := false
-	// A directory in sweepFirst has its own entry budget.
-	phaseCap, phaseStop, phaseDir := int(^uint(0)>>1), false, ""
+	// The directories in sweepFirst each have their own budget; everything
+	// else shares sweepMaxEntries, counted apart from them.
+	visited, limit := 0, sweepMaxEntries
+	stopped, phaseStop, inFirst, phaseDir := false, false, false, ""
+	incompleteSet := map[string]bool{}
+	// remaining records the unvisited entries of a directory the walk left.
+	remaining := func(mp string, des []fs.DirEntry, i int) {
+		if len(des)-i > 50 {
+			incompleteSet[mp] = true
+			return
+		}
+		for _, d := range des[i:] {
+			incompleteSet[path.Join(mp, d.Name())] = true
+		}
+	}
 	dirSkips, droppedSkips := 0, 0
 	dirSkip := func(mp string, err error) {
 		if dirSkips >= maxSweepDirSkips {
@@ -158,7 +179,10 @@ func Sweep(root string, mounts []model.Mount, have []model.FileEntry, opt FileOp
 		}
 	}
 	imageDir := func(p string) bool {
-		hit := strings.HasSuffix(p, userImageDir)
+		hit := false
+		for _, u := range userImageDirs {
+			hit = hit || strings.HasSuffix(p, u)
+		}
 		for _, d := range sweepSkipDirs {
 			hit = hit || p == d
 		}
@@ -193,18 +217,20 @@ func Sweep(root string, mounts []model.Mount, have []model.FileEntry, opt FileOp
 			}
 			return
 		}
-		for _, d := range des {
+		for i, d := range des {
 			if stopped || phaseStop {
+				remaining(mp, des, i)
 				return
 			}
-			if visited++; visited > phaseCap {
-				phaseStop = true
-				skips = append(skips, model.Skip{Check: checkName, Reason: fmt.Sprintf("sweep: %s: stopped after %d entries; the rest of it was not looked at", phaseDir, sweepFirstBudget)})
-				return
-			}
-			if visited > sweepMaxEntries {
-				stopped = true
-				skips = append(skips, model.Skip{Check: checkName, Reason: fmt.Sprintf("sweep: stopped after %d entries; setuid, setgid and capability files beyond this point were not looked for", sweepMaxEntries)})
+			if visited++; visited > limit {
+				if inFirst {
+					phaseStop = true
+					skips = append(skips, model.Skip{Check: checkName, Reason: fmt.Sprintf("sweep: %s: stopped after %d entries; the rest of it was not looked at", phaseDir, sweepFirstBudget)})
+				} else {
+					stopped = true
+					skips = append(skips, model.Skip{Check: checkName, Reason: fmt.Sprintf("sweep: stopped after %d entries; setuid, setgid and capability files beyond this point were not looked for", sweepMaxEntries)})
+				}
+				remaining(mp, des, i)
 				return
 			}
 			child := mp + "/" + d.Name()
@@ -237,6 +263,7 @@ func Sweep(root string, mounts []model.Mount, have []model.FileEntry, opt FileOp
 					}
 				}
 				if e, ok := statEntry(real, child, opt, &skips); ok {
+					e.Swept = true
 					entries = append(entries, e)
 					haveSet[child] = true
 				}
@@ -258,47 +285,56 @@ func Sweep(root string, mounts []model.Mount, have []model.FileEntry, opt FileOp
 				return false
 			}
 		}
-		if i := strings.Index(p+"/", userImageDir+"/"); i >= 0 {
-			imageDir(p[:i+len(userImageDir)])
-			return false
+		for _, u := range userImageDirs {
+			if i := strings.Index(p+"/", u+"/"); i >= 0 {
+				imageDir(p[:i+len(u)])
+				return false
+			}
 		}
 		return true
 	}
 
-	// 1. the places an intruder uses, so the bound never starves them
+	// 1. the places an intruder uses, each with its own budget so a flood in
+	// one cannot starve the others (or the rest of the sweep)
 	for _, p := range sweepFirst {
-		if stopped {
-			break
-		}
 		if fi, err := os.Lstat(root + p); err != nil || !fi.IsDir() || !walkable(p) {
 			continue
 		}
 		done[p] = true
-		phaseCap, phaseStop, phaseDir = visited+sweepFirstBudget, false, p
+		saved := visited
+		visited, limit, inFirst, phaseStop, phaseDir = 0, sweepFirstBudget, true, false, p
 		walk(p)
+		visited, limit, inFirst, phaseStop = saved, sweepMaxEntries, false, false
 	}
-	phaseCap, phaseStop = int(^uint(0)>>1), false
 	// 2. every local mount
 	for _, s := range starts {
-		if stopped {
-			break
-		}
 		switch {
 		case done[s.path] || !walkable(s.path):
 		case isLate(s.path):
 			later(s.path)
+		case stopped:
+			incompleteSet[s.path] = true
 		default:
 			walk(s.path)
 		}
 	}
 	// 3. the users' own trees
-	for i := 0; i < len(deferred) && !stopped; i++ {
-		if walkable(deferred[i]) {
-			walk(deferred[i])
+	for _, d := range deferred {
+		switch {
+		case !walkable(d):
+		case stopped:
+			incompleteSet[d] = true
+		default:
+			walk(d)
 		}
 	}
 	if droppedSkips > 0 {
 		skips = append(skips, model.Skip{Check: checkName, Reason: fmt.Sprintf("sweep: %d more directories could not be read", droppedSkips)})
 	}
-	return entries, skips
+	var incomplete []string
+	for p := range incompleteSet {
+		incomplete = append(incomplete, p)
+	}
+	sort.Strings(incomplete)
+	return entries, skips, incomplete
 }

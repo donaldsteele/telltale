@@ -160,7 +160,7 @@ func TestSweepEntriesDiffNormally(t *testing.T) {
 func TestSweepBoundsAndRecordsSkips(t *testing.T) {
 	root := t.TempDir()
 	for i := 0; i < 20; i++ {
-		plant(t, root, fmt.Sprintf("srv/d/f%02d", i), 0o755)
+		plant(t, root, fmt.Sprintf("data/d/f%02d", i), 0o644)
 	}
 	old := sweepMaxEntries
 	sweepMaxEntries = 10
@@ -356,5 +356,133 @@ func TestSweepMountsAndMediaAreWalkedLast(t *testing.T) {
 	got, _ := Sweep(root, []model.Mount{{Path: "/", FSType: "ext4"}}, nil, FileOptions{})
 	if _, ok := byPath(got)["/var/tmp/.s"]; !ok {
 		t.Errorf("late group walked early: %v", got)
+	}
+}
+
+func TestSweepIsStableWhenTmpGrows(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < 5; i++ {
+		plant(t, root, fmt.Sprintf("tmp/f%02d", i), 0o644)
+	}
+	plant(t, root, "var/tmp/.s", os.ModeSetuid|0o755)
+	for i := 0; i < 10; i++ {
+		plant(t, root, fmt.Sprintf("home/a/f%02d", i), 0o644)
+	}
+	plant(t, root, "home/z/.s", os.ModeSetuid|0o755)
+	ob, om := sweepFirstBudget, sweepMaxEntries
+	sweepFirstBudget, sweepMaxEntries = 10, 24
+	defer func() { sweepFirstBudget, sweepMaxEntries = ob, om }()
+	m := []model.Mount{{Path: "/", FSType: "ext4"}}
+	a, _ := Sweep(root, m, nil, FileOptions{})
+	for i := 5; i < 9; i++ {
+		plant(t, root, fmt.Sprintf("tmp/f%02d", i), 0o644)
+	}
+	b, _ := Sweep(root, m, nil, FileOptions{})
+	for name, got := range map[string][]model.FileEntry{"first": a, "second": b} {
+		if _, ok := byPath(got)["/home/z/.s"]; !ok {
+			t.Errorf("%s scan lost /home/z/.s: %v", name, got)
+		}
+		for _, e := range got {
+			if !e.Swept || e.Supplementary {
+				t.Errorf("%s: entry flags: %+v", name, e)
+			}
+		}
+	}
+}
+
+func TestSweepRecordsWhereItStoppedAndDiffIgnoresIt(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < 30; i++ {
+		plant(t, root, fmt.Sprintf("home/u/f%02d", i), 0o644)
+	}
+	plant(t, root, "home/u/zz-late", os.ModeSetuid|0o755)
+	plant(t, root, "var/tmp/.s", os.ModeSetuid|0o755)
+	old := sweepMaxEntries
+	sweepMaxEntries = 10
+	defer func() { sweepMaxEntries = old }()
+	m := []model.Mount{{Path: "/", FSType: "ext4"}}
+	got, _, incomplete := sweepFull(root, m, nil, FileOptions{})
+	if len(incomplete) == 0 {
+		t.Fatal("no incomplete region recorded")
+	}
+	covered := false
+	for _, p := range incomplete {
+		covered = covered || p == "/home/u/zz-late" || p == "/home/u" || strings.HasPrefix("/home/u/zz-late", p+"/")
+	}
+	if !covered || incompleteHas(incomplete, "/var/tmp") {
+		t.Errorf("incomplete: %v", incomplete)
+	}
+	// An earlier snapshot that saw /home/u/zz-late; this scan did not reach it.
+	e := model.FileEntry{Path: "/home/u/zz-late", Type: "file", Mode: 0o104755, Swept: true}
+	oldSnap := &model.Snapshot{Collection: &model.Collection{Files: []model.FileEntry{e}}}
+	cur := &model.Collection{Files: got, SweepIncomplete: incomplete}
+	for _, c := range diff.Compare(oldSnap, cur, nil) {
+		if c.Subject == "/home/u/zz-late" {
+			t.Errorf("one-sided swept entry under an incomplete region reported: %+v", c)
+		}
+	}
+	// and the reverse: now seen, but the old snapshot was incomplete there
+	oldSnap = &model.Snapshot{Collection: &model.Collection{SweepIncomplete: []string{"/home/u"}}}
+	cur = &model.Collection{Files: []model.FileEntry{e}}
+	for _, c := range diff.Compare(oldSnap, cur, nil) {
+		if c.Subject == "/home/u/zz-late" {
+			t.Errorf("added entry under the old scan's incomplete region reported: %+v", c)
+		}
+	}
+	// a complete scan still reports it
+	oldSnap = &model.Snapshot{Collection: &model.Collection{}}
+	found := false
+	for _, c := range diff.Compare(oldSnap, &model.Collection{Files: []model.FileEntry{e}}, nil) {
+		found = found || c.Subject == "/home/u/zz-late"
+	}
+	if !found {
+		t.Error("complete scans no longer report added swept files")
+	}
+}
+
+func incompleteHas(l []string, p string) bool {
+	for _, x := range l {
+		if x == p || strings.HasPrefix(x, p+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSweepRealisticMountTableOnPAMEnsure(t *testing.T) {
+	root := t.TempDir()
+	for _, d := range []string{"etc/pam.d", "dev/shm", "tmp", "run/user/1000", "opt"} {
+		os.MkdirAll(filepath.Join(root, d), 0o755)
+	}
+	for _, f := range []string{"dev/shm/x.so", "tmp/y.so", "run/user/1000/z.so", "opt/o.so"} {
+		os.WriteFile(filepath.Join(root, f), []byte(f), 0o644)
+	}
+	os.WriteFile(filepath.Join(root, "etc/pam.d/sshd"), []byte(strings.Join([]string{
+		"auth optional /dev/shm/x.so", "auth optional /tmp/y.so", "auth optional /run/user/1000/z.so",
+		"auth optional /opt/o.so", "auth optional /dev/zero", "auth optional /proc/kmsg",
+	}, "\n")+"\n"), 0o644)
+	mounts := []model.Mount{
+		{Path: "/", FSType: "ext4"}, {Path: "/dev", FSType: "devtmpfs"}, {Path: "/dev/shm", FSType: "tmpfs"},
+		{Path: "/tmp", FSType: "tmpfs"}, {Path: "/run", FSType: "tmpfs"}, {Path: "/run/user/1000", FSType: "tmpfs"},
+	}
+	persist, _ := Persistence(root, nil, []byte("k"))
+	files, _ := ensurePAMEntries(root, nil, mounts, persist, defaultMaxHash)
+	got := byPath(files)
+	for _, p := range []string{"/dev/shm/x.so", "/tmp/y.so", "/run/user/1000/z.so", "/opt/o.so"} {
+		if _, ok := got[p]; !ok {
+			t.Errorf("%s not collected", p)
+		}
+	}
+	for _, p := range []string{"/dev/zero", "/proc/kmsg"} {
+		if _, ok := got[p]; ok {
+			t.Errorf("%s must not be opened", p)
+		}
+	}
+	// the nearest mount decides: /dev/shm is tmpfs, not the devtmpfs above it
+	if underMountOf("/dev/shm/x.so", mounts, func(t string) bool { return t == "devtmpfs" }) {
+		t.Error("judged by an ancestor mount")
+	}
+	if !underSkippedMount("/tmp/y.so", mounts) || underSkippedMount("/opt/o.so", mounts) {
+		t.Error("ordinary scan rule changed")
 	}
 }

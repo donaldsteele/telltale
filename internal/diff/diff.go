@@ -75,7 +75,7 @@ func Compare(old *model.Snapshot, cur *model.Collection, curChecks []model.Check
 	if cur == nil {
 		cur = &model.Collection{}
 	}
-	out = append(out, compareFiles(oc.Files, cur.Files)...)
+	out = append(out, compareFiles(oc.Files, cur.Files, append(append([]string{}, oc.SweepIncomplete...), cur.SweepIncomplete...))...)
 	out = append(out, comparePersist(oc.Persist, cur.Persist)...)
 	out = append(out, compareAccounts(oc.Accounts, cur.Accounts)...)
 	out = append(out, comparePackages(oc.Packages.Installed, cur.Packages.Installed)...)
@@ -114,7 +114,21 @@ func (s *summary) join() (string, string) {
 	return strings.Join(s.before, " "), strings.Join(s.after, " ")
 }
 
-func compareFiles(old, cur []model.FileEntry) []Change {
+// underAny reports whether p is one of prefixes or below one.
+func underAny(p string, prefixes []string) bool {
+	for _, d := range prefixes {
+		if p == d || strings.HasPrefix(p, strings.TrimRight(d, "/")+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// compareFiles compares two file inventories. incomplete holds the path
+// prefixes where either sweep stopped early: an entry found by the sweep that
+// exists on one side only, under such a prefix, may simply not have been looked
+// at, so it is not reported.
+func compareFiles(old, cur []model.FileEntry, incomplete []string) []Change {
 	om := make(map[string]model.FileEntry, len(old))
 	for _, f := range old {
 		om[f.Path] = f
@@ -128,6 +142,9 @@ func compareFiles(old, cur []model.FileEntry) []Change {
 			continue // exists only while something refers to it
 		}
 		if !ok {
+			if n.Swept && underAny(n.Path, incomplete) {
+				continue
+			}
 			out = append(out, Change{Kind: FileAdded, Subject: n.Path, After: describeFile(n)})
 			continue
 		}
@@ -166,7 +183,7 @@ func compareFiles(old, cur []model.FileEntry) []Change {
 		}
 	}
 	for _, o := range old {
-		if !seen[o.Path] && !o.Supplementary {
+		if !seen[o.Path] && !o.Supplementary && !(o.Swept && underAny(o.Path, incomplete)) {
 			out = append(out, Change{Kind: FileRemoved, Subject: o.Path, Before: describeFile(o)})
 		}
 	}

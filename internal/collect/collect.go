@@ -71,7 +71,7 @@ func All(opt Options) (*model.Collection, error) {
 	// the system paths too. Before ensureEntries so that a swept file is a
 	// normal entry, not a supplementary one.
 	var swept []model.FileEntry
-	swept, s = Sweep(opt.Root, c.Runtime.Mounts, c.Files, FileOptions{MaxHashBytes: defaultMaxHash})
+	swept, s, c.SweepIncomplete = sweepFull(opt.Root, c.Runtime.Mounts, c.Files, FileOptions{MaxHashBytes: defaultMaxHash})
 	c.Files = append(c.Files, swept...)
 	add(s)
 	// Files the file scan did not walk but something refers to: the program

@@ -32,7 +32,7 @@ func TestCandidatesAreCleaned(t *testing.T) {
 	if got := Candidates("/opt//a/../x.so", nil); len(got) != 1 || got[0] != "/opt/x.so" {
 		t.Errorf("abs: %v", got)
 	}
-	if got := Candidates("pam_x.so", []string{"/usr/lib/x86_64-linux-gnu/security"}); got[0] != "/lib/security/pam_x.so" || got[len(got)-1] != "/usr/lib/x86_64-linux-gnu/security/pam_x.so" {
+	if got := Candidates("pam_x.so", []string{"/usr/lib/x86_64-linux-gnu/security"}); got[0] != "/usr/lib/x86_64-linux-gnu/security/pam_x.so" || got[len(got)-1] != "/usr/lib64/security/pam_x.so" {
 		t.Errorf("bare: %v", got)
 	}
 }

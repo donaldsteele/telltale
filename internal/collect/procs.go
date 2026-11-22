@@ -343,19 +343,27 @@ func linkTargets(persist []model.PersistFile) []string {
 // link to /proc/kmsg or a trace pipe would consume or block on the read.
 var neverRead = []string{"/proc", "/sys", "/dev"}
 
-// underSkippedMount reports whether p lies under a mount of a kind the file
-// scan does not enter (network, proc, tmpfs ...).
+// underSkippedMount reports whether p lies on a filesystem of a kind the file
+// scan does not enter (network, proc, tmpfs ...). The filesystem is the one of
+// the NEAREST mount: the longest mount point that is a prefix of p. A tmpfs
+// at /dev/shm is not judged by the devtmpfs at /dev above it.
 func underSkippedMount(p string, mounts []model.Mount) bool {
+	return underMountOf(p, mounts, skipFS)
+}
+
+// underMountOf reports whether skip holds for the type of the nearest mount
+// of p.
+func underMountOf(p string, mounts []model.Mount, skip func(fstype string) bool) bool {
+	best, bestLen, typ := false, -1, ""
 	for _, m := range mounts {
-		if !skipFS(m.FSType) {
-			continue
-		}
 		mp := filepath.Clean(m.Path)
 		if mp == "/" || p == mp || strings.HasPrefix(p, mp+"/") {
-			return true
+			if len(mp) > bestLen {
+				best, bestLen, typ = true, len(mp), m.FSType
+			}
 		}
 	}
-	return false
+	return best && skip(typ)
 }
 
 // ensureEntries adds to files the current entry of each of paths the file
@@ -364,7 +372,7 @@ func underSkippedMount(p string, mounts []model.Mount) bool {
 // /proc, /sys and /dev, and under mounts the file scan skips, are never
 // opened.
 func ensureEntries(root string, files []model.FileEntry, paths []string, mounts []model.Mount, maxHash int64) ([]model.FileEntry, []model.Skip) {
-	return ensureEntriesIn(root, files, paths, mounts, maxHash, underNeverRead)
+	return ensureEntriesIn(root, files, paths, mounts, maxHash, underNeverRead, skipFS)
 }
 
 // underNeverRead reports whether p is in a tree that is never opened.
@@ -378,7 +386,7 @@ func underNeverRead(p string) bool {
 }
 
 // ensureEntriesIn is ensureEntries with the rule for never-opened paths given.
-func ensureEntriesIn(root string, files []model.FileEntry, paths []string, mounts []model.Mount, maxHash int64, never func(string) bool) ([]model.FileEntry, []model.Skip) {
+func ensureEntriesIn(root string, files []model.FileEntry, paths []string, mounts []model.Mount, maxHash int64, never func(string) bool, skipType func(string) bool) ([]model.FileEntry, []model.Skip) {
 	var skips []model.Skip
 	have := make(map[string]bool, len(files))
 	for _, e := range files {
@@ -391,7 +399,7 @@ func ensureEntriesIn(root string, files []model.FileEntry, paths []string, mount
 		}
 		p = filepath.Clean(p)
 		have[p] = true
-		refused := underSkippedMount(p, mounts) || never(p)
+		refused := underMountOf(p, mounts, skipType) || never(p)
 		if refused {
 			skips = append(skips, model.Skip{Check: checkName, Reason: p + ": not opened (kernel, device or skipped mount)"})
 			continue

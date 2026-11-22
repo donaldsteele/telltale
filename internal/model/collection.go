@@ -13,19 +13,22 @@ const CollectionSchema, SnapshotSchema, ReportSchema = 1, 1, 1
 
 // Collection is everything gathered from one host in one pass.
 type Collection struct {
-	Schema    int               `json:"schema"`
-	Host      Host              `json:"host"`
-	Time      time.Time         `json:"time"`
-	AsRoot    bool              `json:"as_root"`
-	Skipped   []Skip            `json:"skipped,omitempty"`
-	Files     []FileEntry       `json:"files"`
-	Accounts  Accounts          `json:"accounts"`
-	Persist   []PersistFile     `json:"persist"`
-	Runtime   Runtime           `json:"runtime"`
-	Packages  Packages          `json:"packages"`
-	Firewall  Firewall          `json:"firewall"`
-	CrossView []CrossViewResult `json:"cross_view,omitempty"`
-	Sysctl    map[string]string `json:"sysctl,omitempty"`
+	Schema  int       `json:"schema"`
+	Host    Host      `json:"host"`
+	Time    time.Time `json:"time"`
+	AsRoot  bool      `json:"as_root"`
+	Skipped []Skip    `json:"skipped,omitempty"`
+	// SweepIncomplete lists path prefixes where the setuid/capability sweep
+	// stopped early, so files under them were not all looked at.
+	SweepIncomplete []string          `json:"sweep_incomplete,omitempty"`
+	Files           []FileEntry       `json:"files"`
+	Accounts        Accounts          `json:"accounts"`
+	Persist         []PersistFile     `json:"persist"`
+	Runtime         Runtime           `json:"runtime"`
+	Packages        Packages          `json:"packages"`
+	Firewall        Firewall          `json:"firewall"`
+	CrossView       []CrossViewResult `json:"cross_view,omitempty"`
+	Sysctl          map[string]string `json:"sysctl,omitempty"`
 }
 
 // Host identifies the machine a collection came from.
@@ -71,8 +74,12 @@ type FileEntry struct {
 	// deleted program was started from, the target of a startup link). It
 	// exists only while something refers to it, so a snapshot comparison
 	// never reports it as added or removed.
-	Supplementary bool   `json:"supplementary,omitempty"`
-	MD5           string `json:"md5,omitempty"` // only for supplementary entries
+	Supplementary bool `json:"supplementary,omitempty"`
+	// Swept marks an entry found by the setuid/capability sweep rather than the
+	// system-path walk. The sweep can stop early, so a one-sided swept entry
+	// under Collection.SweepIncomplete is not evidence of a change.
+	Swept bool   `json:"swept,omitempty"`
+	MD5   string `json:"md5,omitempty"` // only for supplementary entries
 }
 
 // Accounts holds local users and groups, read the way glibc's files

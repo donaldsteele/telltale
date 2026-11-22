@@ -334,3 +334,56 @@ func TestSetuidPackagedCopy(t *testing.T) {
 		}
 	}
 }
+
+func TestPAMDotDotModuleName(t *testing.T) {
+	c := &model.Collection{}
+	c.Files = []model.FileEntry{
+		{Path: "/usr/lib/x86_64-linux-gnu/security/pam_unix.so", Type: "file", Mode: 0o100644},
+		{Path: "/usr/bin/login", Type: "file", Mode: 0o100755},
+		{Path: "/usr/lib/bin/login", Type: "file", Mode: 0o100644}, // planted, unowned
+	}
+	owned := map[string]string{
+		"/usr/lib/x86_64-linux-gnu/security/pam_unix.so": "libpam-modules", "/lib/x86_64-linux-gnu/security/pam_unix.so": "libpam-modules",
+		"/usr/bin/login": "login", "/bin/login": "login",
+	}
+	c.Persist = []model.PersistFile{{Path: "/etc/pam.d/sshd", Kind: model.PersistKindPAM, Mode: 0o100644, Lines: []string{
+		"auth sufficient ../../bin/login",
+		"auth required pam_unix.so",
+	}}}
+	fs := Run(c, ctx, owned)
+	if f := find(fs, "heur.pam_path_escape:../../bin/login"); f == nil || f.Severity != model.SevBackdoor || f.ID != "TT-HEUR-016" {
+		t.Errorf("no path escape finding: %v", keys(fs))
+	}
+	if f := find(fs, "heur.pam_unowned:/usr/lib/bin/login"); f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("the planted candidate is not reported: %v", keys(fs))
+	}
+	if find(fs, "heur.pam_unowned:/usr/bin/login") != nil || find(fs, "heur.pam_unowned:/usr/lib/x86_64-linux-gnu/security/pam_unix.so") != nil {
+		t.Errorf("owned module flagged: %v", keys(fs))
+	}
+}
+
+func TestSetuidPackagedCopyKeyIncludesModeAndOwner(t *testing.T) {
+	c := &model.Collection{Files: []model.FileEntry{
+		{Path: "/usr/lib/dbus-1.0/dbus-daemon-launch-helper", Type: "file", Mode: 0o104754, GID: 101, SHA256: "dbus"},
+		{Path: "/var/tmp/.d", Type: "file", Mode: 0o104755, GID: 0, SHA256: "dbus"},
+		{Path: "/usr/bin/at", Type: "file", Mode: 0o106755, UID: 1, GID: 1, SHA256: "at"},
+		{Path: "/var/tmp/.a", Type: "file", Mode: 0o106755, UID: 0, GID: 0, SHA256: "at"},
+		{Path: "/usr/bin/su", Type: "file", Mode: 0o104755, SHA256: "su"},
+		{Path: "/var/tmp/su.copy", Type: "file", Mode: 0o104755, SHA256: "su"},
+		// a shell: offline mode cannot confirm the reference's bits are original
+		{Path: "/usr/bin/bash", Type: "file", Mode: 0o104755, SHA256: "bash"},
+		{Path: "/var/tmp/.s", Type: "file", Mode: 0o104755, SHA256: "bash"},
+		{Path: "/usr/bin/python3.12", Type: "file", Mode: 0o104755, SHA256: "py"},
+		{Path: "/var/tmp/.p", Type: "file", Mode: 0o104755, SHA256: "py"},
+	}}
+	owned := map[string]string{"/usr/lib/dbus-1.0/dbus-daemon-launch-helper": "dbus-daemon", "/usr/bin/at": "at", "/usr/bin/su": "util-linux", "/usr/bin/bash": "bash", "/usr/bin/python3.12": "python3.12"}
+	fs := Run(c, ctx, owned)
+	for _, p := range []string{"/var/tmp/.d", "/var/tmp/.a", "/var/tmp/.s", "/var/tmp/.p"} {
+		if f := find(fs, "heur.unowned_setuid:"+p); f == nil || f.Severity != model.SevBackdoor {
+			t.Errorf("%s should stay a backdoor sign: %v", p, keys(fs))
+		}
+	}
+	if find(fs, "heur.setuid_packaged_copy:/var/tmp/su.copy") == nil {
+		t.Errorf("a true copy lost its note: %v", keys(fs))
+	}
+}

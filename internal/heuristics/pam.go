@@ -2,8 +2,6 @@ package heuristics
 
 import (
 	"fmt"
-	"path"
-	"sort"
 	"strings"
 
 	"github.com/donaldsteele/telltale/internal/model"
@@ -26,36 +24,27 @@ func usrSpellings(p string) []string {
 
 // resolvePAMModule returns the path of a module, preferring the spelling that
 // is present in the file inventory. ok is false when no file is found.
-func resolvePAMModule(name string, have map[string]bool, multiarch []string) (string, bool) {
+// existingPAMModules returns the inventory spelling of every file the name can
+// resolve to. A bare name stops at the first directory that has it (the one
+// the loader reaches); a name with a slash lists them all, since the path
+// that really loads depends on which directory libpam prepends.
+func existingPAMModules(name string, have map[string]bool, multiarch []string) []string {
+	var out []string
+	seen := map[string]bool{}
 	for _, cand := range pamconf.Candidates(name, multiarch) {
 		for _, s := range usrSpellings(cand) {
 			if have[s] {
-				return s, true
+				if !seen[s] {
+					seen[s] = true
+					out = append(out, s)
+				}
+				break
 			}
 		}
-	}
-	return "", false
-}
-
-// multiarchPAMDirs lists /lib/<x>/security and /usr/lib/<x>/security
-// directories that hold files in the inventory, sorted.
-func multiarchPAMDirs(c *model.Collection) []string {
-	seen := map[string]bool{}
-	for _, f := range c.Files {
-		d := path.Dir(f.Path)
-		if path.Base(d) != "security" {
-			continue
-		}
-		g := path.Dir(d)
-		if p := path.Dir(g); p == "/lib" || p == "/usr/lib" {
-			seen[d] = true
+		if len(out) > 0 && !strings.Contains(name, "/") {
+			break
 		}
 	}
-	var out []string
-	for d := range seen {
-		out = append(out, d)
-	}
-	sort.Strings(out)
 	return out
 }
 
@@ -68,7 +57,7 @@ func pamModules(c *model.Collection, owned map[string]string) []model.Finding {
 	for _, f := range c.Files {
 		have[f.Path] = true
 	}
-	multi := multiarchPAMDirs(c)
+	multi := pamconf.MultiarchDirs(c.Files)
 
 	type group struct {
 		key  string
@@ -86,17 +75,19 @@ func pamModules(c *model.Collection, owned map[string]string) []model.Finding {
 		g.refs = append(g.refs, r)
 	}
 	for _, r := range refs {
-		mod, found := resolvePAMModule(r.Module, have, multi)
-		if !found {
-			if !r.Quiet {
-				add("m:"+r.Module, r)
+		if strings.Contains(r.Module, "..") {
+			add("e:"+r.Module, r)
+		}
+		found := false
+		for _, mod := range existingPAMModules(r.Module, have, multi) {
+			found = true
+			if owned[mod] == "" {
+				add("u:"+mod, r)
 			}
-			continue
 		}
-		if owned[mod] != "" {
-			continue
+		if !found && !r.Quiet {
+			add("m:"+r.Module, r)
 		}
-		add("u:"+mod, r)
 	}
 
 	var out []model.Finding
@@ -115,6 +106,18 @@ func pamModules(c *model.Collection, owned map[string]string) []model.Finding {
 				Why:   "PAM skips a missing module, or refuses the login when the line says required. A stale line is usually harmless; a module that was removed after use can also mean someone cleaned up.",
 				Fix: fix([]string{first.File, name}, func(q []string) string {
 					return keep(q[0]) + " && grep -n -- " + q[1] + " " + q[0] + "   # see which lines use it; remove them only if the module is not coming back"
+				}),
+				Evidence: ev, Refs: []string{"T1556.003"},
+			})
+			continue
+		}
+		if k[0] == 'e' {
+			out = append(out, model.Finding{
+				Key: "heur.pam_path_escape:" + name, ID: idPAM, Source: source, Severity: model.SevBackdoor,
+				Title: fmt.Sprintf("%s line %d names the PAM module %q, a path that climbs out of the module directory", first.File, first.Line, name),
+				Why:   "A module name containing .. reaches files outside the module directories, and which file loads depends on the directory PAM prepends, so a check against one spelling can be fooled. No stock configuration names a module this way.",
+				Fix: fix([]string{first.File}, func(q []string) string {
+					return fmt.Sprintf("%s && sed -i '%ds/^/#/' %s   # comments the line out, keeps the file; only if you did not write this line yourself", keep(q[0]), first.Line, q[0])
 				}),
 				Evidence: ev, Refs: []string{"T1556.003"},
 			})
