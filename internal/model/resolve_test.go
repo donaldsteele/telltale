@@ -107,3 +107,54 @@ func TestResolveToInventoryEdge(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveDangling(t *testing.T) {
+	files := inv(append(dirs("/usr", "/usr/lib", "/usr/lib/systemd", "/usr/lib/systemd/system", "/etc"),
+		reg("/usr/lib/systemd/system/here.service"),
+		lnk("/etc/gone", "/usr/lib/systemd/system/removed.service"),
+		lnk("/etc/here", "/usr/lib/systemd/system/here.service"),
+		lnk("/etc/deep", "/usr/lib/nothing/removed.service"),
+		lnk("/etc/up", "/usr/lib/nothing/.."),
+		lnk("/etc/via", "/etc/gone"))...)
+	for p, want := range map[string]string{
+		"/etc/gone": "/usr/lib/systemd/system/removed.service",
+		"/etc/via":  "/usr/lib/systemd/system/removed.service",
+		"/etc/here": "", // resolves
+		"/etc/deep": "", // a directory on the way is missing
+		"/etc/up":   "",
+	} {
+		got, ok := ResolveDangling(files, p, LinkHops)
+		if ok != (want != "") || got != want {
+			t.Errorf("%s: dangling at %q (ok %v), want %q", p, got, ok, want)
+		}
+	}
+}
+
+func TestPhysicalOwners(t *testing.T) {
+	pk := Packages{Installed: []Package{
+		{Name: "chrome", Files: []string{"/opt/google/chrome/cron/google-chrome", "/opt/google"}},
+		{Name: "coreutils", Files: []string{"/usr/bin/ls"}},
+		{Name: "other", Files: []string{"/data/opt/google/taken"}},
+		{Name: "chrome2", Files: []string{"/opt/google/taken"}},
+	}}
+	files := inv(append(dirs("/data", "/data/opt", "/data/opt/google", "/data/opt/google/chrome", "/data/opt/google/chrome/cron", "/usr", "/usr/bin"),
+		lnk("/opt", "/data/opt"), reg("/data/opt/google/chrome/cron/google-chrome"), reg("/usr/bin/ls"))...)
+	owners, literal := pk.PhysicalOwners(files)
+	const phys, lit = "/data/opt/google/chrome/cron/google-chrome", "/opt/google/chrome/cron/google-chrome"
+	if owners[phys] != "chrome" || owners[lit] != "chrome" || literal[phys] != lit {
+		t.Errorf("owners[phys]=%q owners[lit]=%q literal[phys]=%q", owners[phys], owners[lit], literal[phys])
+	}
+	if owners["/data/opt/google"] != "chrome" {
+		t.Errorf("the directory itself: %q", owners["/data/opt/google"])
+	}
+	if owners["/data/opt/google/taken"] != "other" || literal["/data/opt/google/taken"] != "" {
+		t.Errorf("a path dpkg lists for another package keeps that owner: %q", owners["/data/opt/google/taken"])
+	}
+	if _, ok := literal["/usr/bin/ls"]; ok || owners["/usr/bin/ls"] != "coreutils" {
+		t.Errorf("a path that is where dpkg says needs no second entry")
+	}
+	// Without the inventory nothing is added.
+	if o, l := pk.PhysicalOwners(nil); len(l) != 0 || o[phys] != "" {
+		t.Errorf("no inventory: %v", l)
+	}
+}

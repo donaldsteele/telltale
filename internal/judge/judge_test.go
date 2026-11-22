@@ -135,6 +135,16 @@ func inventoried(c *model.Collection) *model.Collection {
 	}
 	for _, p := range c.Persist {
 		parents(p.Path)
+		// A link into a system directory leads to something that is there,
+		// as on a real machine, unless the test names it "removed...".
+		if t, ok := p.LinkTarget(); ok && !p.TargetRedacted() && !strings.HasPrefix(path.Base(t), "removed") {
+			for _, d := range []string{"/usr/", "/lib/", "/etc/"} {
+				if strings.HasPrefix(t, d) && !strings.Contains(p.Lines[0], "..") {
+					parents(t)
+					add(model.FileEntry{Path: t, Type: "file", Mode: 0o100644, MTime: taken, CTime: taken})
+				}
+			}
+		}
 		switch {
 		case p.Mode&0o170000 == 0o120000 && len(p.Lines) > 0:
 			add(model.FileEntry{Path: p.Path, Type: "symlink", Target: p.Lines[0], Mode: p.Mode, MTime: taken, CTime: taken})
@@ -1524,8 +1534,15 @@ func TestJudgePackageDirsAndLinksAreChecked(t *testing.T) {
 	must(t, run(c, snapOf(old), archive()), "snap.file_modified:/usr/bin/sudoedit", model.SevBackdoor)
 	// Retargeted within them during an upgrade: shown with the upgrade,
 	// which is explained only when something confirmed the new version.
+	// The new target is the package's own file.
 	setVersion(c, "sudo", "1.9.13p3-1+deb12u2")
 	setFile(c, model.FileEntry{Path: "/usr/bin/sudoedit", Type: "symlink", Target: "/usr/libexec/sudo/sudoedit", Mode: 0o120777})
+	c.Files = append(c.Files, file("/usr/libexec/sudo/sudoedit", "sudoedit", 0o755))
+	for i := range c.Packages.Installed {
+		if c.Packages.Installed[i].Name == "sudo" {
+			c.Packages.Installed[i].Files = append(c.Packages.Installed[i].Files, "/usr/libexec/sudo/sudoedit")
+		}
+	}
 	r := run(c, snapOf(old), archive())
 	absent(t, r, "snap.file_modified:/usr/bin/sudoedit")
 	if f := must(t, r, "snap.pkg_upgraded:sudo", model.SevNote); !hasEvidencePath(f, "/usr/bin/sudoedit") || explained(r, "explained:sudo") != nil {
@@ -1575,6 +1592,7 @@ func TestJudgeSymlinkedAuthorizedKeys(t *testing.T) {
 	old.Accounts.Users = append(old.Accounts.Users, model.User{Name: "alice", UID: 1000, GID: 1000, Home: "/home/alice", Shell: "/bin/bash",
 		Password: model.PasswordState{Known: true, Locked: true, LastChange: 20000}})
 	old.Persist = []model.PersistFile{link("/home/alice/.ssh/authorized_keys", "../keys", ownerKey), link("/root/.ssh/authorized_keys", "/etc/ssh/keys/root", ownerKey)}
+	old.Files = append(old.Files, file("/home/alice/keys", "keys", 0o600)) // what the collector records for the link's chain
 	cur := clone(old)
 	cur.Persist = []model.PersistFile{link("/home/alice/.ssh/authorized_keys", "../keys", evilKey, ownerKey), link("/root/.ssh/authorized_keys", "/etc/ssh/keys/root", evilKey, ownerKey)}
 
@@ -2599,7 +2617,7 @@ func TestJudgeUnconfirmedVersionExplainsNoLinkOrDirectory(t *testing.T) {
 	old.Files = append(old.Files, file("/usr/bin/mawk", "mawk", 0o755), link("mawk"))
 	cur := clone(old)
 	setVersion(cur, "mawk", "1.3.4.20200120-3.2")
-	setFile(cur, link("/usr/local/bin/awk"))
+	setFile(cur, link("./mawk")) // re-pointed, still at the package's own program
 	cur.Files = append(cur.Files, model.FileEntry{Path: "/usr/share/mawk", Type: "dir", Mode: 0o040755, MTime: changed, CTime: changed})
 
 	r := run(cur, snapOf(old), archive())
@@ -3026,5 +3044,162 @@ func TestJudgeMtabLinkToTheMountTable(t *testing.T) {
 		if f := scan("/proc/mounts", to); f == nil || f.Severity != model.SevBackdoor {
 			t.Errorf("/etc/mtab -> %s: want a backdoor sign, got %+v", to, f)
 		}
+	}
+}
+
+// A changed link is judged by where the kernel ends up, not by what its text
+// cleans to: "/opt/q/../../usr/..." with /opt/q a link into /var/tmp reads as
+// a path in /usr and opens a file under /var/tmp.
+func TestJudgeChangedLinkIsJudgedPhysically(t *testing.T) {
+	sym := func(p, target string, when time.Time) model.FileEntry {
+		return model.FileEntry{Path: p, Type: "symlink", Target: target, Mode: 0o120777, MTime: when, CTime: when}
+	}
+	dir := func(p string) model.FileEntry {
+		return model.FileEntry{Path: p, Type: "dir", Mode: 0o40755, MTime: taken, CTime: taken}
+	}
+	const trick = "/opt/q/../../usr/bin/mawk"
+	q := []model.FileEntry{dir("/opt"), sym("/opt/q", "/var/tmp/x/a", taken)}
+
+	// An unowned link that changed (/etc/alternatives/awk).
+	const alt = "/etc/alternatives/awk"
+	old := clean()
+	old.Files = append(old.Files, dir("/etc/alternatives"), sym(alt, "/usr/bin/mawk", taken), file("/usr/bin/mawk", "mawk", 0o755))
+	for name, tc := range map[string]struct {
+		extra []model.FileEntry
+		want  model.Severity
+		why   string
+	}{
+		"control: another program in /usr":          {[]model.FileEntry{sym(alt, "/usr/bin/ls", changed)}, model.SevNote, ""},
+		"control: straight into /var/tmp":           {[]model.FileEntry{sym(alt, "/var/tmp/x/usr/bin/mawk", changed)}, model.SevBackdoor, "/var/tmp"},
+		"dot-dot through a link, not recorded":      {[]model.FileEntry{sym(alt, trick, changed)}, model.SevBackdoor, "cannot be told"},
+		"dot-dot through a link into /var/tmp":      {append([]model.FileEntry{sym(alt, trick, changed)}, q...), model.SevBackdoor, "cannot be told"},
+		"dot-dot through a link into a dot dir":     {[]model.FileEntry{sym(alt, trick, changed), dir("/opt"), sym("/opt/q", "/root/.h/x/a", taken)}, model.SevBackdoor, "cannot be told"},
+		"through a link into /var/tmp, no dot-dot":  {append([]model.FileEntry{sym(alt, "/opt/q/mawk", changed)}, q...), model.SevBackdoor, "/var/tmp"},
+		"through a link into a dot dir, no dot-dot": {[]model.FileEntry{sym(alt, "/opt/q/mawk", changed), dir("/opt"), sym("/opt/q", "/srv/.h/x", taken)}, model.SevBackdoor, "hidden"},
+		"dot-dot inside real directories":           {[]model.FileEntry{sym(alt, "/usr/bin/../bin/ls", changed)}, model.SevNote, ""},
+		"link loop":                                 {[]model.FileEntry{sym(alt, "/etc/alternatives/awk", changed)}, model.SevBackdoor, "cannot be told"},
+	} {
+		c := clean()
+		c.Files = append(c.Files, dir("/etc/alternatives"), file("/usr/bin/mawk", "mawk", 0o755))
+		c.Files = append(c.Files, tc.extra...)
+		f := find(run(c, snapOf(clone(old)), archive()), "snap.file_modified:"+alt)
+		if f == nil || f.Severity != tc.want || !strings.Contains(f.Why, tc.why) {
+			t.Errorf("%s: want %q mentioning %q, got %+v", name, tc.want, tc.why, f)
+		}
+	}
+
+	// A new unowned link (/usr/local/bin/sudo).
+	const nl = "/usr/local/bin/sudo"
+	for name, tc := range map[string]struct {
+		extra []model.FileEntry
+		want  model.Severity
+	}{
+		"control: straight into /var/tmp":      {[]model.FileEntry{sym(nl, "/var/tmp/x/sudo", changed)}, model.SevBackdoor},
+		"dot-dot through a link, not recorded": {[]model.FileEntry{sym(nl, "/opt/q/../../usr/bin/sudo", changed)}, model.SevBackdoor},
+		"dot-dot through a link into /var/tmp": {append([]model.FileEntry{sym(nl, "/opt/q/../../usr/bin/sudo", changed)}, q...), model.SevBackdoor},
+	} {
+		c := clean()
+		c.Files = append(c.Files, dir("/usr/local"), dir("/usr/local/bin"))
+		c.Files = append(c.Files, tc.extra...)
+		if f := find(run(c, snapOf(clean()), archive()), "snap.file_added:"+nl); f == nil || f.Severity != tc.want {
+			t.Errorf("new link, %s: want %q, got %+v", name, tc.want, f)
+		}
+	}
+}
+
+// A package's own link re-pointed during that package's upgrade is part of
+// the upgrade only when it still leads to a file of that package (or of
+// another package that changed). The reviewer's case: zlib1g's soname link
+// aimed, through a directory link, at a copy under /var/tmp.
+func TestJudgePackageLinkFoldsOnlyOntoPackageFiles(t *testing.T) {
+	const zlink, zfile = "/usr/lib/x86_64-linux-gnu/libz.so.1", "/usr/lib/x86_64-linux-gnu/libz.so.1.2.13"
+	const newVersion = "1:1.2.13.dfsg-1+deb12u1"
+	sym := func(p, target string, when time.Time) model.FileEntry {
+		return model.FileEntry{Path: p, Type: "symlink", Target: target, Mode: 0o120777, MTime: when, CTime: when}
+	}
+	mk := func(version, content string, extra ...model.FileEntry) *model.Collection {
+		c := clean()
+		c.Files = append(c.Files, file(zfile, content, 0o644))
+		c.Files = append(c.Files, extra...)
+		c.Packages.Installed = append(c.Packages.Installed, pkg("zlib1g", version, zlink, zfile))
+		return c
+	}
+	snapC := func() *model.Snapshot {
+		return snapOf(mk("1:1.2.13.dfsg-1", "zlib old", sym(zlink, "libz.so.1.2.13", taken)))
+	}
+	v := verdict(zfile, "zlib1g", newVersion, "zlib new")
+	q := []model.FileEntry{{Path: "/opt", Type: "dir", Mode: 0o40755, MTime: taken, CTime: taken}, sym("/opt/q", "/var/tmp/x/a", taken)}
+	const trick = "/opt/q/../../usr/lib/x86_64-linux-gnu/libz.so.1.2.13"
+	inUpgrade := func(r *model.Report) bool {
+		g := explained(r, "explained:zlib1g")
+		return g != nil && hasEvidencePath(g, zlink)
+	}
+
+	// Re-pointed at the package's own library, spelled differently: part of
+	// the upgrade.
+	r := run(mk(newVersion, "zlib new", sym(zlink, "./libz.so.1.2.13", changed)), snapC(), archive(v))
+	if !inUpgrade(r) || find(r, "snap.file_modified:"+zlink) != nil {
+		t.Errorf("link to the package's own file: not folded into the upgrade: %v", keys(r))
+	}
+	for name, extra := range map[string][]model.FileEntry{
+		"dot-dot through a link into /var/tmp": append([]model.FileEntry{sym(zlink, trick, changed)}, q...),
+		"dot-dot through a link, not recorded": {sym(zlink, trick, changed)},
+		"straight into /var/tmp":               {sym(zlink, "/var/tmp/x/libz.so", changed)},
+		"a file no package owns, in /usr":      {sym(zlink, "/usr/lib/x86_64-linux-gnu/libevil.so", changed), file("/usr/lib/x86_64-linux-gnu/libevil.so", "evil", 0o644)},
+	} {
+		// With the upgrade, and with no package change at all.
+		for _, version := range []string{newVersion, "1:1.2.13.dfsg-1"} {
+			content := "zlib new"
+			res := archive(v)
+			if version != newVersion {
+				content, res = "zlib old", archive()
+			}
+			r := run(mk(version, content, extra...), snapC(), res)
+			if inUpgrade(r) {
+				t.Errorf("%s (%s): folded into the upgrade", name, version)
+			}
+			f := find(r, "snap.file_modified:"+zlink)
+			if f == nil {
+				t.Errorf("%s (%s): no finding for the link: %v", name, version, keys(r))
+				continue
+			}
+			if name != "a file no package owns, in /usr" && f.Severity != model.SevBackdoor {
+				t.Errorf("%s (%s): the link is %q, want a backdoor sign", name, version, f.Severity)
+			}
+		}
+	}
+}
+
+// Ownership is by where a file is: with /opt a link to /data/opt, the
+// package-link note is ranked with the verdict and the checksum dpkg keeps
+// under its own spelling of the path.
+func TestPackageLinkBehindALinkedDirectory(t *testing.T) {
+	const l, lit, phys = "/etc/cron.daily/google-chrome", "/opt/google/chrome/cron/google-chrome", "/data/opt/google/chrome/cron/google-chrome"
+	mk := func(md5 string) *model.Collection {
+		c := clean()
+		c.Persist = append(c.Persist, model.PersistFile{Path: l, Kind: model.PersistKindCron, Mode: 0o120777, Lines: []string{lit}})
+		script := file(phys, "job", 0o755)
+		script.MD5 = "0123abcd"
+		c.Files = append(c.Files, script, model.FileEntry{Path: "/opt", Type: "symlink", Target: "/data/opt", Mode: 0o120777, MTime: taken, CTime: taken})
+		p := pkg("google-chrome-stable", "131.0-1", lit)
+		p.LocalMD5 = map[string]string{lit: md5}
+		c.Packages.Installed = append(c.Packages.Installed, p)
+		return c
+	}
+	// The machine's own checksum matches the file where it really is.
+	if f := find(run(mk("0123abcd"), nil, archive()), "heur.persist_link_pkg:"+l); f == nil || f.Severity != model.SevNote {
+		t.Errorf("want the package-link note, got %+v", f)
+	}
+	// It does not: overwritten.
+	r := run(mk("ffff0000"), nil, archive())
+	if f := find(r, "heur.persist_link:"+l); f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("checksum mismatch: want a backdoor sign, got %v", keys(r))
+	}
+	// A mismatch verdict under dpkg's spelling raises it too.
+	res := archive()
+	res.Mismatch = []pkgverify.FileVerdict{{Path: lit, Package: "google-chrome-stable", Version: "131.0-1", Expected: h("job"), Actual: h("other"), Source: "archive"}}
+	r = run(mk("0123abcd"), nil, res)
+	if f := find(r, "heur.persist_link:"+l); f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("mismatch verdict: want a backdoor sign, got %v", keys(r))
 	}
 }

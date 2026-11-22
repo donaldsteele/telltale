@@ -132,7 +132,15 @@ func runScan(ctx *Context) int {
 	opt := pkgverify.Options{Full: *full, Offline: *offline, RefsDir: *refs, ExtraKeys: extra, Root: *root}
 	// Startup links into package-owned files outside the system directories
 	// are only notes; the target is verified so a tampered one still shows.
-	opt.ExtraPaths = heuristics.PackageLinkTargets(c, c.Packages.Owners())
+	// Ownership is by where a file really is; package verification wants
+	// dpkg's spelling of the path.
+	owners, literal := c.Packages.PhysicalOwners(model.Inventory(c.Files))
+	for _, t := range heuristics.PackageLinkTargets(c, owners) {
+		if lit := literal[t]; lit != "" {
+			t = lit
+		}
+		opt.ExtraPaths = append(opt.ExtraPaths, t)
+	}
 	if snap != nil {
 		opt.OnlyPaths = changedOwnedPaths(snap, c)
 	}

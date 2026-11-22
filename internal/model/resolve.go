@@ -136,3 +136,61 @@ func ResolveToInventoryEdge(files map[string]*FileEntry, p string, maxHops int) 
 	}
 	return path.Join(append([]string{reached}, rest...)...), true
 }
+
+// ResolveDangling answers for a path that does not resolve only because its
+// last component is missing: every directory on the way resolved, and the
+// name looked for in the last of them is not there (a link to a file that
+// was removed). It returns where that file would be. ok is false for a path
+// that resolves, and for one that fails any other way.
+func ResolveDangling(files map[string]*FileEntry, p string, maxHops int) (would string, ok bool) {
+	reached, rest, done, missing := WalkPath(inventoryLookup(files), p, maxHops)
+	if done || !missing || len(rest) != 1 || rest[0] == ".." {
+		return "", false
+	}
+	return path.Join(reached, rest[0]), true
+}
+
+// LinkWalk is the path to resolve for a symbolic link at linkPath with the
+// given target text: the target itself when absolute, else the link's
+// directory followed by the target, joined as text and NOT cleaned, so that
+// a resolver sees every component the kernel will.
+func LinkWalk(linkPath, target string) string {
+	if path.IsAbs(target) {
+		return target
+	}
+	return path.Dir(linkPath) + "/" + target
+}
+
+// PhysicalOwners is Owners with every path also listed where it really is.
+// dpkg records the path a package was unpacked through; when a directory on
+// that path is a link (/opt -> /data/opt), the file a link or the linker
+// reaches is somewhere else, and is still the package's. For each owned path
+// whose directory resolves in the inventory to a different place, the
+// physical path gets the same owner, and literal maps it back to dpkg's
+// spelling (package verification and dpkg's checksums use that one).
+func (p Packages) PhysicalOwners(files map[string]*FileEntry) (owners, literal map[string]string) {
+	owners = p.Owners()
+	literal = map[string]string{}
+	dirs := map[string]string{} // directory as dpkg spells it -> where it is ("" = not resolvable)
+	type add struct{ phys, lit, pkg string }
+	var adds []add
+	for lit, pkg := range owners {
+		dir := path.Dir(lit)
+		real, seen := dirs[dir]
+		if !seen {
+			real, _ = ResolveInInventory(files, dir, LinkHops)
+			dirs[dir] = real
+		}
+		if real == "" || real == dir {
+			continue
+		}
+		adds = append(adds, add{path.Join(real, path.Base(lit)), lit, pkg})
+	}
+	for _, a := range adds {
+		if _, taken := owners[a.phys]; !taken {
+			owners[a.phys] = a.pkg
+			literal[a.phys] = a.lit
+		}
+	}
+	return owners, literal
+}

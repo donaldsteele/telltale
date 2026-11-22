@@ -54,6 +54,10 @@ type judge struct {
 	ctx model.ScanContext
 
 	owned, oldOwned map[string]string
+	// literal maps a path that is owned by where it really is (see
+	// model.PhysicalOwners) to the spelling dpkg and package verification
+	// use for it.
+	literal         map[string]string
 	files, oldFiles map[string]*model.FileEntry
 	persist         map[string]*model.PersistFile
 	oldPersist      map[string]*model.PersistFile
@@ -127,8 +131,10 @@ func newJudge(in Input, c *model.Collection) *judge {
 		j.old = in.Snapshot.Collection
 	}
 	j.owned, j.files, j.persist, j.pkgs = indexCollection(c)
+	j.owned, j.literal = c.Packages.PhysicalOwners(j.files)
 	if j.old != nil {
 		j.oldOwned, j.oldFiles, j.oldPersist, _ = indexCollection(j.old)
+		j.oldOwned, _ = j.old.Packages.PhysicalOwners(j.oldFiles)
 	} else {
 		j.oldOwned, j.oldFiles, j.oldPersist = map[string]string{}, map[string]*model.FileEntry{}, map[string]*model.PersistFile{}
 	}
@@ -587,10 +593,17 @@ func (j *judge) rankPackageLink(f *model.Finding) {
 	if !ok {
 		return
 	}
+	// Verdicts and dpkg's checksums are under dpkg's spelling of the path,
+	// which differs from where the file is when a directory on the way is
+	// a link.
+	physical := target
+	if lit := j.literal[target]; lit != "" {
+		target = lit
+	}
 	const localOnly = " The file was checked only against the machine's own checksums, which root can edit."
 	if r := j.in.Pkg; r != nil {
 		for _, v := range r.Mismatch {
-			if v.Path == target {
+			if v.Path == target || v.Path == physical {
 				f.Severity, f.Key = model.SevBackdoor, "heur.persist_link:"+link
 				f.Why = "The startup entry runs a package-owned file that no longer matches its package (see the tampering finding for it). " + f.Why
 				return
@@ -608,7 +621,7 @@ func (j *judge) rankPackageLink(f *model.Finding) {
 	if p := j.pkgs[j.owned[target]]; p != nil {
 		want = strings.ToLower(p.LocalMD5[target])
 	}
-	if e := j.files[target]; e != nil {
+	if e := j.files[physical]; e != nil {
 		got = strings.ToLower(e.MD5)
 	}
 	if want == "" || got == "" || want != got {

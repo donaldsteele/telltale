@@ -266,12 +266,21 @@ var systemDirs = []string{"/usr", "/lib", "/lib32", "/lib64", "/libx32", "/bin",
 
 // badLink says why a symbolic link now points somewhere it should not, or
 // "": into a temporary or hidden place (whenever it changed), or, when it
-// was pointed somewhere new, out of the system directories.
-func badLink(p string, old, cur *model.FileEntry) string {
+// was pointed somewhere new, out of the system directories. The target is
+// where the kernel ends up, not what the link's text cleans to: every link on
+// the way is followed in the inventory and ".." is applied to the directory
+// really reached. Beyond what the inventory records the rest of the path is
+// taken as written, unless it climbs with ".." or cannot be followed at all
+// (a loop, a file in the middle): then nothing is known about where the link
+// leads, and that is the reason.
+func (j *judge) badLink(p string, old, cur *model.FileEntry) string {
 	if cur == nil || cur.Type != "symlink" {
 		return ""
 	}
-	t := linkTarget(p, cur.Target)
+	t, ok := model.ResolveToInventoryEdge(j.files, model.LinkWalk(p, cur.Target), model.LinkHops)
+	if !ok {
+		return "where it leads cannot be told: its path climbs out of what telltale recorded, or cannot be followed"
+	}
 	for _, d := range []string{"/tmp", "/dev/shm", "/var/tmp"} {
 		if t == d || strings.HasPrefix(t, d+"/") {
 			return "it points into " + d
@@ -292,6 +301,23 @@ func badLink(p string, old, cur *model.FileEntry) string {
 		return "it was pointed outside the system directories"
 	}
 	return ""
+}
+
+// linkStaysWithPackages reports whether a package's symbolic link leads to a
+// path owned by that package or by a package that changed in this scan: what
+// an upgrade re-pointing its own link looks like. A link that leads anywhere
+// else, or nowhere the inventory can follow, did not simply change with its
+// package.
+func (j *judge) linkStaysWithPackages(p string, cur *model.FileEntry, owner string) bool {
+	if cur == nil {
+		return true // the link went with the package change
+	}
+	t, ok := model.ResolveInInventory(j.files, model.LinkWalk(p, cur.Target), model.LinkHops)
+	if !ok {
+		return false
+	}
+	to := j.owned[t]
+	return to != "" && (to == owner || j.pkgChanged(to))
 }
 
 func (j *judge) fileChange(ch diff.Change) {
@@ -346,7 +372,7 @@ func (j *judge) fileChange(ch diff.Change) {
 		return
 	}
 
-	linkWhy := badLink(p, old, cur)
+	linkWhy := j.badLink(p, old, cur)
 	accountWhy := j.accountNote(p, old, cur)
 	cat := catNote
 	switch {
@@ -411,8 +437,14 @@ func (j *judge) fileChange(ch diff.Change) {
 			fix = fixKeepOnly(p, "then rebuild it from the installed packages: update-initramfs -u -k all for an initramfs, update-grub for the boot menu, grub-install for GRUB's modules, depmod -a for module indexes (check /etc/initramfs-tools and /etc/grub.d first)")
 		}
 	case catLink:
+		// Where it really leads when that is known; else its text as it
+		// is, which may not be where it leads.
+		to, ok := model.ResolveToInventoryEdge(j.files, model.LinkWalk(p, cur.Target), model.LinkHops)
+		if !ok {
+			to = cur.Target + " (as written)"
+		}
 		why = fmt.Sprintf("This link now points to %s: %s. A program or file replaced by a link runs or reads whatever sits at the other end, so it no longer matters what the package installed here.",
-			linkTarget(p, cur.Target), linkWhy)
+			to, linkWhy)
 		refs = []string{"T1574"}
 	case catMaintScript:
 		why = "This dpkg maintainer script runs as root the next time the package is upgraded, reconfigured or removed, and nothing confirmed a package change that would explain the edit. A planted line here is a way back in that waits for routine maintenance."
@@ -539,7 +571,7 @@ func (j *judge) placed(ch diff.Change, e, old, cur *model.FileEntry, owner strin
 	case e.Type == "dir" && j.pkgChanged(owner) && (old == nil || cur == nil || sameMeta(old, cur)):
 		j.foldWithChange(owner, ev)
 		return true
-	case e.Type == "symlink" && j.pkgChanged(owner):
+	case e.Type == "symlink" && j.pkgChanged(owner) && j.linkStaysWithPackages(p, cur, owner):
 		j.foldWithChange(owner, ev)
 		return true
 	case ch.Kind == diff.FileRemoved && j.owned[p] == "" && j.pkgChanged(j.oldOwned[p]):
@@ -859,11 +891,16 @@ type linkView struct {
 	target string // the resolved target; "" when unknown
 }
 
-func linkViewOf(p string, cur, old *model.PersistFile) linkView {
+// The target is the file the link really opens (resolved in the inventory):
+// a fix that edits "the link's target" must never be aimed at a decoy the
+// link's text names but the kernel does not reach.
+func (j *judge) linkViewOf(p string, cur, old *model.PersistFile) linkView {
 	isLink := func(pf *model.PersistFile) bool { return pf != nil && pf.Mode&0o170000 == 0o120000 }
 	v := linkView{link: isLink(cur) || (cur == nil && isLink(old))}
-	if v.link && cur != nil && len(cur.Lines) > 0 && !strings.HasPrefix(cur.Lines[0], "<redacted") {
-		v.target = linkTarget(p, cur.Lines[0])
+	if v.link && cur != nil {
+		if t, ok := heuristics.LinkFile(j.files, *cur); ok {
+			v.target = t
+		}
 	}
 	return v
 }
@@ -898,7 +935,7 @@ func (j *judge) persistChange(ch diff.Change) {
 		kind = old.Kind
 	}
 	meta := cur != nil && old != nil && (cur.Mode&0o7777 != old.Mode&0o7777 || cur.UID != old.UID)
-	lv := linkViewOf(p, cur, old)
+	lv := j.linkViewOf(p, cur, old)
 	summary := func(lines []diff.LineChange) model.Evidence {
 		adds, dels := 0, 0
 		first := 0

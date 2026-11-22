@@ -33,6 +33,11 @@ type Collection struct {
 	// (/etc/ld.so.cache) sends programs to, sorted; nil when there is no
 	// cache or it could not be parsed.
 	LinkerCache []string `json:"linker_cache,omitempty"`
+	// LinkRefused lists the paths at which following a startup link
+	// stopped because the collector does not look there (a kernel or
+	// device tree, a network or FUSE mount). Nothing is known about what
+	// is at or below them, not even that it is missing.
+	LinkRefused []string `json:"link_refused,omitempty"`
 }
 
 // Host identifies the machine a collection came from.

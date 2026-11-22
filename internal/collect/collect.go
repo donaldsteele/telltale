@@ -76,14 +76,19 @@ func All(opt Options) (*model.Collection, error) {
 	add(s)
 	// Files the file scan did not walk but something refers to: the program
 	// behind a deleted exe, the targets of startup links.
-	c.Files, s = ensureEntries(opt.Root, c.Files, append(exePaths(c.Runtime.Processes), linkTargets(c.Persist)...), c.Runtime.Mounts, defaultMaxHash)
+	c.Files, s = ensureEntries(opt.Root, c.Files, exePaths(c.Runtime.Processes), c.Runtime.Mounts, defaultMaxHash)
+	add(s)
+	// Link targets may lie on a tmpfs (/run is one); see linkSkipFS.
+	c.Files, s = ensureEntriesIn(opt.Root, c.Files, linkTargets(c.Persist), c.Runtime.Mounts, defaultMaxHash, underNeverRead, linkSkipFS)
 	add(s)
 	// Every directory and link the kernel passes through on the way to a
 	// startup link's target, so that links can be resolved as the kernel
-	// resolves them. These exist and are not in refused places, so this adds
-	// entries and no skips.
-	refuse := func(p string) bool { return underNeverRead(p) || underMountOf(p, c.Runtime.Mounts, skipFS) }
-	c.Files, s = ensureEntries(opt.Root, c.Files, linkChains(opt.Root, c.Persist, SystemPaths, refuse), c.Runtime.Mounts, defaultMaxHash)
+	// resolves them. These exist and are not in refused places, so recording
+	// them adds entries and no skips of its own.
+	chain, refused, s := linkChains(opt.Root, c.Persist, SystemPaths, func(p string) bool { return RefusedForLinks(p, c.Runtime.Mounts) })
+	c.LinkRefused = refused
+	add(s)
+	c.Files, s = ensureEntriesIn(opt.Root, c.Files, chain, c.Runtime.Mounts, defaultMaxHash, underNeverRead, linkSkipFS)
 	add(s)
 	// Modules the PAM configuration loads from outside the system paths.
 	c.Files, s = ensurePAMEntries(opt.Root, c.Files, c.Runtime.Mounts, c.Persist, defaultMaxHash)

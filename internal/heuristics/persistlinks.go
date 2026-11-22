@@ -3,6 +3,7 @@ package heuristics
 import (
 	"fmt"
 	"path"
+	"slices"
 	"strings"
 
 	"github.com/donaldsteele/telltale/internal/model"
@@ -34,9 +35,9 @@ type linkDest struct {
 	// cannot tell (the target does not exist or lies where the scan does
 	// not look, the text was redacted, or too many links are involved).
 	file string
-	// within is the path as far as it could be followed, then as written;
-	// "" when even that is not known. It answers where the target lies.
-	within string
+	// dangling is where the target would be when everything on the way
+	// to it resolved and only the file itself is missing; else "".
+	dangling string
 	// null: the link is a plain link to /dev/null (a systemd mask).
 	null bool
 }
@@ -57,15 +58,11 @@ func resolveLink(inv map[string]*model.FileEntry, p model.PersistFile) (linkDest
 	// Walk from the link's directory through the target as written (not
 	// cleaned), so that the directory the link is really in and every link
 	// inside the target are followed.
-	walk := p.Lines[0]
-	if !path.IsAbs(walk) {
-		walk = path.Dir(p.Path) + "/" + walk
-	}
+	walk := model.LinkWalk(p.Path, p.Lines[0])
 	if t, ok := model.ResolveInInventory(inv, walk, model.LinkHops); ok {
 		d.file, d.shown = t, t
-	}
-	if t, ok := model.ResolveToInventoryEdge(inv, walk, model.LinkHops); ok {
-		d.within = t
+	} else if t, ok := model.ResolveDangling(inv, walk, model.LinkHops); ok {
+		d.dangling, d.shown = t, t
 	}
 	return d, true
 }
@@ -99,20 +96,38 @@ func LinkFile(inv map[string]*model.FileEntry, p model.PersistFile) (string, boo
 // the link has the layout `systemctl --user enable` creates: a link inside
 // <home>/.config/systemd/user/<x>.wants (or .requires) whose target is a unit
 // in the same home's user unit directories or in the system-wide user unit
-// directories.
-func userUnitOwner(c *model.Collection, link, target string) (string, bool) {
+// directories. target is the file the link really opens, so the unit
+// directories are compared where they really are: a home whose
+// ~/.config/systemd is a link into a dotfiles directory of the same home
+// still counts, one that leads out of the home does not.
+func userUnitOwner(c *model.Collection, inv map[string]*model.FileEntry, link, target string) (string, bool) {
 	dir := path.Dir(link)
 	if b := path.Base(dir); !strings.HasSuffix(b, ".wants") && !strings.HasSuffix(b, ".requires") {
 		return "", false
 	}
 	unitDir := path.Dir(dir)
+	under := func(dir string) bool { return dir != "" && strings.HasPrefix(target, dir+"/") }
+	physical := func(dir string) string {
+		real, _ := model.ResolveInInventory(inv, dir, model.LinkHops)
+		return real
+	}
 	for _, u := range c.Accounts.Users {
 		h := path.Clean(u.Home)
 		if isNIS(u.Name) || u.Home == "" || h == "/" || tempDir(h) || unitDir != h+"/.config/systemd/user" {
 			continue
 		}
-		for _, pre := range []string{h + "/.config/systemd/user/", h + "/.local/share/systemd/user/", "/etc/systemd/user/", "/usr/lib/systemd/user/"} {
-			if strings.HasPrefix(target, pre) {
+		home := physical(h)
+		if home == "" || home == "/" || tempDir(home) {
+			continue
+		}
+		for _, d := range []string{h + "/.config/systemd/user", h + "/.local/share/systemd/user"} {
+			// The user's own unit directory, wherever in the home it is.
+			if real := physical(d); under(real) && strings.HasPrefix(real, home+"/") {
+				return u.Name, true
+			}
+		}
+		for _, d := range []string{"/etc/systemd/user", "/usr/lib/systemd/user"} {
+			if under(physical(d)) {
 				return u.Name, true
 			}
 		}
@@ -121,10 +136,10 @@ func userUnitOwner(c *model.Collection, link, target string) (string, bool) {
 }
 
 // execStarts returns the ExecStart lines of the collected unit file at p.
-func execStarts(c *model.Collection, p string) []string {
+func execStarts(c *model.Collection, inv map[string]*model.FileEntry, p string) []string {
 	var out []string
 	for _, f := range c.Persist {
-		if f.Path != p || f.Mode&0o170000 == 0o120000 {
+		if f.Mode&0o170000 == 0o120000 || !samePlace(inv, f.Path, p) {
 			continue
 		}
 		for _, l := range f.Lines {
@@ -170,9 +185,9 @@ func persistLinks(c *model.Collection, owned map[string]string) []model.Finding 
 			}
 			continue
 		}
-		if owner, ok := userUnitOwner(c, p.Path, target); ok && resolved && collectedUnit(c, target) {
+		if owner, ok := userUnitOwner(c, inv, p.Path, target); ok && resolved && collectedUnit(c, inv, target) {
 			unit := path.Base(p.Path)
-			for _, l := range execStarts(c, target) {
+			for _, l := range execStarts(c, inv, target) {
 				ev = append(ev, model.Evidence{Path: target, Detail: l})
 			}
 			out = append(out, model.Finding{
@@ -186,10 +201,29 @@ func persistLinks(c *model.Collection, owned map[string]string) []model.Finding 
 			})
 			continue
 		}
-		if d.within != "" && inSystemDir(d.within) {
+		// A system directory counts only for a target that is really
+		// there (this is also what makes /run/systemd acceptable: the chain
+		// through it was followed to an existing file).
+		if resolved && inSystemDir(target) {
 			continue
 		}
-		if pkg := owned[target]; pkg != "" && resolved && regularFile(c, target) {
+		// Everything on the way resolved inside a system directory and only
+		// the file is gone: the enable link of a unit that was removed.
+		// Nothing runs from it. A missing file on a mount the scan stays
+		// out of is not known to be missing, and is not this case.
+		if d.dangling != "" && inSystemDir(d.dangling) && !notLookedAt(c, d.dangling) {
+			out = append(out, model.Finding{
+				Key: "heur.persist_link_dangling:" + p.Path, ID: idPersistLink, Source: source, Severity: model.SevNote,
+				Title: fmt.Sprintf("%s is a link to %s, which does not exist", p.Path, target),
+				Why:   "The link is left over from something that was removed (a unit of an uninstalled package, usually). Nothing runs from it now, but whatever is put at that path later would.",
+				Fix: fix([]string{p.Path}, func(q []string) string {
+					return "rm " + q[0] + "   # if nothing you use needs it"
+				}),
+				Evidence: ev, Refs: []string{"T1543.002"},
+			})
+			continue
+		}
+		if pkg := owned[target]; pkg != "" && resolved && !tempDir(target) && regularFile(c, target) {
 			out = append(out, model.Finding{
 				Key: "heur.persist_link_pkg:" + p.Path, ID: idPersistLink, Source: source, Severity: model.SevNote,
 				Title: fmt.Sprintf("%s runs %s from package %s, outside the system directories", p.Path, target, pkg),
@@ -214,6 +248,13 @@ func persistLinks(c *model.Collection, owned map[string]string) []model.Finding 
 	return out
 }
 
+// notLookedAt reports whether p is at or below a path the collector refused
+// to look at when it followed startup links (the file scan records a mount
+// point it stays out of, so what is inside only seems to be missing).
+func notLookedAt(c *model.Collection, p string) bool {
+	return slices.ContainsFunc(c.LinkRefused, func(r string) bool { return p == r || strings.HasPrefix(p, r+"/") })
+}
+
 // tempDir reports whether p is in a world-writable temporary tree.
 func tempDir(p string) bool {
 	for _, d := range []string{"/tmp", "/var/tmp", "/dev/shm"} {
@@ -225,14 +266,28 @@ func tempDir(p string) bool {
 }
 
 // collectedUnit reports whether p is a regular unit file whose contents were
-// collected.
-func collectedUnit(c *model.Collection, p string) bool {
+// collected. Persistence files are recorded at the path they were found
+// through, which need not be where they are.
+func collectedUnit(c *model.Collection, inv map[string]*model.FileEntry, p string) bool {
 	for _, f := range c.Persist {
-		if f.Path == p {
+		if samePlace(inv, f.Path, p) {
 			return f.Mode&0o170000 == 0o100000
 		}
 	}
 	return false
+}
+
+// samePlace reports whether the persistence file recorded at recorded is the
+// file at the resolved path p.
+func samePlace(inv map[string]*model.FileEntry, recorded, p string) bool {
+	if recorded == p {
+		return true
+	}
+	if path.Base(recorded) != path.Base(p) {
+		return false
+	}
+	real, ok := model.ResolveInInventory(inv, path.Dir(recorded), model.LinkHops)
+	return ok && path.Join(real, path.Base(recorded)) == p
 }
 
 // regularFile reports whether the file scan saw p as a regular file it could

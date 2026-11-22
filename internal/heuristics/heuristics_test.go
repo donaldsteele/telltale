@@ -94,7 +94,7 @@ func want(t *testing.T, c *model.Collection, key string, sev model.Severity) mod
 }
 
 func TestHeuristicsCleanCollectionHasNoFindings(t *testing.T) {
-	if fs := Run(cleanCollection(), ctx, cleanOwned()); len(fs) != 0 {
+	if fs := Run(inventoried(cleanCollection()), ctx, cleanOwned()); len(fs) != 0 {
 		t.Fatalf("findings on clean collection: %v", keys(fs))
 	}
 }
@@ -845,6 +845,16 @@ func inventoried(c *model.Collection) *model.Collection {
 	}
 	for _, p := range c.Persist {
 		parents(p.Path)
+		// A link into a system directory leads to something that is there,
+		// as on a real machine, unless the test names it "removed...".
+		if t, ok := p.LinkTarget(); ok && !p.TargetRedacted() && !strings.HasPrefix(path.Base(t), "removed") {
+			for _, d := range []string{"/usr/", "/lib/", "/etc/"} {
+				if strings.HasPrefix(t, d) && !strings.Contains(p.Lines[0], "..") {
+					parents(t)
+					add(model.FileEntry{Path: t, Type: "file", Mode: 0o100644})
+				}
+			}
+		}
 		switch {
 		case p.Mode&0o170000 == 0o120000 && len(p.Lines) > 0:
 			add(model.FileEntry{Path: p.Path, Type: "symlink", Target: p.Lines[0], Mode: p.Mode})
@@ -913,14 +923,146 @@ func TestPersistLinkResolvedAsTheKernelDoes(t *testing.T) {
 	c, owned = base("/opt/pkg/qdir/../../../dev/null", symlinkEntry("/opt/pkg/qdir", "/srv/evil/a/b"))
 	backdoor("not a plain /dev/null", c, owned)
 
-	// A link into a system directory whose target does not exist (a unit of
-	// a removed package) and one into /run/systemd, which the scan does not
-	// record, stay quiet as before.
-	for _, target := range []string{"/usr/lib/systemd/system/removed.service", "../run/systemd/resolve/stub-resolv.conf", "/lib/systemd/system/x.service"} {
-		c, owned = base(target)
-		if fs := runOwned(c, owned); find(fs, "heur.persist_link:"+l) != nil {
-			t.Errorf("link to %s: reported %v", target, keys(fs))
+	// A link to a file that is there, in a system directory: quiet.
+	c, owned = base("/lib/systemd/system/x.service")
+	if fs := runOwned(c, owned); find(fs, "heur.persist_link:"+l) != nil || find(fs, "heur.persist_link_dangling:"+l) != nil {
+		t.Errorf("link to an existing unit: reported %v", keys(fs))
+	}
+}
+
+// What a link leads to when the file is not there, and when the way to it
+// goes through /run.
+func TestPersistLinkDanglingAndRun(t *testing.T) {
+	const l = "/etc/systemd/system/multi-user.target.wants/x.service"
+	dir := func(p string) model.FileEntry { return model.FileEntry{Path: p, Type: "dir", Mode: 0o40755} }
+	reg := func(p string) model.FileEntry { return model.FileEntry{Path: p, Type: "file", Mode: 0o100644} }
+	type want struct {
+		key string
+		sev model.Severity
+	}
+	quiet := want{}
+	dangling := want{"heur.persist_link_dangling:" + l, model.SevNote}
+	backdoor := want{"heur.persist_link:" + l, model.SevBackdoor}
+	sysDirs := []model.FileEntry{dir("/usr"), dir("/usr/lib"), dir("/usr/lib/systemd"), dir("/usr/lib/systemd/system")}
+	run := []model.FileEntry{dir("/run"), dir("/run/systemd"), dir("/run/systemd/system"), dir("/tmp")}
+	// What the collector records when the walk stops at a network mount.
+	nfs := []string{"/usr/lib/systemd/system"}
+	for _, tc := range []struct {
+		name    string
+		target  string
+		files   []model.FileEntry
+		refused []string
+		want    want
+	}{
+		// The enable link of a unit whose package was removed.
+		{"file missing in a system directory", "/usr/lib/systemd/system/removed.service", sysDirs, nil, dangling},
+		// A directory on the way is missing: nothing is known about where
+		// this leads.
+		{"directory missing on the way", "/usr/lib/removed-dir/removed.service", sysDirs, nil, backdoor},
+		{"missing file outside the system directories", "/srv/app/removed.service", []model.FileEntry{dir("/srv"), dir("/srv/app")}, nil, backdoor},
+		// "Missing" on a mount the scan stays out of is not known to be missing.
+		{"missing on a network mount", "/usr/lib/systemd/system/removed.service", sysDirs, nfs, backdoor},
+		// /run/systemd counts only for a target that is really there.
+		{"/run/systemd, existing file", "/run/systemd/system/x.service", append(run[:len(run):len(run)], reg("/run/systemd/system/x.service")), nil, quiet},
+		{"/run/systemd, nothing recorded", "/run/systemd/system/x.service", nil, nil, backdoor},
+		{"/run/systemd, file missing", "/run/systemd/system/removed.service", run, nil, dangling},
+		// The reviewer's probe: /run/systemd/x is itself a link to a payload.
+		{"/run/systemd link onward to /tmp", "/run/systemd/x",
+			append(run[:len(run):len(run)], symlinkEntry("/run/systemd/x", "/tmp/payload"), reg("/tmp/payload")), nil, backdoor},
+		{"/run/systemd link onward, payload not recorded", "/run/systemd/x",
+			append(run[:len(run):len(run)], symlinkEntry("/run/systemd/x", "/tmp/payload")), nil, backdoor},
+		// A tmpfs inside a system directory hides nothing either.
+		{"link onward out of /etc", "/etc/x.d/job", []model.FileEntry{dir("/etc/x.d"), symlinkEntry("/etc/x.d/job", "/var/tmp/payload")}, nil, backdoor},
+		{"climbing out past what was recorded", "../../../../srv/x/../../etc/removed.service", nil, nil, backdoor},
+	} {
+		c := cleanCollection()
+		c.Persist = append(c.Persist, link(l, tc.target))
+		c.Files = append(c.Files, tc.files...)
+		c.LinkRefused = tc.refused
+		fs := runOwned(c, cleanOwned())
+		var got []string
+		for _, f := range fs {
+			if strings.HasSuffix(f.Key, ":"+l) {
+				got = append(got, f.Key+" ("+f.Severity.String()+")")
+			}
 		}
+		switch {
+		case tc.want == quiet && len(got) != 0:
+			t.Errorf("%s: want nothing, got %v", tc.name, got)
+		case tc.want != quiet:
+			if f := find(fs, tc.want.key); f == nil || f.Severity != tc.want.sev || len(got) != 1 {
+				t.Errorf("%s: want %s (%s), got %v", tc.name, tc.want.key, tc.want.sev, got)
+			}
+		}
+	}
+}
+
+// Ownership is by where a file is. With /opt a link to /data/opt, dpkg lists
+// Chrome's cron script under /opt and the link opens it under /data/opt: it
+// is still the package's file.
+func TestPersistLinkPackageFileBehindALinkedDirectory(t *testing.T) {
+	const l, lit, phys = "/etc/cron.daily/google-chrome", "/opt/google/chrome/cron/google-chrome", "/data/opt/google/chrome/cron/google-chrome"
+	c := cleanCollection()
+	c.Persist = append(c.Persist, link(l, lit))
+	c.Files = append(c.Files, symlinkEntry("/opt", "/data/opt"),
+		model.FileEntry{Path: phys, Type: "file", Mode: 0o100755},
+		model.FileEntry{Path: lit, Type: "file", Mode: 0o100755}) // the entry recorded for the link's text
+	inventoried(c)
+	pk := model.Packages{Installed: []model.Package{{Name: "google-chrome-stable", Files: []string{lit}}}}
+	owned, literal := pk.PhysicalOwners(model.Inventory(c.Files))
+	fs := Run(c, ctx, owned)
+	if f := find(fs, "heur.persist_link_pkg:"+l); f == nil || f.Severity != model.SevNote {
+		t.Fatalf("want the package-file note, got %v", keys(fs))
+	}
+	if got := PackageLinkTargets(c, owned); len(got) != 1 || got[0] != phys || literal[phys] != lit {
+		t.Errorf("targets %v, dpkg spelling %q", got, literal[phys])
+	}
+	// The same link when /opt leads somewhere the package's file is not.
+	c = cleanCollection()
+	c.Persist = append(c.Persist, link(l, lit))
+	c.Files = append(c.Files, symlinkEntry("/opt", "/var/tmp/opt"),
+		model.FileEntry{Path: "/var/tmp/opt/google/chrome/cron/google-chrome", Type: "file", Mode: 0o100755})
+	inventoried(c)
+	owned, _ = pk.PhysicalOwners(model.Inventory(c.Files))
+	fs = Run(c, ctx, owned)
+	if f := find(fs, "heur.persist_link:"+l); f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("a package path that really lies in /var/tmp: want a backdoor sign, got %v", keys(fs))
+	}
+}
+
+// A home whose ~/.config/systemd is a link into a dotfiles directory of the
+// same home (GNU stow): the enabled unit is still the user's own.
+func TestUserUnitInAStowManagedHome(t *testing.T) {
+	const l = "/home/alice/.config/systemd/user/default.target.wants/x.service"
+	stow := func(linkTo string) *model.Collection {
+		c := userUnitCollection(l, "/home/alice/.config/systemd/user/x.service")
+		for i := range c.Persist {
+			if c.Persist[i].Path == l {
+				c.Persist[i].Lines[0] = "../x.service"
+			}
+		}
+		real := path.Clean(path.Join("/home/alice/.config", linkTo))
+		c.Files = append(c.Files,
+			symlinkEntry("/home/alice/.config/systemd", linkTo),
+			model.FileEntry{Path: real + "/user/default.target.wants", Type: "dir", Mode: 0o40755},
+			symlinkEntry(real+"/user/default.target.wants/x.service", "../x.service"),
+			model.FileEntry{Path: real + "/user/x.service", Type: "file", Mode: 0o100644})
+		return c
+	}
+	fs := runOwned(stow("../dotfiles/systemd/.config/systemd"), cleanOwned())
+	if f := find(fs, "heur.user_unit:"+l); f == nil || f.Severity != model.SevNote {
+		t.Errorf("stow home: want the user-unit note, got %v", keys(fs))
+	}
+	if find(fs, "heur.persist_link:"+l) != nil {
+		t.Errorf("stow home: backdoor sign: %v", keys(fs))
+	}
+	// The same layout leading out of the home is not the user's own unit.
+	fs = runOwned(stow("/var/tmp/q/systemd"), cleanOwned())
+	if find(fs, "heur.user_unit:"+l) != nil {
+		t.Errorf("unit directory outside the home: got the user-unit note: %v", keys(fs))
+	}
+	if f := find(fs, "heur.persist_link:"+l); f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("unit directory outside the home: want a backdoor sign, got %v", keys(fs))
 	}
 }
 
