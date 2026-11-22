@@ -56,24 +56,26 @@ func policyName(p *nftables.ChainPolicy) string {
 	return "accept" // nftables default for a base chain without an explicit policy
 }
 
-// inputPolicy returns the policy of the input base chain, preferring family
-// inet over ip, and the strictest when several exist; "none" when absent.
-func inputPolicy(chains []nftChain) string {
-	for _, fam := range []nftables.TableFamily{nftables.TableFamilyINet, nftables.TableFamilyIPv4} {
-		got := ""
-		for _, c := range chains {
-			if c.Family != fam || c.Hook == nil || *c.Hook != *nftables.ChainHookInput {
-				continue
-			}
-			if p := policyName(c.Policy); got == "" || p == "drop" {
-				got = p
-			}
+// inputPolicy returns the strictest policy across all input base chains in
+// inet, ip and ip6 (drop beats accept), and the number of rules in them.
+// The policy is "none" when there is no such chain.
+func inputPolicy(chains []nftChain) (string, int) {
+	got, rules := "none", 0
+	for _, c := range chains {
+		switch c.Family {
+		case nftables.TableFamilyINet, nftables.TableFamilyIPv4, nftables.TableFamilyIPv6:
+		default:
+			continue
 		}
-		if got != "" {
-			return got
+		if c.Hook == nil || *c.Hook != *nftables.ChainHookInput {
+			continue
+		}
+		rules += c.Rules
+		if p := policyName(c.Policy); got == "none" || p == "drop" {
+			got = p
 		}
 	}
-	return "none"
+	return got, rules
 }
 
 // Firewall reports the live nftables ruleset and ufw's configuration.
@@ -89,7 +91,7 @@ func Firewall(root string) (model.Firewall, []model.Skip) {
 		for _, c := range snap.Chains {
 			fw.Rules += c.Rules
 		}
-		fw.InputPolicy = inputPolicy(snap.Chains)
+		fw.InputPolicy, fw.InputRules = inputPolicy(snap.Chains)
 	}
 	b, err := readRaw(root, "/etc/ufw/ufw.conf", 64<<10)
 	if err != nil {

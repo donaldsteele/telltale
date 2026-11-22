@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/donaldsteele/telltale/internal/model"
@@ -127,5 +128,27 @@ func TestDpkgListTooLargeSkips(t *testing.T) {
 	_, skips := Packages(root)
 	if len(skips) == 0 {
 		t.Fatal("expected skip")
+	}
+}
+
+func TestDpkgHostileNameNotTraversed(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{
+		"var/lib/dpkg/status": "Package: ../../etc/evil\nStatus: install ok installed\nArchitecture: amd64\nVersion: 1\n",
+		"etc/evil.list":       "/decoy\n",
+		"etc/evil.md5sums":    "aaaa  decoy\n",
+	})
+	pk, skips := Packages(root)
+	if len(pk.Installed) != 1 || len(pk.Installed[0].Files) != 0 || len(pk.Installed[0].LocalMD5) != 0 {
+		t.Fatalf("traversal read: %+v", pk.Installed)
+	}
+	found := false
+	for _, s := range skips {
+		if strings.Contains(s.Reason, "../../etc/evil") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no skip naming package: %v", skips)
 	}
 }

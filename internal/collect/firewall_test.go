@@ -45,34 +45,30 @@ func TestFirewallInjectedError(t *testing.T) {
 
 func TestFirewallInputPolicySelection(t *testing.T) {
 	drop, accept := nftables.ChainPolicyDrop, nftables.ChainPolicyAccept
-	in := nftables.ChainHookInput
-	fwd := nftables.ChainHookForward
-	mk := func(fam nftables.TableFamily, hook *nftables.ChainHook, pol *nftables.ChainPolicy) nftChain {
-		return nftChain{Family: fam, Hook: hook, Policy: pol, Rules: 2}
+	in, fwd := nftables.ChainHookInput, nftables.ChainHookForward
+	mk := func(fam nftables.TableFamily, hook *nftables.ChainHook, pol *nftables.ChainPolicy, rules int) nftChain {
+		return nftChain{Family: fam, Hook: hook, Policy: pol, Rules: rules}
 	}
+	inet, ip4, ip6 := nftables.TableFamilyINet, nftables.TableFamilyIPv4, nftables.TableFamilyIPv6
 	cases := []struct {
-		name   string
-		chains []nftChain
-		want   string
+		name      string
+		chains    []nftChain
+		want      string
+		inputRule int
 	}{
-		{"inet drop + ip accept", []nftChain{mk(nftables.TableFamilyIPv4, in, &accept), mk(nftables.TableFamilyINet, in, &drop)}, "drop"},
-		{"ip only", []nftChain{mk(nftables.TableFamilyIPv4, in, &accept)}, "accept"},
-		{"no input", []nftChain{mk(nftables.TableFamilyINet, fwd, &drop), mk(nftables.TableFamilyINet, nil, nil)}, "none"},
-		{"empty", nil, "none"},
-		{"ip6 ignored", []nftChain{mk(nftables.TableFamilyIPv6, in, &drop)}, "none"},
-	}
-	for _, c := range cases {
-		if got := inputPolicy(c.chains); got != c.want {
-			t.Errorf("%s: got %s want %s", c.name, got, c.want)
-		}
+		{"ip drop + inet accept", []nftChain{mk(inet, in, &accept, 0), mk(ip4, in, &drop, 1)}, "drop", 1},
+		{"ip6 only drop", []nftChain{mk(ip6, in, &drop, 2)}, "drop", 2},
+		{"inet accept with 3 rules", []nftChain{mk(inet, in, &accept, 3), mk(inet, fwd, &drop, 9)}, "accept", 3},
+		{"no input chains", []nftChain{mk(inet, fwd, &drop, 5), mk(inet, nil, nil, 4)}, "none", 0},
+		{"empty", nil, "none", 0},
 	}
 	old := nftList
-	nftList = func() (nftSnapshot, error) {
-		return nftSnapshot{Tables: 2, Chains: []nftChain{mk(nftables.TableFamilyINet, in, &drop), mk(nftables.TableFamilyINet, nil, nil)}}, nil
-	}
 	defer func() { nftList = old }()
-	fw, _ := Firewall(t.TempDir())
-	if fw.Backend != "nftables" || fw.Tables != 2 || fw.Rules != 4 || fw.InputPolicy != "drop" {
-		t.Errorf("%+v", fw)
+	for _, c := range cases {
+		nftList = func() (nftSnapshot, error) { return nftSnapshot{Tables: 2, Chains: c.chains}, nil }
+		fw, _ := Firewall(t.TempDir())
+		if fw.Backend != "nftables" || fw.InputPolicy != c.want || fw.InputRules != c.inputRule {
+			t.Errorf("%s: %+v", c.name, fw)
+		}
 	}
 }

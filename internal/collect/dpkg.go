@@ -110,6 +110,11 @@ func Packages(root string) (model.Packages, []model.Skip) {
 	pk := model.Packages{Installed: make([]model.Package, 0, len(ents))}
 	for _, e := range ents {
 		p := e.p
+		if !safePkgToken(p.Name) || (p.Arch != "" && !safePkgToken(p.Arch)) {
+			skip("package %q (arch %q): unsafe name, file lists not read", p.Name, p.Arch)
+			pk.Installed = append(pk.Installed, p)
+			continue
+		}
 		base := "/var/lib/dpkg/info/" + p.Name
 		if e.multiArch && p.Arch != "" {
 			base += ":" + p.Arch
@@ -144,4 +149,20 @@ func Packages(root string) (model.Packages, []model.Skip) {
 	var s2 []model.Skip
 	pk.Sources, s2 = aptSources(root)
 	return pk, append(skips, s2...)
+}
+
+// safePkgToken accepts only [a-z0-9][a-z0-9+.-]* with no "..".
+func safePkgToken(s string) bool {
+	if s == "" || strings.Contains(s, "..") {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+		case i > 0 && (r == '+' || r == '.' || r == '-'):
+		default:
+			return false
+		}
+	}
+	return true
 }

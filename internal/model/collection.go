@@ -227,6 +227,7 @@ type Firewall struct {
 	InputPolicy string `json:"input_policy"`
 	Tables      int    `json:"tables"`
 	Rules       int    `json:"rules"`
+	InputRules  int    `json:"input_rules"`
 	UFWEnabled  *bool  `json:"ufw_enabled,omitempty"`
 }
 
