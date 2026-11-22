@@ -327,7 +327,7 @@ func ensureExeEntries(root string, files []model.FileEntry, procs []model.Proces
 func linkTargets(persist []model.PersistFile) []string {
 	var out []string
 	for _, p := range persist {
-		if t, ok := p.LinkTarget(); ok && p.Redactions == 0 && t != "/dev/null" {
+		if t, ok := p.LinkTarget(); ok && !p.TargetRedacted() && t != "/dev/null" {
 			out = append(out, t)
 		}
 	}

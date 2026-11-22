@@ -30,7 +30,7 @@ func PackageLinkTargets(c *model.Collection, owned map[string]string) []string {
 	seen := map[string]bool{}
 	for _, p := range c.Persist {
 		t, ok := p.LinkTarget()
-		if !ok || p.Redactions > 0 || t == "/dev/null" || inSystemDir(t) || owned[t] == "" || seen[t] {
+		if !ok || p.TargetRedacted() || t == "/dev/null" || inSystemDir(t) || owned[t] == "" || seen[t] {
 			continue
 		}
 		seen[t] = true
@@ -89,7 +89,7 @@ func persistLinks(c *model.Collection, owned map[string]string) []model.Finding 
 		}
 		ev := []model.Evidence{{Path: p.Path, Line: 1, After: p.Lines[0], Detail: "symlink to " + target}}
 		key := "heur.persist_link:" + p.Path
-		redacted := p.Redactions > 0 // the target text is not what the link holds
+		redacted := p.TargetRedacted() // the target text is not what the link holds
 		if target == "/dev/null" && !redacted {
 			base := path.Base(p.Path)
 			for _, w := range maskedWeak {

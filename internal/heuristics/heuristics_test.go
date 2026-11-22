@@ -746,13 +746,13 @@ func TestUserUnitUncollectedAndHostileTargets(t *testing.T) {
 	c = userUnitCollection(l, "/home/alice/.config/systemd/user/x.service")
 	for i := range c.Persist {
 		if c.Persist[i].Path == l {
-			c.Persist[i].Lines = []string{"/home/alice/.config/systemd/user/key=x/../../../../../../tmp/evil.service"}
+			c.Persist[i].Lines = []string{"/home/alice/.config/systemd/user/key=<redacted h:0011>/../../../../../../tmp/evil.service"}
 			c.Persist[i].Redactions = 1
 		}
 	}
 	backdoor("redacted user-unit link", c)
 	c = cleanCollection()
-	c.Persist = append(c.Persist, model.PersistFile{Path: "/etc/systemd/system/y.service", Kind: model.PersistKindSystemdUnit, Mode: 0o120777, Lines: []string{"/usr/key=x/../../tmp/evil"}, Redactions: 1})
+	c.Persist = append(c.Persist, model.PersistFile{Path: "/etc/systemd/system/y.service", Kind: model.PersistKindSystemdUnit, Mode: 0o120777, Lines: []string{"/usr/key=<redacted h:0011>/../../tmp/evil"}, Redactions: 1})
 	if f := find(runOwned(c, cleanOwned()), "heur.persist_link:/etc/systemd/system/y.service"); f == nil || f.Severity != model.SevBackdoor {
 		t.Errorf("redacted system-prefix link: %+v", f)
 	}
@@ -771,5 +771,18 @@ func TestUserUnitUncollectedAndHostileTargets(t *testing.T) {
 	c.Persist = c.Persist[:len(c.Persist)-1]
 	if fs := runOwned(c, cleanOwned()); len(fs) != 0 {
 		t.Errorf("uncollected /usr/lib target: %v", keys(fs))
+	}
+}
+
+// Redactions counts secrets in the unit text that follows the target line; a
+// clean target line is still resolved.
+func TestLinkWithRedactedContentStillResolves(t *testing.T) {
+	c := cleanCollection()
+	p := link("/etc/systemd/system/z.service", "/usr/lib/systemd/system/z.service")
+	p.Lines = append(p.Lines, "Environment=A=<redacted h:0011>")
+	p.Redactions = 1
+	c.Persist = append(c.Persist, p)
+	if fs := runOwned(c, cleanOwned()); len(fs) != 0 {
+		t.Errorf("findings: %v", keys(fs))
 	}
 }

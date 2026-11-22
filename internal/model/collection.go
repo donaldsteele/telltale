@@ -347,3 +347,10 @@ func (p PersistFile) LinkTarget() (target string, ok bool) {
 	}
 	return path.Clean(target), true
 }
+
+// TargetRedacted reports whether the link's target text had a secret-like
+// part replaced by a digest marker: it is then not the text the link holds
+// and must not be resolved.
+func (p PersistFile) TargetRedacted() bool {
+	return len(p.Lines) > 0 && strings.Contains(p.Lines[0], "<redacted ")
+}
