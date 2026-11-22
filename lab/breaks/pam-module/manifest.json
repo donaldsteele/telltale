@@ -3,10 +3,21 @@
   "with_snapshot": {
     "must": [
       {
+        "key_prefix": "heur.pam_unowned:",
+        "severity": "backdoor sign"
+      },
+      {
         "key_prefix": "snap.persist:/etc/pam.d/common-auth",
         "severity": "backdoor sign"
       }
     ]
   },
-  "without_snapshot": {}
+  "without_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.pam_unowned:",
+        "severity": "backdoor sign"
+      }
+    ]
+  }
 }

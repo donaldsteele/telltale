@@ -1,7 +1,6 @@
 {
   "requires": {
-    "newer_snapshot": true,
-    "network": true
+    "newer_snapshot": true
   },
   "with_snapshot": {
     "must": [
@@ -11,5 +10,7 @@
       }
     ]
   },
-  "without_snapshot": {}
+  "without_snapshot": {
+    "comment": "A package downgrade is only visible by comparing with a snapshot; without one there is no earlier version to compare with."
+  }
 }

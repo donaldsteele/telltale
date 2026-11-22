@@ -4,15 +4,13 @@
 set -eu
 SI=/lab/standins
 need() { [ -e "$SI/$1" ] || { echo "$0: $SI/$1 is missing (copy the stand-ins in first)" >&2; exit 1; }; }
-need callback.sh
-install -m 755 "$SI/callback.sh" /usr/local/bin/.lab-sync
-cat > /etc/systemd/system/lab-sync.service <<'EOT'
+cat > /etc/systemd/system/lab-sync.service <<EOT
 [Unit]
 Description=Lab sync
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/.lab-sync
+ExecStart=/bin/bash -c 'exec 3<>/dev/tcp/sink/4444 && echo lab-callback >&3'
 EOT
 cat > /etc/systemd/system/lab-sync.timer <<'EOT'
 [Unit]

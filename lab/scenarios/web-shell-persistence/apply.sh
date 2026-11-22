@@ -1,6 +1,6 @@
 #!/bin/sh
 # A break-in story: a world-writable script dropped under /var/www, a systemd
-# timer that calls the sink, and a setuid copy of a shell. The script is inert
+# timer that calls the sink, and a setuid copy of a shell in /var/tmp. The script is inert
 # text; telltale's file inventory does not cover /var/www.
 # Runs as root inside a lab machine; /lab/breaks and /lab/standins are in place.
 set -eu

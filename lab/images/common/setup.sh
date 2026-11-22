@@ -24,6 +24,17 @@ apt-get install -y --no-install-recommends ca-certificates
 apt-get update
 apt-get install -y --no-install-recommends \
   openssh-server iproute2 procps kmod ca-certificates sudo cron e2fsprogs
+
+# Packages for the offline break scripts (the build has network, the machines
+# do not): this snapshot's openssl and its library, which the downgrade break
+# installs over a newer pair, and lighttpd with the dependencies this image
+# lacks, for the new-service break.
+D=/var/cache/telltale-lab/debs
+mkdir -p $D/openssl $D/lighttpd
+(cd $D/openssl && apt-get download openssl $(dpkg-query -W -f '${Package} ' 'libssl3*'))
+apt-get install -y --download-only lighttpd
+cp /var/cache/apt/archives/*.deb $D/lighttpd/
+apt-get clean
 rm -rf /var/lib/apt/lists/*
 
 # Accounts: a normal user with key-only login, root without a usable password.

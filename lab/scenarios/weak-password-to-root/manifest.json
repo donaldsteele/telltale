@@ -5,6 +5,7 @@
       {"key_prefix": "snap.user_changed:lab", "severity": "note"},
       {"key_prefix": "snap.root_key:/root/.ssh/authorized_keys:", "severity": "backdoor sign"},
       {"key_prefix": "snap.persist:/etc/cron.d/lab-update", "severity": "backdoor sign"},
+      {"key_prefix": "heur.persist_callback:/etc/cron.d/lab-update", "severity": "backdoor sign"},
       {"key_prefix": "heur.ld_preload", "severity": "backdoor sign"},
       {"key_prefix": "heur.crossview:ps", "severity": "tampering"},
       {"key_prefix": "check:TT-SSH-001", "severity": "tampering"}
@@ -13,6 +14,7 @@
   "without_snapshot": {
     "must": [
       {"key_prefix": "heur.root_key:/root/.ssh/authorized_keys", "severity": "note"},
+      {"key_prefix": "heur.persist_callback:/etc/cron.d/lab-update", "severity": "backdoor sign"},
       {"key_prefix": "heur.ld_preload", "severity": "backdoor sign"},
       {"key_prefix": "heur.crossview:ps", "severity": "tampering"},
       {"key_prefix": "check:TT-SSH-001", "severity": "weak setting"}

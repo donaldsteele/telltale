@@ -3,7 +3,11 @@
   "with_snapshot": {
     "must": [
       {
-        "key_prefix": "heur.unowned_setuid:/usr/lib/.s",
+        "key_prefix": "heur.unowned_setuid:/var/tmp/.s",
+        "severity": "backdoor sign"
+      },
+      {
+        "key_prefix": "snap.file_added:/var/tmp/.s",
         "severity": "backdoor sign"
       }
     ]
@@ -11,7 +15,7 @@
   "without_snapshot": {
     "must": [
       {
-        "key_prefix": "heur.unowned_setuid:/usr/lib/.s",
+        "key_prefix": "heur.unowned_setuid:/var/tmp/.s",
         "severity": "backdoor sign"
       }
     ]

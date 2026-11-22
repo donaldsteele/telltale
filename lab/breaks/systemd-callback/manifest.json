@@ -3,6 +3,10 @@
   "with_snapshot": {
     "must": [
       {
+        "key_prefix": "heur.persist_callback:/etc/systemd/system/lab-sync.service",
+        "severity": "backdoor sign"
+      },
+      {
         "key_prefix": "snap.persist:/etc/systemd/system/lab-sync.service",
         "severity": "backdoor sign"
       },
@@ -12,5 +16,12 @@
       }
     ]
   },
-  "without_snapshot": {}
+  "without_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.persist_callback:/etc/systemd/system/lab-sync.service",
+        "severity": "backdoor sign"
+      }
+    ]
+  }
 }

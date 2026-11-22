@@ -3,10 +3,21 @@
   "with_snapshot": {
     "must": [
       {
+        "key_prefix": "heur.persist_callback:/etc/cron.d/lab-update",
+        "severity": "backdoor sign"
+      },
+      {
         "key_prefix": "snap.persist:/etc/cron.d/lab-update",
         "severity": "backdoor sign"
       }
     ]
   },
-  "without_snapshot": {}
+  "without_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.persist_callback:/etc/cron.d/lab-update",
+        "severity": "backdoor sign"
+      }
+    ]
+  }
 }

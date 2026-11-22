@@ -24,7 +24,6 @@ type Requires struct {
 	Caps          []string `json:"caps,omitempty"`           // labkit Opts.Caps
 	Systemd       bool     `json:"systemd,omitempty"`        // labkit Opts.Systemd
 	NewerSnapshot bool     `json:"newer_snapshot,omitempty"` // the image is built at the *_NEWER package snapshot
-	Network       bool     `json:"network,omitempty"`        // apply.sh needs apt access to the package snapshots, which the internal lab network lacks
 	Distros       []string `json:"distros,omitempty"`        // only these distros; empty means all
 }
 
@@ -38,7 +37,9 @@ type Must struct {
 // Section is what a report must and must not contain. It applies to one of the
 // two ways of scanning: with the clean snapshot, or without one.
 type Section struct {
-	Must []Must `json:"must,omitempty"`
+	// Comment says why a section is empty or unusual; the matcher ignores it.
+	Comment string `json:"comment,omitempty"`
+	Must    []Must `json:"must,omitempty"`
 	// MustNotSeverityAbove, when set, fails the check if any finding ranks
 	// above it (explained < note < weak setting < backdoor sign < tampering).
 	MustNotSeverityAbove *model.Severity `json:"must_not_severity_above,omitempty"`

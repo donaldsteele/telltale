@@ -3,12 +3,15 @@
   "with_snapshot": {
     "must": [
       {"key_prefix": "snap.persist:/etc/systemd/system/lab-sync.timer", "severity": "backdoor sign"},
-      {"key_prefix": "heur.unowned_setuid:/usr/lib/.s", "severity": "backdoor sign"}
+      {"key_prefix": "heur.persist_callback:/etc/systemd/system/lab-sync.service", "severity": "backdoor sign"},
+      {"key_prefix": "heur.unowned_setuid:/var/tmp/.s", "severity": "backdoor sign"},
+      {"key_prefix": "snap.file_added:/var/tmp/.s", "severity": "backdoor sign"}
     ]
   },
   "without_snapshot": {
     "must": [
-      {"key_prefix": "heur.unowned_setuid:/usr/lib/.s", "severity": "backdoor sign"}
+      {"key_prefix": "heur.persist_callback:/etc/systemd/system/lab-sync.service", "severity": "backdoor sign"},
+      {"key_prefix": "heur.unowned_setuid:/var/tmp/.s", "severity": "backdoor sign"}
     ]
   }
 }

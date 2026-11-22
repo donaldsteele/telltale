@@ -1,5 +1,16 @@
 {
   "requires": {"variant": "thirdparty"},
-  "with_snapshot": {"must_not_severity_above": "weak setting"},
-  "without_snapshot": {"must_not_severity_above": "weak setting"}
+  "with_snapshot": {
+    "comment": "lab-vendor is a local .deb: no trusted source has version 2.0, so under the judge's rules (an unconfirmed version explains none of its changed files) the upgrade is ranked as a backdoor sign. If a scan can only compare with the machine's own checksums (offline-local mode) it is explained instead; Task 21 confirms which mode the lab scans run in.",
+    "must": [
+      {"key_prefix": "snap.pkg_upgraded:lab-vendor", "severity": "backdoor sign"}
+    ]
+  },
+  "without_snapshot": {
+    "comment": "The running lab-vendord was replaced by the upgrade: a stale program from a package, a note. Nothing above a weak setting.",
+    "must": [
+      {"key_prefix": "heur.stale_exe:/opt/lab-vendor/bin/lab-vendord", "severity": "note"}
+    ],
+    "must_not_severity_above": "weak setting"
+  }
 }

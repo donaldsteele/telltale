@@ -1,7 +1,5 @@
 {
-  "requires": {
-    "network": true
-  },
+  "requires": {},
   "with_snapshot": {
     "must": [
       {
@@ -14,5 +12,7 @@
       }
     ]
   },
-  "without_snapshot": {}
+  "without_snapshot": {
+    "comment": "Nothing is expected without a snapshot: the package owns the listener, so telltale has nothing to flag in a package that is installed and running."
+  }
 }
