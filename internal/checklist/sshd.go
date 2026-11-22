@@ -417,9 +417,10 @@ func (c *sshdConfig) pass(matchPass bool, addr string) map[string]sshdSetting {
 	return out
 }
 
-// ports returns the TCP ports the files make sshd listen on: every Port value
-// in the global pass (Port adds up and is global-only), or 22 when there is
-// none, and separately the explicit ports of ListenAddress host:port lines.
+// ports returns every Port value in the files' global pass (Port adds up and
+// is global-only; none means sshd's default 22 unless the command line sets
+// a port) and separately the explicit ports of ListenAddress host:port
+// lines.
 func (c *sshdConfig) ports() (ports, listen []int) {
 	c.replay(false, "", func(i int, active bool) {
 		e := c.events[i]
@@ -439,9 +440,6 @@ func (c *sshdConfig) ports() (ports, listen []int) {
 			}
 		}
 	})
-	if len(ports) == 0 {
-		ports = []int{22}
-	}
 	return ports, listen
 }
 
@@ -597,4 +595,19 @@ func (c *sshdConfig) blocks() []matchBlock {
 		}
 	}
 	return out
+}
+
+// blockOf returns the Match block that holds the config line of s.
+func (c *sshdConfig) blockOf(s sshdSetting) (matchBlock, bool) {
+	if s.Path == "" || s.Path == cmdlineSource {
+		return matchBlock{}, false
+	}
+	for _, b := range c.blocks() {
+		for _, bs := range b.Settings {
+			if bs.Path == s.Path && bs.Line == s.Line {
+				return b, true
+			}
+		}
+	}
+	return matchBlock{}, false
 }

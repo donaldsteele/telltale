@@ -1,6 +1,10 @@
 package checklist
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -635,5 +639,170 @@ func TestDroppedStigRefs(t *testing.T) {
 		if it, _ := ByID(id); len(it.Refs) != 0 {
 			t.Errorf("%s refs = %v", id, it.Refs)
 		}
+	}
+}
+
+func TestSSHDListenerWithoutExe(t *testing.T) {
+	// Without root /proc/<pid>/exe cannot be read: Exe is "", and the title
+	// is "sshd: /usr/sbin/sshd ... [listener] ...".
+	c := hardened()
+	c.Runtime.Processes = []model.Process{{PID: 992, UID: 0, Comm: "sshd",
+		Cmdline: "sshd: /usr/sbin/sshd -D -o PermitRootLogin=yes [listener] 0 of 10-100 startups"}}
+	if r := result(t, c, model.ScanContext{}, "TT-SSH-001"); r.Pass || r.Observed != "PermitRootLogin yes (sshd command line)" {
+		t.Errorf("listener without exe: %+v", r)
+	}
+	c.Runtime.Processes[0].Cmdline = "sshd: /usr/sbin/sshd -D -f /tmp/.x/cfg [listener] 0 of 10-100 startups"
+	if r := result(t, c, model.ScanContext{}, "TT-SSH-001"); r.Skipped == "" {
+		t.Errorf("-f on a listener without exe: %+v", r)
+	}
+	// Plain argv form (older sshd) works the same.
+	c.Runtime.Processes[0].Cmdline = "/usr/sbin/sshd -D -o PermitRootLogin=yes"
+	if r := result(t, c, model.ScanContext{}, "TT-SSH-001"); r.Pass {
+		t.Errorf("plain argv listener without exe: %+v", r)
+	}
+}
+
+func TestSSHDListenerMustBeRoot(t *testing.T) {
+	c := hardened()
+	for _, uid := range []int{1000, -1} {
+		c.Runtime.Processes = []model.Process{
+			{PID: 4000, UID: uid, Comm: "sshd", Exe: "/usr/sbin/sshd", Cmdline: "/usr/sbin/sshd -f /home/u/x"},
+			{PID: 4001, UID: uid, Comm: "sshd", Cmdline: "sshd: /usr/sbin/sshd -o PermitRootLogin=yes [listener] 0 of 10-100 startups"},
+		}
+		if r := result(t, c, model.ScanContext{}, "TT-SSH-001"); !r.Pass || r.Skipped != "" {
+			t.Errorf("uid %d process treated as the sshd listener: %+v", uid, r)
+		}
+	}
+}
+
+func TestSSHDOptionForms(t *testing.T) {
+	for _, args := range []string{
+		"-D -o PermitRootLogin=yes",
+		"-D -oPermitRootLogin=yes",
+		"-D -o PermitRootLogin = yes", // -o "PermitRootLogin = yes"
+		"-D -o PermitRootLogin= yes",
+		"-D -o PermitRootLogin =yes",
+		"-D -o PermitRootLogin yes",
+		"-De -o PermitRootLogin=yes",
+	} {
+		l := parseSSHDOptions(strings.Fields(args))
+		if len(l.Opts) != 1 || l.Opts[0] != (sshdOption{Key: "permitrootlogin", Value: "yes"}) {
+			t.Errorf("%q: opts = %+v", args, l.Opts)
+		}
+	}
+}
+
+func TestSSHDPortsFollowSSHD(t *testing.T) {
+	// From sshd -T: -o Port adds to the file's ports; -p replaces them and
+	// makes a later -o Port ignored; 22 only when nothing sets a port.
+	cases := []struct {
+		file []string
+		args string
+		want []int
+	}{
+		{[]string{"Port 22", "Port 2222"}, "-D -o Port=3333", []int{22, 2222, 3333}},
+		{[]string{"Port 22", "Port 2222"}, "-D -p 4444", []int{4444}},
+		{[]string{"Port 22", "Port 2222"}, "-D -p 4444 -o Port=3333", []int{4444}},
+		{[]string{"Port 22", "Port 2222"}, "-D -o Port=3333 -p 4444", []int{3333, 4444}},
+		{[]string{"PermitRootLogin no"}, "-D -o Port=3333", []int{3333}},
+		{[]string{"PermitRootLogin no"}, "-D", []int{22}},
+	}
+	for _, tc := range cases {
+		c := hardened()
+		setSSHD(c, tc.file...)
+		c.Runtime.Processes = []model.Process{{PID: 900, Comm: "sshd", Cmdline: "sshd: /usr/sbin/sshd " + tc.args + " [listener] 0 of 10-100 startups"}}
+		if got := sshPorts(c); fmt.Sprint(got) != fmt.Sprint(tc.want) {
+			t.Errorf("%v %q: ports %v, want %v", tc.file, tc.args, got, tc.want)
+		}
+	}
+}
+
+// applyFix runs a fix command against copies of the sshd config files in a
+// temporary directory and returns them as collected files again.
+func applyFix(t *testing.T, fix string, files []model.PersistFile) []model.PersistFile {
+	t.Helper()
+	if _, err := exec.LookPath("sed"); err != nil {
+		t.Skip("no sed")
+	}
+	dir := t.TempDir()
+	for _, f := range files {
+		p := filepath.Join(dir, f.Path)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(strings.Join(f.Lines, "\n")+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := strings.TrimSuffix(fix, reloadSSH)
+	cmd = strings.ReplaceAll(cmd, " /etc/ssh/", " "+dir+"/etc/ssh/")
+	if out, err := exec.Command("sh", "-c", cmd).CombinedOutput(); err != nil {
+		t.Fatalf("%s: %v %s", cmd, err, out)
+	}
+	var out []model.PersistFile
+	for _, f := range files {
+		b, err := os.ReadFile(filepath.Join(dir, f.Path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, sshdFile(f.Path, strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")...))
+	}
+	return out
+}
+
+func TestRootLoginFixPlacesServerBlockFirst(t *testing.T) {
+	ctx := model.ScanContext{ServerAddr: "10.0.0.5"}
+	it, _ := ByID("TT-SSH-001")
+	cases := []struct {
+		name  string
+		lines []string
+		fix   string
+	}{
+		{"Match all sets yes", []string{"PermitRootLogin no", "Match all", "  PermitRootLogin yes"},
+			`sed -i '3s/.*/PermitRootLogin no/' /etc/ssh/sshd_config && sed -i -e '2i Match Address 10.0.0.5' -e '2i\    PermitRootLogin prohibit-password' /etc/ssh/sshd_config && systemctl reload ssh`},
+		{"broader block for the server", []string{"PermitRootLogin no", "Match Address 10.0.0.0/8", "  PermitRootLogin yes"},
+			`sed -i -e '2i Match Address 10.0.0.5' -e '2i\    PermitRootLogin prohibit-password' /etc/ssh/sshd_config && systemctl reload ssh`},
+		{"global prohibit-password", []string{"PermitRootLogin prohibit-password", "X11Forwarding no"},
+			`sed -i '1s/.*/PermitRootLogin no/' /etc/ssh/sshd_config && printf '\nMatch Address %s\n    PermitRootLogin prohibit-password\n' 10.0.0.5 >> /etc/ssh/sshd_config && systemctl reload ssh`},
+		{"unset", []string{"# PermitRootLogin prohibit-password"},
+			`sed -i '1i PermitRootLogin no' /etc/ssh/sshd_config && printf '\nMatch Address %s\n    PermitRootLogin prohibit-password\n' 10.0.0.5 >> /etc/ssh/sshd_config && systemctl reload ssh`},
+	}
+	for _, tc := range cases {
+		c := hardened()
+		setSSHD(c, tc.lines...)
+		fix := it.FixFor(c, ctx)
+		if fix != tc.fix {
+			t.Errorf("%s: fix = %q", tc.name, fix)
+			continue
+		}
+		fixed := applyFix(t, fix, []model.PersistFile{sshdFile("/etc/ssh/sshd_config", tc.lines...)})
+		wantSSHD(t, EffectiveSSHD(fixed, "10.0.0.5"), "permitrootlogin", "prohibit-password")
+		wantSSHD(t, EffectiveSSHD(fixed, ""), "permitrootlogin", "no")
+		c.Persist[0] = fixed[0]
+		if r := result(t, c, ctx, "TT-SSH-001"); !r.Pass {
+			t.Errorf("%s: still failing after the fix: %+v", tc.name, r)
+		}
+	}
+}
+
+func TestNoPasswdUserLists(t *testing.T) {
+	c := hardened()
+	c.Accounts.Users = append(c.Accounts.Users,
+		model.User{Name: "ubuntu", UID: 1001, GID: 1001, Shell: "/bin/bash", Password: model.PasswordState{Locked: true, LastChange: 19000}},
+	)
+	sudo := model.PersistFile{Path: "/etc/sudoers.d/x", Kind: model.PersistKindSudoers, Mode: 0o100440,
+		Lines: []string{"alice, ubuntu ALL=(ALL) NOPASSWD: ALL"}}
+	c.Persist = append(c.Persist, sudo)
+	c.Files = append(c.Files, fileEntry("/etc/sudoers.d/x", 0o440, 0, 0))
+	it, _ := ByID("TT-SUDO-001")
+	base := `sed -i 's/NOPASSWD[[:space:]]*:/PASSWD:/g' /etc/sudoers.d/x && visudo -c`
+	want := "# ubuntu has no usable password: without NOPASSWD sudo asks for one, so set it first or nobody may be able to become root\npasswd ubuntu && " + base
+	if fix := it.FixFor(c, model.ScanContext{}); fix != want {
+		t.Errorf("space after comma: fix = %q", fix)
+	}
+	c.Persist[len(c.Persist)-1].Lines = []string{"ALL ALL=(ALL) NOPASSWD: ALL"}
+	want = "# a NOPASSWD rule covers ALL users: every user with a locked password must get one before this change\n" + base
+	if fix := it.FixFor(c, model.ScanContext{}); fix != want {
+		t.Errorf("ALL rule: fix = %q", fix)
 	}
 }

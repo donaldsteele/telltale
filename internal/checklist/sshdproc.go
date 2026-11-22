@@ -13,21 +13,36 @@ import (
 // sshdListener is a running sshd that accepts connections, with the options
 // on its command line.
 type sshdListener struct {
-	PID   int
-	Opts  []sshdOption // -o, in order
-	Ports []int        // -p and -o Port
-	File  string       // -f, "" when not given
+	PID  int
+	Opts []sshdOption // -o, in order
+	// Ports are the command-line ports. With PortsOnly (-p was given) they
+	// replace the files' Port lines; otherwise (-o Port) they add to them.
+	Ports     []int
+	PortsOnly bool
+	File      string // -f, "" when not given
 }
 
-// sshdListeners finds running sshd listeners: processes named sshd with an
-// executable named sshd, or whose command line starts with /usr/sbin/sshd.
-// sshd rewrites its title to "sshd: /usr/sbin/sshd -D [listener] ..." (older
-// versions keep the plain argv); per-connection children such as
-// "sshd: alice [priv]" are not listeners.
+// isSSHDListener reports whether p may be an sshd listener: run by root
+// (UID 0; an unknown UID is not accepted), and named sshd with an
+// executable named sshd or an unreadable one (without root,
+// /proc/<pid>/exe cannot be read), or with a command line starting with
+// /usr/sbin/sshd.
+func isSSHDListener(p model.Process) bool {
+	if p.UID != 0 {
+		return false
+	}
+	return p.Comm == "sshd" && (p.Exe == "" || strings.HasSuffix(p.Exe, "/sshd")) ||
+		strings.HasPrefix(p.Cmdline, "/usr/sbin/sshd")
+}
+
+// sshdListeners finds running sshd listeners. sshd rewrites its title to
+// "sshd: /usr/sbin/sshd -D [listener] ..." (older versions keep the plain
+// argv); the program word must be named sshd, so per-connection children
+// such as "sshd: alice [priv]" are not listeners.
 func sshdListeners(c *model.Collection) []sshdListener {
 	var out []sshdListener
 	for _, p := range c.Runtime.Processes {
-		if !(p.Comm == "sshd" && strings.HasSuffix(p.Exe, "/sshd")) && !strings.HasPrefix(p.Cmdline, "/usr/sbin/sshd") {
+		if !isSSHDListener(p) {
 			continue
 		}
 		args, ok := sshdArgv(p.Cmdline)
@@ -41,7 +56,8 @@ func sshdListeners(c *model.Collection) []sshdListener {
 	return out
 }
 
-// sshdArgv returns the arguments after the program in a listener's title.
+// sshdArgv returns the arguments after the program in a listener's title,
+// stopping at "[listener]".
 func sshdArgv(cmdline string) ([]string, bool) {
 	s := strings.TrimPrefix(strings.TrimSpace(cmdline), "sshd: ")
 	if i := strings.LastIndex(s, " [listener]"); i >= 0 {
@@ -58,9 +74,12 @@ func sshdArgv(cmdline string) ([]string, bool) {
 const sshdArgOpts = "CEbcfghkopu"
 
 // parseSSHDOptions reads -o, -p and -f getopt-style ("-o X", "-oX",
-// clustered flags). The collected command line joins arguments with
-// spaces, so "-o 'Keyword value'" arrives as two words; a word after -o that
-// has no "=" takes the next word as its value.
+// clustered flags). The collected title joins arguments with spaces, so one
+// -o argument such as "PermitRootLogin = yes" arrives as several words:
+// words are taken until there is a keyword and a value.
+//
+// Ports follow sshd -T: -p ports replace the files' Port lines and make any
+// later -o Port ignored; an -o Port before -p, or without -p, is kept.
 func parseSSHDOptions(args []string) sshdListener {
 	var l sshdListener
 	for i := 0; i < len(args); i++ {
@@ -83,20 +102,23 @@ func parseSSHDOptions(args []string) sshdListener {
 			}
 			switch ch {
 			case 'o':
-				if !strings.Contains(val, "=") && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				kv := sshdArgs(val)
+				for len(kv) < 2 && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
 					i++
 					val += " " + args[i]
+					kv = sshdArgs(val)
 				}
-				if kv := sshdArgs(val); len(kv) >= 2 {
+				if len(kv) >= 2 {
 					key := strings.ToLower(kv[0])
 					l.Opts = append(l.Opts, sshdOption{Key: key, Value: strings.Join(kv[1:], " ")})
-					if n := parsePort(kv[1]); key == "port" && n > 0 {
+					if n := parsePort(kv[1]); key == "port" && n > 0 && !l.PortsOnly {
 						l.Ports = append(l.Ports, n)
 					}
 				}
 			case 'p':
 				if n := parsePort(val); n > 0 {
 					l.Ports = append(l.Ports, n)
+					l.PortsOnly = true
 				}
 			case 'f':
 				l.File = val
@@ -163,10 +185,11 @@ func sshdViews(c *model.Collection) ([]sshdView, string) {
 	return out, ""
 }
 
-// sshPorts returns the TCP ports sshd listens on, as far as can be told:
-// each listener's -p/-o Port ports or else the files' Port values (22 when
-// the files cannot be read), ListenAddress ports, and the ports of listening
-// sockets owned by a listener.
+// sshPorts returns the TCP ports sshd listens on, as far as can be told,
+// following sshd -T: per listener, its -p ports alone, or its -o Port ports
+// plus the files' Port values, or 22 when nothing sets a port (the files'
+// ports count as 22 when the files cannot be read); plus ListenAddress ports
+// and the ports of listening sockets owned by a listener.
 func sshPorts(c *model.Collection) []int {
 	cfgPorts, listen := []int{22}, []int(nil)
 	if cfg, why := parseSSHD(c.Persist); why == "" {
@@ -174,11 +197,16 @@ func sshPorts(c *model.Collection) []int {
 	}
 	set := map[int]bool{}
 	add := func(ps []int) {
+		if len(ps) == 0 {
+			ps = []int{22}
+		}
 		for _, p := range ps {
 			set[p] = true
 		}
 	}
-	add(listen)
+	for _, p := range listen {
+		set[p] = true
+	}
 	ls := sshdListeners(c)
 	if len(ls) == 0 {
 		add(cfgPorts)
@@ -186,11 +214,11 @@ func sshPorts(c *model.Collection) []int {
 	pids := map[int]bool{}
 	for _, l := range ls {
 		pids[l.PID] = true
-		if len(l.Ports) > 0 {
-			add(l.Ports)
-		} else {
-			add(cfgPorts)
+		ports := append([]int(nil), l.Ports...)
+		if !l.PortsOnly {
+			ports = append(ports, cfgPorts...)
 		}
+		add(ports)
 	}
 	for _, s := range c.Runtime.Sockets {
 		if port, ok := tcpListenPort(s); ok && pids[s.PID] {

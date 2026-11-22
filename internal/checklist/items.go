@@ -355,6 +355,18 @@ func serverBlockFix(addr string) string {
 	return `printf '\nMatch Address %s\n    PermitRootLogin prohibit-password\n' ` + shellQuote(addr) + " >> " + mainSSHDConfig
 }
 
+// serverBlockBefore inserts the enrolment block just before Match block b,
+// so it is the first applying block for the server's address (among
+// applying Match blocks the first value wins). It returns "" when the
+// address has characters that cannot go into a sed script safely.
+func serverBlockBefore(cfg *sshdConfig, b matchBlock, addr string) string {
+	if addr == "" || strings.Trim(addr, "0123456789abcdefABCDEF.:") != "" {
+		return ""
+	}
+	return fmt.Sprintf(`sed -i%s -e '%di Match Address %s' -e '%di\    PermitRootLogin prohibit-password' %s`,
+		followFlag(cfg.links[b.Path]), b.Line, addr, b.Line, shellQuote(b.Path))
+}
+
 func fixRootLogin(c *model.Collection, ctx model.ScanContext) string {
 	views, why := sshdViews(c)
 	if why != "" {
@@ -369,11 +381,17 @@ func fixRootLogin(c *model.Collection, ctx model.ScanContext) string {
 }
 
 // fixRootLoginIn turns root login off for everyone, keeps or restores key
-// login from the telltale server, and never cuts the server off: when the
-// server's value is the global one, its Match block is added.
+// login from the telltale server, and never cuts the server off:
+//   - the server's value comes from the global section or the default, which
+//     the fix turns to "no": the server's Match block is appended;
+//   - it comes from the server's own block: that line is set to
+//     prohibit-password;
+//   - it comes from another applying block (Match all, or a broader address
+//     block) that would leave the server with "no" or a looser value: the
+//     server's block is inserted before that block, so it wins.
 func fixRootLoginIn(v sshdView, ctx model.ScanContext) string {
 	var edits []string
-	insert, block := "", ""
+	insert, before, block := "", "", ""
 	g := v.effective("")["permitrootlogin"]
 	globalBad := rootLoginValue(g.Value) != "no"
 	if globalBad {
@@ -389,18 +407,30 @@ func fixRootLoginIn(v sshdView, ctx model.ScanContext) string {
 	if ctx.ServerAddr != "" {
 		s := v.effective(ctx.ServerAddr)["permitrootlogin"]
 		sv := rootLoginValue(s.Value)
-		fromGlobal := s.Path == g.Path && s.Line == g.Line
+		serverOK := sv == "no" || sv == "prohibit-password"
+		b, inBlock := v.cfg.blockOf(s)
 		switch {
-		case fromGlobal && globalBad:
-			block = serverBlockFix(ctx.ServerAddr)
-		case !fromGlobal && sv != "no" && sv != "prohibit-password" && s.Path != cmdlineSource:
-			edits = append(edits, sshdLineFix(v.cfg, s, "PermitRootLogin", "prohibit-password"))
+		case s.Path == cmdlineSource:
+			// Only the command line can change it (handled above for "").
+		case !inBlock:
+			if globalBad {
+				block = serverBlockFix(ctx.ServerAddr)
+			}
+		case isServerBlock(b.Criteria, ctx.ServerAddr):
+			if !serverOK {
+				edits = append(edits, sshdLineFix(v.cfg, s, "PermitRootLogin", "prohibit-password"))
+			}
+		case b.Everyone && globalBad, !b.Everyone && !serverOK:
+			if before = serverBlockBefore(v.cfg, b, ctx.ServerAddr); before == "" {
+				block = serverBlockFix(ctx.ServerAddr)
+			}
 		}
 	}
-	// Inserting a line shifts the ones below it, so line edits go first;
-	// appending moves nothing.
+	// Inserting a line shifts the ones below it, so line edits go first,
+	// then the insert lower in the file, then the one at line 1; appending
+	// moves nothing.
 	cmds := edits
-	for _, c := range []string{insert, block} {
+	for _, c := range []string{before, insert, block} {
 		if c != "" {
 			cmds = append(cmds, c)
 		}
@@ -872,10 +902,31 @@ func sudoRuleFix(re *regexp.Regexp, script string) func(*model.Collection, model
 	}
 }
 
-// noPasswdUsers returns the local accounts named first on NOPASSWD rules:
-// users, and members of %groups. ALL, negations, #uids and aliases are not
-// expanded; root is left out (it needs no sudo).
-func noPasswdUsers(c *model.Collection) []model.User {
+// sudoUserList returns the user list that starts a sudoers user spec: the
+// first word, continued across spaces after (or before) commas, as in
+// "alice, ubuntu ALL=(ALL) ALL".
+func sudoUserList(t string) []string {
+	f := strings.Fields(t)
+	if len(f) == 0 {
+		return nil
+	}
+	list := f[0]
+	for i := 1; i < len(f) && (strings.HasSuffix(list, ",") || strings.HasPrefix(f[i], ",")); i++ {
+		list += f[i]
+	}
+	var out []string
+	for _, w := range strings.Split(list, ",") {
+		if w = strings.TrimSpace(w); w != "" {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// noPasswdUsers returns the local accounts named on NOPASSWD rules (users,
+// and members of %groups) and whether a rule covers ALL users. Negations,
+// #uids and aliases are not expanded; root is left out (it needs no sudo).
+func noPasswdUsers(c *model.Collection) (users []model.User, all bool) {
 	names := map[string]bool{}
 	for _, pf := range sudoFiles(c) {
 		lines, ok := persistText(pf)
@@ -884,30 +935,30 @@ func noPasswdUsers(c *model.Collection) []model.User {
 		}
 		for _, l := range lines {
 			t := sudoContent(l)
-			f := strings.Fields(t)
-			if !noPasswdRe.MatchString(t) || len(f) == 0 || strings.HasPrefix(f[0], "Defaults") {
+			if !noPasswdRe.MatchString(t) || strings.HasPrefix(t, "Defaults") {
 				continue
 			}
-			for _, who := range strings.Split(f[0], ",") {
+			for _, who := range sudoUserList(t) {
 				switch {
+				case who == "ALL":
+					all = true
 				case strings.HasPrefix(who, "%"):
 					for _, u := range groupMembers(c, strings.TrimPrefix(strings.TrimPrefix(who, "%:"), "%")) {
 						names[u] = true
 					}
-				case who == "" || who == "ALL" || who[0] == '!' || who[0] == '#' || isSudoAlias(who):
+				case who[0] == '!' || who[0] == '#' || isSudoAlias(who):
 				default:
 					names[who] = true
 				}
 			}
 		}
 	}
-	var out []model.User
 	for _, u := range accounts(c) {
 		if names[u.Name] && u.Name != "root" {
-			out = append(out, u)
+			users = append(users, u)
 		}
 	}
-	return out
+	return users, all
 }
 
 // isSudoAlias reports whether a sudoers name is an alias (upper case,
@@ -947,16 +998,20 @@ func fixNoPasswd(c *model.Collection, ctx model.ScanContext) string {
 	if base == "" {
 		return ""
 	}
-	users := noPasswdUsers(c)
+	users, all := noPasswdUsers(c)
+	var b strings.Builder
+	if all {
+		b.WriteString("# a NOPASSWD rule covers ALL users: every user with a locked password must get one before this change\n")
+	}
 	if shadowMissing(c) != "" {
 		var names []string
 		for _, u := range users {
 			names = append(names, u.Name)
 		}
-		if len(names) == 0 {
-			return base
+		if len(names) > 0 {
+			b.WriteString("# check that " + strings.Join(names, ", ") + " can give sudo a password before running this, or nobody may be able to become root\n")
 		}
-		return "# check that " + strings.Join(names, ", ") + " can give sudo a password before running this, or nobody may be able to become root\n" + base
+		return b.String() + base
 	}
 	var need []string
 	for _, u := range users {
@@ -965,14 +1020,14 @@ func fixNoPasswd(c *model.Collection, ctx model.ScanContext) string {
 		}
 	}
 	if len(need) == 0 {
-		return base
+		return b.String() + base
 	}
 	verb := "has"
 	if len(need) > 1 {
 		verb = "have"
 	}
-	return fmt.Sprintf("# %s %s no usable password: without NOPASSWD sudo asks for one, so set it first or nobody may be able to become root\n", strings.Join(need, ", "), verb) +
-		perUser(need, "passwd") + " && " + base
+	fmt.Fprintf(&b, "# %s %s no usable password: without NOPASSWD sudo asks for one, so set it first or nobody may be able to become root\n", strings.Join(need, ", "), verb)
+	return b.String() + perUser(need, "passwd") + " && " + base
 }
 
 func sudoPaths(c *model.Collection) []string {
