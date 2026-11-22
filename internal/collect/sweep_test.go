@@ -240,3 +240,42 @@ func TestSweepReachesTempDirsBeforeTheBoundRunsOut(t *testing.T) {
 		t.Errorf("/var/tmp not reached: %v", got)
 	}
 }
+
+func TestSweepOverlayRootIsSearched(t *testing.T) {
+	// a container or lab machine: the root filesystem is overlay
+	root := t.TempDir()
+	plant(t, root, "var/tmp/.s", os.ModeSetuid|0o755)
+	got, _ := Sweep(root, []model.Mount{{Path: "/", FSType: "overlay"}}, nil, FileOptions{})
+	if _, ok := byPath(got)["/var/tmp/.s"]; !ok {
+		t.Errorf("overlay root not searched: %v", got)
+	}
+	// even a squashfs root (a live system) is the system being examined
+	got, _ = Sweep(root, []model.Mount{{Path: "/", FSType: "squashfs"}}, nil, FileOptions{})
+	if _, ok := byPath(got)["/var/tmp/.s"]; !ok {
+		t.Errorf("root mount skipped by type: %v", got)
+	}
+}
+
+func TestSweepSkipsOverlayUnderImageStoreAndSquashfsUnderSnap(t *testing.T) {
+	root := t.TempDir()
+	plant(t, root, "var/lib/docker/overlay2/x/merged/usr/bin/su", os.ModeSetuid|0o755)
+	plant(t, root, "var/lib/containerd/io/y/usr/bin/su", os.ModeSetuid|0o755)
+	plant(t, root, "snap/core22/1/usr/bin/sudo", os.ModeSetuid|0o755)
+	plant(t, root, "home/u/.local/share/containers/storage/overlay/z/usr/bin/su", os.ModeSetuid|0o755)
+	plant(t, root, "opt/real", os.ModeSetuid|0o755)
+	mounts := []model.Mount{
+		{Path: "/", FSType: "ext4"},
+		{Path: "/var/lib/docker/overlay2/x/merged", FSType: "overlay"},
+		{Path: "/snap/core22/1", FSType: "squashfs"},
+	}
+	got, _ := Sweep(root, mounts, nil, FileOptions{})
+	if m := byPath(got); len(m) != 1 || m["/opt/real"].Path == "" {
+		t.Errorf("got %v", got)
+	}
+	// an overlay mount elsewhere (not an image store) is searched
+	plant(t, root, "srv/ov/.s", os.ModeSetuid|0o755)
+	got, _ = Sweep(root, append(mounts, model.Mount{Path: "/srv/ov", FSType: "overlay"}), nil, FileOptions{})
+	if _, ok := byPath(got)["/srv/ov/.s"]; !ok {
+		t.Errorf("ordinary overlay mount skipped: %v", got)
+	}
+}

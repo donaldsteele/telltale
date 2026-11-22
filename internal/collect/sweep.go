@@ -24,6 +24,9 @@ const maxSweepDirSkips = 20
 // sweepSkipFS are filesystem types the sweep never enters: kernel
 // pseudo-filesystems and network or user-space mounts. tmpfs is not among
 // them: /tmp, /dev/shm and /run are where a planted setuid file would sit.
+// The mount at "/" is never skipped by type: it holds the system being
+// examined (a container or lab machine has an overlay root), and overlay is
+// not skipped at all; image stores are skipped by path instead.
 var sweepSkipFS = map[string]bool{
 	"proc": true, "sysfs": true, "devtmpfs": true, "devpts": true, "cgroup": true, "cgroup2": true,
 	"securityfs": true, "debugfs": true, "tracefs": true, "bpf": true, "pstore": true, "configfs": true,
@@ -32,13 +35,16 @@ var sweepSkipFS = map[string]bool{
 	"selinuxfs": true, "hugetlbfs": true,
 	// Read-only or layered images of other systems: their setuid files belong
 	// to the image, not to this machine's packages.
-	"squashfs": true, "erofs": true, "iso9660": true, "overlay": true,
+	"squashfs": true, "erofs": true, "iso9660": true,
 }
 
 // sweepSkipDirs hold other systems' file trees (container and VM images, snap
 // and flatpak runtimes). Their setuid files are the image's own, so a sweep
 // that looked there would call every one a stranger.
-var sweepSkipDirs = []string{"/var/lib/docker", "/var/lib/containers", "/var/lib/lxc", "/var/lib/lxd", "/var/lib/incus", "/var/lib/machines", "/var/lib/flatpak", "/var/lib/snapd/snap", "/snap"}
+var sweepSkipDirs = []string{"/var/lib/docker", "/var/lib/containerd", "/var/lib/containers", "/var/lib/snapd", "/snap", "/var/lib/flatpak", "/var/lib/lxc", "/var/lib/lxd", "/var/lib/incus", "/var/lib/machines"}
+
+// userImageDir is a per-user container image store (~/.local/share/containers).
+const userImageDir = "/.local/share/containers"
 
 // sweepFirst are walked before everything else, so that a bounded walk never
 // runs out before reaching them: the world-writable and service-owned places
@@ -82,7 +88,7 @@ func Sweep(root string, mounts []model.Mount, have []model.FileEntry, opt FileOp
 	for _, m := range mounts {
 		p := filepath.Clean("/" + m.Path)
 		boundary[p] = true
-		if sweepSkipType(m.FSType) || seenStart[p] {
+		if (sweepSkipType(m.FSType) && p != "/") || seenStart[p] {
 			continue
 		}
 		seenStart[p] = true
@@ -144,29 +150,28 @@ func Sweep(root string, mounts []model.Mount, have []model.FileEntry, opt FileOp
 		}
 	}
 	imageDir := func(p string) bool {
+		hit := strings.HasSuffix(p, userImageDir)
 		for _, d := range sweepSkipDirs {
-			if p == d {
-				if !skipNoted[p] {
-					skipNoted[p] = true
-					skips = append(skips, model.Skip{Check: checkName, Reason: "sweep: " + p + ": not searched (holds the files of other systems: container, VM or package-runtime images)"})
-				}
-				return true
-			}
+			hit = hit || p == d
 		}
-		return false
+		if hit && !skipNoted[p] {
+			skipNoted[p] = true
+			skips = append(skips, model.Skip{Check: checkName, Reason: "sweep: " + p + ": not searched (holds the files of other systems: container, VM or package-runtime images)"})
+		}
+		return hit
 	}
 	// ownerType is the filesystem type of the mount that holds p.
 	mountType := make(map[string]string, len(mounts))
 	for _, m := range mounts {
 		mountType[filepath.Clean("/"+m.Path)] = m.FSType
 	}
-	ownerType := func(p string) string {
+	ownerType := func(p string) (t, mountPath string) {
 		for q := p; ; q = filepath.Dir(q) {
 			if t, ok := mountType[q]; ok {
-				return t
+				return t, q
 			}
 			if q == "/" {
-				return ""
+				return "", "/"
 			}
 		}
 	}
@@ -230,7 +235,8 @@ func Sweep(root string, mounts []model.Mount, have []model.FileEntry, opt FileOp
 	// local, it is not an image store and the system-path walk has not
 	// already covered it.
 	walkable := func(p string) bool {
-		if t := ownerType(p); sweepSkipType(t) || coveredByFiles(p, t) {
+		t, mp := ownerType(p)
+		if (sweepSkipType(t) && mp != "/") || coveredByFiles(p, t) {
 			return false
 		}
 		for _, d := range sweepSkipDirs {
@@ -238,6 +244,10 @@ func Sweep(root string, mounts []model.Mount, have []model.FileEntry, opt FileOp
 				imageDir(d)
 				return false
 			}
+		}
+		if i := strings.Index(p+"/", userImageDir+"/"); i >= 0 {
+			imageDir(p[:i+len(userImageDir)])
+			return false
 		}
 		return true
 	}

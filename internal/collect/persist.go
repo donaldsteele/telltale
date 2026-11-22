@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/persistsig"
 	"github.com/donaldsteele/telltale/internal/redact"
 	"golang.org/x/sys/unix"
 )
@@ -158,6 +159,8 @@ func (c *collector) file(mp, kind string) {
 	}
 	pf.SHA256 = hex.EncodeToString(h.Sum(nil))
 	if !large {
+		// Matched on the raw text: redaction can swallow the rest of a line.
+		pf.Signals = persistsig.Detect(kind, splitLines(buf))
 		pf.Lines = c.redactLines(buf, &pf)
 	}
 	c.out = append(c.out, pf)

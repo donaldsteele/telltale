@@ -161,6 +161,9 @@ type PersistFile struct {
 	Mode       uint32    `json:"mode"`
 	UID        uint32    `json:"uid"`
 	MTime      time.Time `json:"mtime"`
+	// Signals are callback or download-and-run commands found in the raw text
+	// before redaction: pattern ids and line numbers only, never the text.
+	Signals []PersistSignal `json:"signals,omitempty"`
 }
 
 // Runtime is the live state of the machine.
@@ -353,4 +356,12 @@ func (p PersistFile) LinkTarget() (target string, ok bool) {
 // and must not be resolved.
 func (p PersistFile) TargetRedacted() bool {
 	return len(p.Lines) > 0 && strings.Contains(p.Lines[0], "<redacted ")
+}
+
+// PersistSignal marks one command in a persistence file that matched a
+// callback or download-and-run pattern. Line is the first physical line of
+// the command (1-based); Pattern is a persistsig id.
+type PersistSignal struct {
+	Line    int    `json:"line"`
+	Pattern string `json:"pattern"`
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/persistsig"
 )
 
 // pamDirs are the fixed directories PAM loads bare module names from. The
@@ -122,12 +123,12 @@ func pamModules(c *model.Collection, owned map[string]string) []model.Finding {
 		if p.Kind != model.PersistKindPAM || p.Mode&0o170000 == 0o120000 {
 			continue
 		}
-		for _, l := range joinContinuations(p.Lines) {
-			if l.text == "" || isComment(l.text) {
+		for _, l := range persistsig.Join(p.Lines) {
+			if l.Text == "" || isComment(l.Text) {
 				continue
 			}
-			if m, quiet, ok := parsePAMLine(l.text); ok {
-				refs = append(refs, pamLine{file: p.Path, line: l.first, text: l.text, module: m, quiet: quiet})
+			if m, quiet, ok := parsePAMLine(l.Text); ok {
+				refs = append(refs, pamLine{file: p.Path, line: l.First, text: l.Text, module: m, quiet: quiet})
 			}
 		}
 	}

