@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/donaldsteele/telltale/internal/crossview"
 	"github.com/donaldsteele/telltale/internal/model"
 )
 
@@ -70,8 +71,8 @@ func All(opt Options) (*model.Collection, error) {
 	c.Firewall, s = Firewall(opt.Root)
 	add(s)
 
-	// TODO(task 11): when opt.CrossView is set, call crossview.Collect here
-	// and store the result in c.CrossView.
-	_ = opt.CrossView
+	if opt.CrossView {
+		c.CrossView = crossview.Collect(c.Runtime, opt.Root, nil)
+	}
 	return c, nil
 }

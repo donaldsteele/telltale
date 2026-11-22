@@ -32,10 +32,11 @@ func runCollect(ctx *Context) int {
 	sysRoot := fs.String("sys-root", "/sys", "")
 	ctxStdin := fs.Bool("context-stdin", false, "")
 	gz := fs.Bool("gzip", false, "")
+	noCross := fs.Bool("no-cross-view", false, "")
 	if err := fs.Parse(ctx.Args); err != nil {
 		return fail(err)
 	}
-	opt := collect.Options{Root: *root, ProcRoot: *procRoot, SysRoot: *sysRoot}
+	opt := collect.Options{Root: *root, ProcRoot: *procRoot, SysRoot: *sysRoot, CrossView: !*noCross}
 	if *ctxStdin {
 		b, err := io.ReadAll(io.LimitReader(ctx.Stdin, maxContextBytes+1))
 		if err != nil {

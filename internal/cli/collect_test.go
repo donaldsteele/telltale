@@ -12,7 +12,7 @@ import (
 
 func collectArgs(extra ...string) []string {
 	return append([]string{"collect", "--root", "../collect/testdata/root1",
-		"--proc-root", "../collect/testdata/proc1", "--sys-root", "../collect/testdata/root1"}, extra...)
+		"--proc-root", "../collect/testdata/proc1", "--sys-root", "../collect/testdata/root1", "--no-cross-view"}, extra...)
 }
 
 func TestCollectCommandWritesJSON(t *testing.T) {

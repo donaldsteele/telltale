@@ -1,0 +1,133 @@
+Module                  Size  Used by
+udp_diag               12288  0
+loop                   45056  1
+tcp_diag               12288  0
+inet_diag              28672  2 tcp_diag,udp_diag
+veth                   40960  0
+nf_conntrack_netlink    61440  0
+xt_nat                 12288  98
+xt_tcpudp              16384  0
+xt_conntrack           12288  7
+xt_MASQUERADE          16384  7
+bridge                393216  0
+xfrm_user              69632  1
+xfrm_algo              16384  1 xfrm_user
+xt_set                 20480  0
+ip_set                 69632  1 xt_set
+nft_chain_nat          12288  49
+nf_nat                 65536  3 xt_nat,nft_chain_nat,xt_MASQUERADE
+xt_addrtype            12288  4
+nft_compat             20480  116
+overlay               217088  25
+sunrpc                880640  1
+binfmt_misc            28672  1
+cfg80211             1404928  0
+rfkill                 40960  2 cfg80211
+8021q                  53248  0
+garp                   16384  1 8021q
+stp                    12288  2 bridge,garp
+mrp                    20480  1 8021q
+llc                    16384  3 bridge,stp,garp
+nls_ascii              12288  1
+nls_cp437              16384  1
+vfat                   24576  1
+fat                   102400  1 vfat
+amdgpu              14491648  0
+amd_atl                57344  1
+intel_rapl_msr         20480  0
+intel_rapl_common      53248  1 intel_rapl_msr
+edac_mce_amd           28672  0
+kvm_amd               221184  0
+snd_hda_codec_realtek   225280  1
+snd_hda_codec_generic   114688  1 snd_hda_codec_realtek
+kvm                  1396736  1 kvm_amd
+drm_buddy              12288  1 amdgpu
+snd_hda_scodec_component    20480  1 snd_hda_codec_realtek
+amdxcp                 12288  1 amdgpu
+snd_hda_codec_hdmi     98304  1
+drm_exec               12288  1 amdgpu
+snd_hda_intel          61440  0
+gpu_sched              65536  1 amdgpu
+irqbypass              12288  1 kvm
+snd_intel_dspcfg       40960  1 snd_hda_intel
+drm_suballoc_helper    12288  1 amdgpu
+crct10dif_pclmul       12288  1
+snd_intel_sdw_acpi     16384  1 snd_intel_dspcfg
+drm_display_helper    274432  1 amdgpu
+ghash_clmulni_intel    16384  0
+snd_hda_codec         217088  4 snd_hda_codec_generic,snd_hda_codec_hdmi,snd_hda_intel,snd_hda_codec_realtek
+sha512_ssse3           53248  0
+cec                    69632  1 drm_display_helper
+snd_hda_core          143360  5 snd_hda_codec_generic,snd_hda_codec_hdmi,snd_hda_intel,snd_hda_codec,snd_hda_codec_realtek
+sha256_ssse3           32768  0
+nft_limit              16384  2
+rc_core                73728  1 cec
+snd_hwdep              20480  1 snd_hda_codec
+sha1_ssse3             32768  0
+drm_ttm_helper         16384  1 amdgpu
+snd_pcm               188416  4 snd_hda_codec_hdmi,snd_hda_intel,snd_hda_codec,snd_hda_core
+aesni_intel           122880  0
+ttm                   102400  2 amdgpu,drm_ttm_helper
+gf128mul               16384  1 aesni_intel
+snd_timer              53248  1 snd_pcm
+nft_ct                 28672  2
+drm_kms_helper        253952  3 drm_display_helper,amdgpu,drm_ttm_helper
+crypto_simd            16384  1 aesni_intel
+snd                   151552  8 snd_hda_codec_generic,snd_hda_codec_hdmi,snd_hwdep,snd_hda_intel,snd_hda_codec,snd_hda_codec_realtek,snd_timer,snd_pcm
+nf_conntrack          204800  6 xt_conntrack,nf_nat,nft_ct,xt_nat,nf_conntrack_netlink,xt_MASQUERADE
+cryptd                 28672  2 crypto_simd,ghash_clmulni_intel
+i2c_algo_bit           16384  1 amdgpu
+wmi_bmof               12288  0
+soundcore              16384  1 snd
+ccp                   163840  1 kvm_amd
+rapl                   20480  0
+spd5118                12288  0
+nf_defrag_ipv6         24576  1 nf_conntrack
+pcspkr                 12288  0
+k10temp                12288  0
+button                 24576  0
+nf_defrag_ipv4         12288  1 nf_conntrack
+amd_pmc                57344  0
+evdev                  28672  1
+nf_tables             372736  1409 nft_ct,nft_compat,nft_chain_nat,nft_limit
+drm                   774144  11 gpu_sched,drm_kms_helper,drm_exec,drm_suballoc_helper,drm_display_helper,drm_buddy,amdgpu,drm_ttm_helper,ttm,amdxcp
+libcrc32c              12288  3 nf_conntrack,nf_nat,nf_tables
+efi_pstore             12288  0
+configfs               69632  1
+nfnetlink              20480  6 nft_compat,nf_conntrack_netlink,nf_tables,ip_set
+efivarfs               28672  1
+ip_tables              28672  0
+x_tables               53248  8 xt_conntrack,nft_compat,xt_tcpudp,xt_addrtype,xt_nat,xt_set,ip_tables,xt_MASQUERADE
+autofs4                57344  2
+ext4                 1146880  4
+crc16                  12288  2 amdgpu,ext4
+mbcache                16384  1 ext4
+jbd2                  200704  1 ext4
+crc32c_generic         12288  0
+dm_mod                221184  12
+sdhci_pci              98304  0
+r8169                 126976  0
+sp5100_tco             20480  0
+xhci_pci               24576  0
+xhci_hcd              364544  1 xhci_pci
+watchdog               49152  1 sp5100_tco
+cqhci                  32768  1 sdhci_pci
+realtek                45056  1
+nvme                   57344  6
+crc32_pclmul           12288  0
+i2c_piix4              28672  0
+amd_sfh                53248  0
+sdhci                  86016  1 sdhci_pci
+usbcore               409600  2 xhci_hcd,xhci_pci
+mdio_devres            12288  1 r8169
+nvme_core             225280  7 nvme
+video                  81920  1 amdgpu
+thunderbolt           544768  0
+crc32c_intel           16384  9
+i2c_smbus              16384  1 i2c_piix4
+hid                   262144  1 amd_sfh
+mmc_core              253952  3 sdhci,cqhci,sdhci_pci
+usb_common             16384  2 xhci_hcd,usbcore
+libphy                233472  3 r8169,mdio_devres,realtek
+nvme_auth              24576  1 nvme_core
+wmi                    28672  2 video,wmi_bmof
