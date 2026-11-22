@@ -3,6 +3,7 @@
 package model
 
 import (
+	"path"
 	"strings"
 	"time"
 )
@@ -322,4 +323,21 @@ func usrAlias(f string) []string {
 		}
 	}
 	return nil
+}
+
+// LinkTarget returns the cleaned absolute target of a collected symlink (a
+// relative target is resolved against the link's directory). ok is false for
+// entries that are not symlinks or have no target.
+func (p PersistFile) LinkTarget() (target string, ok bool) {
+	if p.Mode&0o170000 != 0o120000 || len(p.Lines) == 0 {
+		return "", false
+	}
+	target = strings.TrimSpace(p.Lines[0])
+	if target == "" {
+		return "", false
+	}
+	if !path.IsAbs(target) {
+		target = path.Join(path.Dir(p.Path), target)
+	}
+	return path.Clean(target), true
 }

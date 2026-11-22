@@ -67,6 +67,7 @@ func All(opt Options) (*model.Collection, error) {
 	add(s)
 	c.Files, s = Files(opt.Root, SystemPaths, FileOptions{MaxHashBytes: defaultMaxHash, Mounts: c.Runtime.Mounts})
 	c.Files = ensureExeEntries(opt.Root, c.Files, c.Runtime.Processes, defaultMaxHash)
+	c.Files = ensureEntries(opt.Root, c.Files, linkTargets(c.Persist), defaultMaxHash)
 	add(s)
 	c.Packages, s = Packages(opt.Root)
 	add(s)

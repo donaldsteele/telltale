@@ -314,18 +314,42 @@ func bootTime(procRoot string) int64 {
 // it: heuristics compare it with the running process. Hashing stays within
 // maxHash. A path that no longer exists gets no entry.
 func ensureExeEntries(root string, files []model.FileEntry, procs []model.Process, maxHash int64) []model.FileEntry {
+	var paths []string
+	for _, p := range procs {
+		if p.ExeDeleted && p.Exe != "" {
+			paths = append(paths, p.Exe)
+		}
+	}
+	return ensureEntries(root, files, paths, maxHash)
+}
+
+// linkTargets lists the absolute targets of the symlinks in persist, except
+// /dev/null.
+func linkTargets(persist []model.PersistFile) []string {
+	var out []string
+	for _, p := range persist {
+		if t, ok := p.LinkTarget(); ok && t != "/dev/null" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// ensureEntries adds to files the current entry of each of paths the file
+// scan did not cover. A path that does not exist gets no entry.
+func ensureEntries(root string, files []model.FileEntry, paths []string, maxHash int64) []model.FileEntry {
 	have := make(map[string]bool, len(files))
 	for _, e := range files {
 		have[e.Path] = true
 	}
 	root = strings.TrimRight(root, "/")
-	for _, p := range procs {
-		if !p.ExeDeleted || p.Exe == "" || !filepath.IsAbs(p.Exe) || have[p.Exe] {
+	for _, p := range paths {
+		if !filepath.IsAbs(p) || have[p] {
 			continue
 		}
-		have[p.Exe] = true
+		have[p] = true
 		var skips []model.Skip
-		if e, ok := statEntry(root+p.Exe, p.Exe, FileOptions{MaxHashBytes: maxHash}, &skips); ok {
+		if e, ok := statEntry(root+p, p, FileOptions{MaxHashBytes: maxHash}, &skips); ok {
 			files = append(files, e)
 		}
 	}

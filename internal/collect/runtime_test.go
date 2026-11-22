@@ -396,3 +396,18 @@ func TestCollectDeletedExeEntry(t *testing.T) {
 		t.Errorf("oversize: %+v", got)
 	}
 }
+
+func TestCollectLinkTargetEntry(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "opt/g"), 0o755)
+	os.WriteFile(filepath.Join(root, "opt/g/cron"), []byte("#!/bin/sh\n"), 0o755)
+	persist := []model.PersistFile{
+		{Path: "/etc/cron.daily/g", Mode: 0o120777, Lines: []string{"/opt/g/cron"}},
+		{Path: "/etc/cron.daily/n", Mode: 0o120777, Lines: []string{"/dev/null"}},
+		{Path: "/etc/cron.daily/f", Mode: 0o100644, Lines: []string{"/opt/g/notalink"}},
+	}
+	got := ensureEntries(root, nil, linkTargets(persist), 1<<20)
+	if len(got) != 1 || got[0].Path != "/opt/g/cron" || got[0].SHA256 != sum("#!/bin/sh\n") {
+		t.Errorf("entries: %+v", got)
+	}
+}
