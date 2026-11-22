@@ -3,12 +3,14 @@ package collect
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/donaldsteele/telltale/internal/model"
+	"golang.org/x/sys/unix"
 )
 
 // A fixture cannot hold a real deleted executable, so the fixture's
@@ -33,6 +35,7 @@ func sum(s string) string {
 
 func runFixture(t *testing.T) (model.Runtime, map[string]string, []model.Skip) {
 	fakeReadlink(t, map[string]string{"100": "/usr/bin/sleep", "200": "/tmp/x (deleted)"})
+	fakeNlink(t, "/200/")
 	root := t.TempDir()
 	kdir := filepath.Join(root, "lib/modules/6.1.0-test/kernel/fs/ext4")
 	os.MkdirAll(kdir, 0o755)
@@ -82,7 +85,10 @@ func TestRuntimeSocketsOwnersAndListening(t *testing.T) {
 	}
 }
 
-func TestRuntimeProcessVanishes(t *testing.T) {
+// Pid 300 has a live cmdline but no exe link: recorded with empty Exe and a
+// per-pid Skip (a live process is never dropped). Genuinely vanished pids are
+// covered by the StatusReadFailure and ESRCH tests.
+func TestRuntimeProcessMissingExe(t *testing.T) {
 	rt, _, skips := runFixture(t)
 	found := false
 	for _, s := range skips {
@@ -94,10 +100,11 @@ func TestRuntimeProcessVanishes(t *testing.T) {
 		t.Fatalf("no skip for pid 300: %+v", skips)
 	}
 	for _, p := range rt.Processes {
-		if p.PID == 300 {
-			t.Fatalf("pid 300 should not be recorded")
+		if p.PID == 300 && p.Exe == "" {
+			return
 		}
 	}
+	t.Fatalf("pid 300 not recorded with empty Exe")
 }
 
 func TestRuntimeModulesResolveFile(t *testing.T) {
@@ -145,4 +152,158 @@ func TestRuntimeLiveSmoke(t *testing.T) {
 		}
 	}
 	t.Fatalf("own pid %d not found", pid)
+}
+
+// fakeNlink makes fstat report zero links for exe paths containing substr, as
+// for a real deleted executable.
+func fakeNlink(t *testing.T, substr string) {
+	t.Helper()
+	old := nlinkFn
+	nlinkFn = func(p string, st *unix.Stat_t) uint64 {
+		if strings.Contains(p, substr) {
+			return 0
+		}
+		return uint64(st.Nlink)
+	}
+	t.Cleanup(func() { nlinkFn = old })
+}
+
+func mkProc(t *testing.T, pid, stat, status, cmdline string) (procRoot, dir string) {
+	t.Helper()
+	procRoot = t.TempDir()
+	dir = filepath.Join(procRoot, pid)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w := func(n, c string) {
+		if c != "" {
+			os.WriteFile(filepath.Join(dir, n), []byte(c), 0o644)
+		}
+	}
+	w("stat", stat)
+	w("status", status)
+	w("cmdline", cmdline)
+	return
+}
+
+func hasSkip(skips []model.Skip, sub string) bool {
+	for _, s := range skips {
+		if strings.Contains(s.Reason, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+const goodStat = "500 (x) S 1 500 500 0 -1 0\n"
+const goodStatus = "Name:\tx\nUid:\t1000\t1000\t1000\t1000\n"
+
+func TestRuntimeStatusReadFailureOmitsProcess(t *testing.T) {
+	proc, dir := mkProc(t, "500", goodStat, "", "x\x00")
+	os.Mkdir(filepath.Join(dir, "status"), 0o755) // unreadable as a file
+	rt, _, skips := Runtime(proc, t.TempDir(), t.TempDir())
+	if len(rt.Processes) != 0 || !hasSkip(skips, "pid 500: vanished") {
+		t.Fatalf("%+v %+v", rt.Processes, skips)
+	}
+}
+
+func TestRuntimeESRCHOmitsProcess(t *testing.T) {
+	proc, _ := mkProc(t, "500", goodStat, goodStatus, "x\x00")
+	old := readBoundedFn
+	readBoundedFn = func(p string, max int64) ([]byte, error) {
+		if strings.HasSuffix(p, "/status") {
+			return nil, &fs.PathError{Op: "read", Path: p, Err: unix.ESRCH}
+		}
+		return old(p, max)
+	}
+	t.Cleanup(func() { readBoundedFn = old })
+	rt, _, skips := Runtime(proc, t.TempDir(), t.TempDir())
+	if len(rt.Processes) != 0 || !hasSkip(skips, "pid 500: vanished") {
+		t.Fatalf("%+v %+v", rt.Processes, skips)
+	}
+}
+
+func TestRuntimeMissingUidOmitsProcess(t *testing.T) {
+	proc, _ := mkProc(t, "500", goodStat, "Name:\tx\n", "x\x00")
+	rt, _, skips := Runtime(proc, t.TempDir(), t.TempDir())
+	if len(rt.Processes) != 0 || !hasSkip(skips, "pid 500: vanished") {
+		t.Fatalf("%+v %+v", rt.Processes, skips)
+	}
+}
+
+func TestRuntimeMissingExeWithCmdlineIsRecorded(t *testing.T) {
+	proc, _ := mkProc(t, "500", goodStat, goodStatus, "x\x00")
+	rt, _, skips := Runtime(proc, t.TempDir(), t.TempDir())
+	if len(rt.Processes) != 1 || rt.Processes[0].Exe != "" || rt.Processes[0].UID != 1000 || !hasSkip(skips, "pid 500: executable link missing") {
+		t.Fatalf("%+v %+v", rt.Processes, skips)
+	}
+}
+
+func TestRuntimeUnreadableStatusIsUnknownUID(t *testing.T) {
+	proc, _ := mkProc(t, "500", goodStat, goodStatus, "x\x00")
+	old := readBoundedFn
+	readBoundedFn = func(p string, max int64) ([]byte, error) {
+		if strings.HasSuffix(p, "/status") {
+			return nil, &fs.PathError{Op: "open", Path: p, Err: unix.EACCES}
+		}
+		return old(p, max)
+	}
+	t.Cleanup(func() { readBoundedFn = old })
+	rt, _, skips := Runtime(proc, t.TempDir(), t.TempDir())
+	if len(rt.Processes) != 1 || rt.Processes[0].UID != UnknownUID || rt.Processes[0].Comm != "x" || !hasSkip(skips, "processes: 1 not fully readable") {
+		t.Fatalf("%+v %+v", rt.Processes, skips)
+	}
+}
+
+func TestRuntimeDeletedTextNeedsZeroNlink(t *testing.T) {
+	proc, dir := mkProc(t, "500", goodStat, goodStatus, "x\x00")
+	bin := filepath.Join(t.TempDir(), "bin")
+	os.WriteFile(bin, []byte("b"), 0o755)
+	os.Symlink(bin, filepath.Join(dir, "exe"))
+	fakeReadlink(t, map[string]string{"500": "/tmp/x (deleted)"})
+	rt, _, _ := Runtime(proc, t.TempDir(), t.TempDir())
+	p := rt.Processes[0]
+	if p.ExeDeleted || p.Exe != "/tmp/x (deleted)" || p.ExeSHA256 == "" {
+		t.Fatalf("%+v", p)
+	}
+}
+
+func TestRuntimeOversizeExeNotHashed(t *testing.T) {
+	proc, dir := mkProc(t, "500", goodStat, goodStatus, "x\x00")
+	bin := filepath.Join(t.TempDir(), "big")
+	f, _ := os.Create(bin)
+	if err := f.Truncate(3 << 30); err != nil {
+		t.Skip("sparse file unsupported")
+	}
+	f.Close()
+	os.Symlink(bin, filepath.Join(dir, "exe"))
+	rt, _, skips := Runtime(proc, t.TempDir(), t.TempDir())
+	if rt.Processes[0].ExeSHA256 != "" || !hasSkip(skips, "executable too large to hash") {
+		t.Fatalf("%+v %+v", rt.Processes, skips)
+	}
+}
+
+func TestRuntimeModulePrefersUpdates(t *testing.T) {
+	root := t.TempDir()
+	for _, d := range []string{"updates", "kernel/x"} {
+		os.MkdirAll(filepath.Join(root, "lib/modules/6.1.0-test", d), 0o755)
+		os.WriteFile(filepath.Join(root, "lib/modules/6.1.0-test", d, "unknown_mod.ko"), nil, 0o644)
+	}
+	rt, _, skips := Runtime("testdata/proc1", t.TempDir(), root)
+	for _, m := range rt.Modules {
+		if m.Name == "unknown_mod" && m.File != "/lib/modules/6.1.0-test/updates/unknown_mod.ko" {
+			t.Fatalf("%+v", m)
+		}
+	}
+	if hasSkip(skips, "ambiguous") {
+		t.Fatalf("unexpected ambiguity: %+v", skips)
+	}
+	// two candidates at the same level are reported
+	os.MkdirAll(filepath.Join(root, "lib/modules/6.1.0-test/kernel/y"), 0o755)
+	os.WriteFile(filepath.Join(root, "lib/modules/6.1.0-test/kernel/y/ext4_mod.ko"), nil, 0o644)
+	os.WriteFile(filepath.Join(root, "lib/modules/6.1.0-test/kernel/x/ext4_mod.ko"), nil, 0o644)
+	_, _, skips = Runtime("testdata/proc1", t.TempDir(), root)
+	if !hasSkip(skips, "module ext4_mod: ambiguous") {
+		t.Fatalf("%+v", skips)
+	}
 }
