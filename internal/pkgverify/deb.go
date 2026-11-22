@@ -60,6 +60,17 @@ type DebFile struct {
 	// with a literal chmod, as Debian packages do for setuid and setgid
 	// helpers when no dpkg-statoverride exists.
 	ScriptModes []uint32 `json:"script_modes,omitempty"`
+	// ScriptOverrides are the dpkg-statoverride entries the package's own
+	// postinst adds for the file with a literal command.
+	ScriptOverrides []ScriptOverride `json:"script_overrides,omitempty"`
+}
+
+// ScriptOverride is one literal "dpkg-statoverride --add OWNER GROUP MODE
+// PATH" in a package's maintainer script.
+type ScriptOverride struct {
+	Owner string `json:"owner"`
+	Group string `json:"group"`
+	Mode  uint32 `json:"mode"`
 }
 
 // DebFiles reads a .deb (an ar archive holding control.tar and data.tar,
@@ -192,6 +203,22 @@ type control struct {
 	// packaged mode ("chmod u+s").
 	setModes map[string][]uint32
 	addBits  map[string]uint32
+	// statoverrides the postinst adds.
+	overrides map[string][]ScriptOverride
+}
+
+// overridesFor returns the statoverrides the postinst adds for p or its
+// merged-/usr alias.
+func (c *control) overridesFor(p string) []ScriptOverride {
+	var out []ScriptOverride
+	for _, q := range []string{p, usrAlias(p)} {
+		for _, o := range c.overrides[q] {
+			if q != "" && !slices.Contains(out, o) {
+				out = append(out, o)
+			}
+		}
+	}
+	return out
 }
 
 // modesFor returns the modes the postinst gives p (or its merged-/usr
@@ -223,7 +250,7 @@ func readControl(r io.ReaderAt, m *arMember) (*control, error) {
 	defer dec.Close()
 	lr := &io.LimitedReader{R: dec, N: maxControlSize + 1}
 	tr := tar.NewReader(lr)
-	c := &control{conffiles: map[string]bool{}, setModes: map[string][]uint32{}, addBits: map[string]uint32{}}
+	c := &control{conffiles: map[string]bool{}, setModes: map[string][]uint32{}, addBits: map[string]uint32{}, overrides: map[string][]ScriptOverride{}}
 	for n := 0; ; n++ {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -250,7 +277,7 @@ func readControl(r io.ReaderAt, m *arMember) (*control, error) {
 			return nil, fmt.Errorf("%w: %s larger than %d bytes", ErrMalformedDeb, name, maxConffilesList)
 		}
 		if name == "postinst" {
-			c.scriptChmods(string(b))
+			c.scriptCommands(string(b))
 			continue
 		}
 		for _, line := range strings.Split(string(b), "\n") {
@@ -270,70 +297,216 @@ func readControl(r io.ReaderAt, m *arMember) (*control, error) {
 var (
 	octalMode  = regexp.MustCompile(`^0?[0-7]{3,4}$`)
 	addSetBits = map[string]uint32{"u+s": 0o4000, "g+s": 0o2000, "ug+s": 0o6000, "+s": 0o6000}
+	// shellSeparator splits a line into simple commands.
+	shellSeparator = regexp.MustCompile(`;|&&|\|\||\|`)
+	// redirection is a word that redirects output or input ("2>/dev/null",
+	// ">&2", or a bare "2>" whose target is the next word).
+	redirection  = regexp.MustCompile(`^[0-9]*(?:>>?|<)(?:&[0-9-]|[^&<>].*)?$`)
+	bareRedirect = regexp.MustCompile(`^[0-9]*(?:>>?|<)$`)
+	safeName     = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.+-]*$`)
 )
 
 // shellExpansion holds the characters through which a shell word can stand
 // for something other than itself.
-const shellExpansion = "$`*?[]{}()~\\\"'<>"
+const shellExpansion = "$`*?[]{}()~\\\"'<>&;|"
 
-// scriptChmods records the literal "chmod MODE PATH..." commands of a
-// maintainer script: an octal or u+s/g+s mode and absolute paths, each
-// optionally in plain quotes. A command with any variable, substitution,
-// glob, brace or escape among its arguments counts for none of them;
-// recursive changes are ignored.
-func (c *control) scriptChmods(script string) {
+// scriptWords splits a maintainer script into the words of its simple
+// commands, without comments and redirections.
+func scriptWords(script string) [][]string {
+	var out [][]string
 	for _, line := range strings.Split(script, "\n") {
 		if i := strings.IndexByte(line, '#'); i >= 0 {
 			line = line[:i]
 		}
-		for _, cmd := range strings.FieldsFunc(line, func(r rune) bool { return r == ';' || r == '&' || r == '|' }) {
+		for _, cmd := range shellSeparator.Split(line, -1) {
+			var words []string
 			f := strings.Fields(cmd)
-			i := slices.IndexFunc(f, func(s string) bool { return s == "chmod" || strings.HasSuffix(s, "/chmod") })
-			if i < 0 {
-				continue
-			}
-			args := f[i+1:]
-			for len(args) > 0 && strings.HasPrefix(args[0], "-") {
-				if args[0] != "-f" && args[0] != "--" {
-					args = nil // -R and friends: not a single file's mode
-					break
+			for i := 0; i < len(f); i++ {
+				switch {
+				case bareRedirect.MatchString(f[i]):
+					i++ // and its target
+				case redirection.MatchString(f[i]):
+				default:
+					words = append(words, f[i])
 				}
-				args = args[1:]
 			}
-			if len(args) < 2 {
-				continue
+			if len(words) > 0 {
+				out = append(out, words)
 			}
-			var set uint32
-			add, isAdd := addSetBits[args[0]]
-			if !isAdd {
-				if !octalMode.MatchString(args[0]) {
-					continue
-				}
-				m, err := strconv.ParseUint(args[0], 8, 32)
-				if err != nil {
-					continue
-				}
-				set = uint32(m)
-			}
-			paths := make([]string, 0, len(args)-1)
-			for _, p := range args[1:] {
-				if len(p) >= 2 && (p[0] == '"' || p[0] == '\'') && p[len(p)-1] == p[0] {
-					p = p[1 : len(p)-1]
-				}
-				if !validTablePath(p) || strings.ContainsAny(p, shellExpansion) {
-					paths = nil
-					break
-				}
-				paths = append(paths, p)
-			}
-			for _, p := range paths {
-				if isAdd {
-					c.addBits[p] |= add
-				} else if !slices.Contains(c.setModes[p], set) {
-					c.setModes[p] = append(c.setModes[p], set)
+		}
+	}
+	return out
+}
+
+var (
+	// assignLine is an unindented line that only assigns a variable.
+	assignLine = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)=(\S*)$`)
+	// assignAny finds every assignment to a variable anywhere in a line.
+	assignAny = regexp.MustCompile(`(?:^|[\s;&|(!])(?:export\s+|local\s+|readonly\s+|declare\s+(?:-\S+\s+)*)?([A-Za-z_][A-Za-z0-9_]*)\+?=`)
+	// setsVars finds commands that give variables values another way.
+	setsVars = regexp.MustCompile(`(?:^|[\s;&|(!])(?:read|for|unset|local|export|readonly|declare|getopts|typeset)\s+((?:-\S+\s+)*[A-Za-z_][A-Za-z0-9_]*(?:\s+[A-Za-z_][A-Za-z0-9_]*)*)`)
+	// varRef is a whole word that is one variable: $NAME or ${NAME}.
+	varRef = regexp.MustCompile(`^\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})$`)
+)
+
+// scriptConstants returns the script's variables that are constants: set
+// exactly once in the whole script, by an unindented line that does nothing
+// but assign a literal value, and never read, looped over, unset or given a
+// value any other way. Debian maintainer scripts name paths and groups this
+// way ("LAUNCHER=/usr/lib/dbus-1.0/dbus-daemon-launch-helper").
+func scriptConstants(script string) map[string]string {
+	count := map[string]int{}
+	other := map[string]bool{}
+	value := map[string]string{}
+	for _, line := range strings.Split(script, "\n") {
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			line = line[:i]
+		}
+		line = strings.TrimRight(line, " \t\r")
+		for _, m := range assignAny.FindAllStringSubmatch(line, -1) {
+			count[m[1]]++
+		}
+		for _, m := range setsVars.FindAllStringSubmatch(line, -1) {
+			for _, w := range strings.Fields(m[1]) {
+				if !strings.HasPrefix(w, "-") {
+					other[w] = true
 				}
 			}
 		}
+		if m := assignLine.FindStringSubmatch(line); m != nil {
+			if v, ok := literal(m[2], nil); ok {
+				value[m[1]] = v
+			}
+		}
+	}
+	out := map[string]string{}
+	for k, v := range value {
+		if count[k] == 1 && !other[k] {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// literal returns w without one pair of plain surrounding quotes, and
+// whether what remains is free of shell expansion. A whole word that is one
+// of the script's constants ($NAME or ${NAME}, unquoted or in double quotes)
+// is replaced by its value.
+func literal(w string, consts map[string]string) (string, bool) {
+	single := false
+	if len(w) >= 2 && (w[0] == '"' || w[0] == '\'') && w[len(w)-1] == w[0] {
+		single = w[0] == '\''
+		w = w[1 : len(w)-1]
+	}
+	if m := varRef.FindStringSubmatch(w); m != nil && !single {
+		v, ok := consts[m[1]+m[2]]
+		return v, ok
+	}
+	return w, w != "" && !strings.ContainsAny(w, shellExpansion)
+}
+
+// literalPaths returns ws as absolute paths, or nil if any of them is not
+// a literal clean absolute path ("--" is skipped).
+func literalPaths(ws []string, consts map[string]string) []string {
+	var out []string
+	for _, w := range ws {
+		if w == "--" {
+			continue
+		}
+		p, ok := literal(w, consts)
+		if !ok || !validTablePath(p) {
+			return nil
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// scriptCommands records what a maintainer script does to file modes with
+// literal commands: "chmod MODE PATH..." (an octal or u+s/g+s mode) and
+// "dpkg-statoverride [--update] --add OWNER GROUP MODE PATH". Arguments must
+// be literal or one of the script's constants; a command with any other
+// variable, substitution, glob, brace or escape among its arguments counts
+// for none of them; recursive changes are ignored.
+func (c *control) scriptCommands(script string) {
+	consts := scriptConstants(script)
+	for _, f := range scriptWords(script) {
+		cmd := slices.IndexFunc(f, func(s string) bool {
+			return s == "chmod" || strings.HasSuffix(s, "/chmod") || s == "dpkg-statoverride" || strings.HasSuffix(s, "/dpkg-statoverride")
+		})
+		if cmd < 0 {
+			continue
+		}
+		args := f[cmd+1:]
+		if strings.HasSuffix(f[cmd], "dpkg-statoverride") {
+			c.scriptOverride(args, consts)
+			continue
+		}
+		for len(args) > 0 && strings.HasPrefix(args[0], "-") {
+			if args[0] != "-f" && args[0] != "--" {
+				args = nil // -R and friends: not a single file's mode
+				break
+			}
+			args = args[1:]
+		}
+		if len(args) < 2 {
+			continue
+		}
+		var set uint32
+		add, isAdd := addSetBits[args[0]]
+		if !isAdd {
+			if !octalMode.MatchString(args[0]) {
+				continue
+			}
+			m, err := strconv.ParseUint(args[0], 8, 32)
+			if err != nil {
+				continue
+			}
+			set = uint32(m)
+		}
+		for _, p := range literalPaths(args[1:], consts) {
+			if isAdd {
+				c.addBits[p] |= add
+			} else if !slices.Contains(c.setModes[p], set) {
+				c.setModes[p] = append(c.setModes[p], set)
+			}
+		}
+	}
+}
+
+// scriptOverride records "dpkg-statoverride [options] --add OWNER GROUP
+// MODE PATH" when every argument is literal.
+func (c *control) scriptOverride(args []string, consts map[string]string) {
+	var pos []string
+	adding := false
+	for _, a := range args {
+		switch {
+		case a == "--add":
+			adding = true
+		case a == "--update" || a == "--quiet" || strings.HasPrefix(a, "--force"):
+		case strings.HasPrefix(a, "-"):
+			return // --remove, --list, --admindir ... or anything unknown
+		default:
+			pos = append(pos, a)
+		}
+	}
+	if !adding || len(pos) != 4 {
+		return
+	}
+	owner, ok1 := literal(pos[0], consts)
+	group, ok2 := literal(pos[1], consts)
+	mode, ok3 := literal(pos[2], consts)
+	paths := literalPaths(pos[3:], consts)
+	if !ok1 || !ok2 || !ok3 || !safeName.MatchString(owner) || !safeName.MatchString(group) || !octalMode.MatchString(mode) || len(paths) != 1 {
+		return
+	}
+	m, err := strconv.ParseUint(mode, 8, 32)
+	if err != nil {
+		return
+	}
+	o := ScriptOverride{Owner: owner, Group: group, Mode: uint32(m)}
+	if !slices.Contains(c.overrides[paths[0]], o) {
+		c.overrides[paths[0]] = append(c.overrides[paths[0]], o)
 	}
 }
 
@@ -385,6 +558,7 @@ func readData(r io.ReaderAt, m *arMember, ctl *control) (map[string]DebFile, err
 				f.Text = nil
 			}
 			f.ScriptModes = ctl.modesFor(p, f.Mode)
+			f.ScriptOverrides = ctl.overridesFor(p)
 			files[p] = f
 			continue
 		default: // directories, symlinks, devices, FIFOs
@@ -398,6 +572,7 @@ func readData(r io.ReaderAt, m *arMember, ctl *control) (map[string]DebFile, err
 		}
 		f := DebFile{Mode: uint32(hdr.Mode) & 0o7777, Conffile: conffiles[p]}
 		f.ScriptModes = ctl.modesFor(p, f.Mode)
+		f.ScriptOverrides = ctl.overridesFor(p)
 		h := sha256.New()
 		if f.Conffile && hdr.Size <= maxConffileText {
 			b, err := io.ReadAll(io.LimitReader(tr, maxConffileText+1))

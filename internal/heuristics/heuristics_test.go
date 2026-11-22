@@ -345,7 +345,7 @@ func TestPersistLinkFixRemovesDanglingLink(t *testing.T) {
 }
 
 func TestLocalDiversion(t *testing.T) {
-	c := &model.Collection{Packages: model.Packages{Diversions: []model.Diversion{
+	c := &model.Collection{Packages: model.Packages{Installed: []model.Package{{Name: "dash", Status: "install ok installed"}}, Diversions: []model.Diversion{
 		{Path: "/usr/bin/sudo", DivertTo: "/usr/bin/sudo.real", Package: ":"},
 		{Path: "/bin/sh", DivertTo: "/bin/sh.distrib", Package: "dash"},
 		{Path: "/opt/app/bin/x", DivertTo: "/opt/app/bin/x.orig", Package: ":"},
@@ -374,26 +374,51 @@ func TestLocalDiversion(t *testing.T) {
 }
 
 func TestLocalDiversionStockUbuntu(t *testing.T) {
-	c := &model.Collection{Packages: model.Packages{Diversions: []model.Diversion{
-		// Exactly as ubuntu:22.04 and ubuntu:24.04 images record them.
-		{Path: "/usr/bin/man", DivertTo: "/usr/bin/man.REAL", Package: ":"},
-		{Path: "/sbin/initctl", DivertTo: "/sbin/initctl.distrib", Package: ":"},
-		// The same paths diverted anywhere else are not the stock ones.
-		{Path: "/usr/bin/man", DivertTo: "/usr/bin/man.orig", Package: ":"},
-	}}}
-	sev := map[string][]model.Severity{}
+	stock := model.SevNote
+	for _, osid := range []string{"ubuntu", "debian"} {
+		c := &model.Collection{Host: model.Host{OSID: osid}, Packages: model.Packages{Diversions: []model.Diversion{
+			// Exactly as ubuntu:22.04 and ubuntu:24.04 images record them.
+			{Path: "/usr/bin/man", DivertTo: "/usr/bin/man.REAL", Package: ":"},
+			{Path: "/sbin/initctl", DivertTo: "/sbin/initctl.distrib", Package: ":"},
+			// The same paths diverted anywhere else are not the stock ones.
+			{Path: "/usr/bin/man", DivertTo: "/usr/bin/man.orig", Package: ":"},
+		}}}
+		sev := map[string][]model.Severity{}
+		for _, f := range Run(c, model.ScanContext{}, nil) {
+			if f.ID == "TT-HEUR-014" {
+				sev[f.Evidence[0].Detail] = append(sev[f.Evidence[0].Detail], f.Severity)
+			}
+		}
+		for detail, want := range map[string]model.Severity{
+			"local diversion to /usr/bin/man.REAL":     stock,
+			"local diversion to /sbin/initctl.distrib": stock,
+			"local diversion to /usr/bin/man.orig":     model.SevBackdoor,
+		} {
+			if got := sev[detail]; len(got) != 1 || got[0] != want {
+				t.Errorf("%s: %s: severities %v, want %v", osid, detail, got, want)
+			}
+		}
+		stock = model.SevBackdoor // the stock pairs are notes only on Ubuntu
+	}
+}
+
+func TestDiversionByMissingPackage(t *testing.T) {
+	c := &model.Collection{Packages: model.Packages{
+		Installed: []model.Package{{Name: "dash", Status: "install ok installed"}},
+		Diversions: []model.Diversion{
+			{Path: "/usr/bin/sudo", DivertTo: "/usr/bin/sudo.distrib", Package: "ghost"},
+			{Path: "/bin/sh", DivertTo: "/bin/sh.distrib", Package: "dash"},
+		}}}
+	var got []model.Finding
 	for _, f := range Run(c, model.ScanContext{}, nil) {
 		if f.ID == "TT-HEUR-014" {
-			sev[f.Evidence[0].Detail] = append(sev[f.Evidence[0].Detail], f.Severity)
+			got = append(got, f)
 		}
 	}
-	for detail, want := range map[string]model.Severity{
-		"local diversion to /usr/bin/man.REAL":     model.SevNote,
-		"local diversion to /sbin/initctl.distrib": model.SevNote,
-		"local diversion to /usr/bin/man.orig":     model.SevBackdoor,
-	} {
-		if got := sev[detail]; len(got) != 1 || got[0] != want {
-			t.Errorf("%s: severities %v, want %v", detail, got, want)
-		}
+	if len(got) != 1 || got[0].Key != "heur.local_diversion:/usr/bin/sudo" || got[0].Severity != model.SevBackdoor || !strings.Contains(got[0].Title, "ghost") {
+		t.Fatalf("findings %+v", got)
+	}
+	if !strings.Contains(got[0].Fix, "dpkg-divert --package 'ghost' --rename --remove '/usr/bin/sudo'") {
+		t.Errorf("fix %q", got[0].Fix)
 	}
 }

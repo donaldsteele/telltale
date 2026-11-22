@@ -91,8 +91,9 @@ type BundleUnavailable struct {
 // WriteBundle builds a reference bundle in dir (which must be empty or not
 // exist) holding what Verify needs to check the collection's packages with
 // the same Options: the signed indexes and the .debs of every installed
-// package (with OnlyPaths, of the packages listing those paths). Packages it
-// cannot include are listed in bundle.json with the reason. Only signed
+// package (OnlyPaths is ignored: a check limited to changed paths may need
+// every package). Packages it cannot include are listed in bundle.json with
+// the reason. Only signed
 // chains go into a bundle; versions that only sources trusted through HTTPS
 // alone have are left out. It returns an error wrapping ErrBadSignature or
 // ErrHashMismatch, after writing bundle.json, when it met evidence of
@@ -104,7 +105,7 @@ func WriteBundle(ctx context.Context, c *model.Collection, dir string, opt Optio
 	if err := checkBundleDir(dir); err != nil {
 		return err
 	}
-	opt.RefsDir, opt.Offline = "", false
+	opt.RefsDir, opt.Offline, opt.OnlyPaths = "", false, nil
 	res := &Result{Mode: ModeArchive}
 	s := newSession(c, opt, res)
 	s.bw = &bundleWriter{dir: dir, files: map[string]BundleFile{}}

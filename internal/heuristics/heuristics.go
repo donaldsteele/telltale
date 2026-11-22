@@ -554,14 +554,20 @@ func stockUbuntuDiversion(d model.Diversion) bool {
 		(d.Path == stockUbuntuInitctlPath && d.DivertTo == stockUbuntuInitctlDivert)
 }
 
-// localDiversions flags dpkg-divert --local entries for system files: every
-// package's version of the file is installed elsewhere, so whatever sits at
-// the original path is never replaced by updates or checked against a
-// package.
+// localDiversions flags diversions of system files that no installed package
+// stands behind: dpkg-divert --local entries, and diversions in the name of
+// a package that is not installed. Every package's version of the file is
+// installed elsewhere, so whatever sits at the original path is never
+// replaced by updates or checked against a package.
 func localDiversions(c *model.Collection) []model.Finding {
+	installed := map[string]bool{}
+	for _, p := range c.Packages.Installed {
+		installed[p.Name] = true
+	}
 	var out []model.Finding
 	for _, d := range c.Packages.Diversions {
-		if d.Package != model.LocalDiversion {
+		local := d.Package == model.LocalDiversion
+		if !local && installed[d.Package] {
 			continue
 		}
 		system := false
@@ -575,19 +581,28 @@ func localDiversions(c *model.Collection) []model.Finding {
 			continue
 		}
 		sev := model.SevBackdoor
+		title := fmt.Sprintf("%s is locally diverted to %s", d.Path, d.DivertTo)
+		detail := "local diversion to " + d.DivertTo
 		why := "A local dpkg diversion makes every package install its version of this file under another name, so the file at the original path is never replaced by updates and is not the packaged one. Image builders use it (Ubuntu's minimised images divert /usr/bin/man); an attacker can use it to keep a replaced system program in place."
-		if stockUbuntuDiversion(d) {
+		owner := "--local"
+		switch {
+		case !local:
+			title = fmt.Sprintf("%s is diverted to %s by package %s, which is not installed", d.Path, d.DivertTo, d.Package)
+			detail = "diversion to " + d.DivertTo + " by " + d.Package + ", which is not installed"
+			why = "A dpkg diversion in the name of a package that is not installed has nothing behind it: whatever sits at the original path is not the packaged file, and the real one is moved aside. Removing a package removes its diversions, so one left over or added by hand is how a replaced system program can be kept in place."
+			owner = "--package " + sq(d.Package)
+		case c.Host.OSID == "ubuntu" && stockUbuntuDiversion(d):
 			sev = model.SevNote
 			why = "Ubuntu's official images make exactly this local diversion, so it is expected on machines built from them. The file at the original path is not the packaged one and is not checked against a package; if this machine was not built from such an image, treat it as a backdoor sign."
 		}
 		out = append(out, model.Finding{
 			Key: "heur.local_diversion:" + d.Path, ID: idDiversion, Source: source, Severity: sev,
-			Title: fmt.Sprintf("%s is locally diverted to %s", d.Path, d.DivertTo),
+			Title: title,
 			Why:   why,
-			Fix: fix([]string{d.Path, d.DivertTo}, func(q []string) string {
-				return keep(q[0]) + " && { cp -a --parents " + q[1] + " " + evidenceDir + "/ 2>/dev/null || echo 'diverted file not saved (missing or unreadable)'; } && rm " + q[0] + " && dpkg-divert --local --rename --remove " + q[0] + "   # puts the packaged file back; inspect the saved copies first"
+			Fix: fix([]string{d.Path, d.DivertTo, d.Package}, func(q []string) string {
+				return keep(q[0]) + " && { cp -a --parents " + q[1] + " " + evidenceDir + "/ 2>/dev/null || echo 'diverted file not saved (missing or unreadable)'; } && rm " + q[0] + " && dpkg-divert " + owner + " --rename --remove " + q[0] + "   # puts the packaged file back; inspect the saved copies first"
 			}),
-			Evidence: []model.Evidence{{Path: d.Path, Detail: "local diversion to " + d.DivertTo}},
+			Evidence: []model.Evidence{{Path: d.Path, Detail: detail}},
 			Refs:     []string{"T1574", "T1036.005"},
 		})
 	}

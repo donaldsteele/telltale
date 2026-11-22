@@ -1273,13 +1273,25 @@ func TestVerifyDiversions(t *testing.T) {
 			t.Errorf("/usr/bin/man.REAL verified as %+v", v)
 		}
 	})
-	t.Run("package diversion, file made by the diverting package's scripts", func(t *testing.T) {
+	t.Run("package diversion, diverting package ships no file there", func(t *testing.T) {
+		// Only the machine's own data explains the file: suspicious.
 		f := manFixture(t, false)
 		res := Verify(context.Background(), manCollection(model.Diversion{Path: "/usr/bin/man", DivertTo: "/usr/bin/man.REAL", Package: "manpatch"}), f.opts())
 		wantPaths(t, "Mismatch", res.Mismatch)
+		wantPaths(t, "Unverifiable", res.Unverifiable)
 		wantPaths(t, "Verified", res.Verified, "/usr/bin/man.REAL")
-		if v, ok := find(res.Unverifiable, "/usr/bin/man"); !ok || !strings.Contains(v.Reason, "manpatch") {
-			t.Errorf("Unverifiable = %+v", res.Unverifiable)
+		if v, ok := find(res.Suspicious, "/usr/bin/man"); !ok || v.Reason != "diverted by manpatch, which does not ship this file" || v.Package != "manpatch" {
+			t.Errorf("Suspicious = %+v", res.Suspicious)
+		}
+	})
+	t.Run("forged diversion by a package that is not installed", func(t *testing.T) {
+		f := toolFixture(t)
+		c := toolCollection(map[string]string{"/usr/bin/tool": "evil\n"})
+		c.Packages.Diversions = []model.Diversion{{Path: "/usr/bin/tool", DivertTo: "/usr/bin/tool.distrib", Package: "ghost"}}
+		res := Verify(context.Background(), c, f.opts())
+		wantPaths(t, "Unverifiable", res.Unverifiable)
+		if v, ok := find(res.Suspicious, "/usr/bin/tool"); !ok || v.Reason != "diverted by ghost, which is not installed" {
+			t.Errorf("Suspicious = %+v", res.Suspicious)
 		}
 	})
 	t.Run("local diversion, as Ubuntu's minimised images make", func(t *testing.T) {
@@ -1293,8 +1305,11 @@ func TestVerifyDiversions(t *testing.T) {
 	})
 }
 
+// cronPostinst is how Debian's cron makes crontab setgid.
+const cronPostinst = "#!/bin/sh\nset -e\ndpkg-statoverride --update --add root crontab 2755 /usr/bin/crontab\n"
+
 func TestVerifyFileModes(t *testing.T) {
-	crontab := buildDeb(t, "xz", nil, []debEntry{{name: "./usr/bin/crontab", body: "crontab\n", mode: 0o755}})
+	crontab := buildDebScript(t, "xz", nil, cronPostinst, []debEntry{{name: "./usr/bin/crontab", body: "crontab\n", mode: 0o755}})
 	passwd := buildDeb(t, "xz", nil, []debEntry{
 		{name: "./usr/bin/chfn", body: "chfn\n", mode: 0o4755},
 		{name: "./usr/lib/x86_64-linux-gnu/libpw.so.1", body: "pw\n", mode: 0o644},
@@ -1303,7 +1318,8 @@ func TestVerifyFileModes(t *testing.T) {
 	c := collectionOf(toolDisk(map[string]string{"/usr/bin/crontab": "crontab\n"}), toolPackage(),
 		model.Package{Name: "cron", Version: "3.0", Arch: "amd64", Status: "install ok installed", Files: []string{"/usr/bin/crontab"}},
 		model.Package{Name: "passwd", Version: "1", Arch: "amd64", Status: "install ok installed", Files: []string{"/usr/bin/chfn", libDir + "/libpw.so.1"}})
-	// cron's maintainer script makes crontab setgid through dpkg-statoverride.
+	// cron's signed maintainer script makes crontab setgid through
+	// dpkg-statoverride.
 	withFile(c, model.FileEntry{Path: "/usr/bin/crontab", Type: "file", SHA256: sha256hex([]byte("crontab\n")), Mode: 0o102755})
 	c.Packages.StatOverrides = []model.StatOverride{{Path: "/usr/bin/crontab", Owner: "root", Group: "crontab", Mode: 0o2755}}
 	// Someone made tool setuid root: added privilege.
@@ -1339,6 +1355,45 @@ func TestVerifyFileModes(t *testing.T) {
 	res = Verify(context.Background(), c, f.opts())
 	if m, ok := find(res.Mismatch, "/usr/bin/crontab"); !ok || m.Reason != "mode differs: deb 0755, disk 2755" {
 		t.Errorf("Mismatch = %+v", res.Mismatch)
+	}
+}
+
+func TestVerifyStatOverrideForgery(t *testing.T) {
+	passwd := buildDeb(t, "xz", nil, []debEntry{{name: "./usr/bin/chfn", body: "chfn\n", mode: 0o4755}})
+	crontab := buildDeb(t, "xz", nil, []debEntry{{name: "./usr/bin/crontab", body: "crontab\n", mode: 0o755}}) // no maintainer script
+	f := newFixture(t, map[string][]fakePkg{"bookworm": {{"cron", "3.0", "amd64", crontab}, {"passwd", "1", "amd64", passwd}, {"tool", "1.0-1", "amd64", toolDeb(t, "xz")}}})
+	c := collectionOf(toolDisk(map[string]string{"/usr/bin/crontab": "crontab\n", "/usr/bin/chfn": "chfn\n"}), toolPackage(),
+		model.Package{Name: "cron", Version: "3.0", Arch: "amd64", Status: "install ok installed", Files: []string{"/usr/bin/crontab"}},
+		model.Package{Name: "passwd", Version: "1", Arch: "amd64", Status: "install ok installed", Files: []string{"/usr/bin/chfn"}})
+	mode := func(p, body string, m uint32) {
+		withFile(c, model.FileEntry{Path: p, Type: "file", SHA256: sha256hex([]byte(body)), Mode: 0o100000 | m})
+	}
+	mode("/usr/bin/tool", toolBin, 0o4755)
+	mode(libDir+"/libtool.so.1", toolLib, 0o666)
+	mode("/usr/bin/crontab", "crontab\n", 0o2755)
+	mode("/usr/bin/chfn", "chfn\n", 0o755)
+	// Root can write statoverride entries that explain any mode.
+	c.Packages.StatOverrides = []model.StatOverride{
+		{Path: "/usr/bin/tool", Owner: "root", Group: "root", Mode: 0o4755},
+		{Path: libDir + "/libtool.so.1", Owner: "root", Group: "root", Mode: 0o666},
+		{Path: "/usr/bin/crontab", Owner: "root", Group: "crontab", Mode: 0o2755},
+		// Removing privilege with a statoverride is fine.
+		{Path: "/usr/bin/chfn", Owner: "root", Group: "root", Mode: 0o755},
+	}
+	res := Verify(context.Background(), c, f.opts())
+	wantPaths(t, "Mismatch", res.Mismatch)
+	wantPaths(t, "Suspicious", res.Suspicious, "/usr/bin/crontab", "/usr/bin/tool", libDir+"/libtool.so.1")
+	for p, want := range map[string]string{
+		"/usr/bin/tool":          "privilege granted by a local statoverride: deb 0755, disk 4755",
+		libDir + "/libtool.so.1": "privilege granted by a local statoverride: deb 0644, disk 0666",
+		"/usr/bin/crontab":       "privilege granted by a local statoverride: deb 0755, disk 2755",
+	} {
+		if v, _ := find(res.Suspicious, p); v.Reason != want || v.Expected == "" || v.Actual != v.Expected {
+			t.Errorf("%s: %+v, want reason %q", p, v, want)
+		}
+	}
+	if v, ok := find(res.Verified, "/usr/bin/chfn"); !ok || v.Reason != "mode differs (less permissive): deb 4755, disk 0755" {
+		t.Errorf("chfn: %+v (found %v)", v, ok)
 	}
 }
 
@@ -1442,6 +1497,15 @@ if [ "$1" = configure ]; then
 	chmod $MODE /usr/bin/other
 	chmod 4755 "${PREFIX}/usr/bin/other"
 	chmod 4755 $(which other) /usr/bin/other2
+	chmod 4750 /usr/bin/quiet 2>/dev/null || true
+	chmod 2750 -- /usr/bin/dashed
+	chmod 4711 /usr/bin/both >/dev/null 2>&1
+	dpkg-statoverride --update --add root crontab 2755 /usr/bin/crontab
+	dpkg-statoverride --quiet --add root "mail" 2755 '/usr/sbin/sendmail' || true
+	dpkg-statoverride --update --add root $GROUP 2755 /usr/bin/other
+	dpkg-statoverride --add root root 4755 /usr/bin/oth*
+	dpkg-statoverride --list /usr/bin/agent
+	dpkg-statoverride --remove /usr/bin/other2
 fi
 `
 
@@ -1452,6 +1516,11 @@ func TestDebFilesScriptModes(t *testing.T) {
 		{name: "./usr/bin/ping", body: "ping\n", mode: 0o755},
 		{name: "./usr/bin/other", body: "other\n", mode: 0o755},
 		{name: "./usr/bin/other2", body: "other2\n", mode: 0o755},
+		{name: "./usr/bin/quiet", body: "q\n", mode: 0o755},
+		{name: "./usr/bin/dashed", body: "d\n", mode: 0o755},
+		{name: "./usr/bin/both", body: "b\n", mode: 0o755},
+		{name: "./usr/bin/crontab", body: "c\n", mode: 0o755},
+		{name: "./usr/sbin/sendmail", body: "s\n", mode: 0o755},
 	})
 	files, err := DebFiles(bytes.NewReader(deb), int64(len(deb)))
 	if err != nil {
@@ -1463,9 +1532,24 @@ func TestDebFilesScriptModes(t *testing.T) {
 		"/usr/bin/ping":       {0o4755}, // u+s on the packaged 0755
 		"/usr/bin/other":      nil,      // only computed or globbed chmods name it
 		"/usr/bin/other2":     nil,      // in a chmod that also has a computed argument
+		"/usr/bin/quiet":      {0o4750}, // a redirection and "|| true" do not matter
+		"/usr/bin/dashed":     {0o2750}, // "chmod MODE -- PATH"
+		"/usr/bin/both":       {0o4711},
 	} {
 		if got := files[p].ScriptModes; !slices.Equal(got, want) {
 			t.Errorf("%s: ScriptModes = %o, want %o", p, got, want)
+		}
+	}
+	for p, want := range map[string][]ScriptOverride{
+		"/usr/bin/crontab":    {{Owner: "root", Group: "crontab", Mode: 0o2755}},
+		"/usr/sbin/sendmail":  {{Owner: "root", Group: "mail", Mode: 0o2755}},
+		"/usr/bin/other":      nil, // a variable group
+		"/usr/bin/other2":     nil, // --remove, --list
+		"/usr/bin/agent":      nil,
+		"/usr/bin/fusermount": nil,
+	} {
+		if got := files[p].ScriptOverrides; !slices.Equal(got, want) {
+			t.Errorf("%s: ScriptOverrides = %+v, want %+v", p, got, want)
 		}
 	}
 }
@@ -1523,49 +1607,198 @@ func TestDebFilesBackslashNames(t *testing.T) {
 }
 
 func TestModeDiff(t *testing.T) {
-	s := &session{overrides: map[string]model.StatOverride{"/usr/bin/crontab": {Path: "/usr/bin/crontab", Mode: 0o2755}}}
+	s := &session{overrides: map[string]model.StatOverride{
+		"/usr/bin/crontab": {Path: "/usr/bin/crontab", Owner: "root", Group: "crontab", Mode: 0o2755},
+		"/usr/bin/chfn":    {Path: "/usr/bin/chfn", Owner: "root", Group: "root", Mode: 0o755},
+		"/usr/bin/y":       {Path: "/usr/bin/y", Owner: "root", Group: "root", Mode: 0o750},
+		"/usr/bin/agent2":  {Path: "/usr/bin/agent2", Owner: "root", Group: "_ssh", Mode: 0o2755},
+	}}
+	const V, M, S = verdictVerified, verdictMismatch, verdictSuspicious
+	cronScript := []ScriptOverride{{Owner: "root", Group: "crontab", Mode: 0o2755}}
 	for _, c := range []struct {
-		path     string
-		disk     uint32
-		deb      DebFile
-		reason   string
-		mismatch bool
+		path   string
+		disk   uint32
+		deb    DebFile
+		reason string
+		kind   verdictKind
 	}{
-		{"/usr/bin/x", 0o100755, DebFile{Mode: 0o755}, "", false},
+		{"/usr/bin/x", 0o100755, DebFile{Mode: 0o755}, "", V},
 		// Added privilege: setuid, setgid, sticky, group or other write.
-		{"/usr/bin/x", 0o104755, DebFile{Mode: 0o755}, "mode differs: deb 0755, disk 4755", true},
-		{"/usr/bin/x", 0o102755, DebFile{Mode: 0o755}, "mode differs: deb 0755, disk 2755", true},
-		{"/usr/bin/x", 0o101755, DebFile{Mode: 0o755}, "mode differs: deb 0755, disk 1755", true},
-		{"/usr/bin/x", 0o100775, DebFile{Mode: 0o755}, "mode differs: deb 0755, disk 0775", true},
-		{"/usr/share/x", 0o100666, DebFile{Mode: 0o644}, "mode differs: deb 0644, disk 0666", true},
+		{"/usr/bin/x", 0o104755, DebFile{Mode: 0o755}, "mode differs: deb 0755, disk 4755", M},
+		{"/usr/bin/x", 0o102755, DebFile{Mode: 0o755}, "mode differs: deb 0755, disk 2755", M},
+		{"/usr/bin/x", 0o101755, DebFile{Mode: 0o755}, "mode differs: deb 0755, disk 1755", M},
+		{"/usr/bin/x", 0o100775, DebFile{Mode: 0o755}, "mode differs: deb 0755, disk 0775", M},
+		{"/usr/share/x", 0o100666, DebFile{Mode: 0o644}, "mode differs: deb 0644, disk 0666", M},
 		// Swapping setuid for setgid still adds a bit.
-		{"/usr/bin/x", 0o102755, DebFile{Mode: 0o4755}, "mode differs: deb 4755, disk 2755", true},
+		{"/usr/bin/x", 0o102755, DebFile{Mode: 0o4755}, "mode differs: deb 4755, disk 2755", M},
 		// Only removed bits: noted.
-		{"/usr/bin/chfn", 0o100755, DebFile{Mode: 0o4755}, "mode differs (less permissive): deb 4755, disk 0755", false},
-		{"/usr/bin/x", 0o100700, DebFile{Mode: 0o755}, "mode differs (less permissive): deb 0755, disk 0700", false},
+		{"/usr/bin/x", 0o100755, DebFile{Mode: 0o4755}, "mode differs (less permissive): deb 4755, disk 0755", V},
+		{"/usr/bin/x", 0o100700, DebFile{Mode: 0o755}, "mode differs (less permissive): deb 0755, disk 0700", V},
 		// Bits that grant nothing to others (owner write, execute) are
 		// noted too.
-		{"/usr/share/x", 0o100755, DebFile{Mode: 0o644}, "mode differs: deb 0644, disk 0755", false},
-		// Maintainer-script modes and statoverrides.
-		{"/usr/bin/agent", 0o102755, DebFile{Mode: 0o755, ScriptModes: []uint32{0o2755}}, "", false},
-		{"/usr/bin/agent", 0o100755, DebFile{Mode: 0o755, ScriptModes: []uint32{0o2755}}, "", false},
-		{"/usr/bin/agent", 0o104755, DebFile{Mode: 0o755, ScriptModes: []uint32{0o2755}}, "mode differs: deb 0755 (maintainer script sets 2755), disk 4755", true},
-		{"/usr/bin/agent", 0o100711, DebFile{Mode: 0o755, ScriptModes: []uint32{0o2755}}, "mode differs (less permissive): deb 0755, disk 0711", false},
-		{"/usr/bin/agent", 0o100755, DebFile{Mode: 0o4755, ScriptModes: []uint32{0o2755}}, "mode differs (less permissive): deb 4755, disk 0755", false},
-		{"/usr/bin/crontab", 0o102755, DebFile{Mode: 0o755}, "", false},
-		{"/usr/bin/crontab", 0o100755, DebFile{Mode: 0o755}, "mode differs (less permissive): statoverride 2755, disk 0755", false},
-		{"/usr/bin/crontab", 0o106755, DebFile{Mode: 0o755}, "mode differs: statoverride 2755, disk 6755", true},
+		{"/usr/share/x", 0o100755, DebFile{Mode: 0o644}, "mode differs: deb 0644, disk 0755", V},
+		// Maintainer-script modes.
+		{"/usr/bin/agent", 0o102755, DebFile{Mode: 0o755, ScriptModes: []uint32{0o2755}}, "", V},
+		{"/usr/bin/agent", 0o100755, DebFile{Mode: 0o755, ScriptModes: []uint32{0o2755}}, "", V},
+		{"/usr/bin/agent", 0o104755, DebFile{Mode: 0o755, ScriptModes: []uint32{0o2755}}, "mode differs: deb 0755 (maintainer script sets 2755), disk 4755", M},
+		{"/usr/bin/agent", 0o100711, DebFile{Mode: 0o755, ScriptModes: []uint32{0o2755}}, "mode differs (less permissive): deb 0755, disk 0711", V},
+		{"/usr/bin/agent", 0o100755, DebFile{Mode: 0o4755, ScriptModes: []uint32{0o2755}}, "mode differs (less permissive): deb 4755, disk 0755", V},
+		// A local statoverride that grants privilege the package never
+		// gives: only the machine's own data explains the mode.
+		{"/usr/bin/crontab", 0o102755, DebFile{Mode: 0o755}, "privilege granted by a local statoverride: deb 0755, disk 2755", S},
+		{"/usr/bin/crontab", 0o100755, DebFile{Mode: 0o755}, "", V},
+		{"/usr/bin/crontab", 0o106755, DebFile{Mode: 0o755}, "mode differs: deb 0755, disk 6755", M},
+		{"/usr/bin/crontab", 0o102755, DebFile{Mode: 0o755, ScriptOverrides: []ScriptOverride{{Owner: "root", Group: "root", Mode: 0o2755}}}, "privilege granted by a local statoverride: deb 0755, disk 2755", S},
+		// ... unless the package's own maintainer script adds exactly it.
+		{"/usr/bin/crontab", 0o102755, DebFile{Mode: 0o755, ScriptOverrides: cronScript}, "", V},
+		{"/usr/bin/crontab", 0o100755, DebFile{Mode: 0o755, ScriptOverrides: cronScript}, "mode differs (less permissive): statoverride 2755, disk 0755", V},
+		{"/usr/bin/crontab", 0o106755, DebFile{Mode: 0o755, ScriptOverrides: cronScript}, "mode differs: statoverride 2755, disk 6755", M},
+		// ... or a postinst chmod already gives that privilege.
+		{"/usr/bin/agent2", 0o102755, DebFile{Mode: 0o755, ScriptModes: []uint32{0o2755}}, "", V},
+		// A statoverride that removes privilege is fine; the mode is
+		// then what it says.
+		{"/usr/bin/chfn", 0o100755, DebFile{Mode: 0o4755}, "mode differs (less permissive): deb 4755, disk 0755", V},
+		{"/usr/bin/chfn", 0o104755, DebFile{Mode: 0o4755}, "mode differs: statoverride 0755, disk 4755", M},
+		{"/usr/bin/y", 0o100750, DebFile{Mode: 0o755}, "mode differs (less permissive): deb 0755, disk 0750", V},
 	} {
-		reason, mismatch := s.modeDiff(c.path, c.disk, c.deb)
-		if reason != c.reason || mismatch != c.mismatch {
-			t.Errorf("%s disk %o deb %+v: got %q %v, want %q %v", c.path, c.disk, c.deb, reason, mismatch, c.reason, c.mismatch)
+		reason, kind := s.modeDiff(c.path, c.disk, c.deb)
+		if reason != c.reason || kind != c.kind {
+			t.Errorf("%s disk %o deb %+v: got %q %v, want %q %v", c.path, c.disk, c.deb, reason, kind, c.reason, c.kind)
 		}
 	}
 }
 
 func TestModeDiffPrefersExactScriptMode(t *testing.T) {
 	s := &session{overrides: map[string]model.StatOverride{}}
-	if r, bad := s.modeDiff("/usr/bin/x", 0o100711, DebFile{Mode: 0o755, ScriptModes: []uint32{0o711}}); r != "" || bad {
-		t.Errorf("got %q %v, want an exact match with the script's mode", r, bad)
+	if r, kind := s.modeDiff("/usr/bin/x", 0o100711, DebFile{Mode: 0o755, ScriptModes: []uint32{0o711}}); r != "" || kind != verdictVerified {
+		t.Errorf("got %q %v, want an exact match with the script's mode", r, kind)
+	}
+}
+
+// onlyPathsFixture serves tool and an unrelated package, so a test can tell
+// whether every installed package was fetched (the fallback) or not.
+func onlyPathsFixture(t *testing.T) (*fixture, string) {
+	t.Helper()
+	other := buildDeb(t, "xz", nil, []debEntry{{name: "./usr/bin/otherbin", body: "other\n", mode: 0o755}})
+	f := newFixture(t, map[string][]fakePkg{"bookworm": {{"tool", "1.0-1", "amd64", toolDeb(t, "xz")}, {"other", "1", "amd64", other}}})
+	return f, "/debian/" + poolName(fakePkg{"other", "1", "amd64", nil})
+}
+
+func onlyPathsCollection(tool model.Package, extra ...model.Package) *model.Collection {
+	other := model.Package{Name: "other", Version: "1", Arch: "amd64", Status: "install ok installed", Files: []string{"/usr/bin/otherbin"}}
+	return collectionOf(toolDisk(map[string]string{"/usr/bin/tool": "evil\n", "/usr/bin/otherbin": "other\n"}), append([]model.Package{tool, other}, extra...)...)
+}
+
+func TestVerifyOnlyPathsHiddenOwner(t *testing.T) {
+	trimmed := toolPackage()
+	trimmed.Files = []string{"/usr/share/doc/tool/README"}
+	moved := toolPackage()
+	moved.Files = slices.DeleteFunc(moved.Files, func(s string) bool { return s == "/usr/bin/tool" })
+	helper := model.Package{Name: "aaa-helper", Version: "1.0", Arch: "amd64", Status: "install ok installed", Files: []string{"/usr/bin/tool"}}
+	changed := map[string]bool{"/usr/bin/tool": true}
+
+	t.Run("trimmed list, warm cache: the cached table places the file", func(t *testing.T) {
+		f, otherDeb := onlyPathsFixture(t)
+		cache := t.TempDir()
+		warm := f.opts()
+		warm.CacheDir = cache
+		Verify(context.Background(), toolCollection(nil), warm) // caches tool's table only
+		toolDebPath := "/debian/" + poolName(fakePkg{"tool", "1.0-1", "amd64", nil})
+		before := f.srv.hitCount(toolDebPath)
+
+		opt := warm
+		opt.OnlyPaths = changed
+		res := Verify(context.Background(), onlyPathsCollection(trimmed), opt)
+		wantPaths(t, "Mismatch", res.Mismatch, "/usr/bin/tool")
+		if m, _ := find(res.Mismatch, "/usr/bin/tool"); m.Package != "tool" {
+			t.Errorf("mismatch %+v", m)
+		}
+		if n := f.srv.hitCount(toolDebPath) - before; n != 0 {
+			t.Errorf("tool's .deb fetched %d times; the cached table should have placed the file", n)
+		}
+		if n := f.srv.hitCount(otherDeb); n != 0 {
+			t.Errorf("fell back to every package (other's .deb fetched %d times)", n)
+		}
+	})
+	t.Run("trimmed list, no cache: falls back to every package", func(t *testing.T) {
+		f, otherDeb := onlyPathsFixture(t)
+		opt := f.opts()
+		opt.OnlyPaths = changed
+		res := Verify(context.Background(), onlyPathsCollection(trimmed), opt)
+		wantPaths(t, "Mismatch", res.Mismatch, "/usr/bin/tool")
+		if f.srv.hitCount(otherDeb) != 1 {
+			t.Errorf("other's .deb fetched %d times, want the fallback to fetch it", f.srv.hitCount(otherDeb))
+		}
+		// Only the changed path is judged.
+		wantPaths(t, "Verified", res.Verified)
+	})
+	t.Run("path moved to a fake package's list, no cache", func(t *testing.T) {
+		f, _ := onlyPathsFixture(t)
+		opt := f.opts()
+		opt.OnlyPaths = changed
+		res := Verify(context.Background(), onlyPathsCollection(moved, helper), opt)
+		wantPaths(t, "Mismatch", res.Mismatch, "/usr/bin/tool")
+		wantPaths(t, "Unverifiable", res.Unverifiable)
+	})
+	t.Run("changed file that is nobody's: fallback, then left to the judge", func(t *testing.T) {
+		f, _ := onlyPathsFixture(t)
+		opt := f.opts()
+		opt.OnlyPaths = map[string]bool{"/usr/local/bin/mine": true}
+		c := withFile(onlyPathsCollection(toolPackage()), regular("/usr/local/bin/mine", "mine\n", 0o755))
+		res := Verify(context.Background(), c, opt)
+		if n := len(res.Verified) + len(res.Mismatch) + len(res.Unverifiable) + len(res.Suspicious); n != 0 {
+			t.Errorf("%d verdicts for an unowned file", n)
+		}
+	})
+}
+
+// dbusPostinst is Debian dbus 1.16.2-2's: the override goes through
+// variables set once at the top of the script.
+const dbusPostinst = `#!/bin/sh
+set -e
+
+MESSAGEUSER=messagebus
+LAUNCHER=/usr/lib/dbus-1.0/dbus-daemon-launch-helper
+TWICE=/usr/bin/a
+ONCEINDENTED=/usr/bin/b
+READ=/usr/bin/c
+
+if [ "$1" = configure ]; then
+    if ! dpkg-statoverride --list "$LAUNCHER" >/dev/null; then
+        dpkg-statoverride --update --add root "$MESSAGEUSER" 4754 "$LAUNCHER"
+    fi
+    TWICE=/usr/bin/elsewhere
+    dpkg-statoverride --update --add root root 4755 "$TWICE"
+      INDENTED=/usr/bin/b
+    dpkg-statoverride --update --add root root 4755 "$INDENTED"
+    read READ < /etc/somewhere
+    chmod 4755 "$READ"
+    chmod 4755 "${LAUNCHER}x"
+    chmod 4711 "${LAUNCHER}"
+fi
+`
+
+func TestDebFilesScriptConstants(t *testing.T) {
+	deb := buildDebScript(t, "xz", nil, dbusPostinst, []debEntry{
+		{name: "./usr/lib/dbus-1.0/dbus-daemon-launch-helper", body: "h\n", mode: 0o755},
+		{name: "./usr/bin/a", body: "a\n", mode: 0o755},
+		{name: "./usr/bin/b", body: "b\n", mode: 0o755},
+		{name: "./usr/bin/c", body: "c\n", mode: 0o755},
+	})
+	files, err := DebFiles(bytes.NewReader(deb), int64(len(deb)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := files["/usr/lib/dbus-1.0/dbus-daemon-launch-helper"]
+	if want := []ScriptOverride{{Owner: "root", Group: "messagebus", Mode: 0o4754}}; !slices.Equal(helper.ScriptOverrides, want) {
+		t.Errorf("helper ScriptOverrides = %+v, want %+v", helper.ScriptOverrides, want)
+	}
+	if want := []uint32{0o4711}; !slices.Equal(helper.ScriptModes, want) {
+		t.Errorf("helper ScriptModes = %o, want %o (only the whole-word ${LAUNCHER})", helper.ScriptModes, want)
+	}
+	for _, p := range []string{"/usr/bin/a", "/usr/bin/b", "/usr/bin/c", "/usr/bin/elsewhere"} {
+		if f := files[p]; f.ScriptOverrides != nil || f.ScriptModes != nil {
+			t.Errorf("%s: %+v; a variable assigned twice, indented or read is not a constant", p, f)
+		}
 	}
 }

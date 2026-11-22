@@ -115,12 +115,17 @@ type Options struct {
 
 // Result is the outcome of verifying a collection's files.
 type Result struct {
-	Mode         string         `json:"mode"`
-	Verified     []FileVerdict  `json:"verified,omitempty"`
-	Mismatch     []FileVerdict  `json:"mismatch,omitempty"`
-	Unverifiable []FileVerdict  `json:"unverifiable,omitempty"`
-	Conffiles    []ConffileDiff `json:"conffiles,omitempty"`
-	SourcesUsed  []string       `json:"sources_used,omitempty"`
+	Mode         string        `json:"mode"`
+	Verified     []FileVerdict `json:"verified,omitempty"`
+	Mismatch     []FileVerdict `json:"mismatch,omitempty"`
+	Unverifiable []FileVerdict `json:"unverifiable,omitempty"`
+	// Suspicious files are not cleanly verified because only data on the
+	// examined machine explains them: a diversion by a package that is not
+	// installed or does not ship the file, or a local statoverride that
+	// grants privilege the package never gives.
+	Suspicious  []FileVerdict  `json:"suspicious,omitempty"`
+	Conffiles   []ConffileDiff `json:"conffiles,omitempty"`
+	SourcesUsed []string       `json:"sources_used,omitempty"`
 	// Errors lists problems, most serious first: the offline warning, then
 	// evidence of tampering ("BAD SIGNATURE", "HASH MISMATCH"), then
 	// sources that could not be read.
@@ -184,7 +189,7 @@ func Verify(ctx context.Context, c *model.Collection, opt Options) *Result {
 		return res
 	}
 	plans := s.plan()
-	if len(plans) == 0 {
+	if len(plans) == 0 && !s.changedFiles() {
 		return res
 	}
 	results := newResults(plans)
@@ -197,9 +202,59 @@ func Verify(ctx context.Context, c *model.Collection, opt Options) *Result {
 		s.loadIndexes(ctx, s.indexWanted(plans))
 		results = s.addCachedTables(results)
 		s.run(ctx, results)
+		// A changed file no loaded table places may belong to a package
+		// whose file list was edited to hide it: check every package.
+		if s.opt.OnlyPaths != nil && s.unplacedChange(results) {
+			results = s.addAllInstalled(results)
+			s.run(ctx, results)
+		}
 	}
 	s.judge(results)
 	return res
+}
+
+// changedFiles reports whether OnlyPaths names any collected regular file
+// or symlink.
+func (s *session) changedFiles() bool {
+	for p := range s.opt.OnlyPaths {
+		if e := s.files[p]; e != nil && (isRegular(e) || e.Type == "symlink") {
+			return true
+		}
+	}
+	return false
+}
+
+// unplacedChange reports whether a changed in-scope regular file is placed
+// by none of the loaded tables.
+func (s *session) unplacedChange(results []*pkgResult) bool {
+	idx := s.placeTables(results)
+	for p := range s.opt.OnlyPaths {
+		e := s.files[p]
+		if e == nil || !isRegular(e) || len(idx[p]) > 0 {
+			continue
+		}
+		if s.opt.Full || InScope(p, e.Mode) {
+			return true
+		}
+	}
+	return false
+}
+
+// addAllInstalled adds every installed package not yet in results.
+func (s *session) addAllInstalled(results []*pkgResult) []*pkgResult {
+	have := map[PkgKey]bool{}
+	for _, r := range results {
+		have[PkgKey{r.pkg.Name, r.pkg.Version, r.pkg.Arch}] = true
+	}
+	for i := range s.c.Packages.Installed {
+		p := &s.c.Packages.Installed[i]
+		k := PkgKey{p.Name, p.Version, p.Arch}
+		if filesInstalled(p.Status) && !have[k] {
+			have[k] = true
+			results = append(results, &pkgResult{pkg: p})
+		}
+	}
+	return results
 }
 
 // pkgResult is what became of one installed package.
@@ -228,6 +283,8 @@ type session struct {
 	owners    map[string]string
 	divs      map[string]model.Diversion    // by original path
 	overrides map[string]model.StatOverride // by path
+	installed map[string]bool               // package names
+	byName    map[string]*pkgResult         // set by judge
 
 	archives []*Archive
 	third    []thirdSource
@@ -283,6 +340,12 @@ func newSession(c *model.Collection, opt Options, res *Result) *session {
 	}
 	for _, o := range c.Packages.StatOverrides {
 		s.overrides[o.Path] = o
+	}
+	s.installed = map[string]bool{}
+	for _, p := range c.Packages.Installed {
+		if filesInstalled(p.Status) {
+			s.installed[p.Name] = true
+		}
 	}
 	return s
 }
@@ -375,10 +438,10 @@ func (s *session) listsChanged(p *model.Package) bool {
 }
 
 // indexWanted returns the packages to look up in the indexes: the planned
-// ones, plus with OnlyPaths and a cache every installed package, whose
-// cached table may hold a changed path.
+// ones, plus with OnlyPaths every installed package, whose cached table may
+// hold a changed path or which the fallback to every package may need.
 func (s *session) indexWanted(plans []*model.Package) []*model.Package {
-	if s.opt.OnlyPaths == nil || s.opt.CacheDir == "" || s.bw != nil {
+	if s.opt.OnlyPaths == nil || s.bw != nil {
 		return plans
 	}
 	var out []*model.Package
@@ -903,6 +966,57 @@ type expect struct {
 // a file a package lists but no signed package ships, or one belonging to a
 // package that could not be checked.
 func (s *session) judge(results []*pkgResult) {
+	idx := s.placeTables(results)
+	listers := map[string][]*pkgResult{}
+	for _, r := range results {
+		for _, f := range r.pkg.Files {
+			listers[f] = append(listers[f], r)
+			if a := usrAlias(f); a != "" {
+				listers[a] = append(listers[a], r)
+			}
+		}
+	}
+	s.byName = map[string]*pkgResult{}
+	for _, r := range results {
+		if _, dup := s.byName[r.pkg.Name]; !dup || r.table != nil {
+			s.byName[r.pkg.Name] = r
+		}
+	}
+
+	var verified, mismatch, unverifiable, suspicious []FileVerdict
+	var diffs []ConffileDiff
+	seen := map[string]bool{}
+	for i := range s.c.Files {
+		e := &s.c.Files[i]
+		if seen[e.Path] || (s.opt.OnlyPaths != nil && !s.opt.OnlyPaths[e.Path]) {
+			continue
+		}
+		seen[e.Path] = true
+		v, d, kind := s.judgeFile(e, idx[e.Path], listers[e.Path])
+		switch kind {
+		case verdictVerified:
+			verified = append(verified, v)
+		case verdictMismatch:
+			mismatch = append(mismatch, v)
+		case verdictUnverifiable:
+			unverifiable = append(unverifiable, v)
+		case verdictSuspicious:
+			suspicious = append(suspicious, v)
+		case verdictConffile:
+			diffs = append(diffs, d)
+		}
+	}
+	s.res.Verified = append(s.res.Verified, verified...)
+	s.res.Mismatch = append(s.res.Mismatch, mismatch...)
+	s.res.Unverifiable = append(s.res.Unverifiable, unverifiable...)
+	s.res.Suspicious = append(s.res.Suspicious, suspicious...)
+	s.res.Conffiles = append(s.res.Conffiles, diffs...)
+}
+
+// placeTables maps each install path to the signed files dpkg puts there:
+// a package's file at a path another party diverts goes to the divert-to
+// path, and both merged-/usr spellings are entered.
+func (s *session) placeTables(results []*pkgResult) map[string][]expect {
 	idx := map[string][]expect{}
 	place := func(at string, x expect) {
 		idx[at] = append(idx[at], x)
@@ -927,41 +1041,7 @@ func (s *session) judge(results []*pkgResult) {
 			return xs[i].path < xs[j].path
 		})
 	}
-	listers := map[string][]*pkgResult{}
-	for _, r := range results {
-		for _, f := range r.pkg.Files {
-			listers[f] = append(listers[f], r)
-			if a := usrAlias(f); a != "" {
-				listers[a] = append(listers[a], r)
-			}
-		}
-	}
-
-	var verified, mismatch, unverifiable []FileVerdict
-	var diffs []ConffileDiff
-	seen := map[string]bool{}
-	for i := range s.c.Files {
-		e := &s.c.Files[i]
-		if seen[e.Path] || (s.opt.OnlyPaths != nil && !s.opt.OnlyPaths[e.Path]) {
-			continue
-		}
-		seen[e.Path] = true
-		v, d, kind := s.judgeFile(e, idx[e.Path], listers[e.Path])
-		switch kind {
-		case verdictVerified:
-			verified = append(verified, v)
-		case verdictMismatch:
-			mismatch = append(mismatch, v)
-		case verdictUnverifiable:
-			unverifiable = append(unverifiable, v)
-		case verdictConffile:
-			diffs = append(diffs, d)
-		}
-	}
-	s.res.Verified = append(s.res.Verified, verified...)
-	s.res.Mismatch = append(s.res.Mismatch, mismatch...)
-	s.res.Unverifiable = append(s.res.Unverifiable, unverifiable...)
-	s.res.Conffiles = append(s.res.Conffiles, diffs...)
+	return idx
 }
 
 type verdictKind int
@@ -971,8 +1051,13 @@ const (
 	verdictVerified
 	verdictMismatch
 	verdictUnverifiable
+	verdictSuspicious
 	verdictConffile
 )
+
+func (k verdictKind) String() string {
+	return [...]string{"none", "verified", "mismatch", "unverifiable", "suspicious", "conffile"}[k]
+}
 
 // judgeFile decides one collected entry e, given the signed files placed at
 // its path and the packages whose file lists name it.
@@ -1033,8 +1118,9 @@ func (s *session) judgeFile(e *model.FileEntry, exp []expect, lst []*pkgResult) 
 		return v, ConffileDiff{}, verdictUnverifiable
 	}
 	// The best verdict among the matching shippers: an exact mode, then a
-	// noted mode difference, then added privilege.
-	var noted, modeV FileVerdict
+	// noted mode difference, then privilege only a local statoverride
+	// grants, then added privilege.
+	var noted, susp, modeV FileVerdict
 	matchedConf := false
 	for i := range exp {
 		x := &exp[i]
@@ -1045,14 +1131,17 @@ func (s *session) judgeFile(e *model.FileEntry, exp []expect, lst []*pkgResult) 
 			matchedConf = true
 			continue
 		}
-		why, bad := s.modeDiff(e.Path, e.Mode, x.f)
+		why, kind := s.modeDiff(e.Path, e.Mode, x.f)
 		switch {
-		case why == "":
+		case kind == verdictVerified && why == "":
 			return verdict(x), ConffileDiff{}, verdictVerified
-		case !bad && noted.Reason == "":
+		case kind == verdictVerified && noted.Reason == "":
 			noted = verdict(x)
 			noted.Reason = why
-		case bad && modeV.Reason == "":
+		case kind == verdictSuspicious && susp.Reason == "":
+			susp = verdict(x)
+			susp.Reason = why
+		case kind == verdictMismatch && modeV.Reason == "":
 			modeV = verdict(x)
 			modeV.Reason = why
 		}
@@ -1060,6 +1149,8 @@ func (s *session) judgeFile(e *model.FileEntry, exp []expect, lst []*pkgResult) 
 	switch {
 	case noted.Reason != "":
 		return noted, ConffileDiff{}, verdictVerified
+	case susp.Reason != "":
+		return susp, ConffileDiff{}, verdictSuspicious
 	case modeV.Reason != "":
 		return modeV, ConffileDiff{}, verdictMismatch
 	case matchedConf:
@@ -1098,11 +1189,28 @@ func (s *session) judgeUnshipped(e *model.FileEntry, regular bool, lst []*pkgRes
 	if diverted {
 		if d.Package == model.LocalDiversion {
 			v.Reason = ReasonLocalDiversion
-		} else {
-			v.Package, v.Version = d.Package, ""
-			v.Reason = fmt.Sprintf("diverted by package %s (dpkg-divert), which ships no file here", d.Package)
+			return v, ConffileDiff{}, verdictUnverifiable
 		}
-		return v, ConffileDiff{}, verdictUnverifiable
+		// A package diversion moves the other packages' files away, and
+		// only the diverting package's own file belongs here. Had its
+		// signed table shipped one, this path would have been placed.
+		v.Package, v.Version = d.Package, ""
+		r := s.byName[d.Package]
+		switch {
+		case !s.installed[d.Package]:
+			v.Reason = fmt.Sprintf("diverted by %s, which is not installed", d.Package)
+		case r == nil:
+			v.Reason = fmt.Sprintf("diverted by %s, which was not checked", d.Package)
+			return v, ConffileDiff{}, verdictUnverifiable
+		case r.table == nil:
+			v.Version = r.pkg.Version
+			v.Reason = fmt.Sprintf("diverted by %s, which could not be checked: %s", d.Package, r.reason)
+			return v, ConffileDiff{}, verdictUnverifiable
+		default:
+			v.Version, v.Source = r.pkg.Version, r.source
+			v.Reason = fmt.Sprintf("diverted by %s, which does not ship this file", d.Package)
+		}
+		return v, ConffileDiff{}, verdictSuspicious
 	}
 	if len(lst) == 0 {
 		return none() // not a package file
@@ -1129,55 +1237,84 @@ func (s *session) judgeUnshipped(e *model.FileEntry, regular bool, lst []*pkgRes
 // package intended: setuid, setgid, sticky, and write for group or others.
 const privilegeBits = 0o7000 | 0o022
 
-// modeDiff compares a file's mode on disk with what is expected: a
-// dpkg-statoverride for the path if there is one, else the package's mode or
-// one its own postinst sets. Only added privilege (privilegeBits on disk
-// that no expected mode has) is a mismatch. Any other difference is a
-// reason on a verified file ("less permissive" when the disk only lacks
+type expectedMode struct {
+	mode  uint32
+	label string
+}
+
+// modeDiff compares a file's mode on disk with what is expected, and says
+// how to judge the file (verdictVerified, verdictMismatch or
+// verdictSuspicious) and why.
+//
+// The package gives the deb mode and any mode its own postinst sets. A
+// dpkg-statoverride replaces them when it grants no privilege beyond them,
+// or when the package's own maintainer script adds exactly that override;
+// a local statoverride that grants more is the machine's own data, so a
+// mode only it explains is suspicious. Only added privilege (privilegeBits
+// on disk that no expected mode has) is a mismatch. Any other difference is
+// a reason on a verified file ("less permissive" when the disk only lacks
 // bits); an exact match gives "".
-func (s *session) modeDiff(p string, diskMode uint32, f DebFile) (reason string, mismatch bool) {
+func (s *session) modeDiff(p string, diskMode uint32, f DebFile) (string, verdictKind) {
 	disk := diskMode & 0o7777
+	base := []expectedMode{{f.Mode & 0o7777, "deb"}}
+	for _, m := range f.ScriptModes {
+		base = append(base, expectedMode{m & 0o7777, "maintainer script"})
+	}
 	o, ok := s.overrides[p]
 	if a := usrAlias(p); !ok && a != "" {
 		o, ok = s.overrides[a]
 	}
-	type expected struct {
-		mode  uint32
-		label string
+	if !ok {
+		return judgeMode(base, disk, f.ScriptModes)
 	}
-	exp := []expected{{f.Mode & 0o7777, "deb"}}
-	for _, m := range f.ScriptModes {
-		exp = append(exp, expected{m & 0o7777, "maintainer script"})
-	}
-	if ok {
-		exp = []expected{{o.Mode & 0o7777, "statoverride"}}
-	}
-	for _, e := range exp {
-		if disk == e.mode {
-			return "", false
+	ov := o.Mode & 0o7777
+	grants := !slices.ContainsFunc(base, func(e expectedMode) bool { return ov&^e.mode&privilegeBits == 0 })
+	backed := slices.ContainsFunc(f.ScriptOverrides, func(so ScriptOverride) bool {
+		return so.Owner == o.Owner && so.Group == o.Group && so.Mode&0o7777 == ov
+	})
+	if !grants || backed {
+		if disk != ov {
+			return judgeMode([]expectedMode{{ov, "statoverride"}}, disk, nil)
 		}
+		if !slices.ContainsFunc(base, func(e expectedMode) bool { return e.mode == disk }) && disk&^base[0].mode == 0 {
+			// Privilege taken away with a statoverride.
+			return fmt.Sprintf("mode differs (less permissive): deb %04o, disk %04o", base[0].mode, disk), verdictVerified
+		}
+		return "", verdictVerified
+	}
+	reason, kind := judgeMode(base, disk, f.ScriptModes)
+	if kind == verdictMismatch && disk&^ov&privilegeBits == 0 {
+		return fmt.Sprintf("privilege granted by a local statoverride: deb %04o, disk %04o", base[0].mode, disk), verdictSuspicious
+	}
+	return reason, kind
+}
+
+// judgeMode judges disk against the expected modes exp.
+func judgeMode(exp []expectedMode, disk uint32, scriptModes []uint32) (string, verdictKind) {
+	if slices.ContainsFunc(exp, func(e expectedMode) bool { return e.mode == disk }) {
+		return "", verdictVerified
 	}
 	other := ""
 	for _, e := range exp {
 		switch {
 		case disk&^e.mode&privilegeBits != 0:
 		case disk&^e.mode == 0:
-			return fmt.Sprintf("mode differs (less permissive): %s %04o, disk %04o", e.label, e.mode, disk), false
+			return fmt.Sprintf("mode differs (less permissive): %s %04o, disk %04o", e.label, e.mode, disk), verdictVerified
 		case other == "":
 			other = fmt.Sprintf("mode differs: %s %04o, disk %04o", e.label, e.mode, disk)
 		}
 	}
 	if other != "" {
-		return other, false
+		return other, verdictVerified
 	}
-	if !ok && len(f.ScriptModes) > 0 {
+	if len(scriptModes) > 0 {
 		var sm []string
-		for _, m := range f.ScriptModes {
+		for _, m := range scriptModes {
 			sm = append(sm, fmt.Sprintf("%04o", m))
 		}
-		return fmt.Sprintf("mode differs: deb %04o (maintainer script sets %s), disk %04o", exp[0].mode, strings.Join(sm, " or "), disk), true
+		return fmt.Sprintf("mode differs: deb %04o (maintainer script sets %s), disk %04o", exp[0].mode, strings.Join(sm, " or "), disk), verdictMismatch
 	}
-	return fmt.Sprintf("mode differs: %s %04o, disk %04o", exp[0].label, exp[0].mode, disk), true
+	return fmt.Sprintf("mode differs: %s %04o, disk %04o", exp[0].label, exp[0].mode, disk), verdictMismatch
 }
 
 // explain words an error for a verdict, naming the bundle in refs mode.
@@ -1236,7 +1373,7 @@ func (s *session) finish() {
 		s.bundle.close()
 	}
 	r := s.res
-	for _, vs := range [][]FileVerdict{r.Verified, r.Mismatch, r.Unverifiable} {
+	for _, vs := range [][]FileVerdict{r.Verified, r.Mismatch, r.Unverifiable, r.Suspicious} {
 		sort.Slice(vs, func(i, j int) bool {
 			if vs[i].Path != vs[j].Path {
 				return vs[i].Path < vs[j].Path

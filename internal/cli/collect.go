@@ -3,6 +3,7 @@ package cli
 import (
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -27,13 +28,19 @@ func runCollect(ctx *Context) int {
 	}
 	fs := flag.NewFlagSet("collect", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	root := fs.String("root", "/", "")
-	procRoot := fs.String("proc-root", "/proc", "")
-	sysRoot := fs.String("sys-root", "/sys", "")
-	ctxStdin := fs.Bool("context-stdin", false, "")
-	gz := fs.Bool("gzip", false, "")
-	noCross := fs.Bool("no-cross-view", false, "")
+	root := fs.String("root", "/", "the examined machine's root filesystem")
+	procRoot := fs.String("proc-root", "/proc", "its /proc")
+	sysRoot := fs.String("sys-root", "/sys", "its /sys")
+	ctxStdin := fs.Bool("context-stdin", false, "read a scan context (JSON with the digest key) from stdin")
+	gz := fs.Bool("gzip", false, "gzip the output")
+	noCross := fs.Bool("no-cross-view", false, "skip comparing with the machine's own tools")
 	if err := fs.Parse(ctx.Args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprintln(ctx.Stdout, "usage: telltale collect [flags] > SCAN.json\n\nWrites this machine's raw collection as JSON, for fetch-refs or offline analysis.\n\nFlags:")
+			fs.SetOutput(ctx.Stdout)
+			fs.PrintDefaults()
+			return 0
+		}
 		return fail(err)
 	}
 	opt := collect.Options{Root: *root, ProcRoot: *procRoot, SysRoot: *sysRoot, CrossView: !*noCross}

@@ -77,3 +77,17 @@ func TestCollectCommand32ByteKey(t *testing.T) {
 		t.Fatalf("code=%d err=%q", code, errb.String())
 	}
 }
+
+func TestCollectHelp(t *testing.T) {
+	for _, arg := range []string{"--help", "-h"} {
+		code, out, errs := run("collect", arg)
+		if code != 0 || errs != "" {
+			t.Fatalf("%s: code=%d err=%q", arg, code, errs)
+		}
+		for _, want := range []string{"usage: telltale collect", "-root", "-gzip", "-context-stdin", "fetch-refs"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("%s: help lacks %q: %q", arg, want, out)
+			}
+		}
+	}
+}
