@@ -371,11 +371,22 @@ func (f *OldFinder) findUbuntu(ctx context.Context, key PkgKey) (DebRef, error) 
 // signedOnlyError explains why a SignedOnly lookup gave up. It is not
 // ErrNotFound: the version exists, only not where the built-in keys reach.
 func signedOnlyError(key PkgKey, lastErr error) error {
+	msg := fmt.Sprintf("%s %s %s: no signed snapshot index has it, and sources trusted through HTTPS alone are not used here", key.Name, key.Version, key.Arch)
 	if lastErr != nil {
-		return fmt.Errorf("%s %s %s: no signed snapshot index has it, and sources trusted through HTTPS alone are not used here: %w", key.Name, key.Version, key.Arch, lastErr)
+		msg += ": " + lastErr.Error()
 	}
-	return fmt.Errorf("%s %s %s: no signed snapshot index has it, and sources trusted through HTTPS alone are not used here", key.Name, key.Version, key.Arch)
+	return &signedOnlyErr{msg: msg, last: lastErr}
 }
+
+// signedOnlyErr is the error signedOnlyError returns; last is the last
+// signed lookup's error, if any, and stays reachable with errors.Is.
+type signedOnlyErr struct {
+	msg  string
+	last error
+}
+
+func (e *signedOnlyErr) Error() string { return e.msg }
+func (e *signedOnlyErr) Unwrap() error { return e.last }
 
 // launchpadFile asks Launchpad for the .deb's HTTPS URL, size and SHA-256.
 func (f *OldFinder) launchpadFile(ctx context.Context, key PkgKey, self string) (DebRef, error) {

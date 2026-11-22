@@ -86,6 +86,8 @@ type BundleUnavailable struct {
 	Version string `json:"version"`
 	Arch    string `json:"arch"`
 	Reason  string `json:"reason"`
+	// Kind is the Kind* of the reason; empty in bundles written before kinds.
+	Kind string `json:"kind,omitempty"`
 }
 
 // WriteBundle builds a reference bundle in dir (which must be empty or not
@@ -124,7 +126,7 @@ func WriteBundle(ctx context.Context, c *model.Collection, dir string, opt Optio
 		s.run(ctx, results)
 		for _, r := range results {
 			if r.reason != "" {
-				s.bw.addUnavailable(r.pkg, r.reason)
+				s.bw.addUnavailable(r.pkg, r.reason, r.kind)
 			}
 		}
 	}
@@ -164,7 +166,7 @@ func checkBundleDir(dir string) error {
 func (s *session) bundleDeb(ctx context.Context, r *pkgResult, ref DebRef) {
 	p := r.pkg
 	if ref.Source != SourceArchive && ref.Source != SourceThirdParty {
-		r.reason = "only a source trusted through HTTPS alone has this version, and a bundle carries only signed indexes"
+		r.fail("only a source trusted through HTTPS alone has this version, and a bundle carries only signed indexes", KindNotChecked)
 		return
 	}
 	if err := downloadDeb(ctx, s.client, ref, io.Discard); err != nil {
@@ -173,7 +175,7 @@ func (s *session) bundleDeb(ctx context.Context, r *pkgResult, ref DebRef) {
 		} else {
 			s.downloadFailed(err)
 		}
-		r.reason = "could not download the package: " + err.Error()
+		r.fail("could not download the package: "+err.Error(), problemKind(err))
 		return
 	}
 	s.bw.mu.Lock()
@@ -190,10 +192,10 @@ type bundleWriter struct {
 	unavailable []BundleUnavailable
 }
 
-func (bw *bundleWriter) addUnavailable(p *model.Package, reason string) {
+func (bw *bundleWriter) addUnavailable(p *model.Package, reason, kind string) {
 	bw.mu.Lock()
 	defer bw.mu.Unlock()
-	bw.unavailable = append(bw.unavailable, BundleUnavailable{Name: p.Name, Version: p.Version, Arch: p.Arch, Reason: reason})
+	bw.unavailable = append(bw.unavailable, BundleUnavailable{Name: p.Name, Version: p.Version, Arch: p.Arch, Reason: reason, Kind: kind})
 }
 
 func (bw *bundleWriter) lookup(key string) (BundleFile, bool) {
@@ -421,7 +423,7 @@ type bundleReader struct {
 	root        *os.Root
 	files       map[string]BundleFile
 	manifest    *BundleManifest
-	unavailable map[PkgKey]string
+	unavailable map[PkgKey]BundleUnavailable
 }
 
 func openBundle(dir string) (*bundleReader, error) {
@@ -433,12 +435,12 @@ func openBundle(dir string) (*bundleReader, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &bundleReader{root: root, files: map[string]BundleFile{}, manifest: m, unavailable: map[PkgKey]string{}}
+	b := &bundleReader{root: root, files: map[string]BundleFile{}, manifest: m, unavailable: map[PkgKey]BundleUnavailable{}}
 	for _, f := range m.Files {
 		b.files[f.URL] = f
 	}
 	for _, u := range m.Unavailable {
-		b.unavailable[PkgKey{u.Name, u.Version, u.Arch}] = u.Reason
+		b.unavailable[PkgKey{u.Name, u.Version, u.Arch}] = u
 	}
 	return b, nil
 }

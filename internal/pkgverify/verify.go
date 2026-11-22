@@ -63,6 +63,81 @@ const (
 	NoteObsoleteConffile = "obsolete conffile (no longer shipped by the package)"
 )
 
+// Kinds of Unverifiable verdict (FileVerdict.Kind): why a file could not be
+// verified, for callers that must not depend on the wording of Reason.
+const (
+	// KindNotFound: verification ran and no trusted source (the official
+	// archive, its snapshots, a trusted third-party source) has this
+	// version.
+	KindNotFound = "not_found"
+	// KindUntrusted: the package comes from a third-party source whose key
+	// was not given.
+	KindUntrusted = "untrusted_source"
+	// KindUnreachable: a source could not be read (network, HTTP error,
+	// timeout).
+	KindUnreachable = "unreachable"
+	// KindBadSignature: a signed index or a package failed its signature or
+	// hash check, so nothing that depends on it was verified.
+	KindBadSignature = "bad_signature"
+	// KindNotInBundle: the reference bundle does not cover the package.
+	KindNotInBundle = "not_in_bundle"
+	// KindNotChecked: telltale did not check it (limits, an unsupported
+	// release or architecture, a version only HTTPS-trusted sources have,
+	// an internal error).
+	KindNotChecked = "not_checked"
+	// KindPro: an Ubuntu Pro package; checking it needs a Pro token.
+	KindPro = "pro"
+	// KindLocalDiversion: the file at the original path of a local dpkg
+	// diversion, which no package's version is expected at.
+	KindLocalDiversion = "local_diversion"
+	// KindNotHashed: the file on disk could not be hashed, or changed while
+	// it was being checked.
+	KindNotHashed = "not_hashed"
+	// KindNoChecksum: offline mode; the machine's package database holds no
+	// checksum for the file.
+	KindNoChecksum = "no_checksum"
+)
+
+// Kinds of Mismatch, Suspicious and noted Verified verdicts (FileVerdict.Kind).
+const (
+	// KindContentDiffers: the file differs from the package's copy.
+	KindContentDiffers = "content_differs"
+	// KindModeAddsPrivilege: the content matches, the mode adds privilege
+	// (setuid, setgid, sticky, group or other write) the package never gives.
+	KindModeAddsPrivilege = "mode_adds_privilege"
+	// KindTypeDiffers: the package installs a regular file, the machine has
+	// something else.
+	KindTypeDiffers = "type_differs"
+	// KindNotShipped: the machine lists the file as part of the package, but
+	// the signed package has no regular file there.
+	KindNotShipped = "not_shipped"
+	// KindStatOverride: Suspicious; privilege only a local statoverride grants.
+	KindStatOverride = "statoverride"
+	// KindDiversion: Suspicious; a diversion by a package that is not
+	// installed or does not ship the file.
+	KindDiversion = "diversion"
+	// KindModeLessPermissive: Verified; the mode lacks bits the package sets.
+	KindModeLessPermissive = "mode_less_permissive"
+	// KindModeDiffers: Verified; the mode differs without adding privilege.
+	KindModeDiffers = "mode_differs"
+)
+
+// modeKind is the kind of a mode reason on a verified file.
+func modeKind(reason string) string {
+	if strings.HasPrefix(reason, "mode differs (less permissive)") {
+		return KindModeLessPermissive
+	}
+	return KindModeDiffers
+}
+
+// problemKind classifies an error from reading a source.
+func problemKind(err error) string {
+	if tampered(err) || errors.Is(err, ErrNoValidSignature) {
+		return KindBadSignature
+	}
+	return KindUnreachable
+}
+
 // Limits on the work one collection can cause.
 const (
 	maxPackages         = 10_000
@@ -144,6 +219,8 @@ type FileVerdict struct {
 	Actual   string `json:"actual,omitempty"`
 	Reason   string `json:"reason,omitempty"`
 	Source   string `json:"source,omitempty"`
+	// Kind says why an Unverifiable file could not be verified (Kind*).
+	Kind string `json:"kind,omitempty"`
 }
 
 // ConffileDiff is a configuration file that differs from its package's
@@ -195,8 +272,12 @@ func Verify(ctx context.Context, c *model.Collection, opt Options) *Result {
 	results := newResults(plans)
 	if err := s.setup(); err != nil {
 		s.problem(err)
+		kind := KindNotChecked
+		if tampered(err) || errors.Is(err, ErrNoValidSignature) {
+			kind = KindBadSignature
+		}
 		for _, r := range results {
-			r.reason = err.Error()
+			r.fail(err.Error(), kind)
 		}
 	} else {
 		s.loadIndexes(ctx, s.indexWanted(plans))
@@ -264,6 +345,12 @@ type pkgResult struct {
 	source string             // verdict Source for its files
 	table  map[string]DebFile // nil when the package could not be checked
 	reason string             // why not
+	kind   string             // Kind* of reason
+}
+
+// fail records why a package could not be checked.
+func (r *pkgResult) fail(reason, kind string) {
+	r.reason, r.kind = reason, kind
 }
 
 func newResults(plans []*model.Package) []*pkgResult {
@@ -775,7 +862,7 @@ func (s *session) run(ctx context.Context, results []*pkgResult) {
 			continue
 		}
 		if n++; n > maxPackages {
-			r.reason = fmt.Sprintf("not checked: the collection lists more than %d packages", maxPackages)
+			r.fail(fmt.Sprintf("not checked: the collection lists more than %d packages", maxPackages), KindNotChecked)
 			continue
 		}
 		ch <- r
@@ -791,19 +878,19 @@ func (s *session) onePackage(ctx context.Context, r *pkgResult) {
 	defer func() {
 		if x := recover(); x != nil {
 			r.table = nil
-			r.reason = fmt.Sprintf("internal error while checking the package: %v", x)
+			r.fail(fmt.Sprintf("internal error while checking the package: %v", x), KindNotChecked)
 		}
 	}()
 	if err := ctx.Err(); err != nil {
-		r.reason = "check stopped: " + err.Error()
+		r.fail("check stopped: "+err.Error(), KindNotChecked)
 		return
 	}
 	if p.Arch != "" && !knownArches[p.Arch] {
-		r.reason = fmt.Sprintf("unsupported architecture %q", p.Arch)
+		r.fail(fmt.Sprintf("unsupported architecture %q", p.Arch), KindNotChecked)
 		return
 	}
 	if strings.Contains(p.Version, "+esm") {
-		r.reason = ReasonPro
+		r.fail(ReasonPro, KindPro)
 		return
 	}
 	ref, ok := s.lookup(p)
@@ -831,7 +918,7 @@ func (s *session) onePackage(ctx context.Context, r *pkgResult) {
 		}
 	}
 	if !ok {
-		r.reason = s.notFound(p, oldErr)
+		r.fail(s.notFound(p, oldErr))
 		return
 	}
 	if s.bw != nil {
@@ -845,7 +932,7 @@ func (s *session) onePackage(ctx context.Context, r *pkgResult) {
 		} else {
 			s.downloadFailed(err)
 		}
-		r.reason = "could not check the package: " + s.explain(err)
+		r.fail("could not check the package: "+s.explain(err), problemKind(err))
 		return
 	}
 	r.ref, r.table, r.source = ref, table, s.sourceOf(ref)
@@ -867,18 +954,27 @@ func oldSource(ref DebRef) string {
 }
 
 // notFound explains why no trusted source gave a package version.
-func (s *session) notFound(p *model.Package, oldErr error) string {
+func (s *session) notFound(p *model.Package, oldErr error) (string, string) {
 	if err := s.idxErr[s.archOf(p)]; err != nil {
-		return "could not read the official archive index: " + s.explain(err)
+		return "could not read the official archive index: " + s.explain(err), problemKind(err)
 	}
 	if s.bundle != nil {
-		if r, ok := s.bundle.unavailable[PkgKey{p.Name, p.Version, p.Arch}]; ok {
-			return "not in the reference bundle: " + r
+		if u, ok := s.bundle.unavailable[PkgKey{p.Name, p.Version, p.Arch}]; ok {
+			kind := u.Kind
+			if kind == "" {
+				kind = KindNotInBundle // a bundle written before kinds were recorded
+			}
+			return "not in the reference bundle: " + u.Reason, kind
 		}
-		return "package not in the reference bundle"
+		return "package not in the reference bundle", KindNotInBundle
 	}
 	if oldErr != nil && !errors.Is(oldErr, ErrNotFound) {
-		return "not in the current archive, and the snapshot archives could not be checked: " + s.explain(oldErr)
+		kind := problemKind(oldErr)
+		var so *signedOnlyErr
+		if errors.Is(oldErr, errOldBudget) || (errors.As(oldErr, &so) && so.last == nil) {
+			kind = KindNotChecked
+		}
+		return "not in the current archive, and the snapshot archives could not be checked: " + s.explain(oldErr), kind
 	}
 	r := ReasonNotOfficial
 	if len(s.trusted) > 0 {
@@ -891,9 +987,9 @@ func (s *session) notFound(p *model.Package, oldErr error) string {
 		}
 	}
 	if len(untrusted) > 0 {
-		r += "; source not trusted: " + strings.Join(untrusted, ", ")
+		return r + "; source not trusted: " + strings.Join(untrusted, ", "), KindUntrusted
 	}
-	return r
+	return r, KindNotFound
 }
 
 // table returns the file table of the .deb ref names: from the cache, keyed
@@ -1103,7 +1199,7 @@ func (s *session) judgeFile(e *model.FileEntry, exp []expect, lst []*pkgResult) 
 		}
 		v := verdict(&exp[0])
 		v.Actual = actual
-		v.Reason = "the signed package installs a regular file here, the machine has a " + e.Type
+		v.Reason, v.Kind = "the signed package installs a regular file here, the machine has a "+e.Type, KindTypeDiffers
 		return v, ConffileDiff{}, verdictMismatch
 	}
 	if e.SHA256 == "" {
@@ -1111,7 +1207,7 @@ func (s *session) judgeFile(e *model.FileEntry, exp []expect, lst []*pkgResult) 
 			return FileVerdict{}, ConffileDiff{}, verdictNone
 		}
 		v := verdict(&exp[0])
-		v.Reason = "the file on disk was not hashed"
+		v.Reason, v.Kind = "the file on disk was not hashed", KindNotHashed
 		if e.Err != "" {
 			v.Reason += ": " + e.Err
 		}
@@ -1137,13 +1233,13 @@ func (s *session) judgeFile(e *model.FileEntry, exp []expect, lst []*pkgResult) 
 			return verdict(x), ConffileDiff{}, verdictVerified
 		case kind == verdictVerified && noted.Reason == "":
 			noted = verdict(x)
-			noted.Reason = why
+			noted.Reason, noted.Kind = why, modeKind(why)
 		case kind == verdictSuspicious && susp.Reason == "":
 			susp = verdict(x)
-			susp.Reason = why
+			susp.Reason, susp.Kind = why, KindStatOverride
 		case kind == verdictMismatch && modeV.Reason == "":
 			modeV = verdict(x)
-			modeV.Reason = why
+			modeV.Reason, modeV.Kind = why, KindModeAddsPrivilege
 		}
 	}
 	switch {
@@ -1159,7 +1255,7 @@ func (s *session) judgeFile(e *model.FileEntry, exp []expect, lst []*pkgResult) 
 		return FileVerdict{}, diff(e.SHA256), verdictConffile
 	}
 	v := verdict(&exp[0])
-	v.Reason = "differs from the file in the signed package"
+	v.Reason, v.Kind = "differs from the file in the signed package", KindContentDiffers
 	var names []string
 	for _, x := range exp {
 		if n := x.r.pkg.Name + " " + x.r.pkg.Version; !slices.Contains(names, n) {
@@ -1188,7 +1284,7 @@ func (s *session) judgeUnshipped(e *model.FileEntry, regular bool, lst []*pkgRes
 	}
 	if diverted {
 		if d.Package == model.LocalDiversion {
-			v.Reason = ReasonLocalDiversion
+			v.Reason, v.Kind = ReasonLocalDiversion, KindLocalDiversion
 			return v, ConffileDiff{}, verdictUnverifiable
 		}
 		// A package diversion moves the other packages' files away, and
@@ -1198,17 +1294,17 @@ func (s *session) judgeUnshipped(e *model.FileEntry, regular bool, lst []*pkgRes
 		r := s.byName[d.Package]
 		switch {
 		case !s.installed[d.Package]:
-			v.Reason = fmt.Sprintf("diverted by %s, which is not installed", d.Package)
+			v.Reason, v.Kind = fmt.Sprintf("diverted by %s, which is not installed", d.Package), KindDiversion
 		case r == nil:
-			v.Reason = fmt.Sprintf("diverted by %s, which was not checked", d.Package)
+			v.Reason, v.Kind = fmt.Sprintf("diverted by %s, which was not checked", d.Package), KindNotChecked
 			return v, ConffileDiff{}, verdictUnverifiable
 		case r.table == nil:
 			v.Version = r.pkg.Version
-			v.Reason = fmt.Sprintf("diverted by %s, which could not be checked: %s", d.Package, r.reason)
+			v.Reason, v.Kind = fmt.Sprintf("diverted by %s, which could not be checked: %s", d.Package, r.reason), r.kind
 			return v, ConffileDiff{}, verdictUnverifiable
 		default:
 			v.Version, v.Source = r.pkg.Version, r.source
-			v.Reason = fmt.Sprintf("diverted by %s, which does not ship this file", d.Package)
+			v.Reason, v.Kind = fmt.Sprintf("diverted by %s, which does not ship this file", d.Package), KindDiversion
 		}
 		return v, ConffileDiff{}, verdictSuspicious
 	}
@@ -1217,7 +1313,7 @@ func (s *session) judgeUnshipped(e *model.FileEntry, regular bool, lst []*pkgRes
 	}
 	for _, r := range lst {
 		if r.table == nil {
-			v.Package, v.Version, v.Reason = r.pkg.Name, r.pkg.Version, r.reason
+			v.Package, v.Version, v.Reason, v.Kind = r.pkg.Name, r.pkg.Version, r.reason, r.kind
 			return v, ConffileDiff{}, verdictUnverifiable
 		}
 	}
@@ -1229,7 +1325,7 @@ func (s *session) judgeUnshipped(e *model.FileEntry, regular bool, lst []*pkgRes
 		}
 	}
 	v.Source = lst[0].source
-	v.Reason = "the signed package has no regular file here, though the machine lists it as part of the package"
+	v.Reason, v.Kind = "the signed package has no regular file here, though the machine lists it as part of the package", KindNotShipped
 	return v, ConffileDiff{}, verdictMismatch
 }
 
@@ -1440,7 +1536,7 @@ func (s *session) offline() {
 			v := FileVerdict{Path: cp, Package: p.Name, Version: p.Version, Source: SourceOfflineLocal}
 			want, ok := lookupPath(p.LocalMD5, lp)
 			if !ok || !isHexLen(want, 32) {
-				v.Reason = "the package database holds no checksum for this file"
+				v.Reason, v.Kind = "the package database holds no checksum for this file", KindNoChecksum
 				s.res.Unverifiable = append(s.res.Unverifiable, v)
 				continue
 			}
@@ -1448,17 +1544,17 @@ func (s *session) offline() {
 			got, sum, err := hashLocal(root, cp)
 			switch {
 			case err != nil:
-				v.Reason = "could not read the file: " + err.Error()
+				v.Reason, v.Kind = "could not read the file: "+err.Error(), KindNotHashed
 				s.res.Unverifiable = append(s.res.Unverifiable, v)
 			case e.SHA256 != "" && sum != e.SHA256:
-				v.Reason = "the file changed after it was collected"
+				v.Reason, v.Kind = "the file changed after it was collected", KindNotHashed
 				s.res.Unverifiable = append(s.res.Unverifiable, v)
 			case got == strings.ToLower(want):
 				v.Actual = "md5:" + got
 				s.res.Verified = append(s.res.Verified, v)
 			default:
 				v.Actual = "md5:" + got
-				v.Reason = "differs from the checksum in the machine's package database"
+				v.Reason, v.Kind = "differs from the checksum in the machine's package database", KindContentDiffers
 				s.res.Mismatch = append(s.res.Mismatch, v)
 			}
 		}

@@ -503,7 +503,7 @@ func TestVerifyDetectsTamperedBinary(t *testing.T) {
 	}
 	wantPaths(t, "Mismatch", res.Mismatch, "/usr/bin/tool")
 	want := FileVerdict{Path: "/usr/bin/tool", Package: "tool", Version: "1.0-1", Expected: sha256hex([]byte(toolBin)), Actual: sha256hex([]byte("evil\n")), Source: SourceArchive}
-	if got, _ := find(res.Mismatch, "/usr/bin/tool"); got.Reason == "" || (got != FileVerdict{Path: want.Path, Package: want.Package, Version: want.Version, Expected: want.Expected, Actual: want.Actual, Reason: got.Reason, Source: want.Source}) {
+	if got, _ := find(res.Mismatch, "/usr/bin/tool"); got.Reason == "" || (got != FileVerdict{Path: want.Path, Package: want.Package, Version: want.Version, Expected: want.Expected, Actual: want.Actual, Reason: got.Reason, Source: want.Source, Kind: KindContentDiffers}) {
 		t.Errorf("mismatch = %+v, want %+v with a reason", got, want)
 	}
 	// /bin/toolctl in the package is /usr/bin/toolctl on a merged-/usr
@@ -630,7 +630,7 @@ func TestVerifyBadSignatureRejected(t *testing.T) {
 			wantPaths(t, "Verified", res.Verified)
 			wantPaths(t, "Mismatch", res.Mismatch)
 			v, ok := find(res.Unverifiable, "/usr/bin/tool")
-			if !ok || !strings.Contains(v.Reason, "signature") {
+			if !ok || !strings.Contains(v.Reason, "signature") || v.Kind != KindBadSignature {
 				t.Errorf("unverifiable %+v, want a signature reason", v)
 			}
 			if len(res.Errors) == 0 || !strings.HasPrefix(res.Errors[0], "BAD SIGNATURE") {
@@ -832,6 +832,9 @@ func TestThirdPartyUnverifiableWithoutKey(t *testing.T) {
 
 	res := Verify(context.Background(), c, f.opts())
 	wantPaths(t, "Unverifiable", res.Unverifiable, "/usr/bin/thirdtool")
+	if k := res.Unverifiable[0].Kind; k != KindUntrusted {
+		t.Errorf("kind %q, want %q", k, KindUntrusted)
+	}
 	if r := res.Unverifiable[0].Reason; r != "package not found in the official archive; source not trusted: "+repo.URL+"/repo" {
 		t.Errorf("reason %q", r)
 	}
@@ -943,7 +946,7 @@ func TestBundleRoundTrip(t *testing.T) {
 	c.Packages.Installed = append(c.Packages.Installed, model.Package{Name: "extra", Version: "1", Arch: "amd64", Status: "install ok installed", Files: []string{"/usr/bin/extra"}})
 	c.Files = append(c.Files, regular("/usr/bin/extra", "extra\n", 0o755))
 	res = Verify(context.Background(), c, opt)
-	if v, ok := find(res.Unverifiable, "/usr/bin/extra"); !ok || !strings.Contains(v.Reason, "reference bundle") {
+	if v, ok := find(res.Unverifiable, "/usr/bin/extra"); !ok || !strings.Contains(v.Reason, "reference bundle") || v.Kind != KindNotInBundle {
 		t.Errorf("extra: %+v", res.Unverifiable)
 	}
 }
@@ -1280,7 +1283,7 @@ func TestVerifyDiversions(t *testing.T) {
 		wantPaths(t, "Mismatch", res.Mismatch)
 		wantPaths(t, "Unverifiable", res.Unverifiable)
 		wantPaths(t, "Verified", res.Verified, "/usr/bin/man.REAL")
-		if v, ok := find(res.Suspicious, "/usr/bin/man"); !ok || v.Reason != "diverted by manpatch, which does not ship this file" || v.Package != "manpatch" {
+		if v, ok := find(res.Suspicious, "/usr/bin/man"); !ok || v.Reason != "diverted by manpatch, which does not ship this file" || v.Package != "manpatch" || v.Kind != KindDiversion {
 			t.Errorf("Suspicious = %+v", res.Suspicious)
 		}
 	})
@@ -1290,7 +1293,7 @@ func TestVerifyDiversions(t *testing.T) {
 		c.Packages.Diversions = []model.Diversion{{Path: "/usr/bin/tool", DivertTo: "/usr/bin/tool.distrib", Package: "ghost"}}
 		res := Verify(context.Background(), c, f.opts())
 		wantPaths(t, "Unverifiable", res.Unverifiable)
-		if v, ok := find(res.Suspicious, "/usr/bin/tool"); !ok || v.Reason != "diverted by ghost, which is not installed" {
+		if v, ok := find(res.Suspicious, "/usr/bin/tool"); !ok || v.Reason != "diverted by ghost, which is not installed" || v.Kind != KindDiversion {
 			t.Errorf("Suspicious = %+v", res.Suspicious)
 		}
 	})
@@ -1332,7 +1335,7 @@ func TestVerifyFileModes(t *testing.T) {
 
 	res := Verify(context.Background(), c, f.opts())
 	wantPaths(t, "Mismatch", res.Mismatch, "/usr/bin/tool", libDir+"/libpw.so.1")
-	if m, _ := find(res.Mismatch, "/usr/bin/tool"); m.Reason != "mode differs: deb 0755, disk 4755" {
+	if m, _ := find(res.Mismatch, "/usr/bin/tool"); m.Reason != "mode differs: deb 0755, disk 4755" || m.Kind != KindModeAddsPrivilege {
 		t.Errorf("mismatch %+v", m)
 	}
 	if m, _ := find(res.Mismatch, libDir+"/libpw.so.1"); m.Reason != "mode differs: deb 0644, disk 0646" {
@@ -1345,8 +1348,12 @@ func TestVerifyFileModes(t *testing.T) {
 		"/usr/bin/crontab":       "",
 		"/usr/bin/toolctl":       "",
 	} {
-		if v, _ := find(res.Verified, p); v.Reason != want {
-			t.Errorf("%s: verified with reason %q, want %q", p, v.Reason, want)
+		wantKind := ""
+		if want != "" {
+			wantKind = KindModeLessPermissive
+		}
+		if v, _ := find(res.Verified, p); v.Reason != want || v.Kind != wantKind {
+			t.Errorf("%s: verified with reason %q kind %q, want %q", p, v.Reason, v.Kind, want)
 		}
 	}
 
@@ -1388,7 +1395,7 @@ func TestVerifyStatOverrideForgery(t *testing.T) {
 		libDir + "/libtool.so.1": "privilege granted by a local statoverride: deb 0644, disk 0666",
 		"/usr/bin/crontab":       "privilege granted by a local statoverride: deb 0755, disk 2755",
 	} {
-		if v, _ := find(res.Suspicious, p); v.Reason != want || v.Expected == "" || v.Actual != v.Expected {
+		if v, _ := find(res.Suspicious, p); v.Reason != want || v.Kind != KindStatOverride || v.Expected == "" || v.Actual != v.Expected {
 			t.Errorf("%s: %+v, want reason %q", p, v, want)
 		}
 	}
@@ -1801,4 +1808,48 @@ func TestDebFilesScriptConstants(t *testing.T) {
 			t.Errorf("%s: %+v; a variable assigned twice, indented or read is not a constant", p, f)
 		}
 	}
+}
+
+// Every unverifiable verdict carries a kind, so callers can tell a version
+// no trusted source has from a source that could not be used without
+// reading the human-readable reason.
+func TestVerifyUnverifiableKinds(t *testing.T) {
+	check := func(t *testing.T, res *Result, want string) {
+		t.Helper()
+		if len(res.Unverifiable) == 0 {
+			t.Fatalf("no unverifiable verdicts")
+		}
+		for _, v := range res.Unverifiable {
+			if v.Kind != want {
+				t.Errorf("%s: kind %q, want %q (reason %q)", v.Path, v.Kind, want, v.Reason)
+			}
+		}
+	}
+	t.Run("archive down", func(t *testing.T) {
+		f := toolFixture(t)
+		f.srv.setDown(true)
+		check(t, Verify(context.Background(), toolCollection(nil), f.opts()), KindUnreachable)
+	})
+	t.Run("package hash mismatch", func(t *testing.T) {
+		f := toolFixture(t)
+		f.srv.set("/debian/"+poolName(fakePkg{"tool", "1.0-1", "amd64", nil}), []byte("not the signed package"))
+		check(t, Verify(context.Background(), toolCollection(nil), f.opts()), KindBadSignature)
+	})
+	t.Run("pro", func(t *testing.T) {
+		f := toolFixture(t)
+		c := toolCollection(nil)
+		c.Packages.Installed[0].Version = "1.0-1+esm1"
+		check(t, Verify(context.Background(), c, f.opts()), KindPro)
+	})
+	t.Run("not found", func(t *testing.T) {
+		f := toolFixture(t)
+		c := toolCollection(nil)
+		c.Packages.Installed[0].Version = "1.0-9"
+		check(t, Verify(context.Background(), c, f.opts()), KindNotFound)
+	})
+	t.Run("unsupported release", func(t *testing.T) {
+		c := toolCollection(nil)
+		c.Host.OSVersionID = "10"
+		check(t, Verify(context.Background(), c, Options{}), KindNotChecked)
+	})
 }
