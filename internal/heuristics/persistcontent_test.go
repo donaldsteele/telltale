@@ -258,6 +258,8 @@ func TestPAMUnownedModule(t *testing.T) {
 	c.Persist = append(c.Persist, pamFile(
 		"# comment",
 		"@include common-account",
+		"auth include runuser",
+		"session substack common-session",
 		"auth [success=1 default=ignore] pam_unix.so nullok",
 		"auth optional pam_lab.so",
 		"auth optional /opt/pam/pam_abs.so debug",
@@ -283,10 +285,10 @@ func TestPAMUnownedModule(t *testing.T) {
 		}
 	}
 	lab := find(fs, "heur.pam_unowned:/usr/lib/x86_64-linux-gnu/security/pam_lab.so")
-	if lab != nil && (lab.Evidence[0].Line != 4 || len(lab.Evidence) < 2) {
+	if lab != nil && (lab.Evidence[0].Line != 6 || len(lab.Evidence) < 2) {
 		t.Errorf("first line is the evidence and the second use is listed: %+v", lab.Evidence)
 	}
-	if lab != nil && (!strings.Contains(lab.Fix, "sed -i '4s/^/#/' '/etc/pam.d/common-auth'") || !strings.Contains(lab.Fix, "cp -a --parents")) {
+	if lab != nil && (!strings.Contains(lab.Fix, "sed -i '6s/^/#/' '/etc/pam.d/common-auth'") || !strings.Contains(lab.Fix, "cp -a --parents")) {
 		t.Errorf("fix: %s", lab.Fix)
 	}
 	if find(fs, "heur.pam_unowned:/usr/lib/x86_64-linux-gnu/security/pam_unix.so") != nil || find(fs, "heur.pam_unowned:/opt/pam/pam_owned.so") != nil {

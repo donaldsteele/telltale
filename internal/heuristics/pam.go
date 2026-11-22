@@ -46,6 +46,9 @@ func parsePAMLine(text string) (module string, quiet, ok bool) {
 			i++
 		}
 	}
+	if c := strings.ToLower(f[1]); c == "include" || c == "substack" {
+		return "", false, false // names another configuration file, not a module
+	}
 	i++ // past the control, to the module
 	if i >= len(f) {
 		return "", false, false

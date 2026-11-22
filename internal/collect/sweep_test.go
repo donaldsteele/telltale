@@ -203,3 +203,40 @@ func TestSweepUnreadableDirIsOneSkip(t *testing.T) {
 		t.Errorf("want one skip for the locked directory, got %d: %v", n, skips)
 	}
 }
+
+func TestSweepSkipsImageStoresAndImageFilesystems(t *testing.T) {
+	root := t.TempDir()
+	plant(t, root, "var/lib/docker/overlay2/abc/diff/usr/bin/su", os.ModeSetuid|0o755)
+	plant(t, root, "snap/core/1/usr/bin/sudo", os.ModeSetuid|0o755)
+	plant(t, root, "mnt/img/usr/bin/su", os.ModeSetuid|0o755)
+	plant(t, root, "srv/real", os.ModeSetuid|0o755)
+	mounts := []model.Mount{{Path: "/", FSType: "ext4"}, {Path: "/mnt/img", FSType: "squashfs"}, {Path: "/var/lib/docker", FSType: "ext4"}}
+	got, skips := Sweep(root, mounts, nil, FileOptions{})
+	if m := byPath(got); len(m) != 1 || m["/srv/real"].Path == "" {
+		t.Errorf("got %v", got)
+	}
+	noted := false
+	for _, s := range skips {
+		noted = noted || strings.Contains(s.Reason, "/var/lib/docker")
+	}
+	if !noted {
+		t.Errorf("image store skip not recorded: %v", skips)
+	}
+}
+
+func TestSweepReachesTempDirsBeforeTheBoundRunsOut(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < 30; i++ {
+		plant(t, root, fmt.Sprintf("aaa/f%02d", i), 0o644)
+		plant(t, root, fmt.Sprintf("home/u/f%02d", i), 0o644)
+	}
+	plant(t, root, "var/tmp/.s", os.ModeSetuid|0o755)
+	plant(t, root, "home/u/z", os.ModeSetuid|0o755)
+	old := sweepMaxEntries
+	sweepMaxEntries = 15
+	defer func() { sweepMaxEntries = old }()
+	got, _ := Sweep(root, []model.Mount{{Path: "/", FSType: "ext4"}}, nil, FileOptions{})
+	if _, ok := byPath(got)["/var/tmp/.s"]; !ok {
+		t.Errorf("/var/tmp not reached: %v", got)
+	}
+}
