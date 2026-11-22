@@ -143,22 +143,26 @@ func (a *Archive) download(ctx context.Context, suite string) ([]byte, error) {
 // as of its own creation time, so the answer depends on no clock; the suite,
 // Valid-Until and key expiry are checked later, against the newest such date
 // (see signedClock).
-func (a *Archive) signedDate(ctx context.Context, suite string) (time.Time, bool) {
+// until is the file's Valid-Until, zero when it has none.
+func (a *Archive) signedDate(ctx context.Context, suite string) (date, until time.Time, ok bool) {
 	data, err := a.download(ctx, suite)
 	if err != nil {
-		return time.Time{}, false
+		return date, until, false
 	}
 	text, err := verifyInReleaseAt(data, a.Keyring, func(created time.Time) (time.Time, error) { return created, nil })
 	if err != nil {
-		return time.Time{}, false
+		return date, until, false
 	}
 	for _, line := range strings.Split(string(text), "\n") {
-		if v, ok := strings.CutPrefix(line, "Date:"); ok {
+		if v, found := strings.CutPrefix(line, "Date:"); found && !ok {
 			t, err := parseReleaseDate(strings.TrimSpace(v))
-			return t, err == nil
+			date, ok = t, err == nil
+		}
+		if v, found := strings.CutPrefix(line, "Valid-Until:"); found && until.IsZero() {
+			until, _ = parseReleaseDate(strings.TrimSpace(v))
 		}
 	}
-	return time.Time{}, false
+	return date, until, ok
 }
 
 // fetchRelease returns suite's verified Release. A fresh download is

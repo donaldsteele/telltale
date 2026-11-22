@@ -364,7 +364,8 @@ func (j *judge) unverifiable(vs []pkgverify.FileVerdict) {
 }
 
 // clockSkew notes that the clock of the machine that ran package
-// verification disagrees with the archive's signed date. The clock decided
+// verification is provably wrong: behind the archive's newest signed date,
+// or past the validity of an index that archive still serves. The clock decided
 // nothing in the verification.
 func clockSkew(s pkgverify.ClockSkew) *model.Finding {
 	d, dir := s.Clock.Sub(s.Signed), "ahead of"
@@ -378,7 +379,7 @@ func clockSkew(s pkgverify.ClockSkew) *model.Finding {
 		Key: "pkg.clock_skew", ID: "TT-PKG-009", Source: srcPackage, Severity: model.SevNote,
 		Title: "The machine's clock is " + by + " the package archive's signed date",
 		Why: "The clock of the machine that ran package verification said " + s.Clock.UTC().Format(layout) + ", while the newest index the archive signed is dated " + s.Signed.UTC().Format(layout) +
-			". Package verification took its time from the signed indexes, so the clock decided nothing there; but root can set the clock, and a wrong one breaks certificate checks, log times and scheduled jobs.",
+			". A clock cannot be right when it is behind what the archive has already signed, or past the date until which a signed index is valid. Package verification took its time from the signed indexes, so the clock decided nothing there; but root can set the clock, and a wrong one breaks certificate checks, log times and scheduled jobs.",
 		Fix:      "timedatectl set-ntp true   # or set the clock by hand with: date -u -s 'YYYY-MM-DD HH:MM:SS'",
 		Evidence: []model.Evidence{{After: "clock " + by + " the signed date", Detail: "clock " + s.Clock.UTC().Format(layout) + "; newest signed index " + s.Signed.UTC().Format(layout)}},
 		Refs:     []string{"T1070.006"},

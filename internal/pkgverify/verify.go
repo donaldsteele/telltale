@@ -225,9 +225,10 @@ type Result struct {
 	// evidence of tampering ("BAD SIGNATURE", "HASH MISMATCH"), then
 	// sources that could not be read.
 	Errors []string `json:"errors,omitempty"`
-	// ClockSkew is set when the clock of the machine running the check and
-	// the newest signed date of the indexes it fetched differ by more than a
-	// day. The clock decides nothing else: see signedClock.
+	// ClockSkew is set when the clock of the machine running the check is
+	// provably wrong: more than a day before the newest signed date of the
+	// indexes it fetched, or past the Valid-Until of one that is still
+	// valid at that date. The clock decides nothing else: see signedClock.
 	ClockSkew *ClockSkew `json:"clock_skew,omitempty"`
 }
 
@@ -924,7 +925,7 @@ func (s *session) loadIndexes(ctx context.Context, wanted []*model.Package) {
 	}
 }
 
-// maxClockSkew is how far the machine's clock may be from the signed
+// maxClockSkew is how far the machine's clock may be behind the signed
 // indexes' date before the result says so.
 const maxClockSkew = 24 * time.Hour
 
@@ -933,12 +934,20 @@ const maxClockSkew = 24 * time.Hour
 // for every later check: Valid-Until, signature dates and key expiry. The
 // clock of the examined machine is root's to set, and moving it must not
 // decide whether the signed indexes are usable. The clock is then only
-// compared with that date, for ClockSkew.
+// compared with the signed dates, for ClockSkew, and reported only when it
+// is provably wrong: more than a day before the newest signed Date, or
+// after the earliest Valid-Until of the indexes still valid at that date. A
+// correct clock is never behind what the archive has signed, and indexes
+// that were simply not re-signed for a while prove nothing.
 func (s *session) syncClock(ctx context.Context) {
+	var untils []time.Time
 	for _, a := range s.archives {
 		for _, suite := range a.Suites {
-			if t, ok := a.signedDate(ctx, suite); ok {
+			if t, until, ok := a.signedDate(ctx, suite); ok {
 				s.clock.observe(t)
+				if !until.IsZero() && !a.Historical {
+					untils = append(untils, until)
+				}
 			}
 		}
 	}
@@ -950,7 +959,15 @@ func (s *session) syncClock(ctx context.Context) {
 	if s.opt.Now != nil {
 		clock = s.opt.Now()
 	}
-	if d := clock.Sub(signed); d > maxClockSkew || d < -maxClockSkew {
+	wrong := clock.Before(signed.Add(-maxClockSkew))
+	for _, until := range untils {
+		// An index already expired at the signed date is refused, and is no
+		// witness against the clock.
+		if !until.Before(signed) && clock.After(until) {
+			wrong = true
+		}
+	}
+	if wrong {
 		s.res.ClockSkew = &ClockSkew{Clock: clock.UTC(), Signed: signed.UTC()}
 	}
 }

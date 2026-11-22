@@ -47,6 +47,7 @@ func TestVerifyTimeComesFromTheSignedIndexes(t *testing.T) {
 		skew  bool
 	}{
 		{"correct clock", recordedNow.Add(time.Hour), false},
+		{"correct clock, indexes not re-signed for three days", recordedNow.Add(3 * 24 * time.Hour), false},
 		{"clock 8 days forward (past the security Valid-Until)", recordedNow.Add(8 * 24 * time.Hour), true},
 		{"clock 2 days back (signatures dated in the future)", recordedNow.Add(-48 * time.Hour), true},
 	} {
@@ -106,5 +107,13 @@ func TestVerifySignatureFarAfterTheSignedDate(t *testing.T) {
 	res := Verify(context.Background(), toolCollection(nil), Options{Archives: []*Archive{a}, Now: fixedClock(recordedNow)})
 	if len(res.Verified) != 0 || len(res.Unverifiable) == 0 || res.Unverifiable[0].Kind != KindBadSignature || !strings.Contains(res.Unverifiable[0].Reason, "more than a day after") {
 		t.Errorf("verified %+v, unverifiable %+v; want the index refused as a bad signature", res.Verified, res.Unverifiable)
+	}
+}
+
+// A replayed index that had already expired at the newest signed date is
+// refused; it does not make a correct clock look wrong.
+func TestVerifyStaleIndexIsNoWitnessAgainstTheClock(t *testing.T) {
+	if res := clockVerify(t, recordedNow, recordedNow.Add(-10*24*time.Hour), recordedNow.Add(time.Hour)); res.ClockSkew != nil {
+		t.Errorf("clock skew %+v reported for a correct clock", res.ClockSkew)
 	}
 }
