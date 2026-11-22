@@ -81,22 +81,25 @@ type judge struct {
 	reported         map[string]bool // every path package verification named
 
 	// From the snapshot comparison.
-	pkgChange   map[string]diff.Change      // package name -> its change
-	pkgFinding  map[string]*model.Finding   // package name -> finding about its change
-	pkgReasons  map[string][]string         // new package -> what raised it
-	unverIn     map[string][]model.Evidence // changed package -> its programs found in no trusted source
-	unchecked   map[string][]model.Evidence // changed package -> its programs that could not be checked
-	gshadowRisk bool                        // a group change gives a group a password or a privileged group a member or admin
-	unconfirmed map[string]bool             // changed package -> a changed file of it was not confirmed
-	listeners   []diff.Change
-	persistDone map[string]*model.Finding  // persistence path -> its finding (nil: explained)
-	acctChanged map[string]bool            // account database -> the account comparison found a change in it
-	acctDirty   map[string]bool            // account database -> it holds a duplicate name or a line glibc rejects
-	touched     map[string]map[string]bool // changed package -> paths shown with its change
-	privGID     map[int]bool               // ids of privileged groups on either side
-	budget      []string                   // reasons package verification stopped at a limit
-	scanLimit   []string                   // reasons package verification could not run at all
-	foldedMax   map[*model.Finding]model.Severity
+	pkgChange     map[string]diff.Change      // package name -> its change
+	pkgFinding    map[string]*model.Finding   // package name -> finding about its change
+	pkgReasons    map[string][]string         // new package -> what raised it
+	unverIn       map[string][]model.Evidence // changed package -> its programs found in no trusted source
+	unchecked     map[string][]model.Evidence // changed package -> its programs that could not be checked
+	gshadowRisk   bool                        // a group change gives a group a password or a privileged group a member or admin
+	unconfirmed   map[string]bool             // changed package -> a changed file of it was not confirmed
+	listeners     []diff.Change
+	persistDone   map[string]*model.Finding  // persistence path -> its finding (nil: explained)
+	acctChanged   map[string]bool            // account database -> the account comparison found a change in it
+	acctDirty     map[string]bool            // account database -> it holds a duplicate name or a line glibc rejects
+	touched       map[string]map[string]bool // changed package -> paths shown with its change
+	privGID       map[int]bool               // ids of privileged groups on either side
+	budget        []string                   // reasons package verification stopped at a limit
+	notRun        string                     // why package verification did not run at all
+	stopped       map[string]bool            // packages a deadline left unchecked
+	confirmed     map[string]bool            // packages one of whose files matched the version installed now
+	extraInstalls []diff.Change              // a second architecture of a package that also changed
+	foldedMax     map[*model.Finding]model.Severity
 }
 
 func newJudge(in Input, c *model.Collection) *judge {
@@ -109,6 +112,7 @@ func newJudge(in Input, c *model.Collection) *judge {
 		pkgReasons: map[string][]string{}, unverIn: map[string][]model.Evidence{}, unchecked: map[string][]model.Evidence{}, unconfirmed: map[string]bool{},
 		acctChanged: map[string]bool{}, foldedMax: map[*model.Finding]model.Severity{},
 		acctDirty: map[string]bool{}, touched: map[string]map[string]bool{}, privGID: map[int]bool{},
+		stopped: map[string]bool{}, confirmed: map[string]bool{},
 	}
 	if in.Snapshot != nil && in.Snapshot.Collection != nil {
 		j.old = in.Snapshot.Collection
@@ -130,8 +134,8 @@ func newJudge(in Input, c *model.Collection) *judge {
 		}
 	}
 	for _, e := range append(append([]string(nil), c.Accounts.Duplicates...), c.Accounts.Malformed...) {
-		if i := strings.LastIndexByte(e, ':'); i > 0 {
-			j.acctDirty[e[:i]] = true
+		if file, _, ok := strings.Cut(e, ":"); ok {
+			j.acctDirty[file] = true
 		}
 	}
 	seen := map[string]bool{}
@@ -344,11 +348,17 @@ func (j *judge) accountAnomalies() {
 		dup("/etc/group:"+name, ev)
 	}
 	for _, e := range j.c.Accounts.Malformed {
-		file, line := splitEntry(e)
+		file, rest := splitEntry(e)
+		line, note, _ := strings.Cut(rest, " ")
 		n, _ := strconv.Atoi(line)
+		title := fmt.Sprintf("Line %s of %s is not a valid entry", line, file)
+		if note != "" {
+			// glibc uses an empty-name line: getpwuid and initgroups match it.
+			title = fmt.Sprintf("Line %s of %s is an entry with no name %s", line, file, note)
+		}
 		j.add(&model.Finding{
 			Key: "acct.malformed:" + e, ID: "TT-JUDGE-002", Source: srcHeuristic, Severity: model.SevBackdoor,
-			Title: fmt.Sprintf("Line %s of %s is not a valid entry", line, file),
+			Title: title,
 			Why: "glibc skips this line, but other programs that read the file may not. A line written so that tools disagree about it is a way to hide an account or a password. " +
 				"Its content is not shown, since it may hold a password hash.",
 			Fix:      fixKeepOnly(file, "then look at line "+line+" and remove or correct it with vipw -s, vigr or vigr -s as fits the file"),
@@ -358,12 +368,10 @@ func (j *judge) accountAnomalies() {
 	}
 }
 
-// splitEntry splits "<file>:<name or line>".
+// splitEntry splits "<file>:<name or line>"; the files have no colon.
 func splitEntry(e string) (string, string) {
-	if i := strings.LastIndexByte(e, ':'); i > 0 {
-		return e[:i], e[i+1:]
-	}
-	return e, ""
+	file, rest, _ := strings.Cut(e, ":")
+	return file, rest
 }
 
 // whenFor is when the file at p last changed: its inode change time (which,

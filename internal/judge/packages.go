@@ -101,6 +101,9 @@ func (j *judge) packages() {
 		if _, ok := j.verified[v.Path]; !ok {
 			j.verified[v.Path] = v
 		}
+		if p := j.pkgs[v.Package]; p != nil && (v.Version == "" || v.Version == p.Version) {
+			j.confirmed[v.Package] = true
+		}
 		if v.Source == pkgverify.SourceSnapshot || v.Source == pkgverify.SourceLaunchpad {
 			lower[v.Source]++
 		}
@@ -115,8 +118,11 @@ func (j *judge) packages() {
 		j.pkgPath[v.Path] = j.add(j.suspicious(v))
 	}
 	j.unverifiable(r.Unverifiable)
-	if len(j.scanLimit) > 0 {
-		j.couldNot = append(j.couldNot, "changed package files: package verification could not run for this scan ("+strings.Join(j.scanLimit, "; ")+")")
+	if j.notRun != "" {
+		j.couldNot = append(j.couldNot, j.notRun)
+	}
+	if n := len(j.stopped); n > 0 {
+		j.couldNot = append(j.couldNot, fmt.Sprintf("verification stopped before %d %s checked", n, plural(n, "package was", "packages were")))
 	}
 	if len(j.budget) > 0 {
 		j.add(&model.Finding{
@@ -266,21 +272,28 @@ func (j *judge) unverifiable(vs []pkgverify.FileVerdict) {
 		switch {
 		case v.Kind == pkgverify.KindBudget && !slices.Contains(j.budget, v.Reason):
 			j.budget = append(j.budget, v.Reason)
-		case class == classScanLimit && !slices.Contains(j.scanLimit, v.Reason):
-			j.scanLimit = append(j.scanLimit, v.Reason)
+		case v.Kind == pkgverify.KindRelease:
+			j.notRun = "package verification did not run: /etc/os-release says " + strings.TrimSpace(j.c.Host.OSID+" "+j.c.Host.OSVersionID)
+		case v.Kind == pkgverify.KindHostArch:
+			j.notRun = "package verification did not run: " + v.Reason
+		case class == classStopped:
+			j.stopped[owner] = true
 		}
-		// A special file that could not be checked because a package source
-		// could not be used goes into the one note on unchecked files: a
-		// network failure must not raise one backdoor sign per module or
-		// setuid program. When verification could not run at all, it is
-		// judged as if it had not run; anything else is a backdoor sign.
+		if class == classHostLimit {
+			continue // stated once; nothing about this file was checked
+		}
+		// A special file goes into the one note on unchecked files only when
+		// the host's own indexes could not be used, so a network failure does
+		// not raise one backdoor sign per module or setuid program; what a
+		// deadline left is a backdoor sign for a package that changed, and
+		// anything else is a backdoor sign.
 		if cat != "" && class == classUnchecked {
 			j.uncheckedSpecial[v.Path] = true
 			j.uncheckedFiles = append(j.uncheckedFiles, model.Evidence{Path: v.Path, After: v.Actual,
 				Detail: strings.TrimSpace(v.Package+" "+v.Version) + ": could not be checked: " + v.Reason, When: j.whenFor(v.Path)})
 			continue
 		}
-		if cat != "" && class == classNotFound {
+		if cat != "" && (class == classNotFound || (class == classStopped && j.pkgChanged(owner))) {
 			j.pkgPath[v.Path] = j.add(&model.Finding{
 				Key: "pkg.unverifiable:" + v.Path, ID: "TT-PKG-003", Source: srcPackage, Severity: model.SevBackdoor,
 				Title: fmt.Sprintf("%s (a %s) could not be verified against its package", v.Path, cat),

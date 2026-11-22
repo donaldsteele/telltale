@@ -208,8 +208,40 @@ func (j *judge) listWhen(name string) *time.Time {
 
 // installed ranks a newly installed package that is not routine.
 func (j *judge) installed(name, version string) {
-	var reasons []model.Evidence
-	if p := j.pkgs[name]; p != nil {
+	f, reasons := j.installFinding(j.pkgs[name], name, version)
+	// What raised the package is part of the value an exception accepts.
+	j.pkgReasons[name] = append(j.pkgReasons[name], reasons...)
+	j.pkgFinding[name] = j.add(f)
+}
+
+// installedExtra ranks a package installed for another architecture while
+// the same name also changed: it is judged as an install of its own.
+func (j *judge) installedExtra(ch diff.Change) {
+	var p *model.Package
+	for i := range j.c.Packages.Installed {
+		if q := &j.c.Packages.Installed[i]; q.Name == ch.Pkg.Name && q.Arch == ch.Pkg.Arch {
+			p = q
+		}
+	}
+	name := ch.Pkg.Name + ":" + ch.Pkg.Arch
+	f, reasons := j.installFinding(p, ch.Pkg.Name, ch.Pkg.New)
+	f.Key = "snap.pkg_installed:" + name
+	f.Title = strings.Replace(f.Title, "New package "+ch.Pkg.Name+" ", "New package "+name+" ", 1)
+	var files []string
+	if p != nil {
+		files = p.Files
+	}
+	sort.Strings(reasons)
+	f.Evidence[0].After = strings.Join(append([]string{ch.Pkg.New}, reasons...), "; ") + "; files " + j.contentDigest(append([]string(nil), files...))
+	j.add(f)
+}
+
+// installFinding builds the finding for a newly installed package p (its
+// dpkg entry; nil if it has none): a note, or a backdoor sign with what
+// raised it. reasons summarise what raised it.
+func (j *judge) installFinding(p *model.Package, name, version string) (*model.Finding, []string) {
+	var raised []model.Evidence
+	if p != nil {
 		for _, f := range p.Files {
 			e := j.files[f]
 			if e == nil {
@@ -219,27 +251,27 @@ func (j *judge) installed(name, version string) {
 			}
 			if e != nil && e.Type == "file" {
 				if e.Mode&0o6000 != 0 {
-					reasons = append(reasons, model.Evidence{Path: f, Detail: fmt.Sprintf("setuid/setgid program (mode %04o)", e.Mode&0o7777)})
+					raised = append(raised, model.Evidence{Path: f, Detail: fmt.Sprintf("setuid/setgid program (mode %04o)", e.Mode&0o7777)})
 				}
 				if e.Caps != "" {
-					reasons = append(reasons, model.Evidence{Path: f, Detail: "file capability " + e.Caps})
+					raised = append(raised, model.Evidence{Path: f, Detail: "file capability " + e.Caps})
 				}
 			}
 			switch {
 			case isKernelModule(f):
-				reasons = append(reasons, model.Evidence{Path: f, Detail: "kernel module"})
+				raised = append(raised, model.Evidence{Path: f, Detail: "kernel module"})
 			case isPAMModule(f):
-				reasons = append(reasons, model.Evidence{Path: f, Detail: "PAM module"})
+				raised = append(raised, model.Evidence{Path: f, Detail: "PAM module"})
 			case isUnitFile(f):
 				if link := j.enabledLink(f); link != "" {
-					reasons = append(reasons, model.Evidence{Path: f, Detail: "systemd unit enabled by " + link})
+					raised = append(raised, model.Evidence{Path: f, Detail: "systemd unit enabled by " + link})
 				}
 			}
 		}
 	}
 	for _, l := range j.listeners {
 		if l.After != "" && j.owned[l.After] == name {
-			reasons = append(reasons, model.Evidence{Path: l.After, After: l.Subject, Detail: "listens on a new socket"})
+			raised = append(raised, model.Evidence{Path: l.After, After: l.Subject, Detail: "listens on a new socket"})
 		}
 	}
 	f := &model.Finding{
@@ -250,19 +282,19 @@ func (j *judge) installed(name, version string) {
 		Evidence: []model.Evidence{{After: version, Detail: "installed since the snapshot", When: j.listWhen(name)}},
 		Refs:     []string{"T1072"},
 	}
-	if len(reasons) > 0 {
+	if len(raised) > 0 {
 		f.Severity = model.SevBackdoor
-		f.Title = fmt.Sprintf("New package %s %s since the snapshot, with %s", name, version, reasons[0].Detail)
+		f.Title = fmt.Sprintf("New package %s %s since the snapshot, with %s", name, version, raised[0].Detail)
 		f.Why = "A package installed since the machine was known to be clean that adds something that runs with special rights or reaches the network: " +
 			"a setuid/setgid program, a file capability, a kernel module, a PAM module, an enabled service or a listening program. " +
 			"Installing a package is an easy way to plant a backdoor that looks legitimate."
-		f.Evidence = append(f.Evidence, reasons...)
+		f.Evidence = append(f.Evidence, raised...)
 	}
-	// What raised the package is part of the value an exception accepts.
-	for _, r := range reasons {
-		j.pkgReasons[name] = append(j.pkgReasons[name], strings.TrimSpace(r.Detail+" "+r.Path))
+	var reasons []string
+	for _, r := range raised {
+		reasons = append(reasons, strings.TrimSpace(r.Detail+" "+r.Path))
 	}
-	j.pkgFinding[name] = j.add(f)
+	return f, reasons
 }
 
 // changedNames lists the packages that changed, those still installed first
@@ -282,10 +314,10 @@ func (j *judge) changedNames() []string {
 }
 
 // changedPackage is the first changed package (in changedNames order) for
-// which match holds, or "".
+// which match holds and whose change is confirmed (see rebuilderOK), or "".
 func (j *judge) changedPackage(match func(name string) bool) string {
 	for _, n := range j.changedNames() {
-		if match(n) {
+		if j.rebuilderOK(n) && match(n) {
 			return n
 		}
 	}
@@ -313,10 +345,19 @@ func (j *judge) ships(name, prefix string) bool {
 	return false
 }
 
-// kernelPackageFor is the changed kernel package of a kernel release, or "".
+// rebuilderOK reports whether a package change can explain a rebuilt boot
+// file: a removal, or a new version that something confirmed (one of its
+// files matched it). A version bump typed into dpkg status explains
+// nothing.
+func (j *judge) rebuilderOK(name string) bool {
+	return j.pkgChange[name].Kind == diff.PkgRemoved || j.confirmed[name]
+}
+
+// kernelPackageFor is the changed, confirmed kernel package of a kernel
+// release, or "".
 func (j *judge) kernelPackageFor(release string) string {
 	for _, name := range []string{"linux-image-" + release, "linux-image-unsigned-" + release, "linux-modules-" + release, "linux-modules-extra-" + release} {
-		if j.pkgChanged(name) {
+		if j.pkgChanged(name) && j.rebuilderOK(name) {
 			return name
 		}
 	}

@@ -23,8 +23,13 @@ func (j *judge) index(chs []diff.Change) {
 			if ch.Pkg == nil {
 				continue
 			}
-			if prev, ok := j.pkgChange[ch.Pkg.Name]; !ok || prev.Kind == diff.PkgRemoved {
+			prev, ok := j.pkgChange[ch.Pkg.Name]
+			switch {
+			case !ok || prev.Kind == diff.PkgRemoved:
 				j.pkgChange[ch.Pkg.Name] = ch
+			case ch.Kind == diff.PkgInstalled && prev.Pkg != nil && prev.Pkg.Arch != ch.Pkg.Arch:
+				// Another architecture of a package that also changed.
+				j.extraInstalls = append(j.extraInstalls, ch)
 			}
 		case diff.ListenerAdded:
 			j.listeners = append(j.listeners, ch)
@@ -118,6 +123,9 @@ func (j *judge) changes(chs []diff.Change) {
 				j.packageChange(ch)
 			}
 		}
+	}
+	for _, ch := range j.extraInstalls {
+		j.installedExtra(ch)
 	}
 	for _, ch := range chs {
 		if ch.Kind == diff.PersistChanged {
@@ -426,14 +434,22 @@ func (j *judge) placed(ch diff.Change, e, old, cur *model.FileEntry, owner strin
 		ev.Detail = "dpkg's record of the package"
 		j.foldIntoPackage(dpkgInfoPackage(p), ev, model.SevNote)
 		return true
-	case (j.unverified[p] || j.uncheckedSpecial[p]) && j.pkgChanged(owner) && j.classify(j.unverKind[p]) != classScanLimit:
+	case (j.unverified[p] || j.uncheckedSpecial[p]) && j.pkgChanged(owner):
 		// A version no trusted source confirmed explains none of its
 		// files: every one goes on the package's change, which it makes
 		// a backdoor sign. When a source could not be used, programs go
 		// into the note on unchecked files and the rest is counted in
 		// the grouped note.
-		if j.classify(j.unverKind[p]) == classNotFound || (e.Type == "file" && pkgverify.InScope(p, e.Mode)) {
+		// What a deadline left unchecked makes the change unconfirmed.
+		switch j.classify(j.unverKind[p]) {
+		case classNotFound:
 			j.unverifiedProgram(owner, p, ev)
+		case classUnchecked:
+			if e.Type == "file" && pkgverify.InScope(p, e.Mode) {
+				j.unverifiedProgram(owner, p, ev)
+			}
+		case classStopped:
+			j.unconfirmed[owner] = true
 		}
 		return true
 	}
@@ -461,7 +477,7 @@ func (j *judge) placed(ch diff.Change, e, old, cur *model.FileEntry, owner strin
 func (j *judge) unverifiedProgram(pkg, p string, ev model.Evidence) {
 	r := j.unverReason[p]
 	j.touch(pkg, p)
-	if j.classify(j.unverKind[p]) == classNotFound {
+	if c := j.classify(j.unverKind[p]); c == classNotFound || c == classStopped {
 		ev.Detail = "changed; no trusted source confirmed this version: " + r
 		j.unverIn[pkg] = append(j.unverIn[pkg], ev)
 		return
@@ -477,51 +493,37 @@ func (j *judge) unverifiedProgram(pkg, p string, ev model.Evidence) {
 type verdictClass int
 
 const (
-	// classNotFound: no trusted source confirmed the version, or the kind
-	// comes from data root can write (a version string, an architecture,
-	// a package count, a file size). Treated as a version no trusted source
-	// has: a backdoor sign.
+	// classNotFound: nothing confirmed the version (it is in no trusted
+	// source, looking it up failed while the host's indexes were read, or
+	// the kind comes from data root can write). A backdoor sign.
 	classNotFound verdictClass = iota
-	// classUnchecked: a package source could not be read or used (the
-	// network, a signature, the reference bundle). One note for all.
+	// classUnchecked: the host's own signed indexes could not be read or
+	// verified, so nothing could be checked. One note for all.
 	classUnchecked
-	// classScanLimit: package verification could not run for this scan at
-	// all; files are judged as if it had not run.
-	classScanLimit
+	// classStopped: the scan's deadline stopped verification first. Stated
+	// in what could not be ruled out; special files of a changed package
+	// stay backdoor signs.
+	classStopped
+	// classHostLimit: telltale verifies nothing for the host's
+	// architecture. Only stated.
+	classHostLimit
 )
 
-// classify sorts an unverifiable verdict by its pkgverify kind. Only the
-// network kinds count as "could not check"; Ubuntu Pro does too, but only
-// on an Ubuntu host with an ESM source configured. A verdict without a kind
-// is read cautiously, as not found.
+// classify sorts an unverifiable verdict by its pkgverify kind. pkgverify
+// decides once per scan whether the archive could be reached: only its
+// "unreachable" and "bad signature" kinds mean the host's indexes could not
+// be used. Every other kind, and a verdict without one, counts as not
+// found.
 func (j *judge) classify(kind string) verdictClass {
 	switch kind {
-	case pkgverify.KindUnreachable, pkgverify.KindBadSignature, pkgverify.KindNotInBundle:
+	case pkgverify.KindUnreachable, pkgverify.KindBadSignature:
 		return classUnchecked
-	case pkgverify.KindPro:
-		if j.esmHost() {
-			return classUnchecked
-		}
-	case pkgverify.KindScanLimit:
-		return classScanLimit
+	case pkgverify.KindStopped:
+		return classStopped
+	case pkgverify.KindHostArch:
+		return classHostLimit
 	}
 	return classNotFound
-}
-
-// esmHost reports whether the machine is Ubuntu with an ESM source, the
-// only place Pro package versions are expected.
-func (j *judge) esmHost() bool {
-	if j.c.Host.OSID != "ubuntu" {
-		return false
-	}
-	for _, s := range j.c.Packages.Sources {
-		for _, u := range s.URIs {
-			if strings.Contains(u, "esm.ubuntu.com") {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // fullHash puts the entry's whole hash in place of the shortened one diff
@@ -1023,6 +1025,10 @@ func (j *judge) userAdded(ch diff.Change) {
 		f.Title = fmt.Sprintf("New account %q with user id 0 (root powers), not in the snapshot", name)
 		f.Why = "Only root should have user id 0. A new account with id 0 is a second root login under another name, a classic hidden way back in."
 		f.Fix = fixUserAdded(name, true)
+	} else if u != nil && j.privGID[u.GID] {
+		f.Severity = model.SevBackdoor
+		f.Title = fmt.Sprintf("New account %q whose primary group (gid %d) is privileged", name, u.GID)
+		f.Why = "sudo rules such as %sudo, and the rights of groups like shadow, disk or docker, apply to an account's primary group too. A new account placed in such a group gets those rights without appearing in the group's member list."
 	}
 	j.add(f)
 }
@@ -1046,6 +1052,10 @@ func (j *judge) userChanged(ch diff.Change) {
 		f.Severity = model.SevBackdoor
 		f.Title = fmt.Sprintf("Account %q was given user id 0 (root powers) since the snapshot", name)
 		f.Why = "Only root should have user id 0. Giving an existing account id 0 makes it a second root login under another name, a classic hidden way back in."
+	} else if cur != nil && old != nil && cur.GID != old.GID && j.privGID[cur.GID] {
+		f.Severity = model.SevBackdoor
+		f.Title = fmt.Sprintf("Account %q now has a privileged primary group (gid %d)", name, cur.GID)
+		f.Why = "sudo rules such as %sudo, and the rights of groups like shadow, disk or docker, apply to an account's primary group too, which does not show in the group's member list."
 	}
 	j.add(f)
 }

@@ -4,12 +4,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/donaldsteele/telltale/internal/checklist"
+	"github.com/donaldsteele/telltale/internal/collect"
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/internal/pkgverify"
 )
@@ -942,7 +945,8 @@ func TestJudgeKernelUpdateGeneratedFilesFoldIntoKernelPackage(t *testing.T) {
 		file("/lib/modules/6.1.0-27-amd64/modules.dep", "dep 27", 0o644))
 	setFile(cur, file("/boot/grub/grub.cfg", "menu 27", 0o444))
 
-	r := run(cur, snapOf(old), archive())
+	// The new kernel is confirmed by one of its files.
+	r := run(cur, snapOf(old), archive(pkgverify.FileVerdict{Path: "/boot/vmlinuz-6.1.0-27-amd64", Package: "linux-image-6.1.0-27-amd64", Version: "6.1.115-1", Source: "archive"}))
 	for _, k := range []string{"snap.file_added:/boot/initrd.img-6.1.0-27-amd64", "snap.file_added:/lib/modules/6.1.0-27-amd64/modules.dep",
 		"snap.file_removed:/boot/initrd.img-6.1.0-25-amd64", "snap.file_removed:/lib/modules/6.1.0-25-amd64/modules.dep"} {
 		absent(t, r, k)
@@ -1422,7 +1426,7 @@ func TestJudgeBootFilesFoldOnlyIntoRebuilders(t *testing.T) {
 	cur = clone(old)
 	setVersion(cur, "grub-pc", "2.06-13+deb12u2")
 	edit(cur)
-	r = run(cur, snapOf(old), archive())
+	r = run(cur, snapOf(old), archive(pkgverify.FileVerdict{Path: "/usr/lib/grub/i386-pc/kernel.img", Package: "grub-pc", Version: "2.06-13+deb12u2", Source: "archive"}))
 	for _, p := range boot[:2] {
 		absent(t, r, "snap.file_modified:"+p)
 	}
@@ -1434,7 +1438,7 @@ func TestJudgeBootFilesFoldOnlyIntoRebuilders(t *testing.T) {
 	cur = clone(old)
 	setVersion(cur, "udev", "252.31-1~deb12u1")
 	edit(cur)
-	r = run(cur, snapOf(old), archive())
+	r = run(cur, snapOf(old), archive(pkgverify.FileVerdict{Path: "/usr/share/initramfs-tools/hooks/udev", Package: "udev", Version: "252.31-1~deb12u1", Source: "archive"}))
 	absent(t, r, "snap.file_modified:/boot/initrd.img-6.1.0-25-amd64")
 	if g := explained(r, "explained:udev"); g == nil || !hasEvidencePath(g, "/boot/initrd.img-6.1.0-25-amd64") {
 		t.Errorf("initramfs not shown with the hook package: %+v", g)
@@ -1636,19 +1640,17 @@ func TestJudgeUncheckedPackagesAreOneNote(t *testing.T) {
 		t.Errorf("exit %d (%v)", r.ExitCode, keys(r))
 	}
 
-	// A reference bundle that lacks the package could not check it; one
-	// whose builder found the version in no trusted source did.
+	// A reference bundle whose indexes were read but that lacks a package
+	// (R61: a root-chosen version only HTTPS sources have) confirmed
+	// nothing: both are backdoor signs.
 	res2 := &pkgverify.Result{Mode: pkgverify.ModeRefs, SourcesUsed: []string{"reference bundle /mnt/refs"}, Unverifiable: []pkgverify.FileVerdict{
-		{Path: "/usr/sbin/sshd", Package: "openssh-server", Reason: "package not in the reference bundle", Kind: pkgverify.KindNotInBundle},
+		{Path: "/usr/sbin/sshd", Package: "openssh-server", Reason: "package not in the reference bundle", Kind: pkgverify.KindNotFound},
 		{Path: "/usr/bin/sudo", Package: "sudo", Reason: "not in the reference bundle: " + pkgverify.ReasonNotOfficial, Kind: pkgverify.KindNotFound}}}
 	r = run(cur, snapOf(old), res2)
-	absent(t, r, "snap.pkg_upgraded:openssh-server")
+	must(t, r, "snap.pkg_upgraded:openssh-server", model.SevBackdoor)
 	must(t, r, "snap.pkg_upgraded:sudo", model.SevBackdoor)
 	must(t, r, "pkg.unverifiable:/usr/bin/sudo", model.SevBackdoor)
-	u := must(t, r, "pkg.unchecked_changes", model.SevNote)
-	if u.Title != "1 package file could not be checked against a trusted source" {
-		t.Errorf("title %q", u.Title)
-	}
+	absent(t, r, "pkg.unchecked_changes")
 }
 
 // R53: gshadow changes that the group comparison explains are notes, unless
@@ -1712,7 +1714,7 @@ func TestJudgeFirmwareRebuildsInitramfs(t *testing.T) {
 		cur := clone(old)
 		setVersion(cur, name, "2")
 		setFile(cur, file("/boot/initrd.img-6.1.0-25-amd64", "initrd 2", 0o644))
-		r := run(cur, snapOf(old), archive())
+		r := run(cur, snapOf(old), archive(pkgverify.FileVerdict{Path: "/usr/lib/firmware/x.bin", Package: name, Version: "2", Source: "archive"}))
 		absent(t, r, "snap.file_modified:/boot/initrd.img-6.1.0-25-amd64")
 		if g := explained(r, "explained:"+name); g == nil || !hasEvidencePath(g, "/boot/initrd.img-6.1.0-25-amd64") {
 			t.Errorf("%s: initramfs not shown with it", name)
@@ -1807,7 +1809,6 @@ func TestJudgeOnlyNetworkKindsAreUnchecked(t *testing.T) {
 	}{
 		{pkgverify.KindUnreachable, true, "1:9.2p1-2+deb12u9"},
 		{pkgverify.KindBadSignature, true, "1:9.2p1-2+deb12u9"},
-		{pkgverify.KindNotInBundle, true, "1:9.2p1-2+deb12u9"},
 		{pkgverify.KindPro, false, "1:9.2p1-2+deb12u9+esm1"}, // Debian: "+esm" is just text in a version
 		{pkgverify.KindUnsupportedArch, false, "1:9.2p1-2+deb12u9"},
 		{pkgverify.KindBudget, false, "1:9.2p1-2+deb12u9"},
@@ -1828,15 +1829,16 @@ func TestJudgeOnlyNetworkKindsAreUnchecked(t *testing.T) {
 		}
 	}
 
-	// Ubuntu with an ESM source: a Pro package that could not be checked
-	// without a Pro token is unchecked, not a backdoor sign.
+	// R61: even on Ubuntu with an ESM source (both root can write), a Pro
+	// version nothing confirmed is a backdoor sign; only unreadable base
+	// indexes fold.
 	ub := sshBase()
 	ub.Host.OSID = "ubuntu"
 	ub.Packages.Sources = []model.AptSource{{URIs: []string{"https://esm.ubuntu.com/apps/ubuntu"}, Suites: []string{"noble-apps-security"}}}
 	cur, res := upgradeSSH(ub, "1:9.6p1-3ubuntu13.5+esm1", "sshd esm", pkgverify.KindPro, pkgverify.ReasonPro)
 	r := run(cur, snapOf(ub), res)
-	absent(t, r, "snap.pkg_upgraded:openssh-server")
-	must(t, r, "pkg.unchecked_changes", model.SevNote)
+	must(t, r, "snap.pkg_upgraded:openssh-server", model.SevBackdoor)
+	absent(t, r, "pkg.unchecked_changes")
 
 	// The package budget: still a backdoor sign, and the limit is a note.
 	cur, res = upgradeSSH(old, "1:9.2p1-2+deb12u9", "trojan sshd", pkgverify.KindBudget, "not checked: the collection lists more than 10000 packages")
@@ -1862,8 +1864,9 @@ func TestJudgeSpecialFileKindsWithoutSnapshot(t *testing.T) {
 		must(t, r, "pkg.unverifiable:/usr/bin/sudo", model.SevBackdoor)
 		absent(t, r, "pkg.unchecked_changes")
 	}
-	r := run(c, nil, res(pkgverify.KindScanLimit, `host architecture "riscv64" is not supported for package verification`))
+	r := run(c, nil, res(pkgverify.KindHostArch, `host architecture "riscv64" is not supported for package verification`))
 	absent(t, r, "pkg.unverifiable:/usr/bin/sudo")
+	absent(t, r, "pkg.unverifiable")
 	absent(t, r, "pkg.unchecked_changes")
 	if !slices.ContainsFunc(r.CouldNotRuleOut, func(s string) bool { return strings.Contains(s, "riscv64") }) {
 		t.Errorf("scan limit not stated: %q", r.CouldNotRuleOut)
@@ -2006,4 +2009,205 @@ func TestJudgeDuplicateGroupEntries(t *testing.T) {
 	c := clean()
 	c.Accounts.Groups = append(c.Accounts.Groups, model.Group{Name: "sudo", GID: 27, Members: []string{"eve"}})
 	must(t, run(c, nil, nil), "acct.duplicate:/etc/group:sudo", model.SevBackdoor)
+}
+
+// --- review round 3 ---
+
+type acctFiles struct{ passwd, shadow, group, gshadow string }
+
+var acctBase = acctFiles{
+	passwd:  "root:x:0:0:root:/root:/bin/bash\nalice:x:1000:1000::/home/alice:/bin/bash\n",
+	shadow:  "root:$y$orig:20000:0:99999:7:::\nalice:$y$alice:20000:0:99999:7:::\n",
+	group:   "root:x:0:\nsudo:x:27:alice\nstaff:x:50:\nusers:x:100:\nalice:x:1000:\n",
+	gshadow: "root:*::\nsudo:!::alice\nstaff:*::\nusers:*::\nalice:!::\n",
+}
+
+// collectAccounts runs the real collector on account files written to a
+// fresh root and puts the result, and the files' entries, on a collection.
+func collectAccounts(t *testing.T, a acctFiles) *model.Collection {
+	t.Helper()
+	d := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(d, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := clean()
+	for name, body := range map[string]string{"passwd": a.passwd, "shadow": a.shadow, "group": a.group, "gshadow": a.gshadow} {
+		if err := os.WriteFile(filepath.Join(d, "etc", name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		perm := uint32(0o644)
+		if name == "shadow" || name == "gshadow" {
+			perm = 0o640
+		}
+		setFile(c, file("/etc/"+name, body, perm))
+	}
+	c.Accounts, _ = collect.Accounts(d, ctx.DigestKey)
+	return c
+}
+
+func acctRun(t *testing.T, before, after acctFiles) *model.Report {
+	t.Helper()
+	return run(collectAccounts(t, after), snapOf(collectAccounts(t, before)), archive())
+}
+
+// Account file attacks, collected the way glibc reads the files.
+func TestJudgeAccountAttacksEndToEnd(t *testing.T) {
+	b := acctBase
+	for _, tc := range []struct {
+		name  string
+		after acctFiles
+		keys  []string
+	}{
+		{"shadow prepend", acctFiles{b.passwd, "root:$6$attacker:20000:0:99999:7:::\n" + b.shadow, b.group, b.gshadow}, []string{"acct.duplicate:/etc/shadow:root"}},
+		{"4-field passwd uid 0", acctFiles{b.passwd + "toor:x:0:0\n", b.shadow, b.group, b.gshadow}, []string{"snap.user_added:toor"}},
+		{"2-field gshadow replaces", acctFiles{b.passwd, b.shadow, b.group, "root:*::\nsudo:$6$grouphash\nstaff:*::\nusers:*::\nalice:!::\n"}, []string{"snap.group:sudo"}},
+		{"2-field gshadow prepended", acctFiles{b.passwd, b.shadow, b.group, "root:*::\nsudo:$6$grouphash\nsudo:!::alice\nstaff:*::\nusers:*::\nalice:!::\n"}, []string{"snap.group:sudo", "acct.duplicate:/etc/gshadow:sudo"}},
+		{"2-field gshadow appended", acctFiles{b.passwd, b.shadow, b.group, b.gshadow + "sudo:$6$grouphash\n"}, []string{"acct.duplicate:/etc/gshadow:sudo"}},
+		{"duplicate group line", acctFiles{b.passwd, b.shadow, b.group + "sudo:x:27:eve\n", b.gshadow}, []string{"acct.duplicate:/etc/group:sudo"}},
+		{"duplicate group line prepended", acctFiles{b.passwd, b.shadow, "sudo:x:27:alice,eve\n" + b.group, b.gshadow}, []string{"snap.group:sudo"}},
+		{"gid alias", acctFiles{b.passwd, b.shadow, b.group + "wheel2:x:27:eve\n", b.gshadow}, []string{"snap.group:wheel2"}},
+		{"user with primary gid sudo", acctFiles{b.passwd + "eve:x:1001:27::/home/eve:/bin/bash\n", b.shadow + "eve:$y$eve:20000:0:99999:7:::\n", b.group, b.gshadow}, []string{"snap.user_added:eve"}},
+		{"primary gid changed to sudo", acctFiles{"root:x:0:0:root:/root:/bin/bash\nalice:x:1000:27::/home/alice:/bin/bash\n", b.shadow, b.group, b.gshadow}, []string{"snap.user_changed:alice"}},
+		{"uid 2^32", acctFiles{b.passwd + "big:x:4294967296:0::/:/bin/sh\n", b.shadow, b.group, b.gshadow}, []string{"acct.malformed:/etc/passwd:3"}},
+		{"empty-name group gid 27", acctFiles{b.passwd, b.shadow, b.group + ":x:27:eve\n", b.gshadow}, []string{"acct.malformed:/etc/group:6 (empty name, gid 27, members eve)"}},
+		{"empty-name uid 0 first", acctFiles{":x:0:0::/tmp/x:/tmp/x/sh\n" + b.passwd, b.shadow, b.group, b.gshadow}, []string{"acct.malformed:/etc/passwd:1 (empty name, uid 0)"}},
+		{"empty-name gshadow", acctFiles{b.passwd, b.shadow, b.group, b.gshadow + ":$6$grouphash::eve\n"}, []string{"acct.malformed:/etc/gshadow:6 (empty name)"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := acctRun(t, b, tc.after)
+			for _, k := range tc.keys {
+				must(t, r, k, model.SevBackdoor)
+			}
+			if r.ExitCode != 2 {
+				t.Errorf("exit %d (%v)", r.ExitCode, keys(r))
+			}
+		})
+	}
+
+	// An out-of-range first line is dropped by glibc, so the next line for
+	// the same name counts: alice is uid 0.
+	r := acctRun(t, b, acctFiles{"root:x:0:0:root:/root:/bin/bash\nalice:x:4294968296:1000::/home/alice:/bin/bash\nalice:x:0:0::/home/alice:/bin/bash\n", b.shadow, b.group, b.gshadow})
+	f := must(t, r, "snap.user_changed:alice", model.SevBackdoor)
+	if !strings.Contains(f.Evidence[0].After, "uid 0") {
+		t.Errorf("evidence %+v", f.Evidence[0])
+	}
+	must(t, r, "acct.malformed:/etc/passwd:2", model.SevBackdoor)
+	m := must(t, acctRun(t, b, acctFiles{":x:0:0::/tmp/x:/tmp/x/sh\n" + b.passwd, b.shadow, b.group, b.gshadow}), "acct.malformed:/etc/passwd:1 (empty name, uid 0)", model.SevBackdoor)
+	if !strings.Contains(m.Title, "uid 0") {
+		t.Errorf("title %q", m.Title)
+	}
+}
+
+// R61: whether the archive could be reached is decided once per scan. With
+// the host's indexes read, any per-package failure is "no trusted source
+// confirmed it" (the probe: a 9 KB version reached HTTP 414 at the snapshot
+// service); only failing base indexes fold into the note.
+func TestJudgeReachabilityIsPerScan(t *testing.T) {
+	old := sshBase()
+	v := "1:9.2p1-2+deb12u9" + strings.Repeat("a", 9000)
+	cur, res := upgradeSSH(old, v, "trojan sshd", pkgverify.KindNotFound, "the version in dpkg status is not a valid Debian version, so no source was asked")
+	r := run(cur, snapOf(old), res)
+	must(t, r, "snap.pkg_upgraded:openssh-server", model.SevBackdoor)
+	absent(t, r, "pkg.unchecked_changes")
+
+	cur, res = upgradeSSH(old, "1:9.2p1-2+deb12u9", "sshd 2", pkgverify.KindUnreachable, "could not read the official archive index: dial tcp: i/o timeout")
+	r = run(cur, snapOf(old), res)
+	absent(t, r, "snap.pkg_upgraded:openssh-server")
+	must(t, r, "pkg.unchecked_changes", model.SevNote)
+}
+
+// R61: /etc/os-release naming a release telltale does not verify: special
+// files are a backdoor sign each, other files one note, and the report says
+// verification did not run. An unsupported host architecture is only said.
+func TestJudgeVerificationDidNotRun(t *testing.T) {
+	c := clean()
+	c.Host.OSID, c.Host.OSVersionID = "debian", "99"
+	c.Packages.Installed = append(c.Packages.Installed, pkg("sudo", "1.9.13p3-1+deb12u1", "/usr/bin/sudo"), pkg("jq", "1.6-2.1", "/usr/bin/jq"))
+	c.Files = append(c.Files, file("/usr/bin/sudo", "sudo", 0o4755), file("/usr/bin/jq", "jq", 0o755))
+	verdicts := func(kind, reason string) *pkgverify.Result {
+		return &pkgverify.Result{Mode: pkgverify.ModeArchive, Unverifiable: []pkgverify.FileVerdict{
+			{Path: "/usr/bin/sudo", Package: "sudo", Reason: reason, Kind: kind},
+			{Path: "/usr/bin/jq", Package: "jq", Reason: reason, Kind: kind}}}
+	}
+	r := run(c, nil, verdicts(pkgverify.KindRelease, `release not supported for package verification: "debian" "99"`))
+	must(t, r, "pkg.unverifiable:/usr/bin/sudo", model.SevBackdoor)
+	must(t, r, "pkg.unverifiable", model.SevNote)
+	absent(t, r, "pkg.unverifiable:/usr/bin/jq")
+	if !slices.Contains(r.CouldNotRuleOut, "package verification did not run: /etc/os-release says debian 99") {
+		t.Errorf("could not rule out %q", r.CouldNotRuleOut)
+	}
+
+	r = run(c, nil, verdicts(pkgverify.KindHostArch, `host architecture "riscv64" is not supported for package verification`))
+	absent(t, r, "pkg.unverifiable:/usr/bin/sudo")
+	absent(t, r, "pkg.unverifiable")
+	if !slices.ContainsFunc(r.CouldNotRuleOut, func(s string) bool { return strings.Contains(s, "host architecture") }) {
+		t.Errorf("could not rule out %q", r.CouldNotRuleOut)
+	}
+}
+
+// R61: a deadline never folds: what was left is stated, and special files
+// of a changed package stay backdoor signs.
+func TestJudgeDeadlineDoesNotFold(t *testing.T) {
+	old := sshBase()
+	old.Packages.Installed = append(old.Packages.Installed, pkg("sudo", "1.9.13p3-1+deb12u1", "/usr/bin/sudo"))
+	old.Files = append(old.Files, file("/usr/bin/sudo", "sudo", 0o4755))
+	cur := clone(old)
+	setVersion(cur, "sudo", "1.9.13p3-1+deb12u9")
+	setFile(cur, file("/usr/bin/sudo", "trojan sudo", 0o4755))
+	setVersion(cur, "openssh-server", "1:9.2p1-2+deb12u9")
+	setFile(cur, file("/usr/sbin/sshd", "sshd 2", 0o755))
+	res := archive()
+	res.Unverifiable = []pkgverify.FileVerdict{
+		{Path: "/usr/bin/sudo", Package: "sudo", Reason: "check stopped: context deadline exceeded", Kind: pkgverify.KindStopped},
+		{Path: "/usr/sbin/sshd", Package: "openssh-server", Reason: "check stopped: context deadline exceeded", Kind: pkgverify.KindStopped}}
+	r := run(cur, snapOf(old), res)
+	must(t, r, "pkg.unverifiable:/usr/bin/sudo", model.SevBackdoor)
+	must(t, r, "snap.pkg_upgraded:sudo", model.SevBackdoor)
+	absent(t, r, "pkg.unchecked_changes")
+	if explained(r, "explained:openssh-server") != nil {
+		t.Errorf("an upgrade nothing checked is explained")
+	}
+	if !slices.Contains(r.CouldNotRuleOut, "verification stopped before 2 packages were checked") {
+		t.Errorf("could not rule out %q", r.CouldNotRuleOut)
+	}
+}
+
+// A rebuilder's version change explains a rebuilt initramfs only when
+// something confirms the new version (one of its files verified): a
+// hand-edited version bump explains nothing.
+func TestJudgeFakeRebuilderBump(t *testing.T) {
+	old := clean()
+	old.Packages.Installed = append(old.Packages.Installed, pkg("initramfs-tools", "0.142", "/usr/sbin/update-initramfs"))
+	old.Files = append(old.Files, file("/usr/sbin/update-initramfs", "u-i", 0o755), file("/boot/initrd.img-6.1.0-25-amd64", "initrd", 0o644))
+	cur := clone(old)
+	setVersion(cur, "initramfs-tools", "0.142+deb12u9")
+	setFile(cur, file("/boot/initrd.img-6.1.0-25-amd64", "initrd with implant", 0o644))
+	must(t, run(cur, snapOf(old), archive()), "snap.file_modified:/boot/initrd.img-6.1.0-25-amd64", model.SevBackdoor)
+
+	// The real upgrade: its changed program verified.
+	setFile(cur, file("/usr/sbin/update-initramfs", "u-i 2", 0o755))
+	res := archive(pkgverify.FileVerdict{Path: "/usr/sbin/update-initramfs", Package: "initramfs-tools", Version: "0.142+deb12u9", Expected: h("u-i 2"), Actual: h("u-i 2"), Source: "archive"})
+	absent(t, run(cur, snapOf(old), res), "snap.file_modified:/boot/initrd.img-6.1.0-25-amd64")
+}
+
+// A package installed for a second architecture while the same name is
+// upgraded is judged as an install.
+func TestJudgeSecondArchitectureInstall(t *testing.T) {
+	old := clean()
+	old.Packages.Installed = append(old.Packages.Installed, pkg("foo", "1.0-1", "/usr/bin/foo"))
+	old.Files = append(old.Files, file("/usr/bin/foo", "foo1", 0o755))
+	cur := clone(old)
+	setVersion(cur, "foo", "1.0-2")
+	setFile(cur, file("/usr/bin/foo", "foo2", 0o755))
+	i386 := pkg("foo", "1.0-2", "/usr/lib/i386-linux-gnu/foo/helper")
+	i386.Arch = "i386"
+	cur.Packages.Installed = append(cur.Packages.Installed, i386)
+	cur.Files = append(cur.Files, file("/usr/lib/i386-linux-gnu/foo/helper", "helper", 0o4755))
+	res := archive(
+		pkgverify.FileVerdict{Path: "/usr/bin/foo", Package: "foo", Version: "1.0-2", Expected: h("foo2"), Actual: h("foo2"), Source: "archive"},
+		pkgverify.FileVerdict{Path: "/usr/lib/i386-linux-gnu/foo/helper", Package: "foo", Version: "1.0-2", Expected: h("helper"), Actual: h("helper"), Source: "archive"})
+	f := must(t, run(cur, snapOf(old), res), "snap.pkg_installed:foo:i386", model.SevBackdoor)
+	if !hasEvidencePath(f, "/usr/lib/i386-linux-gnu/foo/helper") {
+		t.Errorf("evidence %+v", f.Evidence)
+	}
 }
