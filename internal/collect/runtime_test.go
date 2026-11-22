@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/donaldsteele/telltale/internal/model"
 	"golang.org/x/sys/unix"
@@ -335,5 +336,63 @@ func TestRuntimeOmitsOwnProcess(t *testing.T) {
 	}
 	if !slices.Contains(got, 100) || slices.Contains(got, os.Getpid()) {
 		t.Fatalf("pids %v: want 100 present and own pid %d absent", got, os.Getpid())
+	}
+}
+
+func TestCollectProcessStarted(t *testing.T) {
+	// starttime is field 22 of stat: 19 fields follow the state field.
+	stat := "500 (we ird) name) S 1 500 500 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 123456 1000 10\n"
+	proc, _ := mkProc(t, "500", stat, goodStatus, "x\x00")
+	os.WriteFile(filepath.Join(proc, "stat"), []byte("cpu  1 2 3\nbtime 1700000000\nprocesses 9\n"), 0o644)
+	rt, _, _ := Runtime(proc, t.TempDir(), t.TempDir())
+	if len(rt.Processes) != 1 {
+		t.Fatalf("processes: %+v", rt.Processes)
+	}
+	want := time.Unix(1700000000+1234, 560_000_000).UTC()
+	if got := rt.Processes[0].Started; !got.Equal(want) {
+		t.Errorf("Started = %v, want %v", got, want)
+	}
+
+	// No btime or a short stat line: Started stays zero.
+	proc, _ = mkProc(t, "500", goodStat, goodStatus, "x\x00")
+	rt, _, _ = Runtime(proc, t.TempDir(), t.TempDir())
+	if len(rt.Processes) != 1 || !rt.Processes[0].Started.IsZero() {
+		t.Errorf("want zero Started: %+v", rt.Processes)
+	}
+}
+
+func TestCollectDeletedExeEntry(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "usr/bin"), 0o755)
+	os.WriteFile(filepath.Join(root, "usr/bin/node"), []byte("new node\n"), 0o755)
+	procs := []model.Process{
+		{PID: 1, Exe: "/usr/bin/node", ExeDeleted: true},
+		{PID: 2, Exe: "/usr/bin/node", ExeDeleted: true},
+		{PID: 3, Exe: "/usr/bin/gone", ExeDeleted: true},
+		{PID: 4, Exe: "/usr/bin/covered", ExeDeleted: true},
+		{PID: 5, Exe: "/usr/bin/live"},
+	}
+	have := []model.FileEntry{{Path: "/usr/bin/covered", Type: "file"}}
+	got := ensureExeEntries(root, have, procs, 1<<20)
+	by := map[string]model.FileEntry{}
+	n := 0
+	for _, e := range got {
+		by[e.Path] = e
+		n++
+	}
+	if n != 2 {
+		t.Errorf("entries %d: %+v", n, got)
+	}
+	e := by["/usr/bin/node"]
+	if e.Type != "file" || e.SHA256 != sum("new node\n") || e.CTime.IsZero() {
+		t.Errorf("node entry: %+v", e)
+	}
+	if _, ok := by["/usr/bin/gone"]; ok {
+		t.Error("missing file got an entry")
+	}
+	// Over the hash cap: entry without a hash.
+	got = ensureExeEntries(root, nil, procs[:1], 3)
+	if len(got) != 1 || got[0].SHA256 != "" {
+		t.Errorf("oversize: %+v", got)
 	}
 }

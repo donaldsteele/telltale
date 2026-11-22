@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/donaldsteele/telltale/internal/model"
 	"golang.org/x/sys/unix"
@@ -35,7 +36,7 @@ func gone(err error) bool {
 // readProcess reads one pid. ok is false only when the process has genuinely
 // vanished or is unparseable. denied: exe unreadable for permissions.
 // partial: stat/status unreadable for permissions (hidepid).
-func readProcess(procRoot string, pid int, skip func(string, ...any)) (p model.Process, ok, denied, partial bool) {
+func readProcess(procRoot string, pid int, btime int64, skip func(string, ...any)) (p model.Process, ok, denied, partial bool) {
 	dir := filepath.Join(procRoot, strconv.Itoa(pid))
 	omit := func(why error) (model.Process, bool, bool, bool) {
 		skip("pid %d: vanished: %v", pid, why)
@@ -59,6 +60,12 @@ func readProcess(procRoot string, pid int, skip func(string, ...any)) (p model.P
 		}
 		p.Comm = s[l+1 : r]
 		p.PPID, _ = strconv.Atoi(rest[1])
+		if len(rest) > 19 && btime > 0 {
+			if ticks, err := strconv.ParseUint(rest[19], 10, 63); err == nil && ticks < 1<<40 {
+				// USER_HZ is 100 in the /proc ABI.
+				p.Started = time.Unix(btime+int64(ticks/100), int64(ticks%100)*10_000_000).UTC()
+			}
+		}
 	case errors.Is(err, fs.ErrPermission):
 		partial = true
 	default:
@@ -283,4 +290,44 @@ func moduleIndex(procRoot, root string) map[string][]string {
 		})
 	}
 	return idx
+}
+
+// bootTime reads btime (seconds since the epoch) from procRoot/stat; 0 when
+// it is missing.
+func bootTime(procRoot string) int64 {
+	b, err := readBounded(filepath.Join(procRoot, "stat"), 1<<20)
+	if err != nil {
+		return 0
+	}
+	for _, ln := range strings.Split(string(b), "\n") {
+		if f := strings.Fields(ln); len(f) == 2 && f[0] == "btime" {
+			if n, err := strconv.ParseInt(f[1], 10, 64); err == nil && n > 0 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+// ensureExeEntries adds to files the current entry of the exe path of every
+// process whose program file was deleted, when the file scan did not cover
+// it: heuristics compare it with the running process. Hashing stays within
+// maxHash. A path that no longer exists gets no entry.
+func ensureExeEntries(root string, files []model.FileEntry, procs []model.Process, maxHash int64) []model.FileEntry {
+	have := make(map[string]bool, len(files))
+	for _, e := range files {
+		have[e.Path] = true
+	}
+	root = strings.TrimRight(root, "/")
+	for _, p := range procs {
+		if !p.ExeDeleted || p.Exe == "" || !filepath.IsAbs(p.Exe) || have[p.Exe] {
+			continue
+		}
+		have[p.Exe] = true
+		var skips []model.Skip
+		if e, ok := statEntry(root+p.Exe, p.Exe, FileOptions{MaxHashBytes: maxHash}, &skips); ok {
+			files = append(files, e)
+		}
+	}
+	return files
 }

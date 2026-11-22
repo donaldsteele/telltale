@@ -175,6 +175,8 @@ type Process struct {
 	Cmdline    string `json:"cmdline"`
 	Comm       string `json:"comm"`
 	ExeDeleted bool   `json:"exe_deleted"`
+	// Started is when the process began (zero when unknown).
+	Started time.Time `json:"started,omitempty"`
 }
 
 // Socket is one open network socket.
