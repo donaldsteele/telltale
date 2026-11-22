@@ -67,6 +67,13 @@ func All(opt Options) (*model.Collection, error) {
 	add(s)
 	c.Files, s = Files(opt.Root, SystemPaths, FileOptions{MaxHashBytes: defaultMaxHash, Mounts: c.Runtime.Mounts})
 	add(s)
+	// Setuid, setgid and capability files on every local filesystem, outside
+	// the system paths too. Before ensureEntries so that a swept file is a
+	// normal entry, not a supplementary one.
+	var swept []model.FileEntry
+	swept, s = Sweep(opt.Root, c.Runtime.Mounts, c.Files, FileOptions{MaxHashBytes: defaultMaxHash})
+	c.Files = append(c.Files, swept...)
+	add(s)
 	// Files the file scan did not walk but something refers to: the program
 	// behind a deleted exe, the targets of startup links.
 	c.Files, s = ensureEntries(opt.Root, c.Files, append(exePaths(c.Runtime.Processes), linkTargets(c.Persist)...), c.Runtime.Mounts, defaultMaxHash)
