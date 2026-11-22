@@ -66,10 +66,10 @@ func All(opt Options) (*model.Collection, error) {
 	c.Runtime, c.Sysctl, s = Runtime(opt.ProcRoot, opt.SysRoot, opt.Root)
 	add(s)
 	c.Files, s = Files(opt.Root, SystemPaths, FileOptions{MaxHashBytes: defaultMaxHash, Mounts: c.Runtime.Mounts})
-	c.Files, s = ensureExeEntries(opt.Root, c.Files, c.Runtime.Processes, c.Runtime.Mounts, defaultMaxHash)
 	add(s)
-	c.Files, s = ensureEntries(opt.Root, c.Files, linkTargets(c.Persist), c.Runtime.Mounts, defaultMaxHash)
-	add(s)
+	// Files the file scan did not walk but something refers to: the program
+	// behind a deleted exe, the targets of startup links.
+	c.Files, s = ensureEntries(opt.Root, c.Files, append(exePaths(c.Runtime.Processes), linkTargets(c.Persist)...), c.Runtime.Mounts, defaultMaxHash)
 	add(s)
 	c.Packages, s = Packages(opt.Root)
 	add(s)

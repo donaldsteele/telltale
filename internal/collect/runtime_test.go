@@ -441,3 +441,84 @@ func TestCollectEntriesNeverReadKernelFiles(t *testing.T) {
 		t.Errorf("skips recorded: %+v", skips)
 	}
 }
+
+// An intermediate symlink must not carry a read into a kernel pseudo-
+// filesystem: the path text looks harmless, the descriptor is on procfs.
+func TestCollectEntriesRefuseKernelFSThroughSymlink(t *testing.T) {
+	if _, err := os.Stat("/proc/self/stat"); err != nil {
+		t.Skip("no /proc")
+	}
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "opt"), 0o755)
+	os.Symlink("/proc", filepath.Join(root, "opt/x"))
+	got, skips := ensureEntries(root, nil, []string{"/opt/x/self/stat"}, []model.Mount{{Path: "/proc", FSType: "proc"}}, 1<<20)
+	if len(got) != 0 {
+		t.Errorf("entry for a procfs file: %+v", got)
+	}
+	if !hasSkip(skips, "kernel pseudo-filesystem, not read") {
+		t.Errorf("no skip: %+v", skips)
+	}
+}
+
+// The same through the persistence collector: a cron link to a file on a
+// kernel filesystem keeps its target text and no content. The filesystem is
+// injected, as a fixture cannot sit on procfs.
+func TestPersistenceLinkIntoKernelFSIsNotRead(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "etc/cron.daily"), 0o755)
+	os.WriteFile(filepath.Join(root, "kmsg"), []byte("secret kernel log\n"), 0o644)
+	os.Symlink("/kmsg", filepath.Join(root, "etc/cron.daily/x"))
+	old := fstatfsFn
+	fstatfsFn = func(fd int, st *unix.Statfs_t) error { st.Type = unix.PROC_SUPER_MAGIC; return nil }
+	t.Cleanup(func() { fstatfsFn = old })
+	pf, skips := Persistence(root, nil, testKey)
+	for _, p := range pf {
+		if p.Path == "/etc/cron.daily/x" {
+			if len(p.Lines) != 1 {
+				t.Errorf("content read: %v", p.Lines)
+			}
+			if !hasSkip(skips, "kernel pseudo-filesystem, not read") {
+				t.Errorf("no skip: %+v", skips)
+			}
+			return
+		}
+	}
+	t.Fatal("link not collected")
+}
+
+// A path that never existed is reported once, as not existing.
+func TestEnsureEntriesMissingPathReportedOnce(t *testing.T) {
+	root := t.TempDir()
+	_, skips := ensureEntries(root, nil, []string{"/opt/none", "/opt/none"}, nil, 1<<20)
+	if len(skips) != 1 || !strings.Contains(skips[0].Reason, "does not exist") || strings.Contains(skips[0].Reason, "vanished") {
+		t.Errorf("skips: %+v", skips)
+	}
+}
+
+// The file scan's own skips survive collect.All (a tmpfs over a walked dir).
+func TestCollectAllKeepsFileScanSkips(t *testing.T) {
+	d := t.TempDir()
+	root, proc := filepath.Join(d, "root"), filepath.Join(d, "proc")
+	if out, err := exec.Command("cp", "-a", "testdata/root1", root).CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	if out, err := exec.Command("cp", "-a", "testdata/proc1", proc).CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	os.MkdirAll(filepath.Join(root, "etc/cron.d"), 0o755)
+	mi := "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n31 22 0:26 / /etc/cron.d rw - tmpfs tmpfs rw\n"
+	os.WriteFile(filepath.Join(proc, "self/mountinfo"), []byte(mi), 0o644)
+	c, err := All(Options{Root: root, ProcRoot: proc, SysRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, s := range c.Skipped {
+		if s.Check == "files" && strings.Contains(s.Reason, "not descending") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("want exactly one 'not descending' skip, got %d: %+v", n, c.Skipped)
+	}
+}

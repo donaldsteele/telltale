@@ -786,3 +786,34 @@ func TestLinkWithRedactedContentStillResolves(t *testing.T) {
 		t.Errorf("findings: %v", keys(fs))
 	}
 }
+
+// A link target is resolved exactly as the kernel reads it: a leading space
+// makes it relative, pointing into the link's own directory.
+func TestLinkTargetIsNotTrimmed(t *testing.T) {
+	const l = "/home/alice/.config/systemd/user/default.target.wants/x.service"
+	c := cleanCollection()
+	c.Accounts.Users[2].Home = "/home/alice"
+	c.Persist = append(c.Persist, link(l, " /usr/lib/systemd/user/x.service"))
+	fs := runOwned(c, cleanOwned())
+	f := find(fs, "heur.persist_link:"+l)
+	if f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("leading-space target: %v", keys(fs))
+	}
+}
+
+func TestPidListCapAndStableAfter(t *testing.T) {
+	c := cleanCollection()
+	for pid := 100; pid < 140; pid++ {
+		c.Runtime.Processes = append(c.Runtime.Processes, model.Process{PID: pid, UID: 1000, Exe: "/tmp/cap", Comm: "w"})
+	}
+	f := find(runOwned(c, cleanOwned()), "heur.proc_exe:tmp:/tmp/cap")
+	if f == nil {
+		t.Fatal("no finding")
+	}
+	if !strings.Contains(f.Fix, "120, and 19 more") || strings.Contains(f.Fix, "121") {
+		t.Errorf("fix: %s", f.Fix)
+	}
+	if want := "runs from a temporary directory: /tmp/cap"; f.Evidence[0].After != want {
+		t.Errorf("After %q, want %q", f.Evidence[0].After, want)
+	}
+}

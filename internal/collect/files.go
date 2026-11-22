@@ -180,6 +180,11 @@ func statEntry(p, mp string, opt FileOptions, skips *[]model.Skip) (model.FileEn
 			e.Err = "changed while reading"
 			return e, true
 		}
+		if kernelFS(fd) {
+			unix.Close(fd)
+			*skips = append(*skips, model.Skip{Check: checkName, Reason: mp + ": " + errKernelFS.Error()})
+			return model.FileEntry{}, false
+		}
 		f := os.NewFile(uintptr(fd), p)
 		defer f.Close()
 		e.Flags = inodeFlags(fd)

@@ -568,10 +568,13 @@ func (j *judge) report(checks []model.CheckResult, applied []model.Exception) *m
 // rankPackageLink ranks a startup link into a package-owned file outside the
 // system directories (R68b). With no trusted source for the file, root could
 // have overwritten it, so the note stands only when the file is verified, or
-// matches the md5 the machine's own dpkg database holds for it. A mismatch
+// matches the md5 the machine's own dpkg database holds for it. The escalated
+// finding takes the backdoor key of a plain link, so an exception accepted
+// for the note never covers it. A mismatch
 // against a trusted source is also reported by package verification itself.
 func (j *judge) rankPackageLink(f *model.Finding) {
-	pf := j.persist[strings.TrimPrefix(f.Key, "heur.persist_link_pkg:")]
+	link := strings.TrimPrefix(f.Key, "heur.persist_link_pkg:")
+	pf := j.persist[link]
 	if pf == nil {
 		return
 	}
@@ -583,7 +586,7 @@ func (j *judge) rankPackageLink(f *model.Finding) {
 	if r := j.in.Pkg; r != nil {
 		for _, v := range r.Mismatch {
 			if v.Path == target {
-				f.Severity = model.SevBackdoor
+				f.Severity, f.Key = model.SevBackdoor, "heur.persist_link:"+link
 				f.Why = "The startup entry runs a package-owned file that no longer matches its package (see the tampering finding for it). " + f.Why
 				return
 			}
@@ -604,7 +607,7 @@ func (j *judge) rankPackageLink(f *model.Finding) {
 		got = strings.ToLower(e.MD5)
 	}
 	if want == "" || got == "" || want != got {
-		f.Severity = model.SevBackdoor
+		f.Severity, f.Key = model.SevBackdoor, "heur.persist_link:"+link
 		f.Why = "The startup entry runs a package-owned file outside the system directories that no trusted source could check, and the machine's own checksum for it is missing or does not match the file: it may have been overwritten. " + f.Why
 		return
 	}

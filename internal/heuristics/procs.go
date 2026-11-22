@@ -161,7 +161,7 @@ func (g *procGroup) finding(ctx model.ScanContext) model.Finding {
 	}
 	if len(f.Evidence) > 0 {
 		// What accept records: the situation and the program, never a pid.
-		f.Evidence[0].After = g.class + " " + g.exe
+		f.Evidence[0].After = classText[g.class] + ": " + g.exe
 	}
 	return f
 }
@@ -232,7 +232,7 @@ func listeners(c *model.Collection, ctx model.ScanContext, owned map[string]stri
 			f.Evidence = append(f.Evidence, model.Evidence{Path: g.exe, Detail: d})
 		}
 		if len(f.Evidence) > 0 {
-			f.Evidence[0].After = "listener " + g.exe
+			f.Evidence[0].After = "program with no package listens: " + g.exe
 		}
 		out = append(out, f)
 	}
@@ -266,4 +266,14 @@ func pidsCapped(pids []int) string {
 		s = append(s, strconv.Itoa(p))
 	}
 	return strings.Join(s, ", ")
+}
+
+// classText is what accept records and shows for a grouped process finding:
+// stable text, no pids or ports.
+var classText = map[string]string{
+	"deleted":     "deleted after start",
+	"tmp":         "runs from a temporary directory",
+	"hidden":      "hidden path",
+	"hidden_home": "hidden path in the owner's home",
+	"stale":       "replaced by an update while running",
 }

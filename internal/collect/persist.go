@@ -42,6 +42,10 @@ func openRegular(root, mp string) (*os.File, unix.Stat_t, error) {
 		unix.Close(fd)
 		return nil, st, err
 	}
+	if kernelFS(fd) {
+		unix.Close(fd)
+		return nil, st, errKernelFS
+	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
 		unix.Close(fd)
 		return nil, st, errors.New("not a regular file")
@@ -212,6 +216,9 @@ func (c *collector) link(mp, kind string, lst unix.Stat_t, readContent bool) {
 	}
 	f, st, err := openRegular(c.root, tp)
 	if err != nil {
+		if errors.Is(err, errKernelFS) {
+			c.skip(mp, "target: "+err.Error())
+		}
 		return // dangling, device, FIFO or another symlink: target text only
 	}
 	defer f.Close()

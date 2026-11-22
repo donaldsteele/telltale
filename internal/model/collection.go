@@ -338,7 +338,7 @@ func (p PersistFile) LinkTarget() (target string, ok bool) {
 	if p.Mode&0o170000 != 0o120000 || len(p.Lines) == 0 {
 		return "", false
 	}
-	target = strings.TrimSpace(p.Lines[0])
+	target = p.Lines[0] // exactly as the kernel reads it: no trimming
 	if target == "" {
 		return "", false
 	}

@@ -2722,7 +2722,7 @@ func pkgLinkCollection(withMD5 bool) *model.Collection {
 }
 
 func TestPackageLinkRankedByVerdictAndLocalChecksum(t *testing.T) {
-	const key = "heur.persist_link_pkg:/etc/cron.daily/g"
+	const key, bkey = "heur.persist_link_pkg:/etc/cron.daily/g", "heur.persist_link:/etc/cron.daily/g"
 	v := pkgverify.FileVerdict{Path: "/opt/g/c", Package: "gchrome", Version: "1.0"}
 	unver := func() *pkgverify.Result {
 		return &pkgverify.Result{Mode: pkgverify.ModeArchive, Unverifiable: []pkgverify.FileVerdict{{Path: v.Path, Package: v.Package, Version: v.Version, Reason: "no key", Kind: pkgverify.KindUntrusted}}}
@@ -2740,14 +2740,32 @@ func TestPackageLinkRankedByVerdictAndLocalChecksum(t *testing.T) {
 	// Unverifiable and the md5 differs from the file: a backdoor sign.
 	c := pkgLinkCollection(true)
 	c.Files[len(c.Files)-1].MD5 = "ffffffffffffffffffffffffffffffff"
-	must(t, run(c, nil, unver()), key, model.SevBackdoor)
+	must(t, run(c, nil, unver()), bkey, model.SevBackdoor)
 	// Unverifiable and the machine holds no md5 for it: a backdoor sign.
-	must(t, run(pkgLinkCollection(false), nil, unver()), key, model.SevBackdoor)
+	must(t, run(pkgLinkCollection(false), nil, unver()), bkey, model.SevBackdoor)
 	// No verification at all behaves the same.
-	must(t, run(pkgLinkCollection(false), nil, nil), key, model.SevBackdoor)
+	must(t, run(pkgLinkCollection(false), nil, nil), bkey, model.SevBackdoor)
 	// A mismatch is tampering through its own finding, and the link is not a note.
 	mm := &pkgverify.Result{Mode: pkgverify.ModeArchive, Mismatch: []pkgverify.FileVerdict{{Path: "/opt/g/c", Package: "gchrome", Version: "1.0", Expected: "sha256:aa", Actual: "sha256:bb", Reason: "differs", Kind: pkgverify.KindContentDiffers}}}
 	r := run(pkgLinkCollection(true), nil, mm)
-	must(t, r, key, model.SevBackdoor)
+	must(t, r, bkey, model.SevBackdoor)
+	absent(t, r, key)
 	must(t, r, "pkg.mismatch:/opt/g/c", model.SevTampering)
+}
+
+// An exception accepted for the package-link note must not cover the same
+// link once its target is overwritten: the escalation has its own key.
+func TestAcceptedPackageLinkNoteDoesNotHideOverwrite(t *testing.T) {
+	const key = "heur.persist_link_pkg:/etc/cron.daily/g"
+	unver := &pkgverify.Result{Mode: pkgverify.ModeArchive, Unverifiable: []pkgverify.FileVerdict{{Path: "/opt/g/c", Package: "gchrome", Version: "1.0", Reason: "no key", Kind: pkgverify.KindUntrusted}}}
+	s := snapOf(clean())
+	f := must(t, run(pkgLinkCollection(true), s, unver), key, model.SevNote)
+	s.Exceptions = append(s.Exceptions, model.Exception{FindingKey: key, AcceptedValue: currentValue(f), At: taken})
+	absent(t, run(pkgLinkCollection(true), s, unver), key) // accepted while unchanged
+	after := pkgLinkCollection(true)
+	after.Files[len(after.Files)-1].MD5 = "ffffffffffffffffffffffffffffffff"
+	after.Files[len(after.Files)-1].SHA256 = h("evil")
+	r := run(after, s, unver)
+	must(t, r, "heur.persist_link:/etc/cron.daily/g", model.SevBackdoor)
+	absent(t, r, key)
 }

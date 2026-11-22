@@ -313,13 +313,18 @@ func bootTime(procRoot string) int64 {
 // process whose program file was deleted, when the file scan did not cover
 // it: heuristics compare it with the running process.
 func ensureExeEntries(root string, files []model.FileEntry, procs []model.Process, mounts []model.Mount, maxHash int64) ([]model.FileEntry, []model.Skip) {
+	return ensureEntries(root, files, exePaths(procs), mounts, maxHash)
+}
+
+// exePaths lists the exe paths of processes whose program file was deleted.
+func exePaths(procs []model.Process) []string {
 	var paths []string
 	for _, p := range procs {
 		if p.ExeDeleted && p.Exe != "" {
 			paths = append(paths, p.Exe)
 		}
 	}
-	return ensureEntries(root, files, paths, mounts, maxHash)
+	return paths
 }
 
 // linkTargets lists the absolute targets of the symlinks in persist, except
@@ -379,6 +384,11 @@ func ensureEntries(root string, files []model.FileEntry, paths []string, mounts 
 		}
 		if refused {
 			skips = append(skips, model.Skip{Check: checkName, Reason: p + ": not opened (kernel, device or skipped mount)"})
+			continue
+		}
+		var lst unix.Stat_t
+		if err := unix.Lstat(root+p, &lst); err != nil && errors.Is(err, unix.ENOENT) {
+			skips = append(skips, model.Skip{Check: checkName, Reason: p + ": does not exist"})
 			continue
 		}
 		if e, ok := statEntry(root+p, p, FileOptions{MaxHashBytes: maxHash, MD5: true}, &skips); ok {
