@@ -77,6 +77,7 @@ func Accounts(root string, key []byte) (model.Accounts, []model.Skip) {
 func reduceShadow(key []byte, f []string) model.PasswordState {
 	h := f[1]
 	p := model.PasswordState{
+		Known:      true,
 		Locked:     strings.HasPrefix(h, "!") || strings.HasPrefix(h, "*"),
 		Algo:       shadowAlgo(h),
 		LastChange: -1,

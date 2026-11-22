@@ -29,6 +29,9 @@ func TestPackagesOwners(t *testing.T) {
 	owners := p.Owners()
 	want := map[string]string{
 		"/usr/bin/a":      "first",
+		"/bin/a":          "first",
+		"/bin/b":          "second",
+		"/bin/shared":     "first",
 		"/usr/bin/shared": "first",
 		"/usr/bin/b":      "second",
 	}
@@ -175,5 +178,24 @@ func TestSeverityJSON(t *testing.T) {
 	}
 	if err := json.Unmarshal([]byte(`3`), &bad); err == nil {
 		t.Error("number accepted")
+	}
+}
+
+func TestOwnersMergedUsr(t *testing.T) {
+	p := Packages{Installed: []Package{
+		{Name: "mount", Files: []string{"/bin/su", "/usr/sbin/x", "/lib/modules/k/a.ko", "/etc/y"}},
+		{Name: "other", Files: []string{"/usr/bin/su"}},
+	}}
+	o := p.Owners()
+	for path, pkg := range map[string]string{
+		"/bin/su": "mount", "/usr/bin/su": "mount", "/usr/sbin/x": "mount", "/sbin/x": "mount",
+		"/lib/modules/k/a.ko": "mount", "/usr/lib/modules/k/a.ko": "mount", "/etc/y": "mount",
+	} {
+		if o[path] != pkg {
+			t.Errorf("owner of %s = %q, want %q", path, o[path], pkg)
+		}
+	}
+	if _, ok := o["/usr/etc/y"]; ok {
+		t.Error("etc aliased")
 	}
 }

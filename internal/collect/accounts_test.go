@@ -116,3 +116,24 @@ func TestAccountsPasswdFieldWins(t *testing.T) {
 		t.Error("hash leaked")
 	}
 }
+
+func TestAccountsPasswordKnown(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	passwd := "empty::1000:1000::/h:/bin/sh\nx1:x:1001:1001::/h:/bin/sh\nx2:x:1002:1002::/h:/bin/sh\n"
+	shadow := "x2:!:19000:0:99999:7:::\n"
+	for n, c := range map[string]string{"passwd": passwd, "shadow": shadow, "group": ""} {
+		if err := os.WriteFile(filepath.Join(root, "etc", n), []byte(c), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	acc, _ := Accounts(root, testKey)
+	for name, want := range map[string]bool{"empty": true, "x1": false, "x2": true} {
+		u, _ := userByName(acc, name)
+		if u.Password.Known != want {
+			t.Errorf("%s Known = %v, want %v", name, u.Password.Known, want)
+		}
+	}
+}

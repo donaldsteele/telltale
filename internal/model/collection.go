@@ -2,7 +2,10 @@
 // snapshots and reports.
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Schema versions for the JSON documents written by telltale.
 const CollectionSchema, SnapshotSchema, ReportSchema = 1, 1, 1
@@ -84,6 +87,9 @@ type User struct {
 // PasswordState describes the shadow entry for a user. Digest is kept for
 // comparison only.
 type PasswordState struct {
+	// Known is true when the state was decided from a readable passwd field
+	// or a shadow row; false when it could not be determined.
+	Known      bool   `json:"known"`
 	Set        bool   `json:"set"`
 	Locked     bool   `json:"locked"`
 	Algo       string `json:"algo"`
@@ -218,8 +224,10 @@ func (p Packages) Owners() map[string]string {
 	owners := make(map[string]string)
 	for _, pkg := range p.Installed {
 		for _, f := range pkg.Files {
-			if _, ok := owners[f]; !ok {
-				owners[f] = pkg.Name
+			for _, a := range append([]string{f}, usrAlias(f)...) {
+				if _, ok := owners[a]; !ok {
+					owners[a] = pkg.Name
+				}
 			}
 		}
 	}
@@ -245,4 +253,20 @@ type CrossViewResult struct {
 	SkipReason     string   `json:"skip_reason"`
 	HiddenFromTool []string `json:"hidden_from_tool"`
 	ExtraInTool    []string `json:"extra_in_tool"`
+}
+
+var mergedDirs = []string{"bin", "sbin", "lib", "lib32", "lib64", "libx32"}
+
+// usrAlias returns the other spelling of a path on merged-/usr systems,
+// where /bin is /usr/bin and so on.
+func usrAlias(f string) []string {
+	for _, d := range mergedDirs {
+		if strings.HasPrefix(f, "/"+d+"/") {
+			return []string{"/usr" + f}
+		}
+		if strings.HasPrefix(f, "/usr/"+d+"/") {
+			return []string{strings.TrimPrefix(f, "/usr")}
+		}
+	}
+	return nil
 }
