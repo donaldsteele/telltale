@@ -1,37 +1,38 @@
 package collect
 
 import (
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // defaultAuthorizedKeysFile is sshd's compiled-in default.
 var defaultAuthorizedKeysFile = []string{".ssh/authorized_keys", ".ssh/authorized_keys2"}
 
-const maxSSHDIncludeDepth = 8
+const (
+	maxSSHDIncludeDepth = 8
+	maxSSHDParseBytes   = 16 << 20
+)
 
 // sshdConfig reads /etc/ssh/sshd_config and its Include targets. It returns
-// every config file read (machine paths, in reading order) and the
-// AuthorizedKeysFile patterns: the first global-section setting, or the
-// default. The listed defaults are always included so planted keys in either
-// default location are seen even when the config points elsewhere.
+// every config file found (machine paths, in reading order, whether or not
+// it could be parsed) and the AuthorizedKeysFile patterns: the union of
+// every AuthorizedKeysFile value anywhere in the config (global, Match
+// blocks, Include files) plus the defaults. Extra reads are harmless and
+// avoid evaluating Match scoping.
 //
 // This is a deliberately small reader: no Match evaluation, no quoting
 // beyond double quotes.
 func (c *collector) sshdConfig() (files []string, akf []string) {
-	st := &sshdState{c: c}
+	st := &sshdState{c: c, seenAKF: map[string]bool{}}
 	st.read("/etc/ssh/sshd_config", 0)
-	akf = append(akf, st.akf...)
+	akf = st.akf
 	for _, d := range defaultAuthorizedKeysFile {
-		dup := false
-		for _, a := range akf {
-			if a == d {
-				dup = true
-			}
-		}
-		if !dup {
+		if !st.seenAKF[d] {
 			akf = append(akf, d)
 		}
 	}
@@ -42,9 +43,20 @@ type sshdState struct {
 	c       *collector
 	files   []string
 	akf     []string
-	haveAKF bool
-	inMatch bool
+	seenAKF map[string]bool
 	visited map[string]bool
+}
+
+// readable returns the content of mp, following one symlink level to a
+// regular file under root.
+func (s *sshdState) readable(mp string) ([]byte, error) {
+	var lst unix.Stat_t
+	if err := unix.Lstat(filepath.Join(s.c.root, mp), &lst); err == nil && lst.Mode&unix.S_IFMT == unix.S_IFLNK {
+		if t, err := os.Readlink(filepath.Join(s.c.root, mp)); err == nil {
+			mp = linkTarget(mp, t)
+		}
+	}
+	return readRaw(s.c.root, mp, maxSSHDParseBytes)
 }
 
 func (s *sshdState) read(mp string, depth int) {
@@ -57,20 +69,23 @@ func (s *sshdState) read(mp string, depth int) {
 	if s.visited[mp] {
 		return
 	}
-	b, err := readRaw(s.c.root, mp, maxPersistBytes)
-	if err != nil {
-		return
+	var lst unix.Stat_t
+	if err := unix.Lstat(filepath.Join(s.c.root, mp), &lst); err != nil {
+		return // absent
 	}
 	s.visited[mp] = true
 	s.files = append(s.files, mp)
+	b, err := s.readable(mp)
+	if err != nil {
+		s.c.skip(mp, "sshd config not parsed for AuthorizedKeysFile: "+err.Error())
+		return
+	}
 	for _, line := range splitLines(b) {
 		args := sshdFields(line)
 		if len(args) == 0 {
 			continue
 		}
 		switch strings.ToLower(args[0]) {
-		case "match":
-			s.inMatch = true
 		case "include":
 			for _, pat := range args[1:] {
 				if !path.IsAbs(pat) {
@@ -83,9 +98,11 @@ func (s *sshdState) read(mp string, depth int) {
 				}
 			}
 		case "authorizedkeysfile":
-			if !s.inMatch && !s.haveAKF {
-				s.haveAKF = true
-				s.akf = args[1:]
+			for _, a := range args[1:] {
+				if !s.seenAKF[a] {
+					s.seenAKF[a] = true
+					s.akf = append(s.akf, a)
+				}
 			}
 		}
 	}

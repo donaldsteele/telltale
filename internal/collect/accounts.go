@@ -46,7 +46,10 @@ func Accounts(root string, key []byte) (model.Accounts, []model.Skip) {
 		u.UID, _ = strconv.Atoi(f[2])
 		u.GID, _ = strconv.Atoi(f[3])
 		u.Password = model.PasswordState{Algo: "none", LastChange: -1, MaxDays: -1}
-		if s, ok := shadow[f[0]]; ok {
+		if f[1] != "x" && !strings.HasPrefix(f[1], "##") {
+			// The passwd field is not a shadow reference: it is the hash itself.
+			u.Password = reduceShadow(key, []string{f[0], f[1]})
+		} else if s, ok := shadow[f[0]]; ok {
 			u.Password = reduceShadow(key, s)
 		}
 		acc.Users = append(acc.Users, u)

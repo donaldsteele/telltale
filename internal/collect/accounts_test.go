@@ -2,6 +2,8 @@ package collect
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -81,5 +83,36 @@ func TestShadowAlgo(t *testing.T) {
 		if got := shadowAlgo(in); got != want {
 			t.Errorf("shadowAlgo(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestAccountsPasswdFieldWins(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	passwd := "alice::1000:1000::/home/alice:/bin/sh\nbob:$6$s$PASSWDHASH:1001:1001::/home/bob:/bin/sh\ncarol:x:1002:1002::/home/carol:/bin/sh\n"
+	shadow := "alice:$6$salt$SHADOWHASH:19000:0:99999:7:::\ncarol:$6$salt$CAROLHASH:19000:0:99999:7:::\n"
+	for n, c := range map[string]string{"passwd": passwd, "shadow": shadow, "group": ""} {
+		if err := os.WriteFile(filepath.Join(root, "etc", n), []byte(c), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	acc, _ := Accounts(root, testKey)
+	alice, _ := userByName(acc, "alice")
+	bob, _ := userByName(acc, "bob")
+	carol, _ := userByName(acc, "carol")
+	if alice.Password.Set || alice.Password.Algo != "none" {
+		t.Errorf("alice = %+v", alice.Password)
+	}
+	if !bob.Password.Set || bob.Password.Algo != "sha512" {
+		t.Errorf("bob = %+v", bob.Password)
+	}
+	if !carol.Password.Set || carol.Password.LastChange != 19000 {
+		t.Errorf("carol = %+v", carol.Password)
+	}
+	js, _ := json.Marshal(acc)
+	if strings.Contains(string(js), "PASSWDHASH") {
+		t.Error("hash leaked")
 	}
 }

@@ -96,11 +96,28 @@ func (c *collector) meta(st unix.Stat_t, pf *model.PersistFile) {
 	pf.MTime = time.Unix(st.Mtim.Unix()).UTC()
 }
 
-// file records one regular file. Missing files are silent; anything else
-// that cannot be read becomes a Skip.
+// maxHashBytes caps how much of one persistence file is read for hashing;
+// larger files (e.g. a sparse ~/.bashrc) get metadata and a Skip only.
+const maxHashBytes = 64 << 20
+
+// file records one file at a persistence location. Missing files are
+// silent; symlinks are recorded via link; anything else that cannot be read
+// becomes a Skip.
 func (c *collector) file(mp, kind string) {
 	mp = path.Clean(mp)
 	if c.seen[kind+"\x00"+mp] {
+		return
+	}
+	var lst unix.Stat_t
+	if err := unix.Lstat(filepath.Join(c.root, mp), &lst); err != nil {
+		if !errors.Is(err, unix.ENOENT) && !errors.Is(err, unix.ENOTDIR) {
+			c.skip(mp, err.Error())
+		}
+		return
+	}
+	if lst.Mode&unix.S_IFMT == unix.S_IFLNK {
+		c.seen[kind+"\x00"+mp] = true
+		c.link(mp, kind, lst, true)
 		return
 	}
 	f, st, err := openRegular(c.root, mp)
@@ -115,6 +132,11 @@ func (c *collector) file(mp, kind string) {
 
 	pf := model.PersistFile{Path: mp, Kind: kind}
 	c.meta(st, &pf)
+	if st.Size > maxHashBytes {
+		c.skip(mp, fmt.Sprintf("larger than %d bytes: metadata only, not read", maxHashBytes))
+		c.out = append(c.out, pf)
+		return
+	}
 	h := sha256.New()
 	buf, err := io.ReadAll(io.LimitReader(f, maxPersistBytes+1))
 	if err != nil {
@@ -124,7 +146,7 @@ func (c *collector) file(mp, kind string) {
 	h.Write(buf)
 	large := len(buf) > maxPersistBytes
 	if large {
-		if _, err := io.Copy(h, f); err != nil {
+		if _, err := io.Copy(h, io.LimitReader(f, maxHashBytes)); err != nil {
 			c.skip(mp, "read: "+err.Error())
 			return
 		}
@@ -132,18 +154,86 @@ func (c *collector) file(mp, kind string) {
 	}
 	pf.SHA256 = hex.EncodeToString(h.Sum(nil))
 	if !large {
-		pf.Lines = []string{}
-		for _, l := range splitLines(buf) {
-			r, n := redact.Line(c.key, l)
-			pf.Lines = append(pf.Lines, r)
-			pf.Redactions += n
-		}
+		pf.Lines = c.redactLines(buf, &pf)
 	}
 	c.out = append(c.out, pf)
 }
 
-// dir records the regular files directly inside dir, ignoring symlinked
-// entries and subdirectories.
+func (c *collector) redactLines(b []byte, pf *model.PersistFile) []string {
+	lines := []string{}
+	for _, l := range splitLines(b) {
+		r, n := redact.Line(c.key, l)
+		lines = append(lines, r)
+		pf.Redactions += n
+	}
+	return lines
+}
+
+// secretTarget reports whether a symlink target must never have its content
+// kept.
+func secretTarget(tp string) bool {
+	switch tp {
+	case "/etc/shadow", "/etc/gshadow", "/etc/security/opasswd":
+		return true
+	}
+	return strings.HasPrefix(tp, "/etc/ssh/") && strings.HasSuffix(tp, "_key")
+}
+
+// linkTarget resolves a symlink's target text to a machine path.
+func linkTarget(mp, target string) string {
+	if path.IsAbs(target) {
+		return path.Clean(target)
+	}
+	return path.Join(path.Dir(mp), target)
+}
+
+// link records the symlink at mp. Lines[0] is the redacted target text. When
+// readContent is set and the target resolves to a regular file, its redacted
+// lines follow and SHA256 is the hash of the target's raw bytes; otherwise
+// SHA256 is the hash of the target text.
+func (c *collector) link(mp, kind string, lst unix.Stat_t, readContent bool) {
+	target, err := os.Readlink(filepath.Join(c.root, mp))
+	if err != nil {
+		c.skip(mp, err.Error())
+		return
+	}
+	sum := sha256.Sum256([]byte(target))
+	r, n := redact.Line(c.key, target)
+	pf := model.PersistFile{Path: mp, Kind: kind, SHA256: hex.EncodeToString(sum[:]), Lines: []string{r}, Redactions: n}
+	c.meta(lst, &pf)
+	defer func() { c.out = append(c.out, pf) }()
+	if !readContent {
+		return
+	}
+	tp := linkTarget(mp, target)
+	if secretTarget(tp) {
+		c.skip(mp, "target is a secret file, content not kept")
+		return
+	}
+	f, st, err := openRegular(c.root, tp)
+	if err != nil {
+		return // dangling, device, FIFO or another symlink: target text only
+	}
+	defer f.Close()
+	if st.Size > maxPersistBytes {
+		c.skip(mp, fmt.Sprintf("target larger than %d bytes: content not kept", maxPersistBytes))
+		return
+	}
+	buf, err := io.ReadAll(io.LimitReader(f, maxPersistBytes+1))
+	if err != nil || len(buf) > maxPersistBytes {
+		return
+	}
+	if first, _, _ := strings.Cut(string(buf), "\n"); strings.HasPrefix(first, "-----BEGIN") && strings.Contains(first, "PRIVATE KEY") {
+		c.skip(mp, "target is a secret file, content not kept")
+		return
+	}
+	raw := sha256.Sum256(buf)
+	pf.SHA256 = hex.EncodeToString(raw[:])
+	pf.Lines = append(pf.Lines, c.redactLines(buf, &pf)...)
+}
+
+// dir records the files and symlinks directly inside dir; subdirectories
+// are ignored.
 func (c *collector) dir(dir, kind string) {
 	ents, err := os.ReadDir(filepath.Join(c.root, dir))
 	if err != nil {
@@ -153,28 +243,20 @@ func (c *collector) dir(dir, kind string) {
 		return
 	}
 	for _, e := range ents {
-		if e.Type().IsRegular() {
+		if e.Type().IsRegular() || e.Type()&fs.ModeSymlink != 0 {
 			c.file(path.Join(dir, e.Name()), kind)
 		}
 	}
 }
 
-// symlink records a systemd enabled link: its target text is the only line.
-func (c *collector) symlink(mp string) {
+// enabledLink records a systemd *.wants/*.requires/*.upholds link: the
+// target text is the only line.
+func (c *collector) enabledLink(mp string) {
 	var st unix.Stat_t
 	if err := unix.Lstat(filepath.Join(c.root, mp), &st); err != nil {
 		return
 	}
-	target, err := os.Readlink(filepath.Join(c.root, mp))
-	if err != nil {
-		c.skip(mp, err.Error())
-		return
-	}
-	sum := sha256.Sum256([]byte(target))
-	r, n := redact.Line(c.key, target)
-	pf := model.PersistFile{Path: mp, Kind: model.PersistKindSystemdEnabled, SHA256: hex.EncodeToString(sum[:]), Lines: []string{r}, Redactions: n}
-	c.meta(st, &pf)
-	c.out = append(c.out, pf)
+	c.link(mp, model.PersistKindSystemdEnabled, st, false)
 }
 
 func isUnitName(n string) bool {
@@ -205,8 +287,10 @@ func (c *collector) systemd(dir string, all bool) {
 		parent := path.Base(path.Dir(mp))
 		switch {
 		case d.Type()&fs.ModeSymlink != 0:
-			if strings.HasSuffix(parent, ".wants") || strings.HasSuffix(parent, ".requires") {
-				c.symlink(mp)
+			if strings.HasSuffix(parent, ".wants") || strings.HasSuffix(parent, ".requires") || strings.HasSuffix(parent, ".upholds") {
+				c.enabledLink(mp)
+			} else {
+				c.file(mp, model.PersistKindSystemdUnit)
 			}
 		case d.Type().IsRegular():
 			name := d.Name()
@@ -264,7 +348,7 @@ func Persistence(root string, users []model.User, key []byte) ([]model.PersistFi
 
 	for _, u := range users {
 		home := path.Clean(u.Home)
-		if u.Home == "" || !path.IsAbs(home) || home == "/nonexistent" {
+		if u.Home == "" || !path.IsAbs(home) {
 			continue
 		}
 		for _, n := range []string{".bashrc", ".profile", ".bash_profile", ".bash_login", ".zshrc"} {
