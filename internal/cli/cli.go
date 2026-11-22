@@ -1,0 +1,107 @@
+// Package cli dispatches telltale subcommands.
+package cli
+
+import (
+	"fmt"
+	"io"
+	"sort"
+	"strings"
+
+	"github.com/donaldsteele/telltale/internal/version"
+)
+
+// Exit codes shared by all subcommands.
+const ExitUsage = 3
+
+// Context is what a subcommand receives.
+type Context struct {
+	Args   []string
+	Stdin  io.Reader
+	Stdout io.Writer
+	Stderr io.Writer
+}
+
+// Command is one subcommand.
+type Command struct {
+	Name    string
+	Summary string
+	Hidden  bool
+	Run     func(ctx *Context) int
+}
+
+var registry = map[string]Command{}
+
+// Register adds or replaces a command. Later tasks call it from init().
+func Register(c Command) { registry[c.Name] = c }
+
+// planned lists commands that exist but are not built yet. A real command
+// registered under the same name takes precedence.
+var planned = []Command{
+	{Name: "scan", Summary: "check this machine against a snapshot and the hardening checklist"},
+	{Name: "snapshot", Summary: "record a known-good snapshot of this machine"},
+	{Name: "accept", Summary: "accept reviewed changes into the snapshot"},
+	{Name: "fetch-refs", Summary: "download reference data"},
+	{Name: "server", Summary: "run the telltale server"},
+	{Name: "mcp", Summary: "run the MCP server"},
+	{Name: "collect", Summary: "collect machine facts (internal)", Hidden: true},
+}
+
+func notImplemented(name string) func(*Context) int {
+	return func(ctx *Context) int {
+		fmt.Fprintf(ctx.Stderr, "telltale %s: not implemented yet\n", name)
+		return ExitUsage
+	}
+}
+
+// all returns the registered commands plus the planned ones not yet registered.
+func all() []Command {
+	m := map[string]Command{}
+	for _, c := range planned {
+		c.Run = notImplemented(c.Name)
+		m[c.Name] = c
+	}
+	for n, c := range registry {
+		m[n] = c
+	}
+	m["version"] = Command{Name: "version", Summary: "print the version", Run: func(ctx *Context) int {
+		fmt.Fprintf(ctx.Stdout, "telltale %s\n", version.Version)
+		return 0
+	}}
+	m["help"] = Command{Name: "help", Summary: "show this help", Run: func(ctx *Context) int {
+		usage(ctx.Stdout)
+		return 0
+	}}
+	out := make([]Command, 0, len(m))
+	for _, c := range m {
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func usage(w io.Writer) {
+	var b strings.Builder
+	b.WriteString("Usage: telltale <command> [flags]\n\nCommands:\n")
+	for _, c := range all() {
+		if !c.Hidden {
+			fmt.Fprintf(&b, "  %-11s %s\n", c.Name, c.Summary)
+		}
+	}
+	io.WriteString(w, b.String())
+}
+
+// Run executes the subcommand named by args[0] and returns the exit code.
+func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		usage(stderr)
+		return ExitUsage
+	}
+	for _, c := range all() {
+		if c.Name == args[0] {
+			return c.Run(&Context{Args: args[1:], Stdin: stdin, Stdout: stdout, Stderr: stderr})
+		}
+	}
+	fmt.Fprintf(stderr, "telltale: unknown command %q\n", args[0])
+	usage(stderr)
+	return ExitUsage
+}
