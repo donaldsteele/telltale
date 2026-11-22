@@ -1,0 +1,5 @@
+Include /etc/ssh/sshd_config.d/*.conf
+PermitRootLogin no
+AuthorizedKeysFile .ssh/authorized_keys /etc/ssh/keys/%u
+Match User bob
+    AuthorizedKeysFile /nowhere

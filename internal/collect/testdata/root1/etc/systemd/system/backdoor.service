@@ -1,0 +1,7 @@
+[Unit]
+Description=Example service
+[Service]
+Environment=TOKEN=abc123
+ExecStart=/usr/local/bin/example
+[Install]
+WantedBy=multi-user.target

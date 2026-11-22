@@ -1,0 +1,5 @@
+root:x:0:
+sudo:x:27:alice
+alice:x:1000:
+bob:x:1001:
+staff:x:50:alice,bob

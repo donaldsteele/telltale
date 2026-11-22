@@ -1,0 +1,2 @@
+[Service]
+ExecStart=/home/alice/bin/sync.sh
