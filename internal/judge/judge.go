@@ -39,6 +39,8 @@ const (
 	noSnapshotLimit  = "changes made since the machine was last known to be clean (no snapshot to compare against)"
 	noPkgLimit       = "changed system files (package verification did not run)"
 	offlineLimit     = "system files changed together with the machine's own package checksums (offline mode trusts them)"
+	nonRootLimit     = "checks that need root were skipped (see Skipped); a scan as root is needed for a full answer"
+	nothingCollected = "anything at all: nothing was collected from the machine"
 	checkKeyPrefix   = "check:"
 )
 
@@ -64,16 +66,22 @@ type judge struct {
 	compared []string
 
 	// From package verification.
-	verified   map[string]pkgverify.FileVerdict
-	pkgPath    map[string]*model.Finding // path -> the package finding about it
-	unverified map[string]bool           // grouped unverifiable paths
-	reported   map[string]bool           // every path package verification named
+	verified    map[string]pkgverify.FileVerdict
+	pkgPath     map[string]*model.Finding // path -> the package finding about it
+	unverified  map[string]bool           // grouped unverifiable paths
+	unverReason map[string]string         // every unverifiable path -> why
+	reported    map[string]bool           // every path package verification named
 
 	// From the snapshot comparison.
-	pkgChange   map[string]diff.Change    // package name -> its change
-	pkgFinding  map[string]*model.Finding // package name -> finding about its change
+	pkgChange   map[string]diff.Change      // package name -> its change
+	pkgFinding  map[string]*model.Finding   // package name -> finding about its change
+	pkgReasons  map[string][]string         // new package -> what raised it
+	unverIn     map[string][]model.Evidence // changed package -> its programs no trusted source confirmed
+	unconfirmed map[string]bool             // changed package -> a changed file of it was not confirmed
 	listeners   []diff.Change
 	persistDone map[string]*model.Finding // persistence path -> its finding (nil: explained)
+	acctChanged map[string]bool           // account database -> the account comparison found a change in it
+	foldedMax   map[*model.Finding]model.Severity
 }
 
 func newJudge(in Input, c *model.Collection) *judge {
@@ -81,8 +89,10 @@ func newJudge(in Input, c *model.Collection) *judge {
 		in: in, c: c, ctx: in.Context,
 		byKey: map[string]*model.Finding{}, groups: map[string]*model.Finding{}, omitted: map[*model.Finding]int{},
 		verified: map[string]pkgverify.FileVerdict{}, pkgPath: map[string]*model.Finding{},
-		unverified: map[string]bool{}, reported: map[string]bool{},
+		unverified: map[string]bool{}, unverReason: map[string]string{}, reported: map[string]bool{},
 		pkgChange: map[string]diff.Change{}, pkgFinding: map[string]*model.Finding{}, persistDone: map[string]*model.Finding{},
+		pkgReasons: map[string][]string{}, unverIn: map[string][]model.Evidence{}, unconfirmed: map[string]bool{},
+		acctChanged: map[string]bool{}, foldedMax: map[*model.Finding]model.Severity{},
 	}
 	if in.Snapshot != nil && in.Snapshot.Collection != nil {
 		j.old = in.Snapshot.Collection
@@ -131,9 +141,11 @@ func Judge(in Input) *model.Report {
 	j.packages()
 	if j.old != nil {
 		j.changes(diff.Compare(in.Snapshot, c, checks))
+		j.finishPackages()
 	} else if in.Snapshot != nil {
 		j.skipped = append(j.skipped, model.Skip{Check: "snapshot", Reason: "the snapshot holds no collected data, so nothing was compared with it"})
 	}
+	j.duplicateAccounts()
 	j.heuristics()
 	j.fillWhen()
 	j.finishGroups()
@@ -208,6 +220,41 @@ func (j *judge) heuristics() {
 	}
 }
 
+// duplicateAccounts flags account names that appear on more than one line
+// of /etc/passwd. Tools disagree about which line counts, so a second line
+// for a familiar name can hide another identity, such as user id 0.
+func (j *judge) duplicateAccounts() {
+	byName := map[string][]model.User{}
+	var order []string
+	for _, u := range j.c.Accounts.Users {
+		if u.Name == "" || strings.HasPrefix(u.Name, "+") || strings.HasPrefix(u.Name, "-") {
+			continue
+		}
+		if _, ok := byName[u.Name]; !ok {
+			order = append(order, u.Name)
+		}
+		byName[u.Name] = append(byName[u.Name], u)
+	}
+	for _, name := range order {
+		us := byName[name]
+		if len(us) < 2 {
+			continue
+		}
+		f := &model.Finding{
+			Key: "acct.duplicate:" + name, ID: "TT-JUDGE-001", Source: srcHeuristic, Severity: model.SevBackdoor,
+			Title: fmt.Sprintf("Account %q appears %d times in /etc/passwd", name, len(us)),
+			Why: "Programs disagree about which line counts: login may use one line while other tools use another. " +
+				"A second line for an existing name is a way to hide a second identity, for example user id 0, behind a familiar name.",
+			Fix:  keep("/etc/passwd", "/etc/shadow") + "   # then remove the extra line with vipw",
+			Refs: []string{"T1136.001"},
+		}
+		for _, u := range us {
+			f.Evidence = append(f.Evidence, model.Evidence{Path: "/etc/passwd", After: fmt.Sprintf("uid %d gid %d shell %s home %s", u.UID, u.GID, u.Shell, u.Home), Detail: "line for " + name})
+		}
+		j.add(f)
+	}
+}
+
 // whenFor is when the file at p last changed: its inode change time (which,
 // unlike the modification time, cannot be set back with touch), else its
 // modification time.
@@ -270,6 +317,12 @@ func (j *judge) exceptions() []model.Exception {
 		for _, i := range idx {
 			if all[i].AcceptedValue == val {
 				used[i] = true
+				if j.foldedMax[f] > f.Severity {
+					// Something folded into this finding would rank higher on
+					// its own; the exception did not accept that.
+					f.Evidence = append(f.Evidence, model.Evidence{Detail: "kept although an exception covers this finding: it now includes a change more serious than the one accepted"})
+					return false
+				}
 				return true
 			}
 		}
@@ -348,6 +401,12 @@ func (j *judge) report(checks []model.CheckResult, applied []model.Exception) *m
 	r.ComparedAgainst = append(r.ComparedAgainst, fmt.Sprintf("checklist (%d items)", judged))
 
 	r.CouldNotRuleOut = append(r.CouldNotRuleOut, KernelLimit)
+	switch {
+	case j.in.Collection == nil:
+		r.CouldNotRuleOut = append(r.CouldNotRuleOut, nothingCollected)
+	case !j.c.AsRoot:
+		r.CouldNotRuleOut = append(r.CouldNotRuleOut, nonRootLimit)
+	}
 	if j.old == nil {
 		r.CouldNotRuleOut = append(r.CouldNotRuleOut, noSnapshotLimit)
 	}

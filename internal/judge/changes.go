@@ -23,6 +23,19 @@ func (j *judge) changes(chs []diff.Change) {
 			}
 		case diff.ListenerAdded:
 			j.listeners = append(j.listeners, ch)
+		case diff.UserAdded, diff.UserRemoved:
+			j.acctChanged["/etc/passwd"], j.acctChanged["/etc/shadow"] = true, true
+		case diff.UserChanged:
+			if o, n := findUser(j.old, ch.Subject), findUser(j.c, ch.Subject); o != nil && n != nil {
+				if o.UID != n.UID || o.GID != n.GID || o.Shell != n.Shell || o.Home != n.Home {
+					j.acctChanged["/etc/passwd"] = true
+				}
+				if o.Password.Digest != n.Password.Digest || o.Password.Locked != n.Password.Locked || o.Password.Set != n.Password.Set {
+					j.acctChanged["/etc/shadow"] = true
+				}
+			}
+		case diff.GroupChanged:
+			j.acctChanged["/etc/group"] = true
 		}
 	}
 	for _, ch := range chs {
@@ -101,7 +114,50 @@ const (
 	catPersist
 	catSecurity
 	catGenerated
+	catLink
+	catLoosened
 )
+
+// newlyWritable reports whether a directory became writable by its group or
+// by everyone: write bits added, or a new world-writable directory without
+// the sticky bit.
+func newlyWritable(old, cur *model.FileEntry) bool {
+	if cur == nil || cur.Type != "dir" {
+		return false
+	}
+	if old == nil || old.Type != "dir" {
+		return cur.Mode&0o002 != 0 && cur.Mode&0o1000 == 0
+	}
+	return (cur.Mode&^old.Mode)&0o022 != 0
+}
+
+// systemDirs are where a system program's link may point.
+var systemDirs = []string{"/usr", "/lib", "/lib32", "/lib64", "/libx32", "/bin", "/sbin", "/etc", "/boot", "/run/systemd"}
+
+// badLink says why a symbolic link now points somewhere it should not, or
+// "": into a temporary or hidden place (whenever it changed), or, when it
+// was pointed somewhere new, out of the system directories.
+func badLink(p string, old, cur *model.FileEntry) string {
+	if cur == nil || cur.Type != "symlink" {
+		return ""
+	}
+	t := linkTarget(p, cur.Target)
+	for _, d := range []string{"/tmp", "/dev/shm", "/var/tmp"} {
+		if t == d || strings.HasPrefix(t, d+"/") {
+			return "it points into " + d
+		}
+	}
+	for _, comp := range strings.Split(t, "/") {
+		if strings.HasPrefix(comp, ".") {
+			return "it points into a hidden directory"
+		}
+	}
+	if old != nil && (old.Type != "symlink" || old.Target != cur.Target) &&
+		!slices.ContainsFunc(systemDirs, func(d string) bool { return t == d || strings.HasPrefix(t, d+"/") }) {
+		return "it was pointed outside the system directories"
+	}
+	return ""
+}
 
 func (j *judge) fileChange(ch diff.Change) {
 	p := ch.Subject
@@ -114,17 +170,25 @@ func (j *judge) fileChange(ch diff.Change) {
 		return
 	}
 	if cur != nil && old != nil && sameMeta(old, cur) {
-		// Account databases: the account comparison lists each change,
-		// without password data. Directories: a size change only means
-		// entries came or went, and those are listed themselves.
-		if accountFiles[p] || cur.Type == "dir" {
+		// A directory whose only change is its size: entries came or went,
+		// and those are listed themselves.
+		if cur.Type == "dir" {
+			return
+		}
+		// An account database whose change the account comparison shows,
+		// without password data.
+		if accountDBs[p] && j.acctChanged[p] {
 			return
 		}
 	}
-	if volatileRootFile(p) && ch.Kind != diff.FileRemoved {
+	if volatileRootFile(p, e) && ch.Kind != diff.FileRemoved {
 		return
 	}
 	ev := model.Evidence{Path: p, Before: fullHash(ch.Before, old), After: fullHash(ch.After, cur), Detail: changeWord(ch.Kind), When: j.changeWhen(cur)}
+	owner := j.owned[p]
+	if owner == "" {
+		owner = j.oldOwned[p]
+	}
 
 	// A persistence file: its persistence change carries it.
 	if f, ok := j.persistDone[p]; ok {
@@ -137,59 +201,25 @@ func (j *judge) fileChange(ch diff.Change) {
 	if f := j.pkgPath[p]; f != nil {
 		ev.Detail += " since the snapshot"
 		j.attach(f, ev, maxEvidence)
-		return
-	}
-	// It matches the signed package installed now: shown with that
-	// package's change, or explained by it.
-	if v, ok := j.verified[p]; ok && j.verifiedNow(v, cur) {
-		ev.Detail = "matches " + v.Package + " " + v.Version + " from " + sourceWords(v.Source)
-		j.foldIntoPackage(v.Package, ev)
-		return
-	}
-	// Rebuilt for a kernel package that came or went.
-	if k := j.kernelPackageFor(p); k != "" {
-		ev.Detail += "; rebuilt for " + k
-		j.foldIntoPackage(k, ev)
-		return
-	}
-	// Part of a package that changed: a directory or link it lists, a file
-	// that left with it, or dpkg's own record of it.
-	owner := j.owned[p]
-	if owner == "" {
-		owner = j.oldOwned[p]
-	}
-	switch {
-	case e.Type != "file" && j.pkgChanged(owner):
-		j.foldIntoPackage(owner, ev)
-		return
-	case ch.Kind == diff.FileRemoved && j.owned[p] == "" && j.pkgChanged(j.oldOwned[p]):
-		ev.Detail = "removed with the package change"
-		j.foldIntoPackage(j.oldOwned[p], ev)
-		return
-	case j.pkgChanged(dpkgInfoPackage(p)):
-		ev.Detail = "dpkg's record of the package"
-		j.foldIntoPackage(dpkgInfoPackage(p), ev)
-		return
-	case j.unverified[p] && j.pkgChanged(owner):
-		return // counted in the grouped note on unverifiable files
-	}
-	// A conffile the package change replaced with the new default:
-	// package verification checked it and said nothing.
-	if name := conffileOwner(j.c.Packages.Installed, p); cur != nil && name != "" && j.unreported(p) {
-		switch j.pkgChange[name].Kind {
-		case diff.PkgUpgraded:
-			ev.Detail += "; the package's default configuration"
-			j.explain(name, ev)
-			return
-		case diff.PkgInstalled:
-			ev.Detail += "; the package's default configuration"
-			j.foldIntoPackage(name, ev)
-			return
+		if j.pkgChanged(owner) {
+			if strings.HasPrefix(f.Key, "pkg.unverifiable:") {
+				j.unverifiedProgram(owner, p, ev)
+			} else {
+				j.unconfirmed[owner] = true
+			}
 		}
+		return
 	}
 
+	linkWhy := badLink(p, old, cur)
 	cat := catNote
 	switch {
+	case linkWhy != "":
+		cat = catLink
+	case newlyWritable(old, cur):
+		cat = catLoosened
+	case j.placed(ch, e, old, cur, owner, ev):
+		return
 	case generatedFile(p):
 		cat = catGenerated
 	case j.isPersistLocation(p):
@@ -197,31 +227,44 @@ func (j *judge) fileChange(ch diff.Change) {
 	case e.Type == "file" && pkgverify.InScope(p, e.Mode):
 		cat = catSecurity
 	}
-	sev := model.SevNote
-	why := "No package update explains this change. It is probably routine (a locally installed program, a generated file, an edited setting) but it is listed so that nothing is hidden."
+	if e.Type == "file" && j.pkgChanged(owner) {
+		j.unconfirmed[owner] = true
+	}
+
+	sev := model.SevBackdoor
+	why := ""
 	var refs []string
+	fix := j.fileFix(ch, old, cur, owner)
 	switch cat {
+	case catNote:
+		sev = model.SevNote
+		why = "No package update explains this change. It is probably routine (a locally installed program, a generated file, an edited setting) but it is listed so that nothing is hidden."
 	case catPersist:
-		sev = model.SevBackdoor
 		why = "This is a place attackers use to get back in or to run code again, and no package update explains the change."
+		if w := accountWhy[p]; w != "" {
+			why = w + " It changed since the snapshot, and nothing else telltale compares covers it."
+		}
 		refs = []string{"T1546"}
 	case catSecurity:
-		sev = model.SevBackdoor
 		why = "Programs, libraries, PAM modules, kernel modules and boot files run with the machine's full trust. A change that no package update explains is what a backdoored system file looks like."
 		refs = []string{"T1554"}
 	case catGenerated:
-		if len(j.pkgChange) > 0 {
-			why = "update-initramfs, update-grub, grub-install and depmod rebuild this file when packages change, and packages did change since the snapshot, so this is probably routine. " +
-				"It belongs to no package and cannot be checked against one; if nothing you updated would rebuild it, investigate."
-		} else {
-			sev = model.SevBackdoor
-			why = "This boot file or module index is rebuilt only when packages change, and no package changed since the snapshot. Boot-time backdoors hide in the initramfs and the boot loader."
-		}
+		why = "This boot file or module index is rebuilt only when the packages that build it change (a kernel, GRUB, initramfs-tools or a package with initramfs hooks), and none of them changed since the snapshot. " +
+			"Boot-time backdoors hide in the initramfs, the boot loader and its modules."
 		refs = []string{"T1542"}
-	}
-	fix := j.fileFix(ch, old, cur, owner)
-	if cat == catGenerated && cur != nil {
-		fix = fixKeepOnly(p, "then rebuild it from the installed packages: update-initramfs -u -k all for an initramfs, update-grub for the boot menu, depmod -a for module indexes (check /etc/initramfs-tools and /etc/grub.d first)")
+		if cur != nil {
+			fix = fixKeepOnly(p, "then rebuild it from the installed packages: update-initramfs -u -k all for an initramfs, update-grub for the boot menu, grub-install for GRUB's modules, depmod -a for module indexes (check /etc/initramfs-tools and /etc/grub.d first)")
+		}
+	case catLink:
+		why = fmt.Sprintf("This link now points to %s: %s. A program or file replaced by a link runs or reads whatever sits at the other end, so it no longer matters what the package installed here.",
+			linkTarget(p, cur.Target), linkWhy)
+		refs = []string{"T1574"}
+	case catLoosened:
+		why = fmt.Sprintf("This directory is now writable by its group or by everyone (mode %04o), so they can add or replace the programs and settings inside it.", cur.Mode&0o7777)
+		refs = []string{"T1222.002"}
+		if old == nil {
+			fix = command([]string{p}, func(q []string) string { return "chmod go-w " + q[0] + "   # unless it must be shared on purpose" })
+		}
 	}
 	j.add(&model.Finding{
 		Key: "snap." + ch.Kind + ":" + p, ID: "TT-SNAP-001", Source: srcSnapshot, Severity: sev,
@@ -232,29 +275,76 @@ func (j *judge) fileChange(ch diff.Change) {
 	})
 }
 
-// kernelPackageFor names the kernel package, changed since the snapshot,
-// that a generated initramfs or module index belongs to (by its kernel
-// release in the path), or "".
-func (j *judge) kernelPackageFor(p string) string {
-	release := ""
-	if r, ok := strings.CutPrefix(p, "/boot/initrd.img-"); ok {
-		release = r
-	} else if generatedFile(p) {
-		for _, pre := range []string{"/lib/modules/", "/usr/lib/modules/"} {
-			if r, ok := strings.CutPrefix(p, pre); ok {
-				release, _, _ = strings.Cut(r, "/")
-			}
+// placed shows a file change as part of what explains it, and reports
+// whether it did: the signed package installed now, the package change that
+// rebuilt or listed it, or a conffile default.
+func (j *judge) placed(ch diff.Change, e, old, cur *model.FileEntry, owner string, ev model.Evidence) bool {
+	p := ch.Subject
+	// It matches the package installed now. The machine's own checksums
+	// count only after a package change: a different file at the same
+	// version cannot have come from an update.
+	if v, ok := j.verified[p]; ok && j.verifiedNow(v, cur) && (v.Source != pkgverify.SourceOfflineLocal || j.pkgChanged(v.Package)) {
+		ev.Detail = "matches " + strings.TrimSpace(v.Package+" "+v.Version) + " from " + sourceWords(v.Source)
+		j.foldIntoPackage(v.Package, ev, model.SevExplained)
+		return true
+	}
+	if generatedFile(p) {
+		name := j.rebuiltBy(p)
+		if name == "" {
+			return false
+		}
+		ev.Detail += "; rebuilt by " + name
+		j.foldIntoPackage(name, ev, model.SevNote)
+		return true
+	}
+	switch {
+	case e.Type == "dir" && j.pkgChanged(owner) && (old == nil || cur == nil || sameMeta(old, cur)):
+		j.foldIntoPackage(owner, ev, model.SevNote)
+		return true
+	case e.Type == "symlink" && j.pkgChanged(owner):
+		j.foldIntoPackage(owner, ev, model.SevNote)
+		return true
+	case ch.Kind == diff.FileRemoved && j.owned[p] == "" && j.pkgChanged(j.oldOwned[p]):
+		ev.Detail = "removed with the package change"
+		j.foldIntoPackage(j.oldOwned[p], ev, model.SevNote)
+		return true
+	case j.pkgChanged(dpkgInfoPackage(p)):
+		ev.Detail = "dpkg's record of the package"
+		j.foldIntoPackage(dpkgInfoPackage(p), ev, model.SevNote)
+		return true
+	case j.unverified[p] && j.pkgChanged(owner):
+		// A program goes on its package's change, which it makes a
+		// backdoor sign; anything else is counted in the grouped note.
+		if e.Type == "file" && pkgverify.InScope(p, e.Mode) {
+			j.unverifiedProgram(owner, p, ev)
+		}
+		return true
+	}
+	// A conffile the package change replaced with the new default: package
+	// verification checked it and said nothing.
+	if name := conffileOwner(j.c.Packages.Installed, p); cur != nil && name != "" && j.unreported(p) {
+		switch j.pkgChange[name].Kind {
+		case diff.PkgUpgraded:
+			ev.Detail += "; the package's default configuration"
+			j.explain(name, ev)
+			return true
+		case diff.PkgInstalled:
+			ev.Detail += "; the package's default configuration"
+			j.foldIntoPackage(name, ev, model.SevExplained)
+			return true
 		}
 	}
-	if release == "" {
-		return ""
+	return false
+}
+
+// unverifiedProgram records a changed program of a changed package that no
+// trusted source confirmed.
+func (j *judge) unverifiedProgram(pkg, p string, ev model.Evidence) {
+	ev.Detail = "changed; could not be verified"
+	if r := j.unverReason[p]; r != "" {
+		ev.Detail += ": " + r
 	}
-	for _, name := range []string{"linux-image-" + release, "linux-modules-" + release, "linux-image-unsigned-" + release} {
-		if j.pkgChanged(name) {
-			return name
-		}
-	}
-	return ""
+	j.unverIn[pkg] = append(j.unverIn[pkg], ev)
 }
 
 // fullHash puts the entry's whole hash in place of the shortened one diff
@@ -400,7 +490,7 @@ func (j *judge) persistExplained(p string, cur *model.PersistFile) string {
 	if cur == nil {
 		return ""
 	}
-	if v, ok := j.verified[p]; ok && j.verifiedNow(v, j.files[p]) {
+	if v, ok := j.verified[p]; ok && j.verifiedNow(v, j.files[p]) && (v.Source != pkgverify.SourceOfflineLocal || j.pkgChanged(v.Package)) {
 		return v.Package
 	}
 	if name := conffileOwner(j.c.Packages.Installed, p); name != "" && j.pkgChange[name].Kind == diff.PkgUpgraded && j.unreported(p) {
@@ -411,17 +501,18 @@ func (j *judge) persistExplained(p string, cur *model.PersistFile) string {
 
 // persistOfPackageChange names the newly installed or removed package that
 // a new or vanished persistence file belongs to: a new package's enable link
-// or default conffile, or a file that left with its package.
-func (j *judge) persistOfPackageChange(p string, cur, old *model.PersistFile) string {
+// or default conffile, or a file that left with its package. sev is what
+// the change would rank as on its own.
+func (j *judge) persistOfPackageChange(p string, cur, old *model.PersistFile) (string, model.Severity) {
 	switch {
 	case old == nil && cur != nil:
 		if cur.Kind == model.PersistKindSystemdEnabled && len(cur.Lines) > 0 {
 			if name := j.owned[linkTarget(p, cur.Lines[0])]; name != "" && j.pkgChange[name].Kind == diff.PkgInstalled {
-				return name
+				return name, model.SevBackdoor // it also raises the package
 			}
 		}
 		if name := conffileOwner(j.c.Packages.Installed, p); name != "" && j.pkgChange[name].Kind == diff.PkgInstalled && j.unreported(p) {
-			return name
+			return name, model.SevExplained
 		}
 	case cur == nil && old != nil:
 		name := j.oldOwned[p]
@@ -429,10 +520,47 @@ func (j *judge) persistOfPackageChange(p string, cur, old *model.PersistFile) st
 			name = conffileOwner(j.old.Packages.Installed, p)
 		}
 		if k := j.pkgChange[name].Kind; name != "" && j.owned[p] == "" && (k == diff.PkgRemoved || k == diff.PkgUpgraded) {
-			return name
+			return name, model.SevNote
 		}
 	}
-	return ""
+	return "", 0
+}
+
+// linkView reads a persistence file that is a symbolic link: Lines[0] is
+// the link's target and the rest is the target's content, so content line
+// n is diff line n+1, and edits go to the target (sed -i on the link would
+// replace it with a plain file).
+type linkView struct {
+	link   bool
+	target string // the resolved target; "" when unknown
+}
+
+func linkViewOf(p string, cur, old *model.PersistFile) linkView {
+	isLink := func(pf *model.PersistFile) bool { return pf != nil && pf.Mode&0o170000 == 0o120000 }
+	v := linkView{link: isLink(cur) || (cur == nil && isLink(old))}
+	if v.link && cur != nil && len(cur.Lines) > 0 && !strings.HasPrefix(cur.Lines[0], "<redacted") {
+		v.target = linkTarget(p, cur.Lines[0])
+	}
+	return v
+}
+
+// isTarget reports whether a line change is the link's target changing.
+func (v linkView) isTarget(lc diff.LineChange) bool { return v.link && lc.Line == 1 }
+
+// line is the content line number of a diff line.
+func (v linkView) line(n int) int {
+	if v.link {
+		return n - 1
+	}
+	return n
+}
+
+// deleteLines removes content lines, from the target of a link.
+func (v linkView) deleteLines(p string, lines []int, note string) string {
+	if v.link {
+		return fixDeleteLinesIn(p, v.target, lines, note)
+	}
+	return fixDeleteLines(p, lines, note)
 }
 
 func (j *judge) persistChange(ch diff.Change) {
@@ -446,12 +574,18 @@ func (j *judge) persistChange(ch diff.Change) {
 		kind = old.Kind
 	}
 	meta := cur != nil && old != nil && (cur.Mode&0o7777 != old.Mode&0o7777 || cur.UID != old.UID)
+	lv := linkViewOf(p, cur, old)
 	summary := func(lines []diff.LineChange) model.Evidence {
 		adds, dels := 0, 0
 		first := 0
+		retarget := false
 		for _, lc := range lines {
+			if lv.isTarget(lc) {
+				retarget = true
+				continue
+			}
 			if first == 0 {
-				first = lc.Line
+				first = lv.line(lc.Line)
 			}
 			if lc.Op == "add" {
 				adds++
@@ -465,6 +599,8 @@ func (j *judge) persistChange(ch diff.Change) {
 			parts = append(parts, "new file")
 		case cur == nil:
 			parts = append(parts, "file removed")
+		case retarget:
+			parts = append(parts, "link target changed")
 		}
 		if adds > 0 {
 			parts = append(parts, fmt.Sprintf("%d %s added", adds, plural(adds, "line", "lines")))
@@ -487,8 +623,8 @@ func (j *judge) persistChange(ch diff.Change) {
 			j.persistDone[p] = nil
 			return
 		}
-		if name := j.persistOfPackageChange(p, cur, old); name != "" {
-			j.foldIntoPackage(name, summary(ch.Lines))
+		if name, sev := j.persistOfPackageChange(p, cur, old); name != "" {
+			j.foldIntoPackage(name, summary(ch.Lines), sev)
 			j.persistDone[p] = j.pkgFinding[name]
 			return
 		}
@@ -496,7 +632,7 @@ func (j *judge) persistChange(ch diff.Change) {
 
 	lines := ch.Lines
 	if kind == model.PersistKindAuthorizedKeys && j.rootKeyFile(p) {
-		lines = j.newRootKeys(p, ch, old)
+		lines = j.newRootKeys(p, ch, old, lv)
 		if len(lines) == 0 && !meta {
 			if _, ok := j.persistDone[p]; !ok {
 				j.persistDone[p] = nil // only the telltale server's key, blank lines or comments
@@ -518,14 +654,17 @@ func (j *judge) persistChange(ch diff.Change) {
 		Key: "snap.persist:" + p, ID: "TT-SNAP-002", Source: srcSnapshot, Severity: model.SevBackdoor,
 		Title: title,
 		Why:   info.why + " It changed since the machine was known to be clean, and no package update explains it.",
-		Fix:   persistFix(p, cur, old, lines, meta),
+		Fix:   persistFix(p, cur, old, lines, meta, lv),
 		Refs:  info.refs,
 		// The summary first: its After is the file's full hash.
 		Evidence: []model.Evidence{summary(lines)},
 	})
 	for _, lc := range lines {
-		e := model.Evidence{Path: p, Line: lc.Line, Before: lc.Old, After: lc.New, Detail: "line added"}
-		if lc.Op != "add" {
+		e := model.Evidence{Path: p, Line: lv.line(lc.Line), Before: lc.Old, After: lc.New, Detail: "line added"}
+		switch {
+		case lv.isTarget(lc):
+			e.Line, e.Detail = 0, "link target"
+		case lc.Op != "add":
 			e.Detail = "line removed"
 		}
 		j.attach(f, e, maxEvidence)
@@ -540,7 +679,7 @@ func capitalize(s string) string {
 	return strings.ToUpper(s[:1]) + s[1:]
 }
 
-func persistFix(p string, cur, old *model.PersistFile, lines []diff.LineChange, meta bool) string {
+func persistFix(p string, cur, old *model.PersistFile, lines []diff.LineChange, meta bool, lv linkView) string {
 	switch {
 	case cur == nil:
 		return "Restore the file from a backup if you did not remove it (the snapshot's lines are shown above)."
@@ -553,15 +692,14 @@ func persistFix(p string, cur, old *model.PersistFile, lines []diff.LineChange, 
 	}
 	var added []int
 	for _, lc := range lines {
-		if lc.Op != "add" {
+		if lc.Op != "add" || lv.isTarget(lc) {
 			added = nil
 			break
 		}
-		added = append(added, lc.Line)
+		added = append(added, lv.line(lc.Line))
 	}
-	// sed -i would replace a symlink with a plain file.
-	if !meta && len(added) > 0 && cur.Mode&0o170000 != 0o120000 {
-		return fixDeleteLines(p, added, "removes the added lines shown above")
+	if !meta && len(added) > 0 {
+		return lv.deleteLines(p, added, "removes the added lines shown above")
 	}
 	return fixKeepOnly(p, "then edit it back to the snapshot's lines shown above")
 }
@@ -583,7 +721,7 @@ func (j *judge) rootKeyFile(p string) bool {
 // newRootKeys reports each key added for root (other than the telltale
 // server's) as its own backdoor sign and returns the line changes left
 // over: removed keys, edited key lines and anything that is not a key.
-func (j *judge) newRootKeys(p string, ch diff.Change, old *model.PersistFile) []diff.LineChange {
+func (j *judge) newRootKeys(p string, ch diff.Change, old *model.PersistFile, lv linkView) []diff.LineChange {
 	server, _ := keyBlob(j.ctx.ServerKeyLine)
 	had := map[string]bool{}
 	if old != nil {
@@ -595,6 +733,10 @@ func (j *judge) newRootKeys(p string, ch diff.Change, old *model.PersistFile) []
 	}
 	var rest []diff.LineChange
 	for _, lc := range ch.Lines {
+		if lv.isTarget(lc) {
+			rest = append(rest, lc) // the link now points at another file
+			continue
+		}
 		text := lc.New
 		if lc.Op != "add" {
 			text = lc.Old
@@ -608,13 +750,14 @@ func (j *judge) newRootKeys(p string, ch diff.Change, old *model.PersistFile) []
 			continue // the telltale server's own key: expected on every visit
 		}
 		if lc.Op == "add" && blob != "" && !had[blob] {
+			n := lv.line(lc.Line)
 			j.persistDone[p] = j.add(&model.Finding{
-				Key: fmt.Sprintf("snap.root_key:%s:%d", p, lc.Line), ID: "TT-SNAP-003", Source: srcSnapshot, Severity: model.SevBackdoor,
-				Title: fmt.Sprintf("New SSH key for root, not in the snapshot: %s line %d", p, lc.Line),
+				Key: fmt.Sprintf("snap.root_key:%s:%d", p, n), ID: "TT-SNAP-003", Source: srcSnapshot, Severity: model.SevBackdoor,
+				Title: fmt.Sprintf("New SSH key for root, not in the snapshot: %s line %d", p, n),
 				Why: "Whoever holds the matching private key can now log in as root without a password. Planting a key is the most common way attackers keep root access. " +
 					"It is not the telltale server's key.",
-				Fix:      fixDeleteLines(p, []int{lc.Line}, "only if you do not recognise the key; if you remove several lines from this file, start with the highest line number"),
-				Evidence: []model.Evidence{{Path: p, Line: lc.Line, After: s, Detail: "key added since the snapshot", When: j.whenFor(p)}},
+				Fix:      lv.deleteLines(p, []int{n}, "only if you do not recognise the key; if you remove several lines from this file, start with the highest line number"),
+				Evidence: []model.Evidence{{Path: p, Line: n, After: s, Detail: "key added since the snapshot", When: j.whenFor(p)}},
 				Refs:     []string{"T1098.004"},
 			})
 			continue
@@ -793,7 +936,16 @@ func (j *judge) moduleAdded(ch diff.Change) {
 		f.Why = "A module from an installed package was loaded since the snapshot. That is usually routine (new hardware, a service that needs it); listed so that every change is accounted for."
 		detail = "loaded since the snapshot; from package " + owner
 	}
-	f.Evidence = []model.Evidence{{Path: file, After: name, Detail: detail}}
+	// The value an exception accepts names the file and its owner, so the
+	// same module name loaded from another file is a finding again.
+	from := "no module file found under /lib/modules"
+	if file != "" {
+		from = file + " (no package)"
+		if owner != "" {
+			from = file + " (package " + owner + ")"
+		}
+	}
+	f.Evidence = []model.Evidence{{Path: file, After: name + " from " + from, Detail: detail}}
 	j.add(f)
 }
 
@@ -875,6 +1027,19 @@ func (j *judge) listenerAdded(ch diff.Change) {
 		f.Why = "A service started listening since the snapshot. Its program belongs to package " + owner + "; check that you meant to run it and to expose it."
 		detail = fmt.Sprintf("pid %d; package %s", pid, owner)
 	}
-	f.Evidence = []model.Evidence{{Path: exe, After: ch.Subject, Detail: detail}}
+	// The value an exception accepts names the program, its package and
+	// anything suspicious about it, so another program on the same socket
+	// is a finding again.
+	by := "a program telltale could not see"
+	switch {
+	case exe != "" && owner != "":
+		by = exe + " (package " + owner + ")"
+	case exe != "":
+		by = exe + " (no package)"
+	}
+	if reason != "" {
+		by += "; " + reason
+	}
+	f.Evidence = []model.Evidence{{Path: exe, After: ch.Subject + " served by " + by, Detail: detail}}
 	j.add(f)
 }

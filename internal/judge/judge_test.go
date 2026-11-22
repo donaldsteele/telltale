@@ -232,9 +232,14 @@ func TestJudgeUpgradeExplained(t *testing.T) {
 		t.Errorf("group title %q, want %q (why %q)", e.Title, want, e.Why)
 	}
 
-	// Without verification the same changed program is not explained.
+	// Without verification the same changed program is not explained, and
+	// neither is the upgrade: nothing confirmed its files.
 	r = run(cur, snapOf(old), nil)
 	must(t, r, "snap.file_modified:/usr/bin/openssl", model.SevBackdoor)
+	must(t, r, "snap.pkg_upgraded:openssl", model.SevNote)
+	if explained(r, "explained:openssl") != nil {
+		t.Errorf("unconfirmed upgrade explained")
+	}
 }
 
 func TestJudgeKernelPackageExplained(t *testing.T) {
@@ -292,7 +297,7 @@ func TestJudgeNewPackageWithSetuidIsBackdoor(t *testing.T) {
 	if !hasEvidencePath(f, "/usr/bin/helper") {
 		t.Errorf("evidence does not name the setuid program: %+v", f.Evidence)
 	}
-	if !strings.Contains(f.Fix, "apt-get purge 'helperpkg'") || !strings.HasPrefix(f.Fix, "mkdir -p /root/telltale-evidence && ") {
+	if !strings.Contains(f.Fix, "apt-get purge -- 'helperpkg'") || !strings.HasPrefix(f.Fix, "mkdir -p /root/telltale-evidence && ") {
 		t.Errorf("fix %q", f.Fix)
 	}
 	n := must(t, r, "snap.pkg_installed:jq", model.SevNote)
@@ -313,7 +318,7 @@ func TestJudgeDowngradeIsBackdoor(t *testing.T) {
 
 	r := run(cur, snapOf(old), nil)
 	f := must(t, r, "snap.pkg_downgraded:openssh-server", model.SevBackdoor)
-	if !strings.Contains(f.Fix, "apt-get install 'openssh-server=1:9.2p1-2+deb12u3'") {
+	if !strings.Contains(f.Fix, "apt-get install -- 'openssh-server=1:9.2p1-2+deb12u3'") {
 		t.Errorf("fix %q", f.Fix)
 	}
 	if f.Evidence[0].Before != "1:9.2p1-2+deb12u3" || f.Evidence[0].After != "1:9.2p1-2+deb12u1" {
@@ -336,7 +341,7 @@ func TestJudgeMismatchIsTampering(t *testing.T) {
 	if e := f.Evidence[0]; e.Before != h("ls 9.1") || e.After != h("evil ls") || !strings.Contains(e.Detail, "archive") {
 		t.Errorf("evidence %+v", e)
 	}
-	want := evidenceCopy + "'/usr/bin/ls' /root/telltale-evidence/ && apt-get install --reinstall 'coreutils'"
+	want := evidenceCopy + "'/usr/bin/ls' /root/telltale-evidence/ && apt-get install --reinstall -- 'coreutils'"
 	if !strings.HasPrefix(f.Fix, want) {
 		t.Errorf("fix %q, want prefix %q", f.Fix, want)
 	}
@@ -747,7 +752,7 @@ func TestJudgeUserAdded(t *testing.T) {
 		model.User{Name: "deploy", UID: 1001, GID: 1001, Home: "/home/deploy", Shell: "/bin/bash", Password: model.PasswordState{Known: true, Locked: true, LastChange: 20000}})
 	r := run(cur, snapOf(old), nil)
 	f := must(t, r, "snap.user_added:toor", model.SevBackdoor)
-	if !strings.Contains(f.Fix, "userdel -f 'toor'") || !strings.HasPrefix(f.Fix, evidenceCopy) {
+	if !strings.Contains(f.Fix, "userdel -f -- 'toor'") || !strings.HasPrefix(f.Fix, evidenceCopy) {
 		t.Errorf("fix %q", f.Fix)
 	}
 	must(t, r, "snap.user_added:deploy", model.SevNote)
@@ -791,7 +796,7 @@ func TestJudgePrivilegedGroupMember(t *testing.T) {
 	}
 	r := run(cur, snapOf(old), nil)
 	f := must(t, r, "snap.group:sudo", model.SevBackdoor)
-	if !strings.Contains(f.Fix, "gpasswd -d 'deploy' 'sudo'") {
+	if !strings.Contains(f.Fix, "gpasswd -d 'deploy' -- 'sudo'") {
 		t.Errorf("fix %q", f.Fix)
 	}
 	must(t, r, "snap.group:staff", model.SevNote)
@@ -854,7 +859,7 @@ func TestJudgeFileChangeRankedByLocation(t *testing.T) {
 
 	r := run(cur, snapOf(old), res)
 	f := must(t, r, "snap.file_modified:/usr/bin/ls", model.SevBackdoor)
-	if !strings.HasPrefix(f.Fix, evidenceCopy+"'/usr/bin/ls' /root/telltale-evidence/ && apt-get install --reinstall 'coreutils'") {
+	if !strings.HasPrefix(f.Fix, evidenceCopy+"'/usr/bin/ls' /root/telltale-evidence/ && apt-get install --reinstall -- 'coreutils'") {
 		t.Errorf("fix %q", f.Fix)
 	}
 	// An exception accepts the first evidence's After, so it must name the
@@ -895,12 +900,13 @@ func TestJudgeRoutineChangesAreNotBackdoorSigns(t *testing.T) {
 	r := run(cur, snapOf(old), nil)
 	must(t, r, "snap.file_modified:/boot/initrd.img-6.1.0-25-amd64", model.SevBackdoor)
 
-	// After a package update it is a note; dpkg's own records of the
-	// updated package are explained with it.
+	// An update of a package that does not rebuild the initramfs leaves it
+	// a backdoor sign; dpkg's own records of the updated package are
+	// explained with it.
 	setVersion(cur, "openssl", "3.0.15-1~deb12u1")
 	setFile(cur, file("/var/lib/dpkg/info/openssl.md5sums", "sums 2", 0o644))
 	r = run(cur, snapOf(old), archive())
-	must(t, r, "snap.file_modified:/boot/initrd.img-6.1.0-25-amd64", model.SevNote)
+	must(t, r, "snap.file_modified:/boot/initrd.img-6.1.0-25-amd64", model.SevBackdoor)
 	absent(t, r, "snap.file_modified:/var/lib/dpkg/info/openssl.md5sums")
 	if g := explained(r, "explained:openssl"); g == nil || !hasEvidencePath(g, "/var/lib/dpkg/info/openssl.md5sums") {
 		t.Errorf("dpkg records not explained with the update: %+v", g)
@@ -943,8 +949,11 @@ func TestJudgeKernelUpdateGeneratedFilesFoldIntoKernelPackage(t *testing.T) {
 	if o := explained(r, "explained:linux-image-6.1.0-25-amd64"); o == nil || !hasEvidencePath(o, "/boot/initrd.img-6.1.0-25-amd64") {
 		t.Errorf("old kernel's initrd not shown with its removal: %+v", o)
 	}
-	// The boot menu is rebuilt for any kernel change: a note.
-	must(t, r, "snap.file_modified:/boot/grub/grub.cfg", model.SevNote)
+	// A kernel install rebuilds the boot menu: shown with the new kernel.
+	absent(t, r, "snap.file_modified:/boot/grub/grub.cfg")
+	if !hasEvidencePath(g, "/boot/grub/grub.cfg") {
+		t.Errorf("boot menu not shown with the new kernel: %+v", g.Evidence)
+	}
 
 	// The kernel command line is a persistence location.
 	setFile(cur, file("/etc/default/grub", "GRUB_CMDLINE_LINUX=\"init=/tmp/x\"", 0o644))
@@ -1119,7 +1128,7 @@ func TestJudgeSecurityPackageRemovedIsWeak(t *testing.T) {
 	removePkg(cur, "jq")
 	r := run(cur, snapOf(old), nil)
 	f := must(t, r, "snap.pkg_removed:fail2ban", model.SevWeak)
-	if !strings.Contains(f.Fix, "apt-get install 'fail2ban'") {
+	if !strings.Contains(f.Fix, "apt-get install -- 'fail2ban'") {
 		t.Errorf("fix %q", f.Fix)
 	}
 	must(t, r, "snap.pkg_removed:jq", model.SevNote)
@@ -1189,4 +1198,383 @@ func TestJudgeSkippedListsCollectionAndCheckSkips(t *testing.T) {
 	if r.Schema != model.ReportSchema || r.Host.Hostname != "web01" || !r.Time.Equal(now) {
 		t.Errorf("header %+v %v %v", r.Host, r.Schema, r.Time)
 	}
+}
+
+// --- review round 1: paths where a backdoor was explained, dropped or
+// downgraded ---
+
+// C1: an "upgrade" to a version no trusted source has must not explain the
+// programs it replaced.
+func TestJudgeUnofficialUpgradeIsBackdoor(t *testing.T) {
+	old := clean()
+	old.Packages.Installed = append(old.Packages.Installed, pkg("openssh-server", "1:9.2p1-2+deb12u3", "/usr/sbin/sshd", "/usr/share/doc/openssh-server/README"))
+	old.Files = append(old.Files, file("/usr/sbin/sshd", "sshd", 0o755), file("/usr/share/doc/openssh-server/README", "r", 0o644))
+	cur := clone(old)
+	setVersion(cur, "openssh-server", "1:9.2p1-2+deb12u9")
+	setFile(cur, file("/usr/sbin/sshd", "trojan sshd", 0o755))
+	setFile(cur, file("/usr/share/doc/openssh-server/README", "r2", 0o644))
+	res := archive()
+	res.Unverifiable = []pkgverify.FileVerdict{
+		{Path: "/usr/sbin/sshd", Package: "openssh-server", Version: "1:9.2p1-2+deb12u9", Actual: h("trojan sshd"), Reason: pkgverify.ReasonNotOfficial},
+		{Path: "/usr/share/doc/openssh-server/README", Package: "openssh-server", Version: "1:9.2p1-2+deb12u9", Actual: h("r2"), Reason: pkgverify.ReasonNotOfficial}}
+
+	r := run(cur, snapOf(old), res)
+	f := must(t, r, "snap.pkg_upgraded:openssh-server", model.SevBackdoor)
+	if !hasEvidencePath(f, "/usr/sbin/sshd") || f.Evidence[0].Before != "1:9.2p1-2+deb12u3" || f.Evidence[0].After != "1:9.2p1-2+deb12u9" {
+		t.Errorf("evidence %+v", f.Evidence)
+	}
+	if hasEvidencePath(f, "/usr/share/doc/openssh-server/README") {
+		t.Errorf("a documentation file is not a program: %+v", f.Evidence)
+	}
+	if !strings.Contains(f.Title, "1 program") {
+		t.Errorf("title %q", f.Title)
+	}
+	if explained(r, "explained:openssh-server") != nil {
+		t.Errorf("unofficial upgrade explained")
+	}
+	if r.ExitCode != 2 {
+		t.Errorf("exit %d", r.ExitCode)
+	}
+
+	// A new package whose programs no trusted source has.
+	cur2 := clone(old)
+	cur2.Packages.Installed = append(cur2.Packages.Installed, pkg("tool", "1.0", "/usr/bin/tool"))
+	cur2.Files = append(cur2.Files, file("/usr/bin/tool", "tool", 0o755))
+	res2 := archive()
+	res2.Unverifiable = []pkgverify.FileVerdict{{Path: "/usr/bin/tool", Package: "tool", Version: "1.0", Reason: pkgverify.ReasonNotOfficial}}
+	n := must(t, run(cur2, snapOf(old), res2), "snap.pkg_installed:tool", model.SevBackdoor)
+	if !hasEvidencePath(n, "/usr/bin/tool") {
+		t.Errorf("unverified program not on the package: %+v", n.Evidence)
+	}
+
+	// A routine-looking kernel package whose modules no trusted source has.
+	old3 := clean()
+	old3.Packages.Installed = append(old3.Packages.Installed, pkg("linux-image-6.1.0-25-amd64", "6.1.106-3"))
+	cur3 := clone(old3)
+	ko := "/lib/modules/6.1.0-99-amd64/kernel/x.ko"
+	cur3.Packages.Installed = append(cur3.Packages.Installed, pkg("linux-image-6.1.0-99-amd64", "6.1.999-1", ko))
+	cur3.Files = append(cur3.Files, file(ko, "ko", 0o644))
+	res3 := archive()
+	res3.Unverifiable = []pkgverify.FileVerdict{{Path: ko, Package: "linux-image-6.1.0-99-amd64", Reason: pkgverify.ReasonNotOfficial}}
+	r = run(cur3, snapOf(old3), res3)
+	must(t, r, "snap.pkg_installed:linux-image-6.1.0-99-amd64", model.SevBackdoor)
+	if explained(r, "explained:linux-image-6.1.0-99-amd64") != nil {
+		t.Errorf("unverifiable kernel explained")
+	}
+}
+
+// I1: an exception covers only what it accepted.
+func TestJudgeExceptionValuesCoverWhatMakesItSerious(t *testing.T) {
+	// A listener accepted for a packaged program, later served by another.
+	old := clean()
+	old.Packages.Installed = append(old.Packages.Installed, pkg("nginx", "1.22", "/usr/sbin/nginx"))
+	old.Files = append(old.Files, file("/usr/sbin/nginx", "nginx", 0o755), file("/usr/local/bin/evil", "evil", 0o755))
+	cur := clone(old)
+	cur.Runtime.Processes = []model.Process{{PID: 10, UID: 0, Exe: "/usr/sbin/nginx"}}
+	cur.Runtime.Sockets = []model.Socket{{Proto: "tcp", Local: "0.0.0.0:8080", State: "LISTEN", Listening: true, PID: 10}}
+	s := snapOf(old)
+	f := must(t, run(cur, s, nil), "snap.listener:tcp:0.0.0.0:8080", model.SevNote)
+	s.Exceptions = []model.Exception{{FindingKey: f.Key, AcceptedValue: currentValue(f), At: taken}}
+	absent(t, run(cur, s, nil), "snap.listener:tcp:0.0.0.0:8080")
+	cur2 := clone(cur)
+	cur2.Runtime.Processes = []model.Process{{PID: 66, UID: 0, Exe: "/usr/local/bin/evil"}}
+	cur2.Runtime.Sockets[0].PID = 66
+	must(t, run(cur2, s, nil), "snap.listener:tcp:0.0.0.0:8080", model.SevBackdoor)
+
+	// A module accepted from its package file, later loaded from another.
+	oldm := clean()
+	oldm.Packages.Installed = append(oldm.Packages.Installed, pkg("linux-image-6.1.0-25-amd64", "6.1.106-3", "/lib/modules/6.1.0-25-amd64/kernel/net/wg.ko"))
+	curm := clone(oldm)
+	curm.Runtime.Modules = []model.KernelModule{{Name: "wg", File: "/lib/modules/6.1.0-25-amd64/kernel/net/wg.ko"}}
+	sm := snapOf(oldm)
+	m := must(t, run(curm, sm, nil), "snap.module:wg", model.SevNote)
+	sm.Exceptions = []model.Exception{{FindingKey: m.Key, AcceptedValue: currentValue(m), At: taken}}
+	absent(t, run(curm, sm, nil), "snap.module:wg")
+	curm2 := clone(oldm)
+	curm2.Runtime.Modules = []model.KernelModule{{Name: "wg", File: "/lib/modules/6.1.0-25-amd64/extra/wg.ko"}}
+	must(t, run(curm2, sm, nil), "snap.module:wg", model.SevBackdoor)
+
+	// A new package accepted as a note, which later gains an enabled unit.
+	oldp := clean()
+	curp := clone(oldp)
+	curp.Packages.Installed = append(curp.Packages.Installed, pkg("foo", "1.0", "/usr/bin/foo", "/usr/lib/systemd/system/foo.service"))
+	curp.Files = append(curp.Files, file("/usr/bin/foo", "foo", 0o755), file("/usr/lib/systemd/system/foo.service", "[Service]", 0o644))
+	res := archive(pkgverify.FileVerdict{Path: "/usr/bin/foo", Package: "foo", Version: "1.0", Expected: h("foo"), Actual: h("foo"), Source: "archive"},
+		pkgverify.FileVerdict{Path: "/usr/lib/systemd/system/foo.service", Package: "foo", Version: "1.0", Expected: h("[Service]"), Actual: h("[Service]"), Source: "archive"})
+	sp := snapOf(oldp)
+	pf := must(t, run(curp, sp, res), "snap.pkg_installed:foo", model.SevNote)
+	sp.Exceptions = []model.Exception{{FindingKey: pf.Key, AcceptedValue: currentValue(pf), At: taken}}
+	if r := run(curp, sp, res); r.ExitCode != 0 {
+		t.Errorf("accepted package still reported: %v", keys(r))
+	}
+	curp2 := clone(curp)
+	curp2.Persist = append(curp2.Persist, model.PersistFile{Path: "/etc/systemd/system/multi-user.target.wants/foo.service", Kind: model.PersistKindSystemdEnabled,
+		Mode: 0o120777, Lines: []string{"/usr/lib/systemd/system/foo.service"}, SHA256: h("link")})
+	must(t, run(curp2, sp, res), "snap.pkg_installed:foo", model.SevBackdoor)
+}
+
+// I1: evidence folded into a finding is not dropped with it when it would
+// rank higher on its own.
+func TestJudgeExceptionKeepsMoreSeriousFoldedEvidence(t *testing.T) {
+	s := snapOf(clean())
+	s.Exceptions = []model.Exception{{FindingKey: "snap.pkg_removed:x", AcceptedValue: "removed", At: taken}}
+	j := newJudge(Input{Collection: clean(), Snapshot: s}, clean())
+	f := j.add(&model.Finding{Key: "snap.pkg_removed:x", Severity: model.SevNote, Evidence: []model.Evidence{{After: "removed"}}})
+	j.pkgFinding["x"] = f
+	j.foldIntoPackage("x", model.Evidence{Path: "/etc/cron.d/x", Detail: "changed"}, model.SevNote)
+	if j.exceptions(); len(j.findings) != 0 {
+		t.Fatalf("note-level folded evidence kept an accepted finding")
+	}
+	j = newJudge(Input{Collection: clean(), Snapshot: s}, clean())
+	f = j.add(&model.Finding{Key: "snap.pkg_removed:x", Severity: model.SevNote, Evidence: []model.Evidence{{After: "removed"}}})
+	j.pkgFinding["x"] = f
+	j.foldIntoPackage("x", model.Evidence{Path: "/etc/cron.d/x", Detail: "changed"}, model.SevBackdoor)
+	if j.exceptions(); len(j.findings) != 1 {
+		t.Fatalf("backdoor-level folded evidence dropped with an accepted note")
+	}
+}
+
+// I2: account files are only quiet when the account comparison shows what
+// changed in them.
+func TestJudgeAccountFilesComparedWhenAccountsDoNotExplainThem(t *testing.T) {
+	old := clean()
+	old.Files = append(old.Files, file("/etc/gshadow", "sudo:!::", 0o640), file("/etc/subuid", "alice:100000:65536", 0o644),
+		file("/etc/passwd", "root:x:0:0", 0o644), file("/etc/shadow", "root:$y$a", 0o640))
+	cur := clone(old)
+	setFile(cur, file("/etc/gshadow", "sudo:$y$hash::", 0o640))
+	setFile(cur, file("/etc/subuid", "alice:0:1", 0o644))
+	setFile(cur, file("/etc/passwd", "root:x:0:0\nroot:x:0:0:dup", 0o644))
+	r := run(cur, snapOf(old), nil)
+	must(t, r, "snap.file_modified:/etc/gshadow", model.SevBackdoor)
+	sub := must(t, r, "snap.file_modified:/etc/subuid", model.SevBackdoor)
+	if !strings.Contains(sub.Why, "id 0") {
+		t.Errorf("subuid why %q", sub.Why)
+	}
+	must(t, r, "snap.file_modified:/etc/passwd", model.SevBackdoor)
+
+	// A password change explains /etc/shadow's new content.
+	cur2 := clone(old)
+	cur2.Accounts.Users[0].Password.Digest = "digest-root-2"
+	setFile(cur2, file("/etc/shadow", "root:$y$b", 0o640))
+	r = run(cur2, snapOf(old), nil)
+	absent(t, r, "snap.file_modified:/etc/shadow")
+	must(t, r, "snap.user_changed:root", model.SevNote)
+}
+
+func TestJudgeDuplicateAccountNames(t *testing.T) {
+	c := clean()
+	c.Accounts.Users = append(c.Accounts.Users, model.User{Name: "root", UID: 0, Home: "/root", Shell: "/bin/sh"})
+	f := must(t, run(c, nil, nil), "acct.duplicate:root", model.SevBackdoor)
+	if len(f.Evidence) != 2 {
+		t.Errorf("evidence %+v", f.Evidence)
+	}
+	must(t, run(c, snapOf(clean()), nil), "acct.duplicate:root", model.SevBackdoor)
+}
+
+// I3: boot files fold only into the packages that rebuild them.
+func TestJudgeBootFilesFoldOnlyIntoRebuilders(t *testing.T) {
+	old := clean()
+	old.Packages.Installed = append(old.Packages.Installed, pkg("grub-pc", "2.06-13+deb12u1"),
+		pkg("udev", "252.30-1~deb12u2", "/usr/share/initramfs-tools/hooks/udev"))
+	old.Files = append(old.Files, file("/boot/grub/grub.cfg", "menu", 0o444), file("/boot/grub/x86_64-efi/normal.mod", "mod", 0o644),
+		file("/boot/initrd.img-6.1.0-25-amd64", "initrd", 0o644), file("/boot/efi/EFI/debian/grubx64.efi", "efi", 0o755))
+	edit := func(c *model.Collection) {
+		setFile(c, file("/boot/grub/grub.cfg", "menu init=/bin/bash", 0o444))
+		setFile(c, file("/boot/grub/x86_64-efi/normal.mod", "evil mod", 0o644))
+		setFile(c, file("/boot/initrd.img-6.1.0-25-amd64", "evil initrd", 0o644))
+		setFile(c, file("/boot/efi/EFI/debian/grubx64.efi", "evil efi", 0o755))
+	}
+	boot := []string{"/boot/grub/grub.cfg", "/boot/grub/x86_64-efi/normal.mod", "/boot/initrd.img-6.1.0-25-amd64", "/boot/efi/EFI/debian/grubx64.efi"}
+
+	// An unrelated upgrade explains none of them.
+	cur := clone(old)
+	setVersion(cur, "unattended-upgrades", "2.9.1+nmu4")
+	edit(cur)
+	r := run(cur, snapOf(old), archive())
+	for _, p := range boot {
+		must(t, r, "snap.file_modified:"+p, model.SevBackdoor)
+	}
+
+	// A GRUB upgrade rebuilds the menu, the modules and the EFI binary, not
+	// the initramfs.
+	cur = clone(old)
+	setVersion(cur, "grub-pc", "2.06-13+deb12u2")
+	edit(cur)
+	r = run(cur, snapOf(old), archive())
+	for _, p := range boot[:2] {
+		absent(t, r, "snap.file_modified:"+p)
+	}
+	absent(t, r, "snap.file_modified:/boot/efi/EFI/debian/grubx64.efi")
+	must(t, r, "snap.file_modified:/boot/initrd.img-6.1.0-25-amd64", model.SevBackdoor)
+
+	// A package with an initramfs hook rebuilds the initramfs of every
+	// kernel.
+	cur = clone(old)
+	setVersion(cur, "udev", "252.31-1~deb12u1")
+	edit(cur)
+	r = run(cur, snapOf(old), archive())
+	absent(t, r, "snap.file_modified:/boot/initrd.img-6.1.0-25-amd64")
+	if g := explained(r, "explained:udev"); g == nil || !hasEvidencePath(g, "/boot/initrd.img-6.1.0-25-amd64") {
+		t.Errorf("initramfs not shown with the hook package: %+v", g)
+	}
+	must(t, r, "snap.file_modified:/boot/grub/grub.cfg", model.SevBackdoor)
+}
+
+// I4: a package change does not cover a loosened directory or a link that
+// now points somewhere it should not.
+func TestJudgePackageDirsAndLinksAreChecked(t *testing.T) {
+	old := clean()
+	old.Packages.Installed = append(old.Packages.Installed, pkg("sudo", "1.9.13p3-1+deb12u1", "/etc/sudoers.d", "/usr/bin/sudoedit", "/usr/share/doc/sudo"))
+	old.Files = append(old.Files,
+		model.FileEntry{Path: "/etc/sudoers.d", Type: "dir", Mode: 0o040750, MTime: taken, CTime: taken},
+		model.FileEntry{Path: "/usr/share/doc/sudo", Type: "dir", Mode: 0o040755, MTime: taken, CTime: taken},
+		model.FileEntry{Path: "/usr/bin/sudoedit", Type: "symlink", Target: "sudo", Mode: 0o120777, MTime: taken, CTime: taken})
+	cur := clone(old)
+	setVersion(cur, "sudo", "1.9.13p3-1+deb12u2")
+	setFile(cur, model.FileEntry{Path: "/etc/sudoers.d", Type: "dir", Mode: 0o040777, MTime: changed, CTime: changed})
+	setFile(cur, model.FileEntry{Path: "/usr/bin/sudoedit", Type: "symlink", Target: "/tmp/.x/evil", Mode: 0o120777, MTime: changed, CTime: changed})
+	setFile(cur, model.FileEntry{Path: "/usr/share/doc/sudo", Type: "dir", Mode: 0o040775, MTime: changed, CTime: changed})
+	for _, withUpgrade := range []bool{true, false} {
+		c := clone(cur)
+		if !withUpgrade {
+			setVersion(c, "sudo", "1.9.13p3-1+deb12u1")
+		}
+		r := run(c, snapOf(old), archive())
+		must(t, r, "snap.file_modified:/etc/sudoers.d", model.SevBackdoor)
+		must(t, r, "snap.file_modified:/usr/bin/sudoedit", model.SevBackdoor)
+		must(t, r, "snap.file_modified:/usr/share/doc/sudo", model.SevBackdoor)
+	}
+
+	// A link retargeted out of the system directories.
+	c := clone(old)
+	setFile(c, model.FileEntry{Path: "/usr/bin/sudoedit", Type: "symlink", Target: "/opt/x/sudo", Mode: 0o120777})
+	must(t, run(c, snapOf(old), archive()), "snap.file_modified:/usr/bin/sudoedit", model.SevBackdoor)
+	// Retargeted within them during an upgrade: part of the upgrade.
+	setVersion(c, "sudo", "1.9.13p3-1+deb12u2")
+	setFile(c, model.FileEntry{Path: "/usr/bin/sudoedit", Type: "symlink", Target: "/usr/libexec/sudo/sudoedit", Mode: 0o120777})
+	absent(t, run(c, snapOf(old), archive()), "snap.file_modified:/usr/bin/sudoedit")
+}
+
+// I5: the machine's own checksums never explain a content change at the
+// same package version, and are never called signed.
+func TestJudgeOfflineNeverExplainsSameVersion(t *testing.T) {
+	old := clean()
+	old.Packages.Installed = append(old.Packages.Installed, pkg("openssh-server", "1:9.2p1-2+deb12u3", "/usr/sbin/sshd"))
+	old.Files = append(old.Files, file("/usr/sbin/sshd", "sshd", 0o755))
+	cur := clone(old)
+	setFile(cur, file("/usr/sbin/sshd", "trojan", 0o755))
+	off := func() *pkgverify.Result {
+		return &pkgverify.Result{Mode: pkgverify.ModeOfflineLocal, Errors: []string{pkgverify.OfflineWarning},
+			Verified: []pkgverify.FileVerdict{{Path: "/usr/sbin/sshd", Package: "openssh-server", Version: "", Expected: "md5:aa", Actual: "md5:aa", Source: pkgverify.SourceOfflineLocal}}}
+	}
+	r := run(cur, snapOf(old), off())
+	must(t, r, "snap.file_modified:/usr/sbin/sshd", model.SevBackdoor)
+
+	// After an upgrade they may explain it, in honest words.
+	setVersion(cur, "openssh-server", "1:9.2p1-2+deb12u4")
+	r = run(cur, snapOf(old), off())
+	absent(t, r, "snap.file_modified:/usr/sbin/sshd")
+	g := explained(r, "explained:openssh-server")
+	if g == nil {
+		t.Fatalf("upgrade not explained: %v", keys(r))
+	}
+	b, _ := json.Marshal(r)
+	if strings.Contains(string(b), "signed") {
+		t.Errorf("offline report calls something signed: %s", b)
+	}
+	if !strings.Contains(g.Why+g.Evidence[1].Detail, "own package checksums") {
+		t.Errorf("group does not say what explained it: %+v", g)
+	}
+}
+
+// M1: a symlinked authorized_keys: Lines[0] is the link target.
+func TestJudgeSymlinkedAuthorizedKeys(t *testing.T) {
+	link := func(path, target string, lines ...string) model.PersistFile {
+		return model.PersistFile{Path: path, Kind: model.PersistKindAuthorizedKeys, Mode: 0o120777, SHA256: h(strings.Join(lines, "\n")),
+			Lines: append([]string{target}, lines...), MTime: changed}
+	}
+	old := clean()
+	old.Accounts.Users = append(old.Accounts.Users, model.User{Name: "alice", UID: 1000, GID: 1000, Home: "/home/alice", Shell: "/bin/bash",
+		Password: model.PasswordState{Known: true, Locked: true, LastChange: 20000}})
+	old.Persist = []model.PersistFile{link("/home/alice/.ssh/authorized_keys", "../keys", ownerKey), link("/root/.ssh/authorized_keys", "/etc/ssh/keys/root", ownerKey)}
+	cur := clone(old)
+	cur.Persist = []model.PersistFile{link("/home/alice/.ssh/authorized_keys", "../keys", evilKey, ownerKey), link("/root/.ssh/authorized_keys", "/etc/ssh/keys/root", evilKey, ownerKey)}
+
+	r := run(cur, snapOf(old), nil)
+	f := must(t, r, "snap.root_key:/root/.ssh/authorized_keys:1", model.SevBackdoor)
+	want := evidenceCopy + "'/root/.ssh/authorized_keys' '/etc/ssh/keys/root' /root/telltale-evidence/ && sed -i '1d' '/etc/ssh/keys/root'"
+	if !strings.HasPrefix(f.Fix, want) || f.Evidence[0].Line != 1 {
+		t.Errorf("fix %q evidence %+v", f.Fix, f.Evidence[0])
+	}
+	absent(t, r, "snap.root_key:/root/.ssh/authorized_keys:2")
+	g := must(t, r, "snap.persist:/home/alice/.ssh/authorized_keys", model.SevBackdoor)
+	if !strings.Contains(g.Fix, "sed -i '1d' '/home/alice/keys'") || !slices.ContainsFunc(g.Evidence, func(e model.Evidence) bool { return e.Line == 1 && e.After == evilKey }) {
+		t.Errorf("fix %q evidence %+v", g.Fix, g.Evidence)
+	}
+}
+
+// M2: an executable or library under root's cache is reported.
+func TestJudgeRootCacheExecutablesReported(t *testing.T) {
+	old := clean()
+	cur := clone(old)
+	cur.Files = append(cur.Files, file("/root/.cache/pip/http/abc", "cache", 0o600), file("/root/.cache/x/run", "elf", 0o755), file("/root/.cache/x/libx.so", "so", 0o644))
+	r := run(cur, snapOf(old), nil)
+	absent(t, r, "snap.file_added:/root/.cache/pip/http/abc")
+	must(t, r, "snap.file_added:/root/.cache/x/run", model.SevBackdoor)
+	must(t, r, "snap.file_added:/root/.cache/x/libx.so", model.SevBackdoor)
+}
+
+// M3: a scan without root, or with nothing collected, never looks clean.
+func TestJudgeNonRootAndNothingCollectedStated(t *testing.T) {
+	c := clean()
+	c.AsRoot = false
+	r := run(c, nil, nil)
+	if !slices.ContainsFunc(r.CouldNotRuleOut, func(s string) bool { return strings.Contains(s, "checks that need root were skipped") }) {
+		t.Errorf("non-root limit missing: %q", r.CouldNotRuleOut)
+	}
+	if r := run(clean(), nil, nil); slices.ContainsFunc(r.CouldNotRuleOut, func(s string) bool { return strings.Contains(s, "need root") }) {
+		t.Errorf("root scan says root was missing")
+	}
+	r = Judge(Input{Context: ctx, Now: now})
+	if !slices.ContainsFunc(r.CouldNotRuleOut, func(s string) bool { return strings.Contains(s, "nothing was collected") }) {
+		t.Errorf("nil collection: %q", r.CouldNotRuleOut)
+	}
+}
+
+// M4: names in commands come after "--", and a purge saves the package's
+// files first.
+func TestJudgeFixNamesAfterEndOfOptions(t *testing.T) {
+	purge := fixPurge("-evil")
+	for _, want := range []string{"dpkg -L -- '-evil'", "cp -a --parents -- \"$f\" /root/telltale-evidence/", ") && apt-get purge -- '-evil'"} {
+		if !strings.Contains(purge, want) {
+			t.Errorf("purge fix %q lacks %q", purge, want)
+		}
+	}
+	if s := fixUserAdded("-r", false); !strings.Contains(s, "userdel -- '-r'") {
+		t.Errorf("userdel fix %q", s)
+	}
+	if s := fixGroupMembers("sudo", []string{"-x"}); !strings.Contains(s, "gpasswd -d '-x' -- 'sudo'") {
+		t.Errorf("gpasswd fix %q", s)
+	}
+}
+
+// M6: Ubuntu's kernel companions follow the same flavour rule.
+func TestJudgeKernelCompanionsExplained(t *testing.T) {
+	old := clean()
+	old.Host.OSID = "ubuntu"
+	old.Packages.Installed = append(old.Packages.Installed, pkg("linux-image-6.8.0-45-generic", "6.8.0-45.45"), pkg("linux-tools-6.8.0-45", "6.8.0-45.45"))
+	cur := clone(old)
+	news := []string{"linux-image-6.8.0-49-generic", "linux-image-unsigned-6.8.0-49-generic", "linux-tools-6.8.0-49-generic", "linux-tools-6.8.0-49",
+		"linux-cloud-tools-6.8.0-49-generic", "linux-modules-nvidia-550-6.8.0-49-generic", "linux-objects-nvidia-550-server-6.8.0-49-generic"}
+	for _, n := range news {
+		cur.Packages.Installed = append(cur.Packages.Installed, pkg(n, "6.8.0-49.49+1"))
+	}
+	r := run(cur, snapOf(old), nil)
+	for _, n := range news {
+		absent(t, r, "snap.pkg_installed:"+n)
+	}
+	// A flavourless tools package needs a flavourless one before it.
+	cur2 := clone(old)
+	cur2.Packages.Installed = append(cur2.Packages.Installed, pkg("linux-cloud-tools-6.8.0-49", "6.8.0-49.49"))
+	must(t, run(cur2, snapOf(old), nil), "snap.pkg_installed:linux-cloud-tools-6.8.0-49", model.SevNote)
 }

@@ -62,29 +62,48 @@ func keep(q ...string) string {
 // evidence first (when it exists), then dpkg installs the package's copy.
 func fixReinstall(p, pkg string, exists bool) string {
 	if !exists {
-		return command([]string{pkg}, func(q []string) string { return "apt-get install --reinstall " + q[0] })
+		return command([]string{pkg}, func(q []string) string { return "apt-get install --reinstall -- " + q[0] })
 	}
 	return command([]string{p, pkg}, func(q []string) string {
-		return keep(q[0]) + " && apt-get install --reinstall " + q[1]
+		return keep(q[0]) + " && apt-get install --reinstall -- " + q[1]
 	})
 }
 
 // fixDeleteLines removes the given lines (numbers in the current file) in one
 // sed pass, after saving the file.
 func fixDeleteLines(p string, lines []int, note string) string {
+	return command([]string{p}, func(q []string) string {
+		return keep(q[0]) + " && sed -i '" + sedDeletes(lines) + "' " + q[0] + comment(note)
+	})
+}
+
+// fixDeleteLinesIn removes lines from the file a symlink points to. sed -i
+// on the link itself would replace the link with a plain file, so the
+// target is edited, after both are saved.
+func fixDeleteLinesIn(link, target string, lines []int, note string) string {
+	if target == "" {
+		return fixKeepOnly(link, "then remove the lines shown above from the file it links to")
+	}
+	return command([]string{link, target}, func(q []string) string {
+		return keep(q[0], q[1]) + " && sed -i '" + sedDeletes(lines) + "' " + q[1] + comment(note)
+	})
+}
+
+func sedDeletes(lines []int) string {
 	ls := append([]int(nil), lines...)
 	sort.Ints(ls)
 	addr := make([]string, len(ls))
 	for i, n := range ls {
 		addr[i] = strconv.Itoa(n) + "d"
 	}
-	return command([]string{p}, func(q []string) string {
-		s := keep(q[0]) + " && sed -i '" + strings.Join(addr, ";") + "' " + q[0]
-		if note != "" {
-			s += "   # " + note
-		}
-		return s
-	})
+	return strings.Join(addr, ";")
+}
+
+func comment(note string) string {
+	if note == "" {
+		return ""
+	}
+	return "   # " + note
 }
 
 // fixRemove deletes a file (or directory) that should not be there, after
@@ -125,28 +144,30 @@ func fixRestoreMeta(p string, mode uint32, modeChanged bool, uid uint32, gid int
 
 func fixDowngrade(pkg, version string) string {
 	return command([]string{pkg + "=" + version}, func(q []string) string {
-		return "apt-get install " + q[0] + "   # back to the version in the snapshot (or a newer one)"
+		return "apt-get install -- " + q[0] + "   # back to the version in the snapshot (or a newer one), from a trusted source"
 	})
 }
 
-// fixPurge removes a package that should not be there. The list of its files
-// is saved first; dpkg -L reads this machine's own records.
+// fixPurge removes a package that should not be there. Its file list and
+// every file and link on it are saved first; the purge runs only if all of
+// them were copied. dpkg -L reads this machine's own records.
 func fixPurge(pkg string) string {
 	return command([]string{pkg, evidenceDir + "/" + pkg + ".files"}, func(q []string) string {
-		return "mkdir -p " + evidenceDir + " && dpkg -L " + q[0] + " > " + q[1] + " && apt-get purge " + q[0] +
-			"   # only if you did not install it; copy any of its files you want to examine before purging"
+		return "mkdir -p " + evidenceDir + " && dpkg -L -- " + q[0] + " > " + q[1] +
+			` && ( while IFS= read -r f; do if [ -f "$f" ] || [ -L "$f" ]; then cp -a --parents -- "$f" ` + evidenceDir + `/ || exit 1; fi; done < ` + q[1] +
+			" ) && apt-get purge -- " + q[0] + "   # only if you did not install it"
 	})
 }
 
 func fixInstall(pkg string) string {
-	return command([]string{pkg}, func(q []string) string { return "apt-get install " + q[0] })
+	return command([]string{pkg}, func(q []string) string { return "apt-get install -- " + q[0] })
 }
 
 func fixUserAdded(name string, uid0 bool) string {
 	return command([]string{name}, func(q []string) string {
-		del := "userdel "
+		del := "userdel -- "
 		if uid0 {
-			del = "userdel -f " // root's processes would otherwise block it
+			del = "userdel -f -- " // root's processes would otherwise block it
 		}
 		return keep("/etc/passwd", "/etc/shadow", "/etc/group") + " && " + del + q[0] + "   # check first that you did not create this account yourself"
 	})
@@ -168,13 +189,13 @@ func fixUserChanged(name string, old, cur *model.User) string {
 			mod = append(mod, "-d "+q[2])
 		}
 		if len(mod) > 0 {
-			steps = append(steps, "usermod "+strings.Join(mod, " ")+" "+q[0])
+			steps = append(steps, "usermod "+strings.Join(mod, " ")+" -- "+q[0])
 		}
 		if old.UID != cur.UID || old.GID != cur.GID {
 			steps = append(steps, fmt.Sprintf("set the user id back to %d and the group id to %d with vipw (usermod refuses while the account's processes run)", old.UID, old.GID))
 		}
 		if old.Password.Digest != cur.Password.Digest || old.Password.Locked != cur.Password.Locked || old.Password.Set != cur.Password.Set {
-			steps = append(steps, "passwd -l "+q[0]+" if you did not change its password (locks it until you set a new one)")
+			steps = append(steps, "passwd -l -- "+q[0]+" if you did not change its password (locks it until you set a new one)")
 		}
 		if len(steps) == 0 {
 			return ""
@@ -188,7 +209,7 @@ func fixGroupMembers(group string, added []string) string {
 	return command(vals, func(q []string) string {
 		cmds := []string{keep("/etc/group", "/etc/gshadow")}
 		for _, m := range q[1:] {
-			cmds = append(cmds, "gpasswd -d "+m+" "+q[0])
+			cmds = append(cmds, "gpasswd -d "+m+" -- "+q[0])
 		}
 		return strings.Join(cmds, " && ") + "   # only for members you did not add"
 	})

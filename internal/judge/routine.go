@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/donaldsteele/telltale/internal/diff"
 	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/pkgverify"
 )
 
 // Which package changes are routine:
@@ -27,9 +29,13 @@ import (
 // securityPackages are the packages whose removal weakens the machine.
 var securityPackages = map[string]bool{"ufw": true, "nftables": true, "iptables": true, "auditd": true, "fail2ban": true, "apparmor": true}
 
-// kernelRe matches linux-(image|modules|modules-extra|headers)-<abi>-<flavour>.
-// Ubuntu's linux-headers-<abi> has no flavour.
-var kernelRe = regexp.MustCompile(`^linux-(image|modules|modules-extra|headers)-([0-9][0-9.]*-[0-9][0-9.]*)(?:-([a-z][a-z0-9+.-]*))?$`)
+// kernelRe matches a kernel package and its companions:
+// linux-<kind>-<abi>-<flavour>, where kind is image, image-unsigned,
+// modules, modules-extra, headers, tools, cloud-tools, or Ubuntu's
+// modules-/objects-/signatures-nvidia-<driver>[-server][-open].
+// Ubuntu's linux-headers-<abi>, linux-tools-<abi> and
+// linux-cloud-tools-<abi> have no flavour.
+var kernelRe = regexp.MustCompile(`^linux-(image|image-unsigned|modules|modules-extra|headers|tools|cloud-tools|(?:modules|objects|signatures)-nvidia-[0-9]+(?:-(?:server|open))*)-([0-9][0-9.]*-[0-9][0-9.]*)(?:-([a-z][a-z0-9+.-]*))?$`)
 
 type kernelPkg struct{ kind, flavour string }
 
@@ -106,15 +112,27 @@ func (j *judge) explain(name string, e model.Evidence) {
 	j.attach(j.group(name), e, maxExplainedEvidence)
 }
 
-// foldIntoPackage shows a file change as part of its package's change: on
-// the package's finding when the change is ranked, else in its explained
-// group.
-func (j *judge) foldIntoPackage(name string, e model.Evidence) {
+// foldIntoPackage shows a change as part of its package's change: on the
+// package's finding when that is ranked, else in its explained group. sev
+// is what the change would rank as on its own; an exception never drops a
+// finding together with evidence more serious than the finding itself.
+func (j *judge) foldIntoPackage(name string, e model.Evidence, sev model.Severity) {
 	if f := j.pkgFinding[name]; f != nil {
 		j.attach(f, e, maxEvidence)
+		if sev > j.foldedMax[f] {
+			j.foldedMax[f] = sev
+		}
 		return
 	}
 	j.explain(name, e)
+}
+
+// refWords names what package files are compared with in this scan.
+func (j *judge) refWords() string {
+	if j.in.Pkg != nil && j.in.Pkg.Mode == pkgverify.ModeOfflineLocal {
+		return OfflineReference
+	}
+	return "the distribution's signed package"
 }
 
 func (j *judge) packageChange(ch diff.Change) {
@@ -162,7 +180,7 @@ func (j *judge) packageChange(ch diff.Change) {
 				Key: "snap.pkg_removed:" + name, ID: "TT-SNAP-009", Source: srcSnapshot, Severity: model.SevNote,
 				Title:    fmt.Sprintf("%s was removed since the snapshot", name),
 				Why:      "Listed so that every package change is accounted for; removing a package is rarely how an attacker gets in.",
-				Fix:      command([]string{name}, func(q []string) string { return "# if you did not remove it: apt-get install " + q[0] }),
+				Fix:      command([]string{name}, func(q []string) string { return "# if you did not remove it: apt-get install -- " + q[0] }),
 				Evidence: []model.Evidence{{Before: pc.Old, After: "removed", Detail: "removed since the snapshot"}},
 			})
 		}
@@ -235,7 +253,211 @@ func (j *judge) installed(name, version string) {
 			"Installing a package is an easy way to plant a backdoor that looks legitimate."
 		f.Evidence = append(f.Evidence, reasons...)
 	}
+	// What raised the package is part of the value an exception accepts.
+	for _, r := range reasons {
+		j.pkgReasons[name] = append(j.pkgReasons[name], strings.TrimSpace(r.Detail+" "+r.Path))
+	}
 	j.pkgFinding[name] = j.add(f)
+}
+
+// changedNames lists the packages that changed, those still installed first
+// (by name), then the removed ones.
+func (j *judge) changedNames() []string {
+	var in, out []string
+	for n, ch := range j.pkgChange {
+		if ch.Kind == diff.PkgRemoved {
+			out = append(out, n)
+		} else {
+			in = append(in, n)
+		}
+	}
+	sort.Strings(in)
+	sort.Strings(out)
+	return append(in, out...)
+}
+
+// changedPackage is the first changed package (in changedNames order) for
+// which match holds, or "".
+func (j *judge) changedPackage(match func(name string) bool) string {
+	for _, n := range j.changedNames() {
+		if match(n) {
+			return n
+		}
+	}
+	return ""
+}
+
+// ships reports whether the package lists a file below prefix, now or in
+// the snapshot.
+func (j *judge) ships(name, prefix string) bool {
+	for _, c := range []*model.Collection{j.c, j.old} {
+		if c == nil {
+			continue
+		}
+		for _, p := range c.Packages.Installed {
+			if p.Name != name {
+				continue
+			}
+			for _, f := range p.Files {
+				if strings.HasPrefix(f, prefix) || strings.HasPrefix(usrAlias(f), prefix) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// kernelPackageFor is the changed kernel package of a kernel release, or "".
+func (j *judge) kernelPackageFor(release string) string {
+	for _, name := range []string{"linux-image-" + release, "linux-image-unsigned-" + release, "linux-modules-" + release, "linux-modules-extra-" + release} {
+		if j.pkgChanged(name) {
+			return name
+		}
+	}
+	return ""
+}
+
+func isGrub(name string) bool {
+	return strings.HasPrefix(name, "grub") || strings.HasPrefix(name, "shim")
+}
+
+// rebuiltBy names the changed package that rebuilds a generated boot file
+// or module index, or "": an initramfs only for its own kernel, initramfs-
+// tools or a package with initramfs hooks or scripts; the boot menu for
+// GRUB, shim or a kernel image; GRUB's modules, fonts and EFI binaries only
+// for GRUB or shim; a module index for its kernel, a package with modules
+// for that kernel, or DKMS.
+func (j *judge) rebuiltBy(p string) string {
+	switch {
+	case p == "/boot/initrd.img" || p == "/boot/initrd.img.old" || p == "/boot/vmlinuz" || p == "/boot/vmlinuz.old":
+		return j.changedPackage(func(n string) bool { return strings.HasPrefix(n, "linux-image") })
+	case strings.HasPrefix(p, "/boot/initrd.img-"):
+		if k := j.kernelPackageFor(strings.TrimPrefix(p, "/boot/initrd.img-")); k != "" {
+			return k
+		}
+		return j.changedPackage(func(n string) bool {
+			return strings.HasPrefix(n, "initramfs-tools") || j.ships(n, "/usr/share/initramfs-tools/")
+		})
+	case p == "/boot/grub/grub.cfg" || p == "/boot/grub/grubenv":
+		return j.changedPackage(func(n string) bool { return isGrub(n) || strings.HasPrefix(n, "linux-image") })
+	case strings.HasPrefix(p, "/boot/grub/") || strings.HasPrefix(p, "/boot/efi/"):
+		return j.changedPackage(isGrub)
+	}
+	release := moduleRelease(p)
+	if release == "" {
+		return ""
+	}
+	if k := j.kernelPackageFor(release); k != "" {
+		return k
+	}
+	return j.changedPackage(func(n string) bool {
+		return strings.Contains(n, "dkms") || j.ships(n, "/lib/modules/"+release+"/") || j.ships(n, "/usr/lib/modules/"+release+"/")
+	})
+}
+
+// moduleRelease is the kernel release of a depmod output
+// (/lib/modules/<release>/modules.*), or "".
+func moduleRelease(p string) string {
+	for _, pre := range []string{"/lib/modules/", "/usr/lib/modules/"} {
+		if rest, ok := strings.CutPrefix(p, pre); ok {
+			if seg := strings.Split(rest, "/"); len(seg) == 2 && strings.HasPrefix(seg[1], "modules.") {
+				return seg[0]
+			}
+		}
+	}
+	return ""
+}
+
+// finishPackages settles package changes once every file change is placed.
+// An upgrade, or a routine kernel change, is explained only when the files
+// it changed matched the package: programs no trusted source confirmed make
+// it a backdoor sign, other unconfirmed files a note. A ranked package
+// change gains the programs no trusted source confirmed, and a new
+// package's value names everything that raised it.
+func (j *judge) finishPackages() {
+	for _, name := range j.changedNames() {
+		ch := j.pkgChange[name]
+		unver := j.unverIn[name]
+		g := j.groups["explained:"+name]
+		f := j.pkgFinding[name]
+		switch {
+		case f == nil && g != nil && ch.Kind != diff.PkgRemoved && (len(unver) > 0 || j.unconfirmed[name]):
+			f = j.unexplain(name, ch, g, unver)
+		case f != nil && len(unver) > 0:
+			for _, e := range unver {
+				j.attach(f, e, maxEvidence)
+			}
+			if f.Severity < model.SevBackdoor && ch.Pkg != nil {
+				f.Severity = model.SevBackdoor
+				f.Title = fmt.Sprintf("New package %s %s since the snapshot, with %d %s no trusted source confirmed", name, ch.Pkg.New, len(unver), plural(len(unver), "program", "programs"))
+				f.Why = unverifiedWhy(unver)
+			}
+		}
+		if f != nil && ch.Kind == diff.PkgInstalled && ch.Pkg != nil && len(f.Evidence) > 0 {
+			reasons := append([]string(nil), j.pkgReasons[name]...)
+			if len(unver) > 0 {
+				var ps []string
+				for _, e := range unver {
+					ps = append(ps, e.Path)
+				}
+				sort.Strings(ps)
+				reasons = append(reasons, "not confirmed by a trusted source: "+strings.Join(ps, ", "))
+			}
+			sort.Strings(reasons)
+			f.Evidence[0].After = strings.Join(append([]string{ch.Pkg.New}, reasons...), "; ")
+		}
+	}
+}
+
+func unverifiedWhy(unver []model.Evidence) string {
+	why := "No trusted source (the signed archive, its snapshots or a reference bundle) confirmed the programs this package change brought"
+	if len(unver) > 0 && unver[0].Detail != "" {
+		why += " (" + unver[0].Detail + ")"
+	}
+	return why + ". A package \"update\" from an unofficial source is a way to slip in replaced programs, so they count as unexplained."
+}
+
+// unexplain turns an explained package change into a finding.
+func (j *judge) unexplain(name string, ch diff.Change, g *model.Finding, unver []model.Evidence) *model.Finding {
+	delete(j.groups, g.Key)
+	pc := ch.Pkg
+	f := &model.Finding{Key: "snap.pkg_upgraded:" + name, ID: "TT-SNAP-012", Source: srcSnapshot, Severity: model.SevNote, Refs: []string{"T1554"}}
+	installed := ch.Kind == diff.PkgInstalled
+	if installed {
+		f.Key, f.ID = "snap.pkg_installed:"+name, "TT-SNAP-006"
+	}
+	for _, e := range g.Evidence {
+		j.attach(f, e, maxEvidence)
+	}
+	if len(unver) > 0 {
+		n := len(unver)
+		f.Severity = model.SevBackdoor
+		f.Why = unverifiedWhy(unver)
+		if installed {
+			f.Title = fmt.Sprintf("New package %s %s since the snapshot, with %d %s no trusted source confirmed", name, pc.New, n, plural(n, "program", "programs"))
+			f.Fix = fixPurge(name)
+		} else {
+			f.Title = fmt.Sprintf("%s changed from %s to %s, a version no trusted source confirmed; %d %s changed", name, pc.Old, pc.New, n, plural(n, "program", "programs"))
+			f.Fix = fixDowngrade(name, pc.Old)
+		}
+		for _, e := range unver {
+			j.attach(f, e, maxEvidence)
+		}
+	} else {
+		f.Why = "The package change itself may be routine, but files it changed could not be confirmed against the package for the version installed now; they are listed as their own findings."
+		f.Fix = command([]string{name}, func(q []string) string {
+			return "apt-get install --reinstall -- " + q[0] + "   # puts the package's own files back"
+		})
+		if installed {
+			f.Title = fmt.Sprintf("New package %s %s since the snapshot; not all of its files match the package", name, pc.New)
+		} else {
+			f.Title = fmt.Sprintf("%s upgraded from %s to %s, but not all of the files it changed match the package", name, pc.Old, pc.New)
+		}
+	}
+	f = j.add(f)
+	j.pkgFinding[name] = f
+	return f
 }
 
 var unitSuffixes = []string{".service", ".socket", ".timer", ".path"}
@@ -291,32 +513,30 @@ func usrAlias(p string) string {
 	return ""
 }
 
-// accountFiles hold the account databases. Their content changes are listed
-// one account or group at a time from the account comparison, which never
-// shows password hashes.
-var accountFiles = map[string]bool{}
+// accountDBs are the account databases whose content the account comparison
+// shows line by line (without password data). A content change is left to
+// that comparison only when it found a change belonging to the file; every
+// other edit (a duplicate line, a field it does not compare) is ranked.
+// gshadow, subuid and subgid are not compared there, so they are always
+// ranked.
+var accountDBs = map[string]bool{"/etc/passwd": true, "/etc/shadow": true, "/etc/group": true}
 
-func init() {
-	for _, f := range []string{"/etc/passwd", "/etc/shadow", "/etc/group", "/etc/gshadow", "/etc/subuid", "/etc/subgid"} {
-		accountFiles[f] = true
-		accountFiles[f+"-"] = true
-	}
+// accountWhy explains files whose meaning is not obvious from their place.
+var accountWhy = map[string]string{
+	"/etc/gshadow": "This file holds group passwords and group administrators; a password or administrator added here lets an account join privileged groups such as sudo.",
+	"/etc/subuid":  "This file gives accounts ranges of user ids for their containers. A range that includes id 0 maps a user's container root to the real root of this machine.",
+	"/etc/subgid":  "This file gives accounts ranges of group ids for their containers. A range that includes id 0 maps a user's containers to the real root group of this machine.",
 }
 
-// generatedFile: files that update-initramfs, update-grub, grub-install and
-// depmod rebuild when packages change. They belong to no package, so they
-// cannot be verified.
+// generatedFile: files that update-initramfs, update-grub, grub-install,
+// the kernel's install scripts and depmod rebuild when packages change.
+// They belong to no package, so they cannot be verified.
 func generatedFile(p string) bool {
-	if strings.HasPrefix(p, "/boot/initrd.img") || strings.HasPrefix(p, "/boot/grub/") || strings.HasPrefix(p, "/boot/efi/") {
+	switch p {
+	case "/boot/initrd.img", "/boot/initrd.img.old", "/boot/vmlinuz", "/boot/vmlinuz.old":
 		return true
 	}
-	for _, pre := range []string{"/lib/modules/", "/usr/lib/modules/"} {
-		if rest, ok := strings.CutPrefix(p, pre); ok {
-			seg := strings.Split(rest, "/")
-			return len(seg) == 2 && strings.HasPrefix(seg[1], "modules.")
-		}
-	}
-	return false
+	return strings.HasPrefix(p, "/boot/initrd.img-") || strings.HasPrefix(p, "/boot/grub/") || strings.HasPrefix(p, "/boot/efi/") || moduleRelease(p) != ""
 }
 
 // dpkgInfoPackage is the package a file of dpkg's own database belongs to,
@@ -338,7 +558,8 @@ func dpkgInfoPackage(p string) string {
 // collected persistence files: places whose files run code or decide who
 // gets in.
 var (
-	persistExact    = map[string]bool{"/etc/passwd": true, "/etc/shadow": true, "/etc/group": true, "/etc/gshadow": true, "/etc/ld.so.preload": true, "/etc/rc.local": true, "/etc/environment": true, "/etc/bash.bashrc": true, "/etc/crontab": true}
+	persistExact = map[string]bool{"/etc/passwd": true, "/etc/shadow": true, "/etc/group": true, "/etc/gshadow": true, "/etc/subuid": true, "/etc/subgid": true,
+		"/etc/ld.so.preload": true, "/etc/rc.local": true, "/etc/environment": true, "/etc/bash.bashrc": true, "/etc/crontab": true}
 	persistPrefixes = []string{
 		"/etc/sudoers", "/etc/ssh/", "/etc/cron.", "/var/spool/cron/", "/etc/systemd/", "/lib/systemd/", "/usr/lib/systemd/", "/etc/init.d/",
 		"/etc/profile", "/etc/ld.so.conf", "/etc/pam.d/", "/etc/security/", "/etc/modules", "/etc/modprobe.d/", "/lib/modprobe.d/",
@@ -358,8 +579,16 @@ var volatileRootFiles = map[string]bool{
 	"/root/.ssh/known_hosts": true, "/root/.ssh/known_hosts.old": true,
 }
 
-func volatileRootFile(p string) bool {
-	return volatileRootFiles[p] || strings.HasPrefix(p, "/root/.cache/")
+// volatileRootFile: one of those, or a directory or plain data file in
+// root's cache. Programs and libraries in the cache are still reported.
+func volatileRootFile(p string, e *model.FileEntry) bool {
+	if volatileRootFiles[p] {
+		return true
+	}
+	if !strings.HasPrefix(p, "/root/.cache/") {
+		return false
+	}
+	return e.Type == "dir" || (e.Type == "file" && !pkgverify.InScope(p, e.Mode))
 }
 
 // finishGroups gives each package's explained group its title, now that
@@ -384,7 +613,7 @@ func (j *judge) finishGroups() {
 		switch {
 		case change != nil && change.Detail == "upgraded":
 			g.Title = fmt.Sprintf("%s upgraded from %s to %s", name, change.Before, change.After)
-			g.Why = "An upgrade to a newer version is routine. Changed files that match the distribution's signed package for the new version are shown here, not ranked."
+			g.Why = "An upgrade to a newer version is routine. Changed files that match " + j.refWords() + " for the new version are shown here, not ranked."
 		case change != nil && change.Before == "":
 			g.Title = fmt.Sprintf("%s %s installed (a newer kernel of a flavour already installed)", name, change.After)
 			g.Why = "Installing a newer kernel of the flavour already in use is how kernel updates arrive, so it is routine."
@@ -392,8 +621,8 @@ func (j *judge) finishGroups() {
 			g.Title = fmt.Sprintf("%s %s removed (a newer kernel of its flavour is installed)", name, change.Before)
 			g.Why = "Removing an old kernel once a newer one of the same flavour is installed is routine clean-up."
 		default:
-			g.Title = fmt.Sprintf("%s match the signed %s package", fileWords, name)
-			g.Why = "These files changed since the snapshot, but they match the distribution's signed package installed now, so the package put them there (for example a reinstall)."
+			g.Title = fmt.Sprintf("%s of %s match %s", fileWords, name, j.refWords())
+			g.Why = "These files changed since the snapshot, but they match " + j.refWords() + " for the version installed now, so the package put them there (for example a reinstall)."
 			continue
 		}
 		if files > 0 {

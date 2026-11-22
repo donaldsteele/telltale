@@ -176,7 +176,7 @@ func distroPackages(osID string) string {
 
 func (j *judge) mismatch(v pkgverify.FileVerdict) *model.Finding {
 	title := fmt.Sprintf("%s does not match the signed %s package", v.Path, v.Package)
-	why := "This file differs from the copy in the distribution's package for the version installed (" + v.Package + " " + v.Version + "). " +
+	why := "This file differs from the copy in the distribution's package for the version installed (" + strings.TrimSpace(v.Package+" "+v.Version) + "). " +
 		"A routine update would match the package; replacing system programs and libraries is how rootkits and backdoors hide."
 	if strings.HasPrefix(v.Reason, "mode differs") {
 		title = fmt.Sprintf("%s has privileges its signed %s package does not give it", v.Path, v.Package)
@@ -184,7 +184,9 @@ func (j *judge) mismatch(v pkgverify.FileVerdict) *model.Finding {
 			"). A setuid bit or a writable system file added after installation is a classic way back to root."
 	}
 	if v.Source == pkgverify.SourceOfflineLocal {
-		why += " The expected value comes from the machine's own package checksums, which root can edit."
+		title = fmt.Sprintf("%s differs from the machine's own package checksums for %s", v.Path, v.Package)
+		why = "This file differs from the checksum the machine's own package database records for it (" + strings.TrimSpace(v.Package+" "+v.Version) + "). " +
+			"A routine update would update both; replacing system programs and libraries is how rootkits and backdoors hide. Root can edit those checksums, so a match would prove less than this mismatch does."
 	}
 	return &model.Finding{
 		Key: "pkg.mismatch:" + v.Path, ID: "TT-PKG-001", Source: srcPackage, Severity: model.SevTampering,
@@ -201,7 +203,7 @@ func (j *judge) suspicious(v pkgverify.FileVerdict) *model.Finding {
 	switch {
 	case strings.Contains(v.Reason, "statoverride"):
 		fix = command([]string{v.Path, v.Package}, func(q []string) string {
-			return keep(q[0]) + " && dpkg-statoverride --remove " + q[0] + " && apt-get install --reinstall " + q[1] + "   # only if you did not add the override yourself"
+			return keep(q[0]) + " && dpkg-statoverride --remove -- " + q[0] + " && apt-get install --reinstall -- " + q[1] + "   # only if you did not add the override yourself"
 		})
 	case strings.Contains(v.Reason, "diverted by"):
 		fix = fixKeepOnly(v.Path, "then compare it with the package's own copy; dpkg-divert --list shows the diversion")
@@ -223,9 +225,9 @@ func (j *judge) modeRelaxed(v pkgverify.FileVerdict) *model.Finding {
 	return &model.Finding{
 		Key: "pkg.mode_relaxed:" + v.Path, ID: "TT-PKG-004", Source: srcPackage, Severity: model.SevNote,
 		Title: fmt.Sprintf("%s has stricter permissions than its package gives it", v.Path),
-		Why:   "The file matches the signed package, but its mode is less permissive than the package sets. That is usually deliberate hardening; it is listed so that nothing about package files goes unsaid.",
+		Why:   "The file matches " + j.refWords() + ", but its mode is less permissive than the package sets. That is usually deliberate hardening; it is listed so that nothing about package files goes unsaid.",
 		Fix: command([]string{v.Package}, func(q []string) string {
-			return "# nothing to do if you tightened it on purpose; apt-get install --reinstall " + q[0] + " restores the package's mode"
+			return "# nothing to do if you tightened it on purpose; apt-get install --reinstall -- " + q[0] + " restores the package's mode"
 		}),
 		Evidence: []model.Evidence{{Path: v.Path, After: v.Reason, Detail: "content matches " + v.Package + " " + v.Version + " from " + sourceWords(v.Source)}},
 	}
@@ -241,6 +243,7 @@ func (j *judge) unverifiable(vs []pkgverify.FileVerdict) {
 	byReason := map[string]*bucket{}
 	n := 0
 	for _, v := range vs {
+		j.unverReason[v.Path] = v.Reason
 		if cat := j.specialCategory(v.Path); cat != "" {
 			j.pkgPath[v.Path] = j.add(&model.Finding{
 				Key: "pkg.unverifiable:" + v.Path, ID: "TT-PKG-003", Source: srcPackage, Severity: model.SevBackdoor,
