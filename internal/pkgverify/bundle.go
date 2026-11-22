@@ -166,7 +166,7 @@ func checkBundleDir(dir string) error {
 func (s *session) bundleDeb(ctx context.Context, r *pkgResult, ref DebRef) {
 	p := r.pkg
 	if ref.Source != SourceArchive && ref.Source != SourceThirdParty {
-		r.fail("only a source trusted through HTTPS alone has this version, and a bundle carries only signed indexes", KindNotChecked)
+		r.fail("only a source trusted through HTTPS alone has this version, and a bundle carries only signed indexes", KindNotInBundle)
 		return
 	}
 	if err := downloadDeb(ctx, s.client, ref, io.Discard); err != nil {

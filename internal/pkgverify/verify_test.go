@@ -1850,6 +1850,18 @@ func TestVerifyUnverifiableKinds(t *testing.T) {
 	t.Run("unsupported release", func(t *testing.T) {
 		c := toolCollection(nil)
 		c.Host.OSVersionID = "10"
-		check(t, Verify(context.Background(), c, Options{}), KindNotChecked)
+		check(t, Verify(context.Background(), c, Options{}), KindScanLimit)
+	})
+	t.Run("package architecture", func(t *testing.T) {
+		f := toolFixture(t)
+		c := toolCollection(nil)
+		c.Packages.Installed[0].Arch = "mips64el"
+		check(t, Verify(context.Background(), c, f.opts()), KindUnsupportedArch)
+	})
+	t.Run("check stopped", func(t *testing.T) {
+		f := toolFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		check(t, Verify(ctx, toolCollection(nil), f.opts()), KindUnreachable)
 	})
 }

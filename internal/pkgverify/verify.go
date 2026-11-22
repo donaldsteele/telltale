@@ -81,10 +81,19 @@ const (
 	KindBadSignature = "bad_signature"
 	// KindNotInBundle: the reference bundle does not cover the package.
 	KindNotInBundle = "not_in_bundle"
-	// KindNotChecked: telltale did not check it (limits, an unsupported
-	// release or architecture, a version only HTTPS-trusted sources have,
-	// an internal error).
+	// KindNotChecked: telltale did not check it because of an internal error.
 	KindNotChecked = "not_checked"
+	// KindUnsupportedArch: the package's own architecture (from dpkg status,
+	// which root can edit) is not one telltale reads indexes for.
+	KindUnsupportedArch = "unsupported_arch"
+	// KindScanLimit: package verification could not run for this scan at all
+	// (an unsupported host architecture, distribution or release, keys that
+	// would not load, a reference bundle that was rejected).
+	KindScanLimit = "scan_limit"
+	// KindBudget: not checked because the collection exceeded a limit (more
+	// than maxPackages packages, or more than maxOldLookups versions missing
+	// from the current archive).
+	KindBudget = "budget"
 	// KindPro: an Ubuntu Pro package; checking it needs a Pro token.
 	KindPro = "pro"
 	// KindLocalDiversion: the file at the original path of a local dpkg
@@ -272,7 +281,7 @@ func Verify(ctx context.Context, c *model.Collection, opt Options) *Result {
 	results := newResults(plans)
 	if err := s.setup(); err != nil {
 		s.problem(err)
-		kind := KindNotChecked
+		kind := KindScanLimit
 		if tampered(err) || errors.Is(err, ErrNoValidSignature) {
 			kind = KindBadSignature
 		}
@@ -862,7 +871,7 @@ func (s *session) run(ctx context.Context, results []*pkgResult) {
 			continue
 		}
 		if n++; n > maxPackages {
-			r.fail(fmt.Sprintf("not checked: the collection lists more than %d packages", maxPackages), KindNotChecked)
+			r.fail(fmt.Sprintf("not checked: the collection lists more than %d packages", maxPackages), KindBudget)
 			continue
 		}
 		ch <- r
@@ -882,11 +891,11 @@ func (s *session) onePackage(ctx context.Context, r *pkgResult) {
 		}
 	}()
 	if err := ctx.Err(); err != nil {
-		r.fail("check stopped: "+err.Error(), KindNotChecked)
+		r.fail("check stopped: "+err.Error(), KindUnreachable)
 		return
 	}
 	if p.Arch != "" && !knownArches[p.Arch] {
-		r.fail(fmt.Sprintf("unsupported architecture %q", p.Arch), KindNotChecked)
+		r.fail(fmt.Sprintf("unsupported architecture %q", p.Arch), KindUnsupportedArch)
 		return
 	}
 	if strings.Contains(p.Version, "+esm") {
@@ -971,8 +980,11 @@ func (s *session) notFound(p *model.Package, oldErr error) (string, string) {
 	if oldErr != nil && !errors.Is(oldErr, ErrNotFound) {
 		kind := problemKind(oldErr)
 		var so *signedOnlyErr
-		if errors.Is(oldErr, errOldBudget) || (errors.As(oldErr, &so) && so.last == nil) {
-			kind = KindNotChecked
+		switch {
+		case errors.Is(oldErr, errOldBudget):
+			kind = KindBudget
+		case errors.As(oldErr, &so) && so.last == nil:
+			kind = KindNotInBundle // only a source a bundle cannot carry has it
 		}
 		return "not in the current archive, and the snapshot archives could not be checked: " + s.explain(oldErr), kind
 	}
