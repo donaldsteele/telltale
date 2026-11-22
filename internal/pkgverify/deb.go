@@ -73,13 +73,25 @@ type ScriptOverride struct {
 	Mode  uint32 `json:"mode"`
 }
 
+// ControlPrefix starts the table key of a maintainer script from a .deb's
+// control.tar ("DEBIAN/postinst"). Every other key is an absolute path, so
+// the two cannot collide.
+const ControlPrefix = "DEBIAN/"
+
+// MaintainerScripts are the control members dpkg keeps in
+// /var/lib/dpkg/info as <package>[:<arch>].<name> and acts on later: the
+// scripts it runs as root when the package is configured, upgraded, removed
+// or purged, and its triggers file.
+var MaintainerScripts = []string{"preinst", "postinst", "prerm", "postrm", "config", "triggers"}
+
 // DebFiles reads a .deb (an ar archive holding control.tar and data.tar,
 // compressed with xz, zstd, gzip or bzip2, or not at all) and returns every
 // regular file in data.tar by absolute path ("/usr/bin/su"), with its SHA-256
 // and mode. Hard links get their target's hash; directories, symlinks and
 // devices are left out. Which files are conffiles comes from the package's
 // own control.tar. Paths that are absolute, climb out with "..", or occur
-// twice make the whole package malformed.
+// twice make the whole package malformed. The maintainer scripts in
+// control.tar are returned too, keyed ControlPrefix plus their name.
 //
 // Files are hashed as they stream past; only conffile text is held in
 // memory. The caller is expected to have checked the .deb's hash against a
@@ -205,6 +217,8 @@ type control struct {
 	addBits  map[string]uint32
 	// statoverrides the postinst adds.
 	overrides map[string][]ScriptOverride
+	// scripts are the maintainer scripts, by member name.
+	scripts map[string]DebFile
 }
 
 // overridesFor returns the statoverrides the postinst adds for p or its
@@ -241,7 +255,8 @@ func (c *control) modesFor(p string, mode uint32) []uint32 {
 	return out
 }
 
-// readControl reads the conffiles list and the postinst of control.tar.
+// readControl reads the conffiles list and the postinst of control.tar, and
+// hashes its maintainer scripts.
 func readControl(r io.ReaderAt, m *arMember) (*control, error) {
 	dec, err := decompressor(r, m, "control.tar")
 	if err != nil {
@@ -250,7 +265,7 @@ func readControl(r io.ReaderAt, m *arMember) (*control, error) {
 	defer dec.Close()
 	lr := &io.LimitedReader{R: dec, N: maxControlSize + 1}
 	tr := tar.NewReader(lr)
-	c := &control{conffiles: map[string]bool{}, setModes: map[string][]uint32{}, addBits: map[string]uint32{}, overrides: map[string][]ScriptOverride{}}
+	c := &control{conffiles: map[string]bool{}, setModes: map[string][]uint32{}, addBits: map[string]uint32{}, overrides: map[string][]ScriptOverride{}, scripts: map[string]DebFile{}}
 	for n := 0; ; n++ {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -266,7 +281,19 @@ func readControl(r io.ReaderAt, m *arMember) (*control, error) {
 			return nil, fmt.Errorf("%w: control.tar has too many entries", ErrMalformedDeb)
 		}
 		name := strings.TrimPrefix(hdr.Name, "./")
-		if hdr.Typeflag != tar.TypeReg || (name != "conffiles" && name != "postinst") {
+		script := slices.Contains(MaintainerScripts, name)
+		if hdr.Typeflag != tar.TypeReg || (name != "conffiles" && !script) {
+			continue
+		}
+		if _, dup := c.scripts[name]; dup {
+			return nil, fmt.Errorf("%w: control.tar holds %s twice", ErrMalformedDeb, name)
+		}
+		if script && name != "postinst" {
+			h := sha256.New()
+			if _, err := io.Copy(h, tr); err != nil {
+				return nil, fmt.Errorf("%w: %s: %v", ErrMalformedDeb, name, err)
+			}
+			c.scripts[name] = DebFile{SHA256: hex.EncodeToString(h.Sum(nil)), Mode: uint32(hdr.Mode) & 0o7777}
 			continue
 		}
 		b, err := io.ReadAll(io.LimitReader(tr, maxConffilesList+1))
@@ -277,6 +304,8 @@ func readControl(r io.ReaderAt, m *arMember) (*control, error) {
 			return nil, fmt.Errorf("%w: %s larger than %d bytes", ErrMalformedDeb, name, maxConffilesList)
 		}
 		if name == "postinst" {
+			sum := sha256.Sum256(b)
+			c.scripts[name] = DebFile{SHA256: hex.EncodeToString(sum[:]), Mode: uint32(hdr.Mode) & 0o7777}
 			c.scriptCommands(string(b))
 			continue
 		}
@@ -586,6 +615,9 @@ func readData(r io.ReaderAt, m *arMember, ctl *control) (map[string]DebFile, err
 		}
 		f.SHA256 = hex.EncodeToString(h.Sum(nil))
 		files[p] = f
+	}
+	for name, f := range ctl.scripts {
+		files[ControlPrefix+name] = f
 	}
 	return files, nil
 }

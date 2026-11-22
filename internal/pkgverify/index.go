@@ -118,25 +118,54 @@ func (a *Archive) release(ctx context.Context, suite string) (*release, error) {
 	if a.memo == nil {
 		return a.fetchRelease(ctx, suite)
 	}
-	a.memo.mu.Lock()
-	if a.memo.m == nil {
-		a.memo.m = map[string]*memoRelease{}
-	}
-	e := a.memo.m[suite]
-	if e == nil {
-		e = &memoRelease{}
-		a.memo.m[suite] = e
-	}
-	a.memo.mu.Unlock()
+	e := a.memo.entry(suite)
 	e.once.Do(func() { e.rel, e.err = a.fetchRelease(ctx, suite) })
 	return e.rel, e.err
+}
+
+func (a *Archive) inReleaseURL(suite string) string {
+	return a.base() + "/dists/" + suite + "/InRelease"
+}
+
+// download fetches suite's InRelease, once per run when the archive has a
+// memo. It never reads the cache.
+func (a *Archive) download(ctx context.Context, suite string) ([]byte, error) {
+	if a.memo == nil {
+		return httpGet(ctx, a.client(), a.inReleaseURL(suite), maxInReleaseSize)
+	}
+	e := a.memo.entry(suite)
+	e.fetch.Do(func() { e.raw, e.fetchErr = httpGet(ctx, a.client(), a.inReleaseURL(suite), maxInReleaseSize) })
+	return e.raw, e.fetchErr
+}
+
+// signedDate downloads suite's InRelease and returns its Date field, when
+// the file is signed by one of the archive's keys. The signature is checked
+// as of its own creation time, so the answer depends on no clock; the suite,
+// Valid-Until and key expiry are checked later, against the newest such date
+// (see signedClock).
+func (a *Archive) signedDate(ctx context.Context, suite string) (time.Time, bool) {
+	data, err := a.download(ctx, suite)
+	if err != nil {
+		return time.Time{}, false
+	}
+	text, err := verifyInReleaseAt(data, a.Keyring, func(created time.Time) (time.Time, error) { return created, nil })
+	if err != nil {
+		return time.Time{}, false
+	}
+	for _, line := range strings.Split(string(text), "\n") {
+		if v, ok := strings.CutPrefix(line, "Date:"); ok {
+			t, err := parseReleaseDate(strings.TrimSpace(v))
+			return t, err == nil
+		}
+	}
+	return time.Time{}, false
 }
 
 // fetchRelease returns suite's verified Release. A fresh download is
 // preferred; the cached copy is used (verified again) when the archive cannot
 // be reached, and always for historical archives, whose indexes never change.
 func (a *Archive) fetchRelease(ctx context.Context, suite string) (*release, error) {
-	url := a.base() + "/dists/" + suite + "/InRelease"
+	url := a.inReleaseURL(suite)
 	cache := a.cachePath("inrelease-" + hashHex([]byte(url)))
 	if a.Historical {
 		if data := readCache(cache, maxInReleaseSize); data != nil {
@@ -145,7 +174,7 @@ func (a *Archive) fetchRelease(ctx context.Context, suite string) (*release, err
 			}
 		}
 	}
-	data, fetchErr := httpGet(ctx, a.client(), url, maxInReleaseSize)
+	data, fetchErr := a.download(ctx, suite)
 	if fetchErr != nil {
 		data = readCache(cache, maxInReleaseSize)
 		if data == nil {
@@ -167,8 +196,23 @@ func (a *Archive) fetchRelease(ctx context.Context, suite string) (*release, err
 
 // verifyRelease checks data's signature, suite and Valid-Until.
 func (a *Archive) verifyRelease(data []byte, suite string) (*release, error) {
-	now := a.now()
-	text, err := verifyInRelease(data, a.Keyring, now)
+	now, signed := a.now()
+	at := func(time.Time) (time.Time, error) { return now, nil }
+	if signed {
+		// now is the newest signed Date of this run. A signature may be
+		// dated a little after it; the keys are judged at the later time.
+		at = func(created time.Time) (time.Time, error) {
+			if created.After(now.Add(signatureSlack)) {
+				return now, fmt.Errorf("signature dated %s, more than a day after the newest signed index date %s",
+					created.UTC().Format(time.RFC3339), now.UTC().Format(time.RFC3339))
+			}
+			if created.After(now) {
+				return created, nil
+			}
+			return now, nil
+		}
+	}
+	text, err := verifyInReleaseAt(data, a.Keyring, at)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +229,11 @@ func (a *Archive) verifyRelease(data []byte, suite string) (*release, error) {
 			return nil, fmt.Errorf("%w: unreadable Valid-Until %q", ErrExpiredIndex, rel.validUntil)
 		}
 		if now.After(until) {
-			return nil, fmt.Errorf("%w: valid until %s, now %s", ErrExpiredIndex, until.UTC().Format(time.RFC3339), now.UTC().Format(time.RFC3339))
+			what := "now"
+			if signed {
+				what = "the newest signed index is dated"
+			}
+			return nil, fmt.Errorf("%w: valid until %s, %s %s", ErrExpiredIndex, until.UTC().Format(time.RFC3339), what, now.UTC().Format(time.RFC3339))
 		}
 	}
 	return rel, nil
@@ -222,8 +270,9 @@ var strongHashes = map[crypto.Hash]bool{
 }
 
 // checkSignature verifies one signature packet over signed with the keys in
-// kr, refusing hash algorithms weaker than SHA-256.
-func checkSignature(kr openpgp.EntityList, signed, pkt []byte, cfg *packet.Config) error {
+// kr, refusing hash algorithms weaker than SHA-256. at gives the time to
+// judge the signature and the keys at, from when the signature was made.
+func checkSignature(kr openpgp.EntityList, signed, pkt []byte, at func(created time.Time) (time.Time, error)) error {
 	p, err := packet.Read(bytes.NewReader(pkt))
 	if err != nil {
 		return err
@@ -235,6 +284,11 @@ func checkSignature(kr openpgp.EntityList, signed, pkt []byte, cfg *packet.Confi
 	if !strongHashes[sig.Hash] {
 		return fmt.Errorf("signature hash %v is weaker than SHA-256", sig.Hash)
 	}
+	now, err := at(sig.CreationTime)
+	if err != nil {
+		return err
+	}
+	cfg := &packet.Config{Time: func() time.Time { return now }}
 	_, err = openpgp.CheckDetachedSignature(kr, bytes.NewReader(signed), bytes.NewReader(pkt), cfg)
 	return err
 }
@@ -244,6 +298,12 @@ func checkSignature(kr openpgp.EntityList, signed, pkt []byte, cfg *packet.Confi
 // valid at now, and returns the signed text. Nothing outside the signed text
 // is ever returned.
 func verifyInRelease(data []byte, kr openpgp.EntityList, now time.Time) ([]byte, error) {
+	return verifyInReleaseAt(data, kr, func(time.Time) (time.Time, error) { return now, nil })
+}
+
+// verifyInReleaseAt is verifyInRelease with the time chosen per signature:
+// at receives when the signature says it was made.
+func verifyInReleaseAt(data []byte, kr openpgp.EntityList, at func(created time.Time) (time.Time, error)) ([]byte, error) {
 	data = bytes.TrimLeft(data, " \t\r\n")
 	if !bytes.HasPrefix(data, []byte("-----BEGIN PGP SIGNED MESSAGE-----")) {
 		return nil, fmt.Errorf("%w: does not start with a clearsigned message", ErrMalformedInRelease)
@@ -266,12 +326,11 @@ func verifyInRelease(data []byte, kr openpgp.EntityList, now time.Time) ([]byte,
 	if len(pkts) == 0 || len(pkts) > maxSignaturePackets {
 		return nil, fmt.Errorf("%w: %d signatures", ErrMalformedInRelease, len(pkts))
 	}
-	cfg := &packet.Config{Time: func() time.Time { return now }}
 	var bad, invalid error
 	// Every signature covers the same text, so the first good signature by
 	// a built-in key settles it; failures only explain why none was good.
 	for _, p := range pkts {
-		err := checkSignature(kr, block.Bytes, p, cfg)
+		err := checkSignature(kr, block.Bytes, p, at)
 		if err == nil {
 			return block.Plaintext, nil
 		}

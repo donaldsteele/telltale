@@ -52,6 +52,9 @@ type OldFinder struct {
 	// sources trusted through HTTPS alone. A reference bundle can carry
 	// only what the built-in keys can check again.
 	SignedOnly bool
+
+	// clock, when it holds a time, replaces Now (see signedClock).
+	clock *signedClock
 }
 
 // NewOldFinder returns an OldFinder for the real snapshot services with the
@@ -113,7 +116,7 @@ func tampered(err error) bool {
 
 // fromSignedIndex looks key up in a snapshot of an archive at base.
 func (f *OldFinder) fromSignedIndex(ctx context.Context, base, suite, component string, key PkgKey, kr openpgp.EntityList) (DebRef, error) {
-	a := &Archive{BaseURL: base, Suites: []string{suite}, Keyring: kr, Client: f.client(), Cache: f.Cache, Now: f.Now, Historical: true}
+	a := &Archive{BaseURL: base, Suites: []string{suite}, Keyring: kr, Client: f.client(), Cache: f.Cache, Now: f.Now, Historical: true, clock: f.clock}
 	arch := key.Arch
 	if arch == "all" {
 		arch = "amd64" // every architecture's index carries the "all" packages

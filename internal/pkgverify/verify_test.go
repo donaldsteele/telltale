@@ -115,12 +115,32 @@ func buildDeb(t *testing.T, comp string, conffiles []string, data []debEntry) []
 // buildDebScript is buildDeb with a postinst maintainer script.
 func buildDebScript(t *testing.T, comp string, conffiles []string, postinst string, data []debEntry) []byte {
 	t.Helper()
+	var scripts map[string]string
+	if postinst != "" {
+		scripts = map[string]string{"postinst": postinst}
+	}
+	return buildDebControl(t, comp, conffiles, scripts, data)
+}
+
+// buildDebControl is buildDeb with the given control members (maintainer
+// scripts by name; triggers is not executable, as dpkg-deb leaves it).
+func buildDebControl(t *testing.T, comp string, conffiles []string, scripts map[string]string, data []debEntry) []byte {
+	t.Helper()
 	control := []debEntry{{name: "./", typ: tar.TypeDir, mode: 0o755}, {name: "./control", body: "Package: test\nVersion: 1\n", mode: 0o644}}
 	if len(conffiles) > 0 {
 		control = append(control, debEntry{name: "./conffiles", body: strings.Join(conffiles, "\n") + "\n", mode: 0o644})
 	}
-	if postinst != "" {
-		control = append(control, debEntry{name: "./postinst", body: postinst, mode: 0o755})
+	names := make([]string, 0, len(scripts))
+	for n := range scripts {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		mode := int64(0o755)
+		if n == "triggers" {
+			mode = 0o644
+		}
+		control = append(control, debEntry{name: "./" + n, body: scripts[n], mode: mode})
 	}
 	ext := ""
 	if comp != "" {
@@ -963,10 +983,17 @@ func TestBundleOutlivesValidUntil(t *testing.T) {
 	c := toolCollection(nil)
 	dir := writeToolBundle(t, f, c)
 
-	// A month later the signed index has expired. The live archive is
-	// refused; the bundle, a record of what was signed, is still checked.
-	a.Now = fixedClock(recordedNow.Add(30 * 24 * time.Hour))
-	res := Verify(context.Background(), c, f.opts())
+	// A month later the signed index has expired: the archive's other suite
+	// carries a newer signed date (the machine's clock alone decides
+	// nothing). The live archive is refused; the bundle, a record of what
+	// was signed, is still checked.
+	later := recordedNow.Add(30 * 24 * time.Hour)
+	for k, v := range fakeSuite(t, readFakeKey(t), later, "/debian", "bookworm", "", map[string][]byte{"main/binary-amd64/Packages.xz": xzBytes(t, nil)}) {
+		srv.set(k, v)
+	}
+	live := *a
+	live.Suites = []string{"bookworm", "bookworm-security"}
+	res := Verify(context.Background(), c, Options{Archives: []*Archive{&live}, Old: f.old, Now: fixedClock(later)})
 	if len(res.Verified) != 0 || len(res.Errors) == 0 || !strings.Contains(res.Errors[0], "Valid-Until") {
 		t.Errorf("live: verified %+v, errors %q", res.Verified, res.Errors)
 	}

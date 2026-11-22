@@ -6,6 +6,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -172,8 +174,15 @@ func TestOnlineDebFileTable(t *testing.T) {
 	if ref.SHA256 != "08ffb1599d05a815ce7d82e84570ab42b0b6152cba8e421a51ab1ba0709ed706" {
 		t.Errorf("ref %+v", ref)
 	}
-	if len(files) != 23 {
-		t.Errorf("%d files, want 23", len(files))
+	var scripts []string
+	for p := range files {
+		if name, ok := strings.CutPrefix(p, ControlPrefix); ok {
+			scripts = append(scripts, name)
+		}
+	}
+	sort.Strings(scripts)
+	if want := []string{"config", "postinst", "postrm", "preinst", "prerm"}; len(files) != 23+len(want) || !slices.Equal(scripts, want) {
+		t.Errorf("%d entries with maintainer scripts %v, want 23 files and %v", len(files), scripts, want)
 	}
 	if f := files["/usr/sbin/sshd"]; f.SHA256 != "838332fe9777b307794760e1c4800b16ac17a93a2fe3f2580ceca8ca6ca2caa5" || f.Mode != 0o755 || f.Conffile {
 		t.Errorf("/usr/sbin/sshd = %+v", f)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -18,7 +19,7 @@ import (
 const (
 	// tableSchema changes whenever DebFiles would produce a different table
 	// for the same .deb, so older tables are not reused.
-	tableSchema  = 4 // 2: ScriptModes; 3: ScriptOverrides; 4: script constants
+	tableSchema  = 5 // 2: ScriptModes; 3: ScriptOverrides; 4: script constants; 5: maintainer scripts
 	maxTableFile = 256 << 20
 )
 
@@ -83,7 +84,11 @@ func storeTable(dir, debSHA string, files map[string]DebFile) {
 	writeCache(p, b)
 }
 
-// validTablePath accepts what debPath produces.
+// validTablePath accepts what debPath produces, and the keys of maintainer
+// scripts.
 func validTablePath(p string) bool {
+	if name, ok := strings.CutPrefix(p, ControlPrefix); ok {
+		return slices.Contains(MaintainerScripts, name)
+	}
 	return len(p) > 1 && p[0] == '/' && path.Clean(p) == p && !strings.ContainsRune(p, 0)
 }

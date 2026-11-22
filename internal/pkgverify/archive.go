@@ -64,14 +64,19 @@ type Archive struct {
 	// Cached files are verified again every time they are used.
 	Cache string
 	// Now is the clock for key expiry and Valid-Until; nil means time.Now.
+	// Verify and WriteBundle use it only when no index they download gives
+	// a signed date (see signedClock).
 	Now func() time.Time
 	// Historical marks a snapshot of the archive at a past moment, whose
 	// Valid-Until has passed by design. Signatures are still checked.
 	Historical bool
 
-	// memo, when set, keeps each suite's verified Release for one run, so
-	// its InRelease is fetched once however many indexes are read.
+	// memo, when set, keeps each suite's InRelease and verified Release for
+	// one run, so it is fetched once however many indexes are read.
 	memo *releaseMemo
+	// clock, when set and once it holds a time, replaces Now: see
+	// signedClock.
+	clock *signedClock
 }
 
 type releaseMemo struct {
@@ -83,7 +88,58 @@ type memoRelease struct {
 	once sync.Once
 	rel  *release
 	err  error
+
+	fetch    sync.Once
+	raw      []byte
+	fetchErr error
 }
+
+func (m *releaseMemo) entry(suite string) *memoRelease {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.m == nil {
+		m.m = map[string]*memoRelease{}
+	}
+	e := m.m[suite]
+	if e == nil {
+		e = &memoRelease{}
+		m.m[suite] = e
+	}
+	return e
+}
+
+// signedClock is the time one run's signed indexes vouch for: the newest
+// Date among the InRelease files it downloaded whose signature is by a
+// built-in key. The examined machine's clock is root's to set, so it must not
+// decide whether an index has expired or a signature is from the future;
+// a signed Date can only be as late as the archive really signed one.
+type signedClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+// observe records a signed date.
+func (c *signedClock) observe(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if t.After(c.t) {
+		c.t = t
+	}
+}
+
+// get returns the newest signed date, if there is one.
+func (c *signedClock) get() (time.Time, bool) {
+	if c == nil {
+		return time.Time{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t, !c.t.IsZero()
+}
+
+// signatureSlack is how much later than the newest signed Date a signature
+// may be dated: a Release is signed moments after its Date is written.
+const signatureSlack = 24 * time.Hour
 
 var (
 	// ErrMalformedInRelease means the InRelease file is not one clearsigned
@@ -219,11 +275,16 @@ var defaultClient = &http.Client{
 	},
 }
 
-func (a *Archive) now() time.Time {
-	if a.Now != nil {
-		return a.Now()
+// now returns the time to check indexes against: the run's signed date
+// when it has one (signed is then true), else the archive's clock.
+func (a *Archive) now() (t time.Time, signed bool) {
+	if t, ok := a.clock.get(); ok {
+		return t, true
 	}
-	return time.Now()
+	if a.Now != nil {
+		return a.Now(), false
+	}
+	return time.Now(), false
 }
 
 func (a *Archive) client() *http.Client {

@@ -200,8 +200,11 @@ type Options struct {
 	Old *OldFinder
 	// Client downloads .debs; nil means the default client.
 	Client *http.Client
-	// Now is the clock for key expiry where an Archive or OldFinder sets
-	// none; nil means time.Now.
+	// Now is the clock of the machine running the check; nil means
+	// time.Now. It is compared with the signed indexes' date for
+	// Result.ClockSkew, and decides key expiry and Valid-Until only when no
+	// downloaded index gives a signed date and an Archive or OldFinder sets
+	// no clock of its own.
 	Now func() time.Time
 }
 
@@ -222,6 +225,17 @@ type Result struct {
 	// evidence of tampering ("BAD SIGNATURE", "HASH MISMATCH"), then
 	// sources that could not be read.
 	Errors []string `json:"errors,omitempty"`
+	// ClockSkew is set when the clock of the machine running the check and
+	// the newest signed date of the indexes it fetched differ by more than a
+	// day. The clock decides nothing else: see signedClock.
+	ClockSkew *ClockSkew `json:"clock_skew,omitempty"`
+}
+
+// ClockSkew is a disagreement between the machine's clock and the signed
+// indexes' date.
+type ClockSkew struct {
+	Clock  time.Time `json:"clock"`
+	Signed time.Time `json:"signed"`
 }
 
 // FileVerdict is the outcome for one file. Path is the collected path.
@@ -331,8 +345,8 @@ func (s *session) unplacedChange(results []*pkgResult) bool {
 	idx := s.placeTables(results)
 	for p := range s.opt.OnlyPaths {
 		e := s.files[p]
-		if e == nil || !isRegular(e) || len(idx[p]) > 0 {
-			continue
+		if e == nil || !isRegular(e) || len(idx[p]) > 0 || strings.HasPrefix(p, dpkgInfoDir) {
+			continue // dpkg's own records are no package's files
 		}
 		if s.opt.Full || InScope(p, e.Mode) {
 			return true
@@ -393,8 +407,12 @@ type session struct {
 	overrides map[string]model.StatOverride // by path
 	installed map[string]bool               // package names
 	byName    map[string]*pkgResult         // set by judge
+	// scriptPkgs lists, by name, the checked packages whose maintainer
+	// scripts dpkg keeps (set by judge).
+	scriptPkgs map[string][]*pkgResult
 
 	archives []*Archive
+	clock    *signedClock // shared by every archive of the run
 	third    []thirdSource
 	old      *OldFinder
 	client   *http.Client
@@ -514,7 +532,9 @@ func filesInstalled(status string) bool {
 
 // plan returns the packages whose signed tables are read: every installed
 // package, whatever its file list says, or with OnlyPaths those that list a
-// changed path.
+// changed path or have a changed maintainer script. Packages removed but
+// not purged are read for the maintainer scripts dpkg still keeps of them
+// (a postrm runs on purge).
 func (s *session) plan() []*model.Package {
 	seen := map[PkgKey]bool{}
 	var out []*model.Package
@@ -524,13 +544,60 @@ func (s *session) plan() []*model.Package {
 		if !filesInstalled(p.Status) || seen[k] {
 			continue
 		}
-		if s.opt.OnlyPaths != nil && !s.listsChanged(p) {
+		if s.opt.OnlyPaths != nil && !s.listsChanged(p) && !s.hasScript(p) {
+			continue
+		}
+		seen[k] = true
+		out = append(out, p)
+	}
+	for i := range s.c.Packages.Residual {
+		p := &s.c.Packages.Residual[i]
+		k := PkgKey{p.Name, p.Version, p.Arch}
+		if filesInstalled(p.Status) || seen[k] || !s.hasScript(p) {
 			continue
 		}
 		seen[k] = true
 		out = append(out, p)
 	}
 	return out
+}
+
+// dpkgInfoDir is where dpkg keeps its records of each package.
+const dpkgInfoDir = "/var/lib/dpkg/info/"
+
+// scriptPaths lists where dpkg keeps the maintainer script name of p: under
+// the package's name, or name:arch for a Multi-Arch: same package.
+func scriptPaths(p *model.Package, name string) []string {
+	out := []string{dpkgInfoDir + p.Name + "." + name}
+	if p.Arch != "" {
+		out = append(out, dpkgInfoDir+p.Name+":"+p.Arch+"."+name)
+	}
+	return out
+}
+
+// scriptOf splits the path of a maintainer script in dpkg's records into
+// the package, its architecture ("" when the name has none) and the script.
+func scriptOf(p string) (pkg, arch, script string, ok bool) {
+	rest, found := strings.CutPrefix(p, dpkgInfoDir)
+	i := strings.LastIndexByte(rest, '.')
+	if !found || i <= 0 || strings.Contains(rest, "/") || !slices.Contains(MaintainerScripts, rest[i+1:]) {
+		return "", "", "", false
+	}
+	pkg, arch, _ = strings.Cut(rest[:i], ":")
+	return pkg, arch, rest[i+1:], pkg != ""
+}
+
+// hasScript reports whether a maintainer script of p was collected and,
+// with OnlyPaths, is one of the changed paths.
+func (s *session) hasScript(p *model.Package) bool {
+	for _, name := range MaintainerScripts {
+		for _, sp := range scriptPaths(p, name) {
+			if s.files[sp] != nil && (s.opt.OnlyPaths == nil || s.opt.OnlyPaths[sp]) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *session) listsChanged(p *model.Package) bool {
@@ -556,6 +623,11 @@ func (s *session) indexWanted(plans []*model.Package) []*model.Package {
 	for i := range s.c.Packages.Installed {
 		if p := &s.c.Packages.Installed[i]; filesInstalled(p.Status) {
 			out = append(out, p)
+		}
+	}
+	for _, p := range plans {
+		if !filesInstalled(p.Status) {
+			out = append(out, p) // removed, not purged: planned for its scripts
 		}
 	}
 	return out
@@ -648,9 +720,11 @@ func (s *session) setup() error {
 			s.problem(fmt.Errorf("the reference bundle was built for %s %s (%s), this machine is %s %s (%s)", mh.OSID, mh.OSVersionID, mh.Arch, h.OSID, h.OSVersionID, h.Arch))
 		}
 	}
+	s.clock = &signedClock{}
 	for _, a := range archives {
 		c := *a
 		c.memo = &releaseMemo{}
+		c.clock = s.clock
 		if wrap != nil {
 			c.Client, c.Cache = wrap(a.client()), ""
 		}
@@ -673,6 +747,7 @@ func (s *session) setup() error {
 		if o.Now == nil {
 			o.Now = s.opt.Now
 		}
+		o.clock = s.clock
 		s.old = &o
 	}
 	s.client = s.opt.Client
@@ -743,7 +818,7 @@ func (s *session) setupThirdParty(wrap func(*http.Client) *http.Client, cache st
 			s.third = append(s.third, thirdSource{uri: uri, a: &Archive{
 				BaseURL: strings.TrimRight(uri, "/"), Suites: sus, Components: comps,
 				Keyring: s.opt.ExtraKeys, Client: client, Cache: cache, Now: s.opt.Now, Historical: refs,
-				memo: &releaseMemo{},
+				memo: &releaseMemo{}, clock: s.clock,
 			}})
 		}
 	}
@@ -782,6 +857,7 @@ func (s *session) archOf(p *model.Package) string {
 // loadIndexes reads every signed index the wanted packages may be in and
 // keeps only their entries.
 func (s *session) loadIndexes(ctx context.Context, wanted []*model.Package) {
+	s.syncClock(ctx)
 	arches := map[string]bool{}
 	want := map[[2]string]bool{}
 	for _, p := range wanted {
@@ -845,6 +921,37 @@ func (s *session) loadIndexes(ctx context.Context, wanted []*model.Package) {
 				}
 			}
 		}
+	}
+}
+
+// maxClockSkew is how far the machine's clock may be from the signed
+// indexes' date before the result says so.
+const maxClockSkew = 24 * time.Hour
+
+// syncClock fetches the InRelease of every suite of the host's archives and
+// takes the newest Date among those signed by a built-in key as the time
+// for every later check: Valid-Until, signature dates and key expiry. The
+// clock of the examined machine is root's to set, and moving it must not
+// decide whether the signed indexes are usable. The clock is then only
+// compared with that date, for ClockSkew.
+func (s *session) syncClock(ctx context.Context) {
+	for _, a := range s.archives {
+		for _, suite := range a.Suites {
+			if t, ok := a.signedDate(ctx, suite); ok {
+				s.clock.observe(t)
+			}
+		}
+	}
+	signed, ok := s.clock.get()
+	if !ok || s.res.Mode != ModeArchive || s.bw != nil {
+		return // a bundle is read long after it was signed
+	}
+	clock := time.Now()
+	if s.opt.Now != nil {
+		clock = s.opt.Now()
+	}
+	if d := clock.Sub(signed); d > maxClockSkew || d < -maxClockSkew {
+		s.res.ClockSkew = &ClockSkew{Clock: clock.UTC(), Signed: signed.UTC()}
 	}
 }
 
@@ -1082,6 +1189,9 @@ type expect struct {
 	r    *pkgResult
 	path string // in the .deb
 	f    DebFile
+	// control marks a maintainer script from the .deb's control member,
+	// placed where dpkg keeps it; such a file is always checked.
+	control bool
 }
 
 // judge compares the collected files with the signed tables. Each table
@@ -1102,7 +1212,12 @@ func (s *session) judge(results []*pkgResult) {
 		}
 	}
 	s.byName = map[string]*pkgResult{}
+	s.scriptPkgs = map[string][]*pkgResult{}
 	for _, r := range results {
+		s.scriptPkgs[r.pkg.Name] = append(s.scriptPkgs[r.pkg.Name], r)
+		if !filesInstalled(r.pkg.Status) {
+			continue
+		}
 		if _, dup := s.byName[r.pkg.Name]; !dup || r.table != nil {
 			s.byName[r.pkg.Name] = r
 		}
@@ -1150,7 +1265,17 @@ func (s *session) placeTables(results []*pkgResult) map[string][]expect {
 		}
 	}
 	for _, r := range results {
+		installed := filesInstalled(r.pkg.Status)
 		for p, f := range r.table {
+			if name, ok := strings.CutPrefix(p, ControlPrefix); ok {
+				for _, at := range scriptPaths(r.pkg, name) {
+					idx[at] = append(idx[at], expect{r: r, path: at, f: f, control: true})
+				}
+				continue
+			}
+			if !installed {
+				continue // removed, not purged: only its scripts are left
+			}
 			at := p
 			if d, ok := s.divs[p]; ok && d.Package != r.pkg.Name {
 				at = d.DivertTo
@@ -1197,7 +1322,7 @@ func (s *session) judgeFile(e *model.FileEntry, exp []expect, lst []*pkgResult) 
 	}
 	inScope := false
 	for i := range exp {
-		if s.opt.candidate(e.Path, exp[i].path, mode, &exp[i].f) {
+		if exp[i].control || s.opt.candidate(e.Path, exp[i].path, mode, &exp[i].f) {
 			inScope = true
 			break
 		}
@@ -1285,6 +1410,9 @@ func (s *session) judgeFile(e *model.FileEntry, exp []expect, lst []*pkgResult) 
 	}
 	v := verdict(&exp[0])
 	v.Reason, v.Kind = "differs from the file in the signed package", KindContentDiffers
+	if exp[0].control {
+		v.Reason = "differs from the maintainer script in the signed package"
+	}
 	var names []string
 	for _, x := range exp {
 		if n := x.r.pkg.Name + " " + x.r.pkg.Version; !slices.Contains(names, n) {
@@ -1300,6 +1428,28 @@ func (s *session) judgeFile(e *model.FileEntry, exp []expect, lst []*pkgResult) 
 // judgeUnshipped decides a collected entry that no signed table places.
 func (s *session) judgeUnshipped(e *model.FileEntry, regular bool, lst []*pkgResult) (FileVerdict, ConffileDiff, verdictKind) {
 	none := func() (FileVerdict, ConffileDiff, verdictKind) { return FileVerdict{}, ConffileDiff{}, verdictNone }
+	if name, arch, script, ok := scriptOf(e.Path); ok && regular {
+		// A maintainer script the signed package does not have: dpkg runs
+		// whatever is there, whether or not the package shipped one.
+		var owners []*pkgResult
+		for _, r := range s.scriptPkgs[name] {
+			if arch == "" || arch == r.pkg.Arch {
+				owners = append(owners, r)
+			}
+		}
+		if len(owners) == 0 {
+			return none() // no package dpkg knows: nothing runs it
+		}
+		v := FileVerdict{Path: e.Path, Package: owners[0].pkg.Name, Version: owners[0].pkg.Version, Actual: e.SHA256, Source: owners[0].source}
+		for _, r := range owners {
+			if r.table == nil {
+				v.Package, v.Version, v.Reason, v.Kind, v.Source = r.pkg.Name, r.pkg.Version, r.reason, r.kind, s.source
+				return v, ConffileDiff{}, verdictUnverifiable
+			}
+		}
+		v.Reason, v.Kind = "the signed package has no "+script+" maintainer script", KindNotShipped
+		return v, ConffileDiff{}, verdictMismatch
+	}
 	if !regular || !s.opt.candidate(e.Path, e.Path, e.Mode, nil) {
 		return none()
 	}
