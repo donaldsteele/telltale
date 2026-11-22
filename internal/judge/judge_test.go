@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -98,7 +99,50 @@ func archive(verified ...pkgverify.FileVerdict) *pkgverify.Result {
 }
 
 func run(c *model.Collection, s *model.Snapshot, r *pkgverify.Result) *model.Report {
-	return Judge(Input{Collection: c, Snapshot: s, Context: ctx, Pkg: r, Now: now})
+	if s != nil && s.Collection != nil {
+		inventoried(s.Collection)
+	}
+	return Judge(Input{Collection: inventoried(c), Snapshot: s, Context: ctx, Pkg: r, Now: now})
+}
+
+// inventoried adds to a fixture what the collector records on a real machine:
+// an entry for every directory on the way to each file and persistence file,
+// and an entry for each persistence file itself. Links are resolved against
+// these (model.ResolveInInventory). The directories carry the snapshot's
+// times, so they are never a change of their own.
+func inventoried(c *model.Collection) *model.Collection {
+	if c == nil {
+		return c
+	}
+	have := map[string]bool{}
+	for _, f := range c.Files {
+		have[f.Path] = true
+	}
+	add := func(e model.FileEntry) {
+		if !have[e.Path] {
+			have[e.Path] = true
+			e.Supplementary = true
+			c.Files = append(c.Files, e)
+		}
+	}
+	parents := func(p string) {
+		for d := path.Dir(p); d != "/" && d != "."; d = path.Dir(d) {
+			add(model.FileEntry{Path: d, Type: "dir", Mode: 0o40755, MTime: taken, CTime: taken})
+		}
+	}
+	for _, f := range append([]model.FileEntry{}, c.Files...) {
+		parents(f.Path)
+	}
+	for _, p := range c.Persist {
+		parents(p.Path)
+		switch {
+		case p.Mode&0o170000 == 0o120000 && len(p.Lines) > 0:
+			add(model.FileEntry{Path: p.Path, Type: "symlink", Target: p.Lines[0], Mode: p.Mode, MTime: taken, CTime: taken})
+		case p.Mode&0o170000 == 0o100000:
+			add(model.FileEntry{Path: p.Path, Type: "file", Mode: p.Mode, MTime: taken, CTime: taken})
+		}
+	}
+	return c
 }
 
 func find(r *model.Report, key string) *model.Finding {
@@ -2825,11 +2869,67 @@ func TestJudgeLinkerCacheRebuild(t *testing.T) {
 	}
 
 	// A newly listed library, reached through its package's link, that this
-	// scan verified. The cache spells the path the pre-merge way.
+	// scan verified. The cache spells the path the pre-merge way, and /lib
+	// is the link to usr/lib that a merged-/usr machine has.
+	usrMerge := model.FileEntry{Path: "/lib", Type: "symlink", Target: "usr/lib", Mode: 0o120777, MTime: taken, CTime: taken}
 	c := rebuilt(ssl, "/lib/x86_64-linux-gnu/libz.so.1")
+	c.Files = append(c.Files, usrMerge)
 	v := withZlib(c, "libz")
-	if f := ranked(run(c, snapOf(base()), archive(v))); f != nil {
+	merged := base()
+	merged.Files = append(merged.Files, usrMerge)
+	if f := ranked(run(c, snapOf(merged), archive(v))); f != nil {
 		t.Errorf("a cache that gained a verified packaged library is ranked %q", f.Severity)
+	}
+	// Without that link (/lib not recorded, or a directory of its own) the
+	// /usr spelling says nothing about a /lib path.
+	c = rebuilt(ssl, "/lib/x86_64-linux-gnu/libz.so.1")
+	v = withZlib(c, "libz")
+	if f := ranked(run(c, snapOf(base()), archive(v))); f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("/lib path with no /lib link in the inventory: want a backdoor sign, got %+v", f)
+	}
+	c = rebuilt(ssl, "/lib/x86_64-linux-gnu/ossl/libz.so.1.2.13")
+	v = withZlib(c, "libz")
+	c.Files = append(c.Files,
+		model.FileEntry{Path: "/lib", Type: "dir", Mode: 0o40755, MTime: taken, CTime: taken},
+		model.FileEntry{Path: "/lib/x86_64-linux-gnu", Type: "dir", Mode: 0o40755, MTime: taken, CTime: taken},
+		model.FileEntry{Path: "/lib/x86_64-linux-gnu/ossl", Type: "symlink", Target: "/opt/q", Mode: 0o120777, MTime: taken, CTime: taken})
+	if f := ranked(run(c, snapOf(base()), archive(v))); f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("non-merged machine, /lib path through a planted link: want a backdoor sign, got %+v", f)
+	}
+
+	// The kernel resolves links physically. libq.so.1 -> qdir/../libz.so.1.2.13
+	// reads as the verified library, but qdir is a link to /opt/q/a/b, so
+	// ".." is /opt/q/a and the loader maps /opt/q/a/libz.so.1.2.13.
+	const multi = "/usr/lib/x86_64-linux-gnu"
+	sym := func(p, target string) model.FileEntry {
+		return model.FileEntry{Path: p, Type: "symlink", Target: target, Mode: 0o120777, MTime: changed, CTime: changed}
+	}
+	for name, extra := range map[string][]model.FileEntry{
+		"dot-dot through a planted directory link": {sym(multi+"/libq.so.1", "qdir/../libz.so.1.2.13"), sym(multi+"/qdir", "/opt/q/a/b")},
+		"the same, the evil file inventoried": {sym(multi+"/libq.so.1", "qdir/../libz.so.1.2.13"), sym(multi+"/qdir", "/opt/q/a/b"),
+			{Path: "/opt/q/a/b", Type: "dir", Mode: 0o40755}, file("/opt/q/a/libz.so.1.2.13", "evil", 0o644)},
+		"relative directory link":      {sym(multi+"/libq.so.1", "up/../libz.so.1.2.13"), sym(multi+"/up", "../../../opt/q/a/b")},
+		"link loop":                    {sym(multi+"/libq.so.1", "libr.so.1"), sym(multi+"/libr.so.1", "libq.so.1")},
+		"link straight out (control)":  {sym(multi+"/libq.so.1", "/opt/q/a/libz.so.1.2.13")},
+		"file in the middle of a path": {sym(multi+"/libq.so.1", "libz.so.1.2.13/../libz.so.1.2.13")},
+	} {
+		c = rebuilt(ssl, multi+"/libq.so.1")
+		v = withZlib(c, "libz")
+		c.Files = append(c.Files, extra...)
+		rep := run(c, snapOf(base()), archive(v))
+		if f := ranked(rep); f == nil || f.Severity != model.SevBackdoor {
+			t.Errorf("%s: want a backdoor sign for the changed cache, got %+v", name, f)
+		}
+		if explained(rep, "rebuilt:"+cache) != nil {
+			t.Errorf("%s: the rebuild is explained", name)
+		}
+	}
+	// Control: the same kind of link to the verified library itself.
+	c = rebuilt(ssl, multi+"/libq.so.1")
+	v = withZlib(c, "libz")
+	c.Files = append(c.Files, sym(multi+"/libq.so.1", "./libz.so.1"))
+	if f := ranked(run(c, snapOf(base()), archive(v))); f != nil {
+		t.Errorf("a link to the verified library: ranked %q", f.Severity)
 	}
 
 	// The same library owned by the package but not verified in this scan,

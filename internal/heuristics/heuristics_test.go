@@ -3,6 +3,7 @@ package heuristics
 import (
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -78,7 +79,7 @@ func keys(fs []model.Finding) []string {
 
 func want(t *testing.T, c *model.Collection, key string, sev model.Severity) model.Finding {
 	t.Helper()
-	fs := Run(c, ctx, cleanOwned())
+	fs := Run(inventoried(c), ctx, cleanOwned())
 	f := find(fs, key)
 	if f == nil {
 		t.Fatalf("no finding %s; got %v", key, keys(fs))
@@ -148,7 +149,7 @@ func TestHeuristicProcExePaths(t *testing.T) {
 func TestHeuristicForcedCommandIgnoresServerKey(t *testing.T) {
 	c := cleanCollection()
 	c.Persist[1].Lines = []string{"command=\"/usr/bin/true\",from=\"10.0.0.1\" " + serverBlob + " telltale"}
-	if fs := Run(c, ctx, cleanOwned()); len(fs) != 0 {
+	if fs := Run(inventoried(c), ctx, cleanOwned()); len(fs) != 0 {
 		t.Fatalf("server key flagged: %v", keys(fs))
 	}
 	c.Persist[1].Lines = append(c.Persist[1].Lines,
@@ -158,7 +159,7 @@ func TestHeuristicForcedCommandIgnoresServerKey(t *testing.T) {
 		t.Errorf("fix: %s", f.Fix)
 	}
 	// forced command also a root key: only the forced-command finding
-	if find(Run(c, ctx, cleanOwned()), "heur.root_key:/root/.ssh/authorized_keys:2") != nil {
+	if find(Run(inventoried(c), ctx, cleanOwned()), "heur.root_key:/root/.ssh/authorized_keys:2") != nil {
 		t.Error("double-reported")
 	}
 }
@@ -170,7 +171,7 @@ func TestHeuristicRootKey(t *testing.T) {
 	// a non-root user's key is not a root key
 	c = cleanCollection()
 	c.Persist = append(c.Persist, model.PersistFile{Path: "/home/alice/.ssh/authorized_keys", Kind: model.PersistKindAuthorizedKeys, Lines: []string{"ssh-rsa AAAAB3other me@x"}})
-	if fs := Run(c, ctx, cleanOwned()); len(fs) != 0 {
+	if fs := Run(inventoried(c), ctx, cleanOwned()); len(fs) != 0 {
 		t.Fatalf("got %v", keys(fs))
 	}
 }
@@ -183,7 +184,7 @@ func TestHeuristicUnownedSetuid(t *testing.T) {
 		model.FileEntry{Path: "/usr/bin/plain", Type: "file", Mode: 0o100755})
 	want(t, c, "heur.unowned_setuid:/usr/bin/evil", model.SevBackdoor)
 	want(t, c, "heur.unowned_setuid:/usr/local/bin/mine", model.SevNote)
-	if find(Run(c, ctx, cleanOwned()), "heur.unowned_setuid:/usr/bin/plain") != nil {
+	if find(Run(inventoried(c), ctx, cleanOwned()), "heur.unowned_setuid:/usr/bin/plain") != nil {
 		t.Error("plain file flagged")
 	}
 }
@@ -199,7 +200,7 @@ func TestHeuristicImmutableFlag(t *testing.T) {
 		t.Errorf("fix: %s", f.Fix)
 	}
 	want(t, c, "heur.immutable:/etc/y", model.SevBackdoor)
-	if find(Run(c, ctx, cleanOwned()), "heur.immutable:/etc/z") != nil {
+	if find(Run(inventoried(c), ctx, cleanOwned()), "heur.immutable:/etc/z") != nil {
 		t.Error("other flag flagged")
 	}
 }
@@ -220,7 +221,7 @@ func TestHeuristicUnownedListener(t *testing.T) {
 		model.Socket{Proto: "tcp", Local: "0.0.0.0:8080", Listening: true, PID: 50},
 		model.Socket{Proto: "tcp", Local: "1.2.3.4:5555", Listening: false, PID: 50})
 	want(t, c, "heur.unowned_listener:/opt/app/bin/app", model.SevNote)
-	if lf := find(Run(c, ctx, cleanOwned()), "heur.unowned_listener:/opt/app/bin/app"); lf == nil || strings.Contains(lf.Title, "5555") {
+	if lf := find(Run(inventoried(c), ctx, cleanOwned()), "heur.unowned_listener:/opt/app/bin/app"); lf == nil || strings.Contains(lf.Title, "5555") {
 		t.Error("non-listening flagged")
 	}
 }
@@ -232,7 +233,7 @@ func TestHeuristicCrossViewHidden(t *testing.T) {
 	if len(f.Evidence) != 2 {
 		t.Errorf("evidence %v", f.Evidence)
 	}
-	if find(Run(c, ctx, cleanOwned()), "heur.crossview:lsmod") != nil {
+	if find(Run(inventoried(c), ctx, cleanOwned()), "heur.crossview:lsmod") != nil {
 		t.Error("not-run tool flagged")
 	}
 }
@@ -247,7 +248,7 @@ func TestHeuristicPersistLink(t *testing.T) {
 	want(t, c, "heur.persist_link:/etc/systemd/system/x.service", model.SevBackdoor)
 	want(t, c, "heur.persist_link:/etc/systemd/system/rel.service", model.SevBackdoor)
 	want(t, c, "heur.persist_link:/etc/systemd/system/auditd.service", model.SevWeak)
-	fs := Run(c, ctx, cleanOwned())
+	fs := Run(inventoried(c), ctx, cleanOwned())
 	if find(fs, "heur.persist_link:/etc/systemd/system/ok.service") != nil || find(fs, "heur.persist_link:/etc/systemd/system/other.service") != nil {
 		t.Errorf("benign links flagged: %v", keys(fs))
 	}
@@ -256,7 +257,7 @@ func TestHeuristicPersistLink(t *testing.T) {
 func TestHeuristicEmptyPasswordUnknownNotFlagged(t *testing.T) {
 	c := cleanCollection()
 	c.Accounts.Users = append(c.Accounts.Users, model.User{Name: "carl", UID: 1002, Shell: "/bin/bash"})
-	if fs := Run(c, ctx, cleanOwned()); len(fs) != 0 {
+	if fs := Run(inventoried(c), ctx, cleanOwned()); len(fs) != 0 {
 		t.Fatalf("unknown state flagged: %v", keys(fs))
 	}
 }
@@ -296,7 +297,7 @@ func TestHeuristicEscapedQuoteCommand(t *testing.T) {
 		t.Errorf("fix = %s", f.Fix)
 	}
 	c.Persist[1].Lines = []string{`from="a,b" ssh-rsa AAAAB3other x`}
-	if find(Run(c, ctx, cleanOwned()), "heur.forced_command:/root/.ssh/authorized_keys:1") != nil {
+	if find(Run(inventoried(c), ctx, cleanOwned()), "heur.forced_command:/root/.ssh/authorized_keys:1") != nil {
 		t.Error("normal from= flagged as command")
 	}
 }
@@ -457,7 +458,7 @@ func TestHeuristicSymlinkedAuthorizedKeys(t *testing.T) {
 }
 
 func runOwned(c *model.Collection, owned map[string]string) []model.Finding {
-	return Run(c, ctx, owned)
+	return Run(inventoried(c), ctx, owned)
 }
 
 func link(path, target string) model.PersistFile {
@@ -721,7 +722,8 @@ func TestPackageLinkTargets(t *testing.T) {
 		link("/etc/cron.daily/b", "/opt/p/b"),
 		link("/etc/cron.daily/c", "/opt/p/a"),
 		link("/etc/cron.daily/d", "/usr/lib/d"))
-	got := PackageLinkTargets(c, map[string]string{"/opt/p/a": "p", "/usr/lib/d": "p"})
+	c.Files = append(c.Files, model.FileEntry{Path: "/opt/p/a", Type: "file", Mode: 0o100755})
+	got := PackageLinkTargets(inventoried(c), map[string]string{"/opt/p/a": "p", "/usr/lib/d": "p"})
 	if len(got) != 1 || got[0] != "/opt/p/a" {
 		t.Errorf("got %v, want [/opt/p/a]", got)
 	}
@@ -815,5 +817,129 @@ func TestPidListCapAndStableAfter(t *testing.T) {
 	}
 	if want := "runs from a temporary directory: /tmp/cap"; f.Evidence[0].After != want {
 		t.Errorf("After %q, want %q", f.Evidence[0].After, want)
+	}
+}
+
+// inventoried adds to a fixture what the collector records on a real machine:
+// an entry for every directory on the way to each file and persistence file,
+// and an entry for each persistence file itself. Links are resolved against
+// these (model.ResolveInInventory).
+func inventoried(c *model.Collection) *model.Collection {
+	have := map[string]bool{}
+	for _, f := range c.Files {
+		have[f.Path] = true
+	}
+	add := func(e model.FileEntry) {
+		if !have[e.Path] {
+			have[e.Path] = true
+			c.Files = append(c.Files, e)
+		}
+	}
+	parents := func(p string) {
+		for d := path.Dir(p); d != "/" && d != "."; d = path.Dir(d) {
+			add(model.FileEntry{Path: d, Type: "dir", Mode: 0o40755})
+		}
+	}
+	for _, f := range append([]model.FileEntry{}, c.Files...) {
+		parents(f.Path)
+	}
+	for _, p := range c.Persist {
+		parents(p.Path)
+		switch {
+		case p.Mode&0o170000 == 0o120000 && len(p.Lines) > 0:
+			add(model.FileEntry{Path: p.Path, Type: "symlink", Target: p.Lines[0], Mode: p.Mode})
+		case p.Mode&0o170000 == 0o100000:
+			add(model.FileEntry{Path: p.Path, Type: "file", Mode: p.Mode})
+		}
+	}
+	return c
+}
+
+func symlinkEntry(p, target string) model.FileEntry {
+	return model.FileEntry{Path: p, Type: "symlink", Target: target, Mode: 0o120777}
+}
+
+// A startup link is judged by the file the kernel opens for it, not by its
+// text: "qdir/../file" with qdir a link elsewhere reads as the package's file
+// and runs another.
+func TestPersistLinkResolvedAsTheKernelDoes(t *testing.T) {
+	const l, pkgFile = "/etc/cron.daily/vendor", "/opt/pkg/file"
+	base := func(target string, extra ...model.FileEntry) (*model.Collection, map[string]string) {
+		c := cleanCollection()
+		c.Persist = append(c.Persist, link(l, target))
+		c.Files = append(c.Files, model.FileEntry{Path: pkgFile, Type: "file", Mode: 0o100755})
+		c.Files = append(c.Files, extra...)
+		owned := cleanOwned()
+		owned[pkgFile] = "vendor"
+		return c, owned
+	}
+	backdoor := func(name string, c *model.Collection, owned map[string]string) {
+		t.Helper()
+		fs := runOwned(c, owned)
+		if f := find(fs, "heur.persist_link:"+l); f == nil || f.Severity != model.SevBackdoor {
+			t.Errorf("%s: want a backdoor sign, got %v", name, keys(fs))
+		}
+		if got := PackageLinkTargets(inventoried(c), owned); len(got) != 0 {
+			t.Errorf("%s: %v handed to package verification as the link's target", name, got)
+		}
+	}
+
+	// Control: the plain link to the package's file is the R68 note.
+	c, owned := base(pkgFile)
+	if f := find(runOwned(c, owned), "heur.persist_link_pkg:"+l); f == nil || f.Severity != model.SevNote {
+		t.Fatalf("plain package link: want the note")
+	}
+	// The directory link leads out of the inventory: /srv/evil/a/file runs.
+	c, owned = base("/opt/pkg/qdir/../file", symlinkEntry("/opt/pkg/qdir", "/srv/evil/a/b"))
+	backdoor("dot-dot through a directory link, target not inventoried", c, owned)
+	// The same with everything in the inventory: the file that runs is
+	// /srv/evil/a/file, which no package owns.
+	c, owned = base("/opt/pkg/qdir/../file", symlinkEntry("/opt/pkg/qdir", "/srv/evil/a/b"),
+		model.FileEntry{Path: "/srv/evil/a/b", Type: "dir", Mode: 0o40755}, model.FileEntry{Path: "/srv/evil/a/file", Type: "file", Mode: 0o100755})
+	backdoor("dot-dot through a directory link, target inventoried", c, owned)
+	if f := find(runOwned(c, owned), "heur.persist_link:"+l); f == nil || !strings.Contains(f.Title, "/srv/evil/a/file") {
+		t.Errorf("the finding does not name the file that really runs: %+v", f)
+	}
+	// A relative target that climbs through a directory link.
+	c, owned = base("../../opt/pkg/up/../file", symlinkEntry("/opt/pkg/up", "../../srv/evil/a/b"))
+	backdoor("relative target through a relative directory link", c, owned)
+	// A system-directory spelling that leaves the system directories.
+	c, owned = base("/usr/lib/qdir/../x.sh", symlinkEntry("/usr/lib/qdir", "/var/tmp/q/b"))
+	backdoor("system prefix by text only", c, owned)
+	// A link loop and a chain longer than the hop limit.
+	c, owned = base("/opt/pkg/a", symlinkEntry("/opt/pkg/a", "b"), symlinkEntry("/opt/pkg/b", "a"))
+	backdoor("link loop", c, owned)
+	// Something that only cleans to /dev/null is not a mask.
+	c, owned = base("/opt/pkg/qdir/../../../dev/null", symlinkEntry("/opt/pkg/qdir", "/srv/evil/a/b"))
+	backdoor("not a plain /dev/null", c, owned)
+
+	// A link into a system directory whose target does not exist (a unit of
+	// a removed package) and one into /run/systemd, which the scan does not
+	// record, stay quiet as before.
+	for _, target := range []string{"/usr/lib/systemd/system/removed.service", "../run/systemd/resolve/stub-resolv.conf", "/lib/systemd/system/x.service"} {
+		c, owned = base(target)
+		if fs := runOwned(c, owned); find(fs, "heur.persist_link:"+l) != nil {
+			t.Errorf("link to %s: reported %v", target, keys(fs))
+		}
+	}
+}
+
+// The user-unit note needs the unit the link really enables to be the user's
+// collected unit.
+func TestUserUnitLinkResolvedAsTheKernelDoes(t *testing.T) {
+	const l = "/home/alice/.config/systemd/user/default.target.wants/x.service"
+	c := userUnitCollection(l, "/home/alice/.config/systemd/user/x.service")
+	for i := range c.Persist {
+		if c.Persist[i].Path == l {
+			c.Persist[i].Lines[0] = "../qdir/../x.service"
+		}
+	}
+	c.Files = append(c.Files, symlinkEntry("/home/alice/.config/systemd/user/qdir", "/var/tmp/q/b"))
+	fs := runOwned(c, cleanOwned())
+	if find(fs, "heur.user_unit:"+l) != nil {
+		t.Errorf("a link that leaves the home through a directory link got the user-unit note: %v", keys(fs))
+	}
+	if f := find(fs, "heur.persist_link:"+l); f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("want a backdoor sign, got %v", keys(fs))
 	}
 }

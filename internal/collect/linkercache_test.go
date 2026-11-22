@@ -2,6 +2,7 @@ package collect
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -118,6 +119,27 @@ func TestLinkerCacheBoundsWork(t *testing.T) {
 	})
 	if allocs > 1000 {
 		t.Errorf("%v allocations for %d entries that share one string", allocs, n)
+	}
+	// Many distinct long strings: the paths together are capped. 9,000
+	// paths of 1,000 bytes are over 8 MiB; 8,000 are under.
+	distinct := func(count int) []byte {
+		head := make([]byte, linkerCacheHeader)
+		copy(head, linkerCacheMagic)
+		binary.LittleEndian.PutUint32(head[len(linkerCacheMagic):], uint32(count))
+		entries := make([]byte, count*linkerCacheEntry)
+		var strs []byte
+		for i := 0; i < count; i++ {
+			binary.LittleEndian.PutUint32(entries[i*linkerCacheEntry+8:], uint32(linkerCacheHeader+len(entries)+len(strs)))
+			name := fmt.Sprintf("/%08d", i)
+			strs = append(append(append(strs, name...), strings.Repeat("a", 1000-len(name))...), 0)
+		}
+		return append(append(head, entries...), strs...)
+	}
+	if got, ok := parseLinkerCache(distinct(8000)); !ok || len(got) != 8000 {
+		t.Errorf("8000 paths of 1000 bytes: parsed %v, %d paths", ok, len(got))
+	}
+	if _, ok := parseLinkerCache(distinct(9000)); ok {
+		t.Errorf("more than %d bytes of paths were kept", linkerCacheMaxPathBytes)
 	}
 	// More entries than any real cache has: not parsed.
 	binary.LittleEndian.PutUint32(head[len(linkerCacheMagic):], linkerCacheMaxEntries+1)

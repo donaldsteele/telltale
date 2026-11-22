@@ -22,21 +22,77 @@ func inSystemDir(target string) bool {
 	return false
 }
 
+// linkDest says where a startup link leads, resolved the way the kernel
+// resolves it (model.ResolveInInventory), never from the link's text alone:
+// "dir/../file" through a planted directory link reads as one file and opens
+// another.
+type linkDest struct {
+	// shown is the target for titles and evidence: file when known, else
+	// the text of the link made absolute.
+	shown string
+	// file is the path of what the link opens; "" when the inventory
+	// cannot tell (the target does not exist or lies where the scan does
+	// not look, the text was redacted, or too many links are involved).
+	file string
+	// within is the path as far as it could be followed, then as written;
+	// "" when even that is not known. It answers where the target lies.
+	within string
+	// null: the link is a plain link to /dev/null (a systemd mask).
+	null bool
+}
+
+func resolveLink(inv map[string]*model.FileEntry, p model.PersistFile) (linkDest, bool) {
+	lexical, ok := p.LinkTarget()
+	if !ok {
+		return linkDest{}, false
+	}
+	d := linkDest{shown: lexical}
+	if p.TargetRedacted() { // the target text is not what the link holds
+		return d, true
+	}
+	if p.Lines[0] == "/dev/null" {
+		d.null = true
+		return d, true
+	}
+	// Walk from the link's directory through the target as written (not
+	// cleaned), so that the directory the link is really in and every link
+	// inside the target are followed.
+	walk := p.Lines[0]
+	if !path.IsAbs(walk) {
+		walk = path.Dir(p.Path) + "/" + walk
+	}
+	if t, ok := model.ResolveInInventory(inv, walk, model.LinkHops); ok {
+		d.file, d.shown = t, t
+	}
+	if t, ok := model.ResolveToInventoryEdge(inv, walk, model.LinkHops); ok {
+		d.within = t
+	}
+	return d, true
+}
+
 // PackageLinkTargets returns the targets of startup links that lie outside
 // the system directories and are owned by an installed package. The scan has
 // them verified against the package.
 func PackageLinkTargets(c *model.Collection, owned map[string]string) []string {
 	var out []string
 	seen := map[string]bool{}
+	inv := model.Inventory(c.Files)
 	for _, p := range c.Persist {
-		t, ok := p.LinkTarget()
-		if !ok || p.TargetRedacted() || t == "/dev/null" || inSystemDir(t) || owned[t] == "" || seen[t] {
+		d, ok := resolveLink(inv, p)
+		if !ok || d.file == "" || inSystemDir(d.file) || owned[d.file] == "" || seen[d.file] {
 			continue
 		}
-		seen[t] = true
-		out = append(out, t)
+		seen[d.file] = true
+		out = append(out, d.file)
 	}
 	return out
+}
+
+// LinkFile is the file a startup link opens, resolved as the heuristics here
+// resolve it; ok is false when the inventory cannot tell.
+func LinkFile(inv map[string]*model.FileEntry, p model.PersistFile) (string, bool) {
+	d, ok := resolveLink(inv, p)
+	return d.file, ok && d.file != ""
 }
 
 // userUnitOwner returns the owner of the user unit that the link enables, when
@@ -82,15 +138,21 @@ func execStarts(c *model.Collection, p string) []string {
 
 func persistLinks(c *model.Collection, owned map[string]string) []model.Finding {
 	var out []model.Finding
+	inv := model.Inventory(c.Files)
 	for _, p := range c.Persist {
-		target, ok := p.LinkTarget()
+		d, ok := resolveLink(inv, p)
 		if !ok {
 			continue
 		}
+		// target is what the link opens when that is known. The quiet
+		// outcomes below all need it (or, for the location check, the path
+		// as far as it can be followed); a link that cannot be resolved
+		// falls through to the finding at the end.
+		target := d.shown
 		ev := []model.Evidence{{Path: p.Path, Line: 1, After: p.Lines[0], Detail: "symlink to " + target}}
 		key := "heur.persist_link:" + p.Path
-		redacted := p.TargetRedacted() // the target text is not what the link holds
-		if target == "/dev/null" && !redacted {
+		resolved := d.file != ""
+		if d.null {
 			base := path.Base(p.Path)
 			for _, w := range maskedWeak {
 				if strings.HasPrefix(base, w) {
@@ -108,7 +170,7 @@ func persistLinks(c *model.Collection, owned map[string]string) []model.Finding 
 			}
 			continue
 		}
-		if owner, ok := userUnitOwner(c, p.Path, target); ok && !redacted && collectedUnit(c, target) {
+		if owner, ok := userUnitOwner(c, p.Path, target); ok && resolved && collectedUnit(c, target) {
 			unit := path.Base(p.Path)
 			for _, l := range execStarts(c, target) {
 				ev = append(ev, model.Evidence{Path: target, Detail: l})
@@ -124,10 +186,10 @@ func persistLinks(c *model.Collection, owned map[string]string) []model.Finding 
 			})
 			continue
 		}
-		if !redacted && inSystemDir(target) {
+		if d.within != "" && inSystemDir(d.within) {
 			continue
 		}
-		if pkg := owned[target]; pkg != "" && !redacted && regularFile(c, target) {
+		if pkg := owned[target]; pkg != "" && resolved && regularFile(c, target) {
 			out = append(out, model.Finding{
 				Key: "heur.persist_link_pkg:" + p.Path, ID: idPersistLink, Source: source, Severity: model.SevNote,
 				Title: fmt.Sprintf("%s runs %s from package %s, outside the system directories", p.Path, target, pkg),

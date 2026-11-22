@@ -26,6 +26,9 @@ const (
 	// a cache telltale reads: a root-writable file must not be able to make
 	// the collector allocate without bound.
 	linkerCacheMaxEntries = 65536
+	// All the paths together; they are kept in every snapshot. A real cache
+	// holds a few hundred kilobytes of them.
+	linkerCacheMaxPathBytes = 8 << 20
 
 	// The format before glibc 2.2, which may still come first in the file:
 	// an 11-byte magic, padding, a 32-bit entry count at offset 12, then
@@ -86,6 +89,7 @@ func parseLinkerCache(b []byte) ([]string, bool) {
 	// Many entries may share one string: read each offset once.
 	seen := make(map[uint32]bool, n)
 	paths := make([]string, 0, n)
+	total := 0
 	for k := 0; k < n; k++ {
 		e := h[linkerCacheHeader+k*linkerCacheEntry:]
 		off := binary.LittleEndian.Uint32(e[8:])
@@ -98,6 +102,9 @@ func parseLinkerCache(b []byte) ([]string, bool) {
 		}
 		end := bytes.IndexByte(h[off:], 0)
 		if end <= 0 || end > linkerPathMax {
+			return nil, false
+		}
+		if total += end; total > linkerCacheMaxPathBytes {
 			return nil, false
 		}
 		paths = append(paths, string(h[off:off+uint32(end)]))

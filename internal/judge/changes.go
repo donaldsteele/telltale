@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/donaldsteele/telltale/internal/diff"
+	"github.com/donaldsteele/telltale/internal/heuristics"
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/internal/pkgverify"
 )
@@ -480,32 +481,24 @@ func (j *judge) linkerCacheRebuilt(ev model.Evidence) bool {
 }
 
 // loadsVerified reports whether the file the linker would load for a cache
-// entry is a package's file that this scan verified as it is now. Links are
-// followed to the file itself (most entries are a package's link to its
-// library). A configuration file never counts: package verification does not
-// compare those, so one overwritten with a library would pass.
+// entry is a package's file that this scan verified as it is now. The entry
+// is resolved the way the kernel resolves it (model.ResolveInInventory):
+// links are followed to the file itself, directory links on the way
+// included, and ".." is applied to the directory really reached. An entry
+// the inventory cannot resolve is not verified. A configuration file never
+// counts: package verification does not compare those, so one overwritten
+// with a library would pass.
 func (j *judge) loadsVerified(p string) bool {
-	for hop := 0; hop < 8; hop++ {
-		e := j.files[p]
-		if e == nil {
-			if p = usrAlias(p); p == "" {
-				return false
-			}
-			if e = j.files[p]; e == nil {
-				return false
-			}
-		}
-		if e.Type == "symlink" {
-			p = linkTarget(p, e.Target)
-			continue
-		}
-		if conffileOwner(j.c.Packages.Installed, p) != "" {
-			return false
-		}
-		v, ok := j.verified[p]
-		return ok && j.verifiedNow(v, e) && (v.Source != pkgverify.SourceOfflineLocal || j.pkgChanged(v.Package))
+	p, ok := model.ResolveInInventory(j.files, p, model.LinkHops)
+	if !ok {
+		return false
 	}
-	return false
+	e := j.files[p]
+	if e == nil || e.Type != "file" || conffileOwner(j.c.Packages.Installed, p) != "" {
+		return false
+	}
+	v, ok := j.verified[p]
+	return ok && j.verifiedNow(v, e) && (v.Source != pkgverify.SourceOfflineLocal || j.pkgChanged(v.Package))
 }
 
 // placed shows a file change as part of what explains it, and reports
@@ -835,8 +828,11 @@ func (j *judge) persistOfPackageChange(p string, cur, old *model.PersistFile) (s
 	switch {
 	case old == nil && cur != nil:
 		if cur.Kind == model.PersistKindSystemdEnabled && len(cur.Lines) > 0 {
-			if name := j.owned[linkTarget(p, cur.Lines[0])]; name != "" && j.pkgChange[name].Kind == diff.PkgInstalled {
-				return name, model.SevBackdoor // it also raises the package
+			// The unit the link really enables, not the one its text names.
+			if t, ok := heuristics.LinkFile(j.files, *cur); ok {
+				if name := j.owned[t]; name != "" && j.pkgChange[name].Kind == diff.PkgInstalled {
+					return name, model.SevBackdoor // it also raises the package
+				}
 			}
 		}
 		if name := conffileOwner(j.c.Packages.Installed, p); name != "" && j.pkgChange[name].Kind == diff.PkgInstalled && j.unreported(p) {

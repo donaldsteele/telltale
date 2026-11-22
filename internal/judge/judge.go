@@ -582,7 +582,8 @@ func (j *judge) rankPackageLink(f *model.Finding) {
 	if pf == nil {
 		return
 	}
-	target, ok := pf.LinkTarget()
+	// The same resolution the note was made with.
+	target, ok := heuristics.LinkFile(j.files, *pf)
 	if !ok {
 		return
 	}
