@@ -40,8 +40,15 @@ func TestHelpListsVisibleCommandsOnly(t *testing.T) {
 	if !strings.Contains(out, "scan") {
 		t.Errorf("help lacks scan: %q", out)
 	}
-	if strings.Contains(out, "collect") {
-		t.Errorf("help shows hidden collect: %q", out)
+	// collect is a documented command: fetch-refs and offline analysis
+	// take its output.
+	if !strings.Contains(out, "collect     write this machine's raw collection as JSON, for fetch-refs or offline analysis") {
+		t.Errorf("help lacks collect: %q", out)
+	}
+	for _, c := range all() {
+		if c.Hidden && strings.Contains(out, "  "+c.Name+" ") {
+			t.Errorf("help shows hidden %s: %q", c.Name, out)
+		}
 	}
 }
 

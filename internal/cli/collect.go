@@ -17,7 +17,7 @@ const (
 )
 
 func init() {
-	Register(Command{Name: "collect", Summary: "collect machine facts (internal)", Hidden: true, Run: runCollect})
+	Register(Command{Name: "collect", Summary: "write this machine's raw collection as JSON, for fetch-refs or offline analysis", Run: runCollect})
 }
 
 func runCollect(ctx *Context) int {

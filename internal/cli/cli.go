@@ -43,7 +43,7 @@ var planned = []Command{
 	{Name: "fetch-refs", Summary: "download reference data"},
 	{Name: "server", Summary: "run the telltale server"},
 	{Name: "mcp", Summary: "run the MCP server"},
-	{Name: "collect", Summary: "collect machine facts (internal)", Hidden: true},
+	{Name: "collect", Summary: "write this machine's raw collection as JSON, for fetch-refs or offline analysis"},
 }
 
 func notImplemented(name string) func(*Context) int {

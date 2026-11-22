@@ -26,12 +26,13 @@ Builds a reference bundle on a machine with network access, so that an
 isolated machine's packages can be verified properly with
 "telltale scan --refs DIR".
 
-  --for SCAN.json  the isolated machine's collection: what "telltale collect"
-                   writes there (plain or with --gzip). Reports carry no
-                   package list and cannot be used.
+  --for SCAN.json  the isolated machine's collection: run
+                   "telltale collect > SCAN.json" there (add --gzip to
+                   compress it). A report carries no package list and
+                   cannot be used.
   --out DIR        a new or empty directory for the bundle
-  --full           include every package, not only those owning executables,
-                   libraries, PAM and kernel modules and /boot
+  --full           recorded in the bundle for "scan --refs --full"; every
+                   installed package goes into the bundle either way
   --keys DIR       public keys of third-party repositories to trust
 
 Everything in the bundle is checked again with telltale's built-in archive
@@ -118,13 +119,23 @@ func readCollectionFile(path string) (*model.Collection, error) {
 		r = zr
 	}
 	lr := &io.LimitedReader{R: r, N: maxScanJSON + 1}
-	var c model.Collection
-	if err := json.NewDecoder(lr).Decode(&c); err != nil {
+	// A report shares a collection's schema and host fields; its own
+	// fields give it away.
+	var doc struct {
+		model.Collection
+		Findings        json.RawMessage `json:"findings"`
+		ComparedAgainst json.RawMessage `json:"compared_against"`
+	}
+	if err := json.NewDecoder(lr).Decode(&doc); err != nil {
 		if lr.N <= 0 {
 			return nil, fmt.Errorf("%s: larger than %d bytes", path, maxScanJSON)
 		}
 		return nil, fmt.Errorf("%s is not a collection: %w", path, err)
 	}
+	if doc.Findings != nil || doc.ComparedAgainst != nil {
+		return nil, fmt.Errorf("%s: fetch-refs needs the output of `telltale collect`, not a report", path)
+	}
+	c := doc.Collection
 	if c.Schema != model.CollectionSchema {
 		return nil, fmt.Errorf("%s: collection schema %d, this telltale reads %d", path, c.Schema, model.CollectionSchema)
 	}

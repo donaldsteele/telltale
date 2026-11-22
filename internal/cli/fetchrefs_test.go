@@ -57,10 +57,21 @@ func TestFetchRefsUsage(t *testing.T) {
 }
 
 func TestFetchRefsRejectsReports(t *testing.T) {
-	// A report has a schema field but no package list.
+	// A report shares the schema and host fields but has no package list.
+	b, err := json.Marshal(model.Report{Schema: model.ReportSchema, Host: model.Host{Hostname: "web01", OSID: "debian", OSVersionID: "12", Arch: "amd64"}, Findings: []model.Finding{}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	p := filepath.Join(t.TempDir(), "report.json")
-	os.WriteFile(p, []byte(`{"schema":1,"host":{"hostname":"web01"},"findings":[]}`), 0o600)
+	os.WriteFile(p, b, 0o600)
 	code, _, errs := run("fetch-refs", "--for", p, "--out", filepath.Join(t.TempDir(), "refs"))
+	if code != ExitUsage || !strings.Contains(errs, "fetch-refs needs the output of `telltale collect`, not a report") {
+		t.Errorf("code=%d err=%q", code, errs)
+	}
+
+	// Anything else without packages is refused with the same pointer.
+	os.WriteFile(p, []byte(`{"schema":1,"host":{"os_id":"debian"}}`), 0o600)
+	code, _, errs = run("fetch-refs", "--for", p, "--out", filepath.Join(t.TempDir(), "refs"))
 	if code != ExitUsage || !strings.Contains(errs, "telltale collect") {
 		t.Errorf("code=%d err=%q", code, errs)
 	}
