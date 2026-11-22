@@ -11,10 +11,10 @@ import (
 	"github.com/donaldsteele/telltale/internal/pkgverify"
 )
 
-// changes ranks every difference from the snapshot. Package changes and new
-// listeners are indexed first, since they decide how file, persistence and
-// package-install changes rank.
-func (j *judge) changes(chs []diff.Change) {
+// index records what the other rules depend on: which packages changed,
+// the new listeners, and which account databases the account comparison
+// explains.
+func (j *judge) index(chs []diff.Change) {
 	for _, ch := range chs {
 		switch ch.Kind {
 		case diff.PkgUpgraded, diff.PkgDowngraded, diff.PkgInstalled, diff.PkgRemoved:
@@ -36,8 +36,76 @@ func (j *judge) changes(chs []diff.Change) {
 			}
 		case diff.GroupChanged:
 			j.acctChanged["/etc/group"] = true
+			o, n := findGroup(j.old, ch.Subject), findGroup(j.c, ch.Subject)
+			if shadowChanged(o, n) {
+				j.acctChanged["/etc/gshadow"] = true
+			}
+			if pw, added, admins := groupGains(o, n); pw || (privilegedGroups[ch.Subject] && (len(added) > 0 || admins)) {
+				j.gshadowRisk = true
+			}
 		}
 	}
+}
+
+// shadowChanged reports whether the group comparison saw a gshadow change
+// for this group: a group added or removed with its gshadow entry, or a
+// different entry where both scans read gshadow.
+func shadowChanged(o, n *model.Group) bool {
+	switch {
+	case o == nil:
+		return n != nil && n.Shadow != nil
+	case n == nil:
+		return o.Shadow != nil
+	case o.Shadow == nil || n.Shadow == nil:
+		return false
+	}
+	return o.Shadow.PasswordSet != n.Shadow.PasswordSet || sortedJoin(o.Shadow.Admins) != sortedJoin(n.Shadow.Admins) ||
+		sortedJoin(o.Shadow.Members) != sortedJoin(n.Shadow.Members)
+}
+
+// groupGains lists what a group change gives: a group password where there
+// was none, members added (in /etc/group or gshadow) and new
+// administrators.
+func groupGains(o, n *model.Group) (password bool, added []string, admins bool) {
+	if n == nil {
+		return false, nil, false
+	}
+	var oldM []string
+	var oldS *model.GroupShadow
+	if o != nil {
+		oldM, oldS = append([]string(nil), o.Members...), o.Shadow
+	}
+	cur := append([]string(nil), n.Members...)
+	// gshadow counts only for a new group or when both scans read it.
+	if n.Shadow != nil && (o == nil || oldS != nil) {
+		password = n.Shadow.PasswordSet && (oldS == nil || !oldS.PasswordSet)
+		for _, a := range n.Shadow.Admins {
+			if oldS == nil || !slices.Contains(oldS.Admins, a) {
+				admins = true
+			}
+		}
+		cur = append(cur, n.Shadow.Members...)
+		if oldS != nil {
+			oldM = append(oldM, oldS.Members...)
+		}
+	}
+	for _, m := range cur {
+		if !slices.Contains(oldM, m) && !slices.Contains(added, m) {
+			added = append(added, m)
+		}
+	}
+	slices.Sort(added)
+	return password, added, admins
+}
+
+func sortedJoin(ss []string) string {
+	m := append([]string(nil), ss...)
+	slices.Sort(m)
+	return strings.Join(m, ",")
+}
+
+// changes ranks every difference from the snapshot (index has run).
+func (j *judge) changes(chs []diff.Change) {
 	for _, ch := range chs {
 		switch ch.Kind {
 		case diff.PkgUpgraded, diff.PkgDowngraded, diff.PkgInstalled, diff.PkgRemoved:
@@ -116,7 +184,27 @@ const (
 	catGenerated
 	catLink
 	catLoosened
+	catAccount
 )
+
+// accountNote says why a content-only change of an account database is a
+// note, or "": passwd or shadow content in which the account comparison
+// found no change to ids, shells, homes or passwords (ageing, comments, a
+// line it skips; duplicate names are their own finding); gshadow content
+// that the group comparison shows group by group, giving no group a
+// password and no privileged group a member or administrator.
+func (j *judge) accountNote(p string, old, cur *model.FileEntry) string {
+	if old == nil || cur == nil || !sameMeta(old, cur) {
+		return ""
+	}
+	switch {
+	case (p == "/etc/passwd" || p == "/etc/shadow") && !j.acctChanged[p]:
+		return "The account comparison found no change to user ids, groups, shells, home directories or passwords in this file, so this is most likely an ageing (chage) or comment (GECOS) change. Duplicate account names are reported on their own."
+	case p == "/etc/gshadow" && j.acctChanged[p] && !j.gshadowRisk:
+		return "The group comparison shows each change in this file (shown above as group changes); none gives a group a password or a privileged group a new member or administrator."
+	}
+	return ""
+}
 
 // newlyWritable reports whether a directory became writable by its group or
 // by everyone: write bits added, or a new world-writable directory without
@@ -212,12 +300,15 @@ func (j *judge) fileChange(ch diff.Change) {
 	}
 
 	linkWhy := badLink(p, old, cur)
+	accountWhy := j.accountNote(p, old, cur)
 	cat := catNote
 	switch {
 	case linkWhy != "":
 		cat = catLink
 	case newlyWritable(old, cur):
 		cat = catLoosened
+	case accountWhy != "":
+		cat = catAccount
 	case j.placed(ch, e, old, cur, owner, ev):
 		return
 	case generatedFile(p):
@@ -239,10 +330,14 @@ func (j *judge) fileChange(ch diff.Change) {
 	case catNote:
 		sev = model.SevNote
 		why = "No package update explains this change. It is probably routine (a locally installed program, a generated file, an edited setting) but it is listed so that nothing is hidden."
+	case catAccount:
+		sev = model.SevNote
+		why = accountWhy
+		refs = []string{"T1098"}
 	case catPersist:
 		why = "This is a place attackers use to get back in or to run code again, and no package update explains the change."
-		if w := accountWhy[p]; w != "" {
-			why = w + " It changed since the snapshot, and nothing else telltale compares covers it."
+		if w := accountFileWhy[p]; w != "" {
+			why = w + " It changed since the snapshot in a way the account comparison does not explain."
 		}
 		refs = []string{"T1546"}
 	case catSecurity:
@@ -338,13 +433,30 @@ func (j *judge) placed(ch diff.Change, e, old, cur *model.FileEntry, owner strin
 }
 
 // unverifiedProgram records a changed program of a changed package that no
-// trusted source confirmed.
+// trusted source confirmed: found in none (a backdoor sign for the package)
+// or not checked at all because a source could not be used (one note for
+// every such package).
 func (j *judge) unverifiedProgram(pkg, p string, ev model.Evidence) {
-	ev.Detail = "changed; could not be verified"
-	if r := j.unverReason[p]; r != "" {
+	r := j.unverReason[p]
+	if notInTrustedSource(r) {
+		ev.Detail = "changed; no trusted source has this version: " + r
+		j.unverIn[pkg] = append(j.unverIn[pkg], ev)
+		return
+	}
+	ev.Detail = "changed; could not be checked"
+	if r != "" {
 		ev.Detail += ": " + r
 	}
-	j.unverIn[pkg] = append(j.unverIn[pkg], ev)
+	j.unchecked[pkg] = append(j.unchecked[pkg], ev)
+}
+
+// notInTrustedSource reports whether an unverifiable reason says that
+// verification ran and found the installed version in no trusted source
+// (directly, or when the reference bundle was built), as opposed to a
+// source that could not be read or used.
+func notInTrustedSource(reason string) bool {
+	r := strings.TrimPrefix(reason, "not in the reference bundle: ")
+	return strings.HasPrefix(r, pkgverify.ReasonNotOfficial) || strings.Contains(r, "source not trusted:")
 }
 
 // fullHash puts the entry's whole hash in place of the shortened one diff
@@ -873,26 +985,15 @@ func (j *judge) userChanged(ch diff.Change) {
 	j.add(f)
 }
 
-// privilegedGroups make their members root, or let them read secrets or
-// raw devices, without any password changing.
-var privilegedGroups = map[string]bool{"root": true, "sudo": true, "wheel": true, "admin": true, "shadow": true, "disk": true, "docker": true, "lxd": true}
+// privilegedGroups make their members root, or let them read logs,
+// secrets or raw devices, without any password changing.
+var privilegedGroups = map[string]bool{"root": true, "sudo": true, "wheel": true, "admin": true, "adm": true, "shadow": true,
+	"disk": true, "docker": true, "lxd": true, "libvirt": true}
 
 func (j *judge) groupChanged(ch diff.Change) {
 	name := ch.Subject
-	var oldM, curM []string
-	if g := findGroup(j.old, name); g != nil {
-		oldM = g.Members
-	}
-	if g := findGroup(j.c, name); g != nil {
-		curM = g.Members
-	}
-	var added []string
-	for _, m := range curM {
-		if !slices.Contains(oldM, m) && !slices.Contains(added, m) {
-			added = append(added, m)
-		}
-	}
-	slices.Sort(added)
+	o, n := findGroup(j.old, name), findGroup(j.c, name)
+	password, added, admins := groupGains(o, n)
 	f := &model.Finding{
 		Key: "snap.group:" + name, ID: "TT-SNAP-005", Source: srcSnapshot, Severity: model.SevNote,
 		Title:    fmt.Sprintf("Group %q changed since the snapshot", name),
@@ -900,13 +1001,22 @@ func (j *judge) groupChanged(ch diff.Change) {
 		Evidence: []model.Evidence{{Path: "/etc/group", Before: ch.Before, After: ch.After, Detail: "changed since the snapshot", When: j.whenFor("/etc/group")}},
 		Refs:     []string{"T1098"},
 	}
-	if len(added) > 0 {
-		f.Fix = fixGroupMembers(name, added)
-		if privilegedGroups[name] {
-			f.Severity = model.SevBackdoor
-			f.Title = fmt.Sprintf("%s added to the %q group since the snapshot", strings.Join(added, ", "), name)
-			f.Why = "Members of this group can become root, or read secrets or raw disks, without any password changing. Adding an account to it is a quiet way to keep root access."
-		}
+	if len(added) > 0 || password || admins {
+		f.Fix = fixGroupChange(name, added, password, admins)
+	}
+	switch {
+	case password:
+		f.Severity = model.SevBackdoor
+		f.Title = fmt.Sprintf("Group %q was given a password since the snapshot", name)
+		f.Why = "Anyone who knows a group's password can join it with newgrp, without being a member. Group passwords are almost never used, so a new one is a quiet way back into the group's rights."
+	case privilegedGroups[name] && admins:
+		f.Severity = model.SevBackdoor
+		f.Title = fmt.Sprintf("The %q group has a new administrator since the snapshot", name)
+		f.Why = "A group administrator can add anyone to the group. For this group that means root, or access to secrets or raw disks, without any password changing."
+	case privilegedGroups[name] && len(added) > 0:
+		f.Severity = model.SevBackdoor
+		f.Title = fmt.Sprintf("%s added to the %q group since the snapshot", strings.Join(added, ", "), name)
+		f.Why = "Members of this group can become root, or read logs, secrets or raw disks, without any password changing. Adding an account to it is a quiet way to keep root access."
 	}
 	j.add(f)
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -337,7 +338,8 @@ func (j *judge) rebuiltBy(p string) string {
 			return k
 		}
 		return j.changedPackage(func(n string) bool {
-			return strings.HasPrefix(n, "initramfs-tools") || j.ships(n, "/usr/share/initramfs-tools/")
+			return strings.HasPrefix(n, "initramfs-tools") || j.ships(n, "/usr/share/initramfs-tools/") ||
+				strings.HasPrefix(n, "linux-firmware") || strings.HasPrefix(n, "firmware-") || n == "intel-microcode" || n == "amd64-microcode"
 		})
 	case p == "/boot/grub/grub.cfg" || p == "/boot/grub/grubenv":
 		return j.changedPackage(func(n string) bool { return isGrub(n) || strings.HasPrefix(n, "linux-image") })
@@ -371,27 +373,41 @@ func moduleRelease(p string) string {
 
 // finishPackages settles package changes once every file change is placed.
 // An upgrade, or a routine kernel change, is explained only when the files
-// it changed matched the package: programs no trusted source confirmed make
-// it a backdoor sign, other unconfirmed files a note. A ranked package
-// change gains the programs no trusted source confirmed, and a new
-// package's value names everything that raised it.
+// it changed matched the package: programs whose version no trusted source
+// has make it a backdoor sign, programs that could not be checked at all
+// put it in one note with every other such package, other unconfirmed files
+// make it a note. A ranked package change gains its unverified programs,
+// and a new package's value names everything that raised it.
 func (j *judge) finishPackages() {
+	var unchecked []string
 	for _, name := range j.changedNames() {
 		ch := j.pkgChange[name]
 		unver := j.unverIn[name]
 		g := j.groups["explained:"+name]
 		f := j.pkgFinding[name]
 		switch {
-		case f == nil && g != nil && ch.Kind != diff.PkgRemoved && (len(unver) > 0 || j.unconfirmed[name]):
+		case f == nil && g != nil && ch.Kind != diff.PkgRemoved && len(unver) > 0:
 			f = j.unexplain(name, ch, g, unver)
+		case len(unver) == 0 && len(j.unchecked[name]) > 0:
+			unchecked = append(unchecked, name)
+			if f == nil && g != nil {
+				delete(j.groups, g.Key) // not explained: nothing checked it
+			}
+		case f == nil && g != nil && ch.Kind != diff.PkgRemoved && j.unconfirmed[name]:
+			f = j.unexplain(name, ch, g, nil)
 		case f != nil && len(unver) > 0:
 			for _, e := range unver {
 				j.attach(f, e, maxEvidence)
 			}
 			if f.Severity < model.SevBackdoor && ch.Pkg != nil {
 				f.Severity = model.SevBackdoor
-				f.Title = fmt.Sprintf("New package %s %s since the snapshot, with %d %s no trusted source confirmed", name, ch.Pkg.New, len(unver), plural(len(unver), "program", "programs"))
+				f.Title = fmt.Sprintf("New package %s %s since the snapshot, with %d %s no trusted source has", name, ch.Pkg.New, len(unver), plural(len(unver), "program", "programs"))
 				f.Why = unverifiedWhy(unver)
+			}
+		}
+		if f != nil && len(unver) > 0 {
+			for _, e := range j.unchecked[name] {
+				j.attach(f, e, maxEvidence)
 			}
 		}
 		if f != nil && ch.Kind == diff.PkgInstalled && ch.Pkg != nil && len(f.Evidence) > 0 {
@@ -408,14 +424,64 @@ func (j *judge) finishPackages() {
 			f.Evidence[0].After = strings.Join(append([]string{ch.Pkg.New}, reasons...), "; ")
 		}
 	}
+	j.uncheckedNote(unchecked)
 }
 
 func unverifiedWhy(unver []model.Evidence) string {
-	why := "No trusted source (the signed archive, its snapshots or a reference bundle) confirmed the programs this package change brought"
+	why := "Verification ran, and no trusted source (the signed archive, its snapshots or a reference bundle) has the version of the programs this package change brought"
 	if len(unver) > 0 && unver[0].Detail != "" {
 		why += " (" + unver[0].Detail + ")"
 	}
 	return why + ". A package \"update\" from an unofficial source is a way to slip in replaced programs, so they count as unexplained."
+}
+
+// uncheckedNote lists, in one note, the changed packages whose changed
+// programs could not be checked because a package source could not be read
+// or used. Not being able to check is not evidence of tampering, so a
+// network failure must not raise a backdoor sign per package; the reasons
+// go into what the report could not rule out.
+func (j *judge) uncheckedNote(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	n := len(names)
+	f := &model.Finding{
+		Key: "pkg.unchecked_changes", ID: "TT-PKG-007", Source: srcPackage, Severity: model.SevNote,
+		Title: fmt.Sprintf("%d changed %s could not be checked against a trusted source", n, plural(n, "package", "packages")),
+		Fix:   "Scan again when the package archive can be reached, or run telltale fetch-refs on a machine with network access and scan with --refs DIR.",
+	}
+	var ids, reasons []string
+	var items []model.Evidence
+	for _, name := range names {
+		ch := j.pkgChange[name]
+		ev := model.Evidence{Detail: name + ": " + strings.TrimPrefix(ch.Kind, "pkg_"), When: j.listWhen(name)}
+		if ch.Pkg != nil {
+			ev.Before, ev.After = ch.Pkg.Old, ch.Pkg.New
+			ids = append(ids, strings.TrimSpace(name+" "+ch.Pkg.New))
+		}
+		items = append(items, ev)
+		for _, e := range j.unchecked[name] {
+			items = append(items, e)
+			if r := j.unverReason[e.Path]; r != "" && !slices.Contains(reasons, r) {
+				reasons = append(reasons, r)
+			}
+		}
+	}
+	sort.Strings(reasons)
+	shown := reasons
+	more := ""
+	if len(shown) > 3 {
+		shown, more = shown[:3], fmt.Sprintf("; and %d more", len(reasons)-3)
+	}
+	f.Why = "These packages changed since the snapshot, but the programs they changed could not be checked: " + strings.Join(shown, "; ") + more +
+		". That is not evidence of tampering, but those programs stay unverified until a scan can use the package archive or a reference bundle."
+	// The value an exception accepts names every package and version.
+	f.Evidence = []model.Evidence{{After: strings.Join(ids, "; "), Detail: "packages that could not be checked"}}
+	for _, e := range items {
+		j.attach(f, e, maxEvidence)
+	}
+	j.add(f)
+	j.couldNot = append(j.couldNot, fmt.Sprintf("changes to the programs of %d changed %s that could not be checked (%s%s)", n, plural(n, "package", "packages"), strings.Join(shown, "; "), more))
 }
 
 // unexplain turns an explained package change into a finding.
@@ -435,10 +501,10 @@ func (j *judge) unexplain(name string, ch diff.Change, g *model.Finding, unver [
 		f.Severity = model.SevBackdoor
 		f.Why = unverifiedWhy(unver)
 		if installed {
-			f.Title = fmt.Sprintf("New package %s %s since the snapshot, with %d %s no trusted source confirmed", name, pc.New, n, plural(n, "program", "programs"))
+			f.Title = fmt.Sprintf("New package %s %s since the snapshot, with %d %s no trusted source has", name, pc.New, n, plural(n, "program", "programs"))
 			f.Fix = fixPurge(name)
 		} else {
-			f.Title = fmt.Sprintf("%s changed from %s to %s, a version no trusted source confirmed; %d %s changed", name, pc.Old, pc.New, n, plural(n, "program", "programs"))
+			f.Title = fmt.Sprintf("%s changed from %s to %s, a version no trusted source has; %d %s changed", name, pc.Old, pc.New, n, plural(n, "program", "programs"))
 			f.Fix = fixDowngrade(name, pc.Old)
 		}
 		for _, e := range unver {
@@ -521,8 +587,8 @@ func usrAlias(p string) string {
 // ranked.
 var accountDBs = map[string]bool{"/etc/passwd": true, "/etc/shadow": true, "/etc/group": true}
 
-// accountWhy explains files whose meaning is not obvious from their place.
-var accountWhy = map[string]string{
+// accountFileWhy explains files whose meaning is not obvious from their place.
+var accountFileWhy = map[string]string{
 	"/etc/gshadow": "This file holds group passwords and group administrators; a password or administrator added here lets an account join privileged groups such as sudo.",
 	"/etc/subuid":  "This file gives accounts ranges of user ids for their containers. A range that includes id 0 maps a user's container root to the real root of this machine.",
 	"/etc/subgid":  "This file gives accounts ranges of group ids for their containers. A range that includes id 0 maps a user's containers to the real root group of this machine.",

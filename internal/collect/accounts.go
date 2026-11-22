@@ -55,6 +55,28 @@ func Accounts(root string, key []byte) (model.Accounts, []model.Skip) {
 		acc.Users = append(acc.Users, u)
 	}
 
+	// gshadow is reduced to whether a usable group password is set and who
+	// administers or belongs to the group; the hash itself is never kept.
+	var gshadow map[string]model.GroupShadow
+	gs, err := readRaw(root, "/etc/gshadow", 4<<20)
+	switch {
+	case err == nil:
+		gshadow = map[string]model.GroupShadow{}
+		for _, line := range splitLines(gs) {
+			f := strings.Split(line, ":")
+			if len(f) < 4 || f[0] == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if _, dup := gshadow[f[0]]; dup {
+				continue // the first line counts, as for the group tools
+			}
+			pw := f[1] != "" && !strings.HasPrefix(f[1], "!") && !strings.HasPrefix(f[1], "*")
+			gshadow[f[0]] = model.GroupShadow{PasswordSet: pw, Admins: splitList(f[2]), Members: splitList(f[3])}
+		}
+	case !isNotExist(err):
+		skip("/etc/gshadow", err.Error())
+	}
+
 	gr, err := readRaw(root, "/etc/group", 4<<20)
 	if err != nil {
 		skip("/etc/group", err.Error())
@@ -69,9 +91,20 @@ func Accounts(root string, key []byte) (model.Accounts, []model.Skip) {
 		if f[3] != "" {
 			g.Members = strings.Split(f[3], ",")
 		}
+		if gshadow != nil {
+			s := gshadow[f[0]]
+			g.Shadow = &s
+		}
 		acc.Groups = append(acc.Groups, g)
 	}
 	return acc, skips
+}
+
+func splitList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, ",")
 }
 
 func reduceShadow(key []byte, f []string) model.PasswordState {

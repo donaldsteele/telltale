@@ -205,13 +205,26 @@ func fixUserChanged(name string, old, cur *model.User) string {
 }
 
 func fixGroupMembers(group string, added []string) string {
+	return fixGroupChange(group, added, false, false)
+}
+
+// fixGroupChange undoes what a group gained: members are removed, a group
+// password is removed, and new administrators are pointed out.
+func fixGroupChange(group string, added []string, password, admins bool) string {
 	vals := append([]string{group}, added...)
 	return command(vals, func(q []string) string {
 		cmds := []string{keep("/etc/group", "/etc/gshadow")}
 		for _, m := range q[1:] {
 			cmds = append(cmds, "gpasswd -d "+m+" -- "+q[0])
 		}
-		return strings.Join(cmds, " && ") + "   # only for members you did not add"
+		if password {
+			cmds = append(cmds, "gpasswd -r -- "+q[0])
+		}
+		note := "   # only for changes you did not make"
+		if admins {
+			note += "; set the group's administrators back with gpasswd -A <names> -- " + q[0]
+		}
+		return strings.Join(cmds, " && ") + note
 	})
 }
 

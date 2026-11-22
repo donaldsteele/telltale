@@ -263,3 +263,33 @@ func TestDiffLinesLargeBounded(t *testing.T) {
 		t.Errorf("len %d in %v", len(ls), time.Since(start))
 	}
 }
+
+func TestCompareGroupShadow(t *testing.T) {
+	sh := func(pw bool, admins ...string) *model.GroupShadow {
+		return &model.GroupShadow{PasswordSet: pw, Admins: admins}
+	}
+	old := &model.Collection{Accounts: model.Accounts{Groups: []model.Group{
+		{Name: "sudo", GID: 27, Shadow: sh(false)},
+		{Name: "staff", GID: 50, Shadow: sh(false)},
+		{Name: "adm", GID: 4, Shadow: sh(false)},
+		{Name: "users", GID: 100, Shadow: sh(false)},
+	}}}
+	cur := &model.Collection{Accounts: model.Accounts{Groups: []model.Group{
+		{Name: "sudo", GID: 27, Shadow: sh(false, "eve")},
+		{Name: "staff", GID: 50, Shadow: sh(true)},
+		{Name: "adm", GID: 4, Shadow: sh(false)},
+		{Name: "users", GID: 100}, // gshadow not read this time
+	}}}
+	cs := Compare(snap(old), cur, nil)
+	if g := find(t, cs, GroupChanged, "sudo"); g.After != "gid 27 members  gshadow no password admins eve members " {
+		t.Errorf("sudo after %q", g.After)
+	}
+	if g := find(t, cs, GroupChanged, "staff"); g.Before != "gid 50 members  gshadow no password admins  members " || g.After != "gid 50 members  gshadow password set admins  members " {
+		t.Errorf("staff %q -> %q", g.Before, g.After)
+	}
+	for _, c := range cs {
+		if c.Subject == "adm" || c.Subject == "users" {
+			t.Errorf("unexpected change %+v", c)
+		}
+	}
+}

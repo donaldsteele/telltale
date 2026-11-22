@@ -1350,7 +1350,9 @@ func TestJudgeAccountFilesComparedWhenAccountsDoNotExplainThem(t *testing.T) {
 	if !strings.Contains(sub.Why, "id 0") {
 		t.Errorf("subuid why %q", sub.Why)
 	}
-	must(t, r, "snap.file_modified:/etc/passwd", model.SevBackdoor)
+	// passwd content the account comparison does not see (ageing, comments,
+	// a line it skips) is a note; duplicate names are their own finding.
+	must(t, r, "snap.file_modified:/etc/passwd", model.SevNote)
 
 	// A password change explains /etc/shadow's new content.
 	cur2 := clone(old)
@@ -1577,4 +1579,141 @@ func TestJudgeKernelCompanionsExplained(t *testing.T) {
 	cur2 := clone(old)
 	cur2.Packages.Installed = append(cur2.Packages.Installed, pkg("linux-cloud-tools-6.8.0-49", "6.8.0-49.49"))
 	must(t, run(cur2, snapOf(old), nil), "snap.pkg_installed:linux-cloud-tools-6.8.0-49", model.SevNote)
+}
+
+// R52: verification that could not run is one note, not a backdoor sign per
+// package; only a version no trusted source has is a backdoor sign.
+func TestJudgeUncheckedPackagesAreOneNote(t *testing.T) {
+	old := clean()
+	old.Packages.Installed = append(old.Packages.Installed,
+		pkg("openssh-server", "1:9.2p1-2+deb12u3", "/usr/sbin/sshd"), pkg("sudo", "1.9.13p3-1+deb12u1", "/usr/bin/sudo"))
+	old.Files = append(old.Files, file("/usr/sbin/sshd", "sshd", 0o755), file("/usr/bin/sudo", "sudo", 0o4755))
+	cur := clone(old)
+	setVersion(cur, "openssh-server", "1:9.2p1-2+deb12u4")
+	setVersion(cur, "sudo", "1.9.13p3-1+deb12u2")
+	setFile(cur, file("/usr/sbin/sshd", "sshd 2", 0o755))
+	setFile(cur, file("/usr/bin/sudo", "sudo 2", 0o4755))
+	timeout := `could not check the package: Get "https://deb.debian.org/debian/pool/main/o/openssh/x.deb": dial tcp 151.101.2.132:443: i/o timeout`
+	res := &pkgverify.Result{Mode: pkgverify.ModeArchive, Unverifiable: []pkgverify.FileVerdict{
+		{Path: "/usr/sbin/sshd", Package: "openssh-server", Version: "1:9.2p1-2+deb12u4", Reason: timeout},
+		{Path: "/usr/bin/sudo", Package: "sudo", Version: "1.9.13p3-1+deb12u2", Reason: "could not read the official archive index: 503 Service Unavailable"}}}
+
+	r := run(cur, snapOf(old), res)
+	for _, k := range []string{"snap.pkg_upgraded:openssh-server", "snap.pkg_upgraded:sudo", "pkg.unverifiable:/usr/bin/sudo", "snap.file_modified:/usr/sbin/sshd"} {
+		absent(t, r, k)
+	}
+	f := must(t, r, "pkg.unchecked_changes", model.SevNote)
+	if !strings.Contains(f.Title, "2 changed packages") || !hasEvidencePath(f, "/usr/sbin/sshd") || !hasEvidencePath(f, "/usr/bin/sudo") {
+		t.Errorf("unchecked note %q %+v", f.Title, f.Evidence)
+	}
+	if explained(r, "explained:openssh-server") != nil || explained(r, "explained:sudo") != nil {
+		t.Errorf("unchecked upgrades explained")
+	}
+	if !slices.ContainsFunc(r.CouldNotRuleOut, func(s string) bool { return strings.Contains(s, "i/o timeout") && strings.Contains(s, "503") }) {
+		t.Errorf("reasons not stated: %q", r.CouldNotRuleOut)
+	}
+	if r.ExitCode != 1 {
+		t.Errorf("exit %d (%v)", r.ExitCode, keys(r))
+	}
+
+	// A reference bundle that lacks the package could not check it; one
+	// whose builder found the version in no trusted source did.
+	res2 := &pkgverify.Result{Mode: pkgverify.ModeRefs, SourcesUsed: []string{"reference bundle /mnt/refs"}, Unverifiable: []pkgverify.FileVerdict{
+		{Path: "/usr/sbin/sshd", Package: "openssh-server", Reason: "package not in the reference bundle"},
+		{Path: "/usr/bin/sudo", Package: "sudo", Reason: "not in the reference bundle: " + pkgverify.ReasonNotOfficial}}}
+	r = run(cur, snapOf(old), res2)
+	absent(t, r, "snap.pkg_upgraded:openssh-server")
+	must(t, r, "snap.pkg_upgraded:sudo", model.SevBackdoor)
+	must(t, r, "pkg.unverifiable:/usr/bin/sudo", model.SevBackdoor)
+	u := must(t, r, "pkg.unchecked_changes", model.SevNote)
+	if !strings.Contains(u.Title, "1 changed package ") {
+		t.Errorf("title %q", u.Title)
+	}
+}
+
+// R53: gshadow changes that the group comparison explains are notes, unless
+// they give a group a password or a privileged group a member or admin.
+func TestJudgeGShadowChangesWithGroups(t *testing.T) {
+	base := func() *model.Collection {
+		c := clean()
+		for i := range c.Accounts.Groups {
+			c.Accounts.Groups[i].Shadow = &model.GroupShadow{}
+		}
+		c.Files = append(c.Files, file("/etc/gshadow", "gshadow", 0o640), file("/etc/group", "group", 0o644))
+		return c
+	}
+	old := base()
+	edit := func(f func(c *model.Collection)) *model.Report {
+		cur := clone(old)
+		f(cur)
+		setFile(cur, file("/etc/gshadow", "gshadow 2", 0o640))
+		setFile(cur, file("/etc/group", "group 2", 0o644))
+		return run(cur, snapOf(old), nil)
+	}
+
+	// adduser: a new group in both files.
+	r := edit(func(c *model.Collection) {
+		c.Accounts.Groups = append(c.Accounts.Groups, model.Group{Name: "alice", GID: 1000, Shadow: &model.GroupShadow{}})
+	})
+	must(t, r, "snap.file_modified:/etc/gshadow", model.SevNote)
+	absent(t, r, "snap.file_modified:/etc/group")
+
+	// A group password.
+	r = edit(func(c *model.Collection) { c.Accounts.Groups[2].Shadow.PasswordSet = true })
+	must(t, r, "snap.file_modified:/etc/gshadow", model.SevBackdoor)
+	g := must(t, r, "snap.group:staff", model.SevBackdoor)
+	if !strings.Contains(g.Fix, "gpasswd -r -- 'staff'") {
+		t.Errorf("fix %q", g.Fix)
+	}
+	// An administrator for a privileged group.
+	r = edit(func(c *model.Collection) { c.Accounts.Groups[1].Shadow.Admins = []string{"eve"} })
+	must(t, r, "snap.file_modified:/etc/gshadow", model.SevBackdoor)
+	must(t, r, "snap.group:sudo", model.SevBackdoor)
+
+	// gshadow changed with no group change to show for it.
+	cur := clone(old)
+	setFile(cur, file("/etc/gshadow", "gshadow 2", 0o640))
+	must(t, run(cur, snapOf(old), nil), "snap.file_modified:/etc/gshadow", model.SevBackdoor)
+
+	// shadow content with no password change seen (ageing): a note.
+	old2 := clean()
+	old2.Files = append(old2.Files, file("/etc/shadow", "root:$y$a:20000", 0o640))
+	cur2 := clone(old2)
+	setFile(cur2, file("/etc/shadow", "root:$y$a:20001", 0o640))
+	must(t, run(cur2, snapOf(old2), nil), "snap.file_modified:/etc/shadow", model.SevNote)
+}
+
+// R54: firmware and microcode updates rebuild the initramfs.
+func TestJudgeFirmwareRebuildsInitramfs(t *testing.T) {
+	for _, name := range []string{"firmware-misc-nonfree", "linux-firmware", "intel-microcode", "amd64-microcode"} {
+		old := clean()
+		old.Packages.Installed = append(old.Packages.Installed, pkg(name, "1"))
+		old.Files = append(old.Files, file("/boot/initrd.img-6.1.0-25-amd64", "initrd", 0o644))
+		cur := clone(old)
+		setVersion(cur, name, "2")
+		setFile(cur, file("/boot/initrd.img-6.1.0-25-amd64", "initrd 2", 0o644))
+		r := run(cur, snapOf(old), archive())
+		absent(t, r, "snap.file_modified:/boot/initrd.img-6.1.0-25-amd64")
+		if g := explained(r, "explained:"+name); g == nil || !hasEvidencePath(g, "/boot/initrd.img-6.1.0-25-amd64") {
+			t.Errorf("%s: initramfs not shown with it", name)
+		}
+	}
+}
+
+// R52: a new package raised for its own reasons keeps them in its value
+// even when its programs could not be checked.
+func TestJudgeUncheckedNewPackageKeepsItsReasons(t *testing.T) {
+	old := clean()
+	cur := clone(old)
+	cur.Packages.Installed = append(cur.Packages.Installed, pkg("helperpkg", "1.0-1", "/usr/bin/helper"))
+	cur.Files = append(cur.Files, file("/usr/bin/helper", "helper", 0o4755))
+	res := &pkgverify.Result{Mode: pkgverify.ModeArchive, Unverifiable: []pkgverify.FileVerdict{
+		{Path: "/usr/bin/helper", Package: "helperpkg", Version: "1.0-1", Reason: "could not check the package: connection refused"}}}
+	r := run(cur, snapOf(old), res)
+	f := must(t, r, "snap.pkg_installed:helperpkg", model.SevBackdoor)
+	if !strings.Contains(f.Evidence[0].After, "setuid/setgid program") {
+		t.Errorf("value %q", f.Evidence[0].After)
+	}
+	must(t, r, "pkg.unchecked_changes", model.SevNote)
+	absent(t, r, "pkg.unverifiable:/usr/bin/helper")
 }

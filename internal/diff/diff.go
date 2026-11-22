@@ -285,10 +285,26 @@ func compareAccounts(old, cur model.Accounts) []Change {
 	return append(out, compareGroups(old.Groups, cur.Groups)...)
 }
 
-func describeGroup(g model.Group) string {
-	m := append([]string(nil), g.Members...)
+// describeGroup summarises a group. The gshadow part is included only when
+// withShadow is set, which the comparison does only when both sides read
+// gshadow, so a scan that could not read it does not show every group as
+// changed.
+func describeGroup(g model.Group, withShadow bool) string {
+	s := fmt.Sprintf("gid %d members %s", g.GID, sortedJoin(g.Members))
+	if withShadow && g.Shadow != nil {
+		pw := "no password"
+		if g.Shadow.PasswordSet {
+			pw = "password set"
+		}
+		s += fmt.Sprintf(" gshadow %s admins %s members %s", pw, sortedJoin(g.Shadow.Admins), sortedJoin(g.Shadow.Members))
+	}
+	return s
+}
+
+func sortedJoin(ss []string) string {
+	m := append([]string(nil), ss...)
 	sort.Strings(m)
-	return fmt.Sprintf("gid %d members %s", g.GID, strings.Join(m, ","))
+	return strings.Join(m, ",")
 }
 
 func compareGroups(old, cur []model.Group) []Change {
@@ -301,16 +317,18 @@ func compareGroups(old, cur []model.Group) []Change {
 	for _, n := range cur {
 		seen[n.Name] = true
 		o, ok := om[n.Name]
-		switch {
-		case !ok:
-			out = append(out, Change{Kind: GroupChanged, Subject: n.Name, Before: absent, After: describeGroup(n)})
-		case describeGroup(o) != describeGroup(n):
-			out = append(out, Change{Kind: GroupChanged, Subject: n.Name, Before: describeGroup(o), After: describeGroup(n)})
+		if !ok {
+			out = append(out, Change{Kind: GroupChanged, Subject: n.Name, Before: absent, After: describeGroup(n, true)})
+			continue
+		}
+		both := o.Shadow != nil && n.Shadow != nil
+		if b, a := describeGroup(o, both), describeGroup(n, both); b != a {
+			out = append(out, Change{Kind: GroupChanged, Subject: n.Name, Before: b, After: a})
 		}
 	}
 	for _, o := range old {
 		if !seen[o.Name] {
-			out = append(out, Change{Kind: GroupChanged, Subject: o.Name, Before: describeGroup(o), After: absent})
+			out = append(out, Change{Kind: GroupChanged, Subject: o.Name, Before: describeGroup(o, true), After: absent})
 		}
 	}
 	return out

@@ -76,7 +76,9 @@ type judge struct {
 	pkgChange   map[string]diff.Change      // package name -> its change
 	pkgFinding  map[string]*model.Finding   // package name -> finding about its change
 	pkgReasons  map[string][]string         // new package -> what raised it
-	unverIn     map[string][]model.Evidence // changed package -> its programs no trusted source confirmed
+	unverIn     map[string][]model.Evidence // changed package -> its programs found in no trusted source
+	unchecked   map[string][]model.Evidence // changed package -> its programs that could not be checked
+	gshadowRisk bool                        // a group change gives a group a password or a privileged group a member or admin
 	unconfirmed map[string]bool             // changed package -> a changed file of it was not confirmed
 	listeners   []diff.Change
 	persistDone map[string]*model.Finding // persistence path -> its finding (nil: explained)
@@ -91,7 +93,7 @@ func newJudge(in Input, c *model.Collection) *judge {
 		verified: map[string]pkgverify.FileVerdict{}, pkgPath: map[string]*model.Finding{},
 		unverified: map[string]bool{}, unverReason: map[string]string{}, reported: map[string]bool{},
 		pkgChange: map[string]diff.Change{}, pkgFinding: map[string]*model.Finding{}, persistDone: map[string]*model.Finding{},
-		pkgReasons: map[string][]string{}, unverIn: map[string][]model.Evidence{}, unconfirmed: map[string]bool{},
+		pkgReasons: map[string][]string{}, unverIn: map[string][]model.Evidence{}, unchecked: map[string][]model.Evidence{}, unconfirmed: map[string]bool{},
 		acctChanged: map[string]bool{}, foldedMax: map[*model.Finding]model.Severity{},
 	}
 	if in.Snapshot != nil && in.Snapshot.Collection != nil {
@@ -138,9 +140,16 @@ func Judge(in Input) *model.Report {
 	j := newJudge(in, c)
 	checks := checklist.Evaluate(c, in.Context)
 	j.checklist(checks)
+	// Package and account changes are indexed first: how package
+	// verification results rank depends on which packages changed.
+	var chs []diff.Change
+	if j.old != nil {
+		chs = diff.Compare(in.Snapshot, c, checks)
+		j.index(chs)
+	}
 	j.packages()
 	if j.old != nil {
-		j.changes(diff.Compare(in.Snapshot, c, checks))
+		j.changes(chs)
 		j.finishPackages()
 	} else if in.Snapshot != nil {
 		j.skipped = append(j.skipped, model.Skip{Check: "snapshot", Reason: "the snapshot holds no collected data, so nothing was compared with it"})

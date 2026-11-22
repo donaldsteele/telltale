@@ -244,7 +244,16 @@ func (j *judge) unverifiable(vs []pkgverify.FileVerdict) {
 	n := 0
 	for _, v := range vs {
 		j.unverReason[v.Path] = v.Reason
-		if cat := j.specialCategory(v.Path); cat != "" {
+		owner := v.Package
+		if owner == "" {
+			owner = j.owned[v.Path]
+		}
+		// A special file of a package that changed since the snapshot and
+		// could not be checked at all goes with that package into the
+		// note on unchecked changes: a network failure during a kernel
+		// update must not raise one backdoor sign per module.
+		uncheckedChange := j.pkgChanged(owner) && !notInTrustedSource(v.Reason)
+		if cat := j.specialCategory(v.Path); cat != "" && !uncheckedChange {
 			j.pkgPath[v.Path] = j.add(&model.Finding{
 				Key: "pkg.unverifiable:" + v.Path, ID: "TT-PKG-003", Source: srcPackage, Severity: model.SevBackdoor,
 				Title: fmt.Sprintf("%s (a %s) could not be verified against its package", v.Path, cat),
@@ -282,7 +291,7 @@ func (j *judge) unverifiable(vs []pkgverify.FileVerdict) {
 		Key: "pkg.unverifiable", ID: "TT-PKG-003", Source: srcPackage, Severity: model.SevNote,
 		Title: fmt.Sprintf("%d package %s could not be verified", n, plural(n, "file", "files")),
 		Why: "These files belong to packages telltale could not check against a trusted copy, so a change to them would go unnoticed. " +
-			"None of them is a setuid program, kernel module, PAM module or boot file.",
+			"Setuid programs, kernel modules, PAM modules and boot files are reported on their own, unless their package changed since the snapshot and could not be checked at all.",
 		Fix:      "Run telltale fetch-refs on a machine with network access and scan again with --refs DIR; pass third-party repository keys with --keys DIR.",
 		Evidence: []model.Evidence{{After: fmt.Sprintf("%d %s", n, plural(n, "file", "files")), Detail: "grouped by reason below"}},
 	}

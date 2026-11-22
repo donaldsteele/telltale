@@ -137,3 +137,46 @@ func TestAccountsPasswordKnown(t *testing.T) {
 		}
 	}
 }
+
+func groupByName(a model.Accounts, name string) (model.Group, bool) {
+	for _, g := range a.Groups {
+		if g.Name == name {
+			return g, true
+		}
+	}
+	return model.Group{}, false
+}
+
+func TestAccountsGShadowReduced(t *testing.T) {
+	acc, _ := Accounts("testdata/root1", testKey)
+	staff, _ := groupByName(acc, "staff")
+	if staff.Shadow == nil || !staff.Shadow.PasswordSet || len(staff.Shadow.Admins) != 1 || staff.Shadow.Admins[0] != "bob" || len(staff.Shadow.Members) != 2 {
+		t.Fatalf("staff shadow = %+v", staff.Shadow)
+	}
+	sudo, _ := groupByName(acc, "sudo")
+	if sudo.Shadow == nil || sudo.Shadow.PasswordSet || len(sudo.Shadow.Members) != 1 {
+		t.Fatalf("sudo shadow = %+v", sudo.Shadow)
+	}
+	// A group with no gshadow line has no group password.
+	bob, _ := groupByName(acc, "bob")
+	if bob.Shadow == nil || bob.Shadow.PasswordSet {
+		t.Fatalf("bob shadow = %+v", bob.Shadow)
+	}
+	js, _ := json.Marshal(acc)
+	if strings.Contains(string(js), "groupsecrethash") {
+		t.Fatalf("group password hash kept")
+	}
+
+	// Without a readable gshadow, groups carry no shadow data.
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "etc/group"), []byte("sudo:x:27:alice\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	acc, _ = Accounts(dir, testKey)
+	if g, _ := groupByName(acc, "sudo"); g.Shadow != nil {
+		t.Fatalf("shadow without gshadow: %+v", g.Shadow)
+	}
+}

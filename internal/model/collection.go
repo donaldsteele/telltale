@@ -98,11 +98,22 @@ type PasswordState struct {
 	MaxDays    int    `json:"max_days"`
 }
 
-// Group is one group entry.
+// Group is one group entry. Shadow is its /etc/gshadow entry, nil when
+// gshadow was not read.
 type Group struct {
-	Name    string   `json:"name"`
-	GID     int      `json:"gid"`
-	Members []string `json:"members"`
+	Name    string       `json:"name"`
+	GID     int          `json:"gid"`
+	Members []string     `json:"members"`
+	Shadow  *GroupShadow `json:"shadow,omitempty"`
+}
+
+// GroupShadow is a group's /etc/gshadow entry without the password hash:
+// whether a usable group password is set, the group administrators and the
+// members listed there. A group with no gshadow line has the zero value.
+type GroupShadow struct {
+	PasswordSet bool     `json:"password_set"`
+	Admins      []string `json:"admins,omitempty"`
+	Members     []string `json:"members,omitempty"`
 }
 
 // Persistence location kinds (values of PersistFile.Kind).
