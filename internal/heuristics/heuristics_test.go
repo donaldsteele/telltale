@@ -422,3 +422,34 @@ func TestDiversionByMissingPackage(t *testing.T) {
 		t.Errorf("fix %q", got[0].Fix)
 	}
 }
+
+// A symlinked authorized_keys: Lines[0] is the link's target and line
+// numbers count the target's content; fixes edit the target, never the
+// link (sed -i would replace the link with a plain file).
+func TestHeuristicSymlinkedAuthorizedKeys(t *testing.T) {
+	c := &model.Collection{
+		Accounts: model.Accounts{Users: []model.User{{Name: "root", UID: 0, Home: "/root", Shell: "/bin/bash"}}},
+		Persist: []model.PersistFile{{Path: "/root/.ssh/authorized_keys", Kind: model.PersistKindAuthorizedKeys, Mode: 0o120777,
+			Lines: []string{"../../etc/ssh/keys/root", "ssh-ed25519 AAAAOWNER owner", `command="/bin/sh" ssh-ed25519 AAAAEVIL evil`}}},
+	}
+	fs := Run(c, model.ScanContext{}, nil)
+	byKey := map[string]model.Finding{}
+	for _, f := range fs {
+		byKey[f.Key] = f
+	}
+	rk, ok := byKey["heur.root_key:/root/.ssh/authorized_keys:1"]
+	if !ok || rk.Evidence[0].Line != 1 {
+		t.Fatalf("root key note: %+v (all %v)", rk, fs)
+	}
+	fc, ok := byKey["heur.forced_command:/root/.ssh/authorized_keys:2"]
+	if !ok {
+		t.Fatalf("forced command finding missing: %v", fs)
+	}
+	want := "mkdir -p /root/telltale-evidence && cp -a --parents '/root/.ssh/authorized_keys' '/etc/ssh/keys/root' /root/telltale-evidence/ && sed -i '2d' '/etc/ssh/keys/root'"
+	if !strings.HasPrefix(fc.Fix, want) {
+		t.Errorf("fix %q, want prefix %q", fc.Fix, want)
+	}
+	if _, bad := byKey["heur.root_key:/root/.ssh/authorized_keys:3"]; bad {
+		t.Errorf("line numbers still count the link target")
+	}
+}

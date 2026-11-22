@@ -307,7 +307,25 @@ func authorizedKeys(c *model.Collection, ctx model.ScanContext) []model.Finding 
 				isRoot = true
 			}
 		}
-		for i, l := range p.Lines {
+		// A symlinked keys file is recorded with the link's target as Lines[0]
+		// and the target's content after it. Line numbers count that content,
+		// and fixes edit the target: sed -i on the link would replace it with
+		// a plain file.
+		lines, link, target := p.Lines, false, ""
+		if p.Mode&0o170000 == 0o120000 {
+			if len(lines) == 0 {
+				continue
+			}
+			link = true
+			if t := strings.TrimSpace(lines[0]); !strings.HasPrefix(t, "<redacted") {
+				if !path.IsAbs(t) {
+					t = path.Join(path.Dir(p.Path), t)
+				}
+				target = path.Clean(t)
+			}
+			lines = lines[1:]
+		}
+		for i, l := range lines {
 			s := strings.TrimSpace(l)
 			if s == "" || strings.HasPrefix(s, "#") {
 				continue
@@ -316,18 +334,29 @@ func authorizedKeys(c *model.Collection, ctx model.ScanContext) []model.Finding 
 			if server != "" && blob == server {
 				continue
 			}
-			ev := []model.Evidence{{Path: p.Path, Line: i + 1, After: s}}
+			n := i + 1
+			ev := []model.Evidence{{Path: p.Path, Line: n, After: s}}
 			del := func(note string) string {
+				const several = "if you remove several lines from this file, start with the highest line number"
+				switch {
+				case link && target == "":
+					return fix([]string{p.Path}, func(q []string) string {
+						return fmt.Sprintf("%s   # %s, then remove line %d from the file this link points to; %s", keep(q[0]), note, n, several)
+					})
+				case link:
+					return fix([]string{p.Path, target}, func(q []string) string {
+						return fmt.Sprintf("%s && sed -i '%dd' %s   # %s; %s", keep(q[0], q[1]), n, q[1], note, several)
+					})
+				}
 				return fix([]string{p.Path}, func(q []string) string {
-					return fmt.Sprintf("%s && sed -i '%dd' %s   # %s; if you remove several lines from this file, start with the highest line number",
-						keep(q[0]), i+1, q[0], note)
+					return fmt.Sprintf("%s && sed -i '%dd' %s   # %s; %s", keep(q[0]), n, q[0], note, several)
 				})
 			}
-			key := fmt.Sprintf(":%s:%d", p.Path, i+1)
+			key := fmt.Sprintf(":%s:%d", p.Path, n)
 			if hasCommandOption(opts) {
 				out = append(out, model.Finding{
 					Key: "heur.forced_command" + key, ID: idForcedCmd, Source: source, Severity: model.SevBackdoor,
-					Title:    fmt.Sprintf("SSH key in %s line %d forces a command", p.Path, i+1),
+					Title:    fmt.Sprintf("SSH key in %s line %d forces a command", p.Path, n),
 					Why:      "A key with command= runs a fixed program when it logs in. Attackers use it to plant a hidden shell or to run code on every connection while looking like a normal key.",
 					Fix:      del("first confirm the key is not yours"),
 					Evidence: ev, Refs: []string{"T1098.004"},
@@ -337,7 +366,7 @@ func authorizedKeys(c *model.Collection, ctx model.ScanContext) []model.Finding 
 				// used, since new keys are then ranked from the diff.
 				out = append(out, model.Finding{
 					Key: "heur.root_key" + key, ID: idRootKey, Source: source, Severity: model.SevNote,
-					Title:    fmt.Sprintf("Root can log in over SSH with a key in %s line %d", p.Path, i+1),
+					Title:    fmt.Sprintf("Root can log in over SSH with a key in %s line %d", p.Path, n),
 					Why:      "Any key listed in root's authorized_keys gives its holder a root login. Make sure each one is yours.",
 					Fix:      del("only if you do not recognise the key"),
 					Evidence: ev, Refs: []string{"T1098.004"},
