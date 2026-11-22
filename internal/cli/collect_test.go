@@ -54,3 +54,26 @@ func TestCollectCommandBadContext(t *testing.T) {
 		t.Fatalf("code=%d out=%d err=%q", code, out.Len(), errb.String())
 	}
 }
+
+func TestCollectCommandRejectsBadContext(t *testing.T) {
+	big := `{"digest_key":"` + strings.Repeat("A", 100<<10) + `"}`
+	cases := map[string]string{
+		"oversized": big,
+		"short key": `{"digest_key":"AAECAwQFBgc="}`,
+	}
+	for name, in := range cases {
+		var out, errb bytes.Buffer
+		code := Run(collectArgs("--context-stdin"), strings.NewReader(in), &out, &errb)
+		if code != 3 || out.Len() != 0 || strings.Count(errb.String(), "\n") != 1 {
+			t.Errorf("%s: code=%d out=%d err=%q", name, code, out.Len(), errb.String())
+		}
+	}
+}
+
+func TestCollectCommand32ByteKey(t *testing.T) {
+	var out, errb bytes.Buffer
+	in := `{"digest_key":"` + strings.Repeat("A", 43) + `="}`
+	if code := Run(collectArgs("--context-stdin"), strings.NewReader(in), &out, &errb); code != 0 {
+		t.Fatalf("code=%d err=%q", code, errb.String())
+	}
+}

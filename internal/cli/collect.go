@@ -11,6 +11,11 @@ import (
 	"github.com/donaldsteele/telltale/internal/model"
 )
 
+const (
+	maxContextBytes = 64 << 10
+	minKeyBytes     = 16
+)
+
 func init() {
 	Register(Command{Name: "collect", Summary: "collect machine facts (internal)", Hidden: true, Run: runCollect})
 }
@@ -32,9 +37,19 @@ func runCollect(ctx *Context) int {
 	}
 	opt := collect.Options{Root: *root, ProcRoot: *procRoot, SysRoot: *sysRoot}
 	if *ctxStdin {
-		var sc model.ScanContext
-		if err := json.NewDecoder(ctx.Stdin).Decode(&sc); err != nil {
+		b, err := io.ReadAll(io.LimitReader(ctx.Stdin, maxContextBytes+1))
+		if err != nil {
 			return fail(fmt.Errorf("read scan context: %w", err))
+		}
+		if len(b) > maxContextBytes {
+			return fail(fmt.Errorf("scan context larger than %d bytes", maxContextBytes))
+		}
+		var sc model.ScanContext
+		if err := json.Unmarshal(b, &sc); err != nil {
+			return fail(fmt.Errorf("read scan context: %w", err))
+		}
+		if len(sc.DigestKey) < minKeyBytes {
+			return fail(fmt.Errorf("digest key too short: %d bytes, need at least %d", len(sc.DigestKey), minKeyBytes))
 		}
 		opt.DigestKey = sc.DigestKey
 	}
