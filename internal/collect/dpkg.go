@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"path"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/donaldsteele/telltale/internal/model"
@@ -71,6 +74,10 @@ func Packages(root string) (model.Packages, []model.Skip) {
 						cur.p.Conffiles = map[string]string{}
 					}
 					cur.p.Conffiles[f[0]] = f[1]
+					// Flags follow the hash: "obsolete", "remove-on-upgrade".
+					if slices.Contains(f[2:], "obsolete") {
+						cur.p.ObsoleteConffiles = append(cur.p.ObsoleteConffiles, f[0])
+					}
 				}
 			}
 			return
@@ -146,9 +153,76 @@ func Packages(root string) (model.Packages, []model.Skip) {
 		}
 		pk.Installed = append(pk.Installed, p)
 	}
+	pk.Diversions = diversions(root, skip)
+	pk.StatOverrides = statOverrides(root, skip)
 	var s2 []model.Skip
 	pk.Sources, s2 = aptSources(root)
 	return pk, append(skips, s2...)
+}
+
+// diversions reads /var/lib/dpkg/diversions: stanzas of three lines, the
+// original path, the path it is diverted to, and the diverting package or
+// ":" for a local diversion. Malformed stanzas are skipped and reported.
+func diversions(root string, skip func(string, ...any)) []model.Diversion {
+	const name = "/var/lib/dpkg/diversions"
+	var out []model.Diversion
+	var stanza []string
+	bad := 0
+	err := scanLines(root, name, maxDpkgList, func(l string) {
+		if stanza = append(stanza, l); len(stanza) < 3 {
+			return
+		}
+		d := model.Diversion{Path: stanza[0], DivertTo: stanza[1], Package: stanza[2]}
+		stanza = stanza[:0]
+		if !absPath(d.Path) || !absPath(d.DivertTo) || (d.Package != model.LocalDiversion && !safePkgToken(d.Package)) {
+			bad++
+			return
+		}
+		out = append(out, d)
+	})
+	if err != nil && !isNotExist(err) {
+		skip("%s: %v", name, err)
+	}
+	if len(stanza) > 0 {
+		bad++
+	}
+	if bad > 0 {
+		skip("%s: %d malformed diversions skipped", name, bad)
+	}
+	return out
+}
+
+// statOverrides reads /var/lib/dpkg/statoverride: "owner group mode path",
+// where the path may contain spaces.
+func statOverrides(root string, skip func(string, ...any)) []model.StatOverride {
+	const name = "/var/lib/dpkg/statoverride"
+	var out []model.StatOverride
+	bad := 0
+	err := scanLines(root, name, maxDpkgList, func(l string) {
+		f := strings.SplitN(l, " ", 4)
+		if len(f) != 4 {
+			bad++
+			return
+		}
+		mode, err := strconv.ParseUint(f[2], 8, 32)
+		if err != nil || mode > 0o7777 || !absPath(f[3]) || f[0] == "" || f[1] == "" {
+			bad++
+			return
+		}
+		out = append(out, model.StatOverride{Path: f[3], Owner: f[0], Group: f[1], Mode: uint32(mode)})
+	})
+	if err != nil && !isNotExist(err) {
+		skip("%s: %v", name, err)
+	}
+	if bad > 0 {
+		skip("%s: %d malformed entries skipped", name, bad)
+	}
+	return out
+}
+
+// absPath accepts a clean absolute path.
+func absPath(p string) bool {
+	return len(p) > 1 && p[0] == '/' && path.Clean(p) == p && !strings.ContainsRune(p, 0)
 }
 
 // safePkgToken accepts only [a-z0-9][a-z0-9+.-]* with no "..".

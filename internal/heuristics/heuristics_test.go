@@ -343,3 +343,32 @@ func TestPersistLinkFixRemovesDanglingLink(t *testing.T) {
 		t.Errorf("link not saved: %v", err)
 	}
 }
+
+func TestLocalDiversion(t *testing.T) {
+	c := &model.Collection{Packages: model.Packages{Diversions: []model.Diversion{
+		{Path: "/usr/bin/sudo", DivertTo: "/usr/bin/sudo.real", Package: ":"},
+		{Path: "/bin/sh", DivertTo: "/bin/sh.distrib", Package: "dash"},
+		{Path: "/opt/app/bin/x", DivertTo: "/opt/app/bin/x.orig", Package: ":"},
+		{Path: "/usr/bin/it's", DivertTo: "/usr/bin/it's.real", Package: ":"},
+	}}}
+	got := map[string]model.Finding{}
+	for _, f := range Run(c, model.ScanContext{}, nil) {
+		if strings.HasPrefix(f.Key, "heur.local_diversion:") {
+			got[f.Key] = f
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("findings %v, want the two local diversions of system files", got)
+	}
+	f := got["heur.local_diversion:/usr/bin/sudo"]
+	if f.Severity != model.SevBackdoor || f.ID != "TT-HEUR-014" || !strings.Contains(f.Evidence[0].Detail, "/usr/bin/sudo.real") {
+		t.Errorf("finding %+v", f)
+	}
+	want := "mkdir -p /root/telltale-evidence && cp -a --parents '/usr/bin/sudo' /root/telltale-evidence/"
+	if !strings.HasPrefix(f.Fix, want) || !strings.Contains(f.Fix, "dpkg-divert --local --rename --remove '/usr/bin/sudo'") {
+		t.Errorf("fix %q", f.Fix)
+	}
+	if q := got["heur.local_diversion:/usr/bin/it's"].Fix; !strings.Contains(q, `'/usr/bin/it'\''s'`) {
+		t.Errorf("fix not quoted: %q", q)
+	}
+}

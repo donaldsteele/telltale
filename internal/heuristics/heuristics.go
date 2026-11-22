@@ -31,6 +31,7 @@ const (
 	idListener     = "TT-HEUR-011"
 	idCrossView    = "TT-HEUR-012"
 	idPersistLink  = "TT-HEUR-013"
+	idDiversion    = "TT-HEUR-014"
 	evidenceDir    = "/root/telltale-evidence"
 	saveEvidence   = "mkdir -p " + evidenceDir
 	flagImmutable  = 0x10
@@ -50,6 +51,7 @@ func Run(c *model.Collection, ctx model.ScanContext, owned map[string]string) []
 	out = append(out, listeners(c, ctx, owned)...)
 	out = append(out, crossView(c)...)
 	out = append(out, persistLinks(c)...)
+	out = append(out, localDiversions(c)...)
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out
 }
@@ -527,6 +529,43 @@ func persistLinks(c *model.Collection) []model.Finding {
 				return keep(q[0]) + " && { cp -a --parents " + q[1] + " " + evidenceDir + "/ 2>/dev/null || echo 'link target not saved (missing or unreadable)'; } && rm " + q[0] + "   # inspect the saved copies first; rm only runs once the link itself is saved"
 			}),
 			Evidence: ev, Refs: []string{"T1543.002", "T1053.003"},
+		})
+	}
+	return out
+}
+
+// diversionDirs are the system trees where a local diversion is suspicious.
+var diversionDirs = []string{"/bin/", "/sbin/", "/usr/", "/lib/", "/lib32/", "/lib64/", "/libx32/", "/etc/", "/boot/"}
+
+// localDiversions flags dpkg-divert --local entries for system files: every
+// package's version of the file is installed elsewhere, so whatever sits at
+// the original path is never replaced by updates or checked against a
+// package.
+func localDiversions(c *model.Collection) []model.Finding {
+	var out []model.Finding
+	for _, d := range c.Packages.Diversions {
+		if d.Package != model.LocalDiversion {
+			continue
+		}
+		system := false
+		for _, dir := range diversionDirs {
+			if strings.HasPrefix(d.Path, dir) {
+				system = true
+				break
+			}
+		}
+		if !system {
+			continue
+		}
+		out = append(out, model.Finding{
+			Key: "heur.local_diversion:" + d.Path, ID: idDiversion, Source: source, Severity: model.SevBackdoor,
+			Title: fmt.Sprintf("%s is locally diverted to %s", d.Path, d.DivertTo),
+			Why:   "A local dpkg diversion makes every package install its version of this file under another name, so the file at the original path is never replaced by updates and is not the packaged one. Image builders use it (Ubuntu's minimised images divert /usr/bin/man); an attacker can use it to keep a replaced system program in place.",
+			Fix: fix([]string{d.Path, d.DivertTo}, func(q []string) string {
+				return keep(q[0]) + " && { cp -a --parents " + q[1] + " " + evidenceDir + "/ 2>/dev/null || echo 'diverted file not saved (missing or unreadable)'; } && rm " + q[0] + " && dpkg-divert --local --rename --remove " + q[0] + "   # puts the packaged file back; inspect the saved copies first"
+			}),
+			Evidence: []model.Evidence{{Path: d.Path, Detail: "local diversion to " + d.DivertTo}},
+			Refs:     []string{"T1574", "T1036.005"},
 		})
 	}
 	return out

@@ -192,19 +192,49 @@ type Mount struct {
 type Packages struct {
 	Installed []Package   `json:"installed"`
 	Sources   []AptSource `json:"sources"`
+	// Diversions come from /var/lib/dpkg/diversions.
+	Diversions []Diversion `json:"diversions,omitempty"`
+	// StatOverrides come from /var/lib/dpkg/statoverride.
+	StatOverrides []StatOverride `json:"stat_overrides,omitempty"`
 }
 
 // Package is one installed dpkg package.
 // Conffiles: path -> md5 from dpkg status.
 // LocalMD5: path -> md5 from /var/lib/dpkg/info (untrusted).
+// ObsoleteConffiles: conffiles dpkg status marks obsolete, still on disk
+// but no longer shipped by the installed version.
 type Package struct {
-	Name      string            `json:"name"`
-	Version   string            `json:"version"`
-	Arch      string            `json:"arch"`
-	Status    string            `json:"status"`
-	Files     []string          `json:"files"`
-	Conffiles map[string]string `json:"conffiles,omitempty"`
-	LocalMD5  map[string]string `json:"local_md5,omitempty"`
+	Name              string            `json:"name"`
+	Version           string            `json:"version"`
+	Arch              string            `json:"arch"`
+	Status            string            `json:"status"`
+	Files             []string          `json:"files"`
+	Conffiles         map[string]string `json:"conffiles,omitempty"`
+	LocalMD5          map[string]string `json:"local_md5,omitempty"`
+	ObsoleteConffiles []string          `json:"obsolete_conffiles,omitempty"`
+}
+
+// LocalDiversion is the Diversion.Package of a diversion an administrator
+// made with dpkg-divert --local.
+const LocalDiversion = ":"
+
+// Diversion is one dpkg-divert entry: every package except Package installs
+// its file Path at DivertTo instead. Package is LocalDiversion when the
+// diversion applies to every package.
+type Diversion struct {
+	Path     string `json:"path"`
+	DivertTo string `json:"divert_to"`
+	Package  string `json:"package"`
+}
+
+// StatOverride is one dpkg-statoverride entry: dpkg gives Path this owner,
+// group and mode instead of the package's. Owner and Group are names or
+// "#<id>".
+type StatOverride struct {
+	Path  string `json:"path"`
+	Owner string `json:"owner"`
+	Group string `json:"group"`
+	Mode  uint32 `json:"mode"`
 }
 
 // AptSource is one apt source entry.

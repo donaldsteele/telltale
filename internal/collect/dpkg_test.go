@@ -152,3 +152,58 @@ func TestDpkgHostileNameNotTraversed(t *testing.T) {
 		t.Errorf("no skip naming package: %v", skips)
 	}
 }
+
+func TestDpkgObsoleteConffiles(t *testing.T) {
+	pk, _ := Packages(dpkgRoot(t))
+	for _, p := range pk.Installed {
+		if p.Name == "libc6" {
+			if !reflect.DeepEqual(p.ObsoleteConffiles, []string{"/etc/rpc"}) {
+				t.Fatalf("ObsoleteConffiles = %q", p.ObsoleteConffiles)
+			}
+			return
+		}
+	}
+	t.Fatal("libc6 missing")
+}
+
+func TestDpkgDiversionsAndStatOverrides(t *testing.T) {
+	root := dpkgRoot(t)
+	writeTree(t, root, map[string]string{
+		// Stanzas of three lines: original path, diverted-to path, the
+		// diverting package or ":" for a local diversion.
+		"var/lib/dpkg/diversions": "/usr/bin/man\n/usr/bin/man.REAL\n:\n/bin/sh\n/bin/sh.distrib\ndash\n" +
+			"relative/path\n/x\n:\n/ok\n/ok.d\n../../evil\n/truncated\n",
+		"var/lib/dpkg/statoverride": "root crontab 2755 /usr/bin/crontab\nroot root 4755 /usr/lib/a path with spaces\n" +
+			"root root 99999 /bad/mode\nroot root 0644\n#1000 grp 0640 /etc/x\n",
+	})
+	pk, skips := Packages(root)
+	wantDiv := []model.Diversion{
+		{Path: "/usr/bin/man", DivertTo: "/usr/bin/man.REAL", Package: ":"},
+		{Path: "/bin/sh", DivertTo: "/bin/sh.distrib", Package: "dash"},
+	}
+	if !reflect.DeepEqual(pk.Diversions, wantDiv) {
+		t.Errorf("Diversions = %+v", pk.Diversions)
+	}
+	wantSO := []model.StatOverride{
+		{Path: "/usr/bin/crontab", Owner: "root", Group: "crontab", Mode: 0o2755},
+		{Path: "/usr/lib/a path with spaces", Owner: "root", Group: "root", Mode: 0o4755},
+		{Path: "/etc/x", Owner: "#1000", Group: "grp", Mode: 0o640},
+	}
+	if !reflect.DeepEqual(pk.StatOverrides, wantSO) {
+		t.Errorf("StatOverrides = %+v", pk.StatOverrides)
+	}
+	var reasons []string
+	for _, s := range skips {
+		reasons = append(reasons, s.Reason)
+	}
+	if !strings.Contains(strings.Join(reasons, "\n"), "diversions") {
+		t.Errorf("malformed diversions not reported: %q", reasons)
+	}
+}
+
+func TestDpkgNoDiversionFiles(t *testing.T) {
+	pk, skips := Packages(dpkgRoot(t))
+	if pk.Diversions != nil || pk.StatOverrides != nil || len(skips) != 0 {
+		t.Errorf("diversions %v, overrides %v, skips %v", pk.Diversions, pk.StatOverrides, skips)
+	}
+}
