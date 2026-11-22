@@ -114,24 +114,50 @@ func (p *fieldParser) intField() (uint64, bool) {
 }
 
 // intFieldMaybeNull is INT_FIELD_MAYBE_NULL: the field may be empty (def),
-// but the line may not end before it.
+// but the line may not end before it. Values are stored through an int,
+// as glibc does for the shadow fields.
 func (p *fieldParser) intFieldMaybeNull(def int64, last bool) (int64, bool) {
+	v, present, ok := p.rawFieldMaybeNull(last)
+	if !present {
+		return def, ok
+	}
+	return int64(int32(v)), ok
+}
+
+// rawFieldMaybeNull is INT_FIELD_MAYBE_NULL without the conversion.
+func (p *fieldParser) rawFieldMaybeNull(last bool) (v uint64, present, ok bool) {
 	if p.atEnd() {
-		return 0, false
+		return 0, false, false
 	}
 	v, n := strtoul(p.s[p.pos:])
-	val := int64(int32(v)) // glibc stores these through an int
-	if n == 0 {
-		val = def
-	}
 	p.pos += n
 	if !p.atEnd() {
 		if last || p.s[p.pos] != ':' {
-			return 0, false
+			return 0, false, false
 		}
 		p.pos++
 	}
-	return val, true
+	return v, n > 0, true
+}
+
+// maxID is the first id glibc refuses: (uid_t)-1 and anything that does
+// not fit in 32 bits make it drop the line.
+const maxID = 1<<32 - 1
+
+// idField reads a user or group id: required (INT_FIELD) or, for the NIS
+// compatibility entries, possibly empty; out of range rejects the line.
+func (p *fieldParser) idField(nis bool) (int, bool) {
+	var v uint64
+	ok := false
+	if nis {
+		v, _, ok = p.rawFieldMaybeNull(false)
+	} else {
+		v, ok = p.intField()
+	}
+	if !ok || v >= maxID {
+		return 0, false
+	}
+	return int(v), true
 }
 
 // list is parse_list: comma-separated names up to term (or the end), each
@@ -176,23 +202,12 @@ func parsePasswd(line string) (pwLine, bool) {
 		return r, true
 	}
 	r.passwd = p.stringField()
-	if nisName(r.name) {
-		uid, ok1 := p.intFieldMaybeNull(0, false)
-		gid, ok2 := p.intFieldMaybeNull(0, false)
-		if !ok1 || !ok2 {
-			return r, false
-		}
-		r.uid, r.gid = int(uint32(uid)), int(uint32(gid))
-	} else {
-		uid, ok1 := p.intField()
-		if !ok1 {
-			return r, false
-		}
-		gid, ok2 := p.intField()
-		if !ok2 {
-			return r, false
-		}
-		r.uid, r.gid = int(uint32(uid)), int(uint32(gid))
+	var ok bool
+	if r.uid, ok = p.idField(nisName(r.name)); !ok {
+		return r, false
+	}
+	if r.gid, ok = p.idField(nisName(r.name)); !ok {
+		return r, false
 	}
 	r.gecos = p.stringField()
 	r.home = p.stringField()
@@ -260,18 +275,9 @@ func parseGroup(line string) (grLine, bool) {
 		return r, true
 	}
 	p.stringField() // password
-	if nisName(r.name) {
-		gid, ok := p.intFieldMaybeNull(0, false)
-		if !ok {
-			return r, false
-		}
-		r.gid = int(uint32(gid))
-	} else {
-		gid, ok := p.intField()
-		if !ok {
-			return r, false
-		}
-		r.gid = int(uint32(gid))
+	var ok bool
+	if r.gid, ok = p.idField(nisName(r.name)); !ok {
+		return r, false
 	}
 	r.members = p.list(0)
 	return r, true
@@ -328,6 +334,12 @@ func (d *accountDB) first(name string) bool {
 	return false
 }
 
-func (d *accountDB) malformed(n int) {
-	d.acc.malformed = append(d.acc.malformed, d.file+":"+strconv.Itoa(n))
+// malformed records a line glibc rejects, or one it uses that names no
+// account (note says what it claims; never a hash).
+func (d *accountDB) malformed(n int, note string) {
+	e := d.file + ":" + strconv.Itoa(n)
+	if note != "" {
+		e += " (" + note + ")"
+	}
+	d.acc.malformed = append(d.acc.malformed, e)
 }

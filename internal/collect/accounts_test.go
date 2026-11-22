@@ -252,3 +252,41 @@ func TestAccountsReadLikeGlibc(t *testing.T) {
 		t.Errorf("clean files: duplicates %v malformed %v", before.Duplicates, before.Malformed)
 	}
 }
+
+// Empty-name lines are used by glibc (getpwuid(0) returns an empty-name uid
+// 0 line placed first; initgroups honours ":x:27:eve"), so they are
+// reported as malformed with what they claim. Lines whose ids are -1 or
+// 2^32 and above are dropped by glibc, so a later line for the same name
+// counts; they are dropped here too and reported.
+func TestAccountsEmptyNamesAndOutOfRangeIDs(t *testing.T) {
+	acc, _ := Accounts(accountsRoot(t,
+		":x:0:0::/tmp/x:/tmp/x/sh\nroot:x:0:0:root:/root:/bin/bash\nalice:x:4294968296:1000::/home/alice:/bin/bash\nalice:x:0:0::/home/alice:/bin/bash\nbig:x:4294967295:0::/:/bin/sh\nneg:x:-1:0::/:/bin/sh\n",
+		":$6$x:20000:0:99999:7:::\nroot:$y$r:20000:0:99999:7:::\n",
+		"root:x:0:\nsudo:x:27:alice\n:x:27:eve\n",
+		"sudo:!::alice\n:$6$grouphash::eve\n"), testKey)
+	for _, want := range []string{
+		"/etc/passwd:1 (empty name, uid 0)",
+		"/etc/passwd:3",
+		"/etc/passwd:5",
+		"/etc/passwd:6",
+		"/etc/shadow:1 (empty name)",
+		"/etc/group:3 (empty name, gid 27, members eve)",
+		"/etc/gshadow:2 (empty name)",
+	} {
+		if !slices.Contains(acc.Malformed, want) {
+			t.Errorf("malformed %q lack %q", acc.Malformed, want)
+		}
+	}
+	if alice, ok := userByName(acc, "alice"); !ok || alice.UID != 0 {
+		t.Errorf("alice = %+v (glibc resolves alice to uid 0)", alice)
+	}
+	for _, name := range []string{"big", "neg"} {
+		if _, ok := userByName(acc, name); ok {
+			t.Errorf("%s kept although glibc drops its line", name)
+		}
+	}
+	js, _ := json.Marshal(acc)
+	if strings.Contains(string(js), "grouphash") || strings.Contains(string(js), "$6$x") {
+		t.Errorf("a hash was kept")
+	}
+}

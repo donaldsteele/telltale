@@ -1,6 +1,7 @@
 package collect
 
 import (
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,8 +32,10 @@ func Accounts(root string, key []byte) (model.Accounts, []model.Skip) {
 			s, ok := parseShadow(l.text)
 			switch {
 			case !ok:
-				db.malformed(l.n)
-			case s.name != "" && db.first(s.name):
+				db.malformed(l.n, "")
+			case s.name == "":
+				db.malformed(l.n, "empty name")
+			case db.first(s.name):
 				shadow[s.name] = s
 			}
 		}
@@ -47,11 +50,16 @@ func Accounts(root string, key []byte) (model.Accounts, []model.Skip) {
 	db := newAccountDB("/etc/passwd", &rep)
 	for _, l := range nssLines(pw) {
 		f, ok := parsePasswd(l.text)
-		if !ok {
-			db.malformed(l.n)
+		switch {
+		case !ok:
+			db.malformed(l.n, "")
 			continue
-		}
-		if f.name == "" || !db.first(f.name) {
+		case f.name == "":
+			// glibc uses it: an empty-name uid 0 line placed first is what
+			// getpwuid(0) returns.
+			db.malformed(l.n, fmt.Sprintf("empty name, uid %d", f.uid))
+			continue
+		case !db.first(f.name):
 			continue
 		}
 		u := model.User{Name: f.name, UID: f.uid, GID: f.gid, Home: f.home, Shell: f.shell}
@@ -75,7 +83,11 @@ func Accounts(root string, key []byte) (model.Accounts, []model.Skip) {
 		db := newAccountDB("/etc/gshadow", &rep)
 		for _, l := range nssLines(gs) {
 			s, _ := parseGShadow(l.text)
-			if s.name == "" || !db.first(s.name) {
+			if s.name == "" {
+				db.malformed(l.n, "empty name")
+				continue
+			}
+			if !db.first(s.name) {
 				continue
 			}
 			set := s.passwd != "" && !strings.HasPrefix(s.passwd, "!") && !strings.HasPrefix(s.passwd, "*")
@@ -92,11 +104,19 @@ func Accounts(root string, key []byte) (model.Accounts, []model.Skip) {
 	db = newAccountDB("/etc/group", &rep)
 	for _, l := range nssLines(gr) {
 		f, ok := parseGroup(l.text)
-		if !ok {
-			db.malformed(l.n)
+		switch {
+		case !ok:
+			db.malformed(l.n, "")
 			continue
-		}
-		if f.name == "" || !db.first(f.name) {
+		case f.name == "":
+			// initgroups honours its members.
+			note := fmt.Sprintf("empty name, gid %d", f.gid)
+			if len(f.members) > 0 {
+				note += ", members " + strings.Join(f.members, ",")
+			}
+			db.malformed(l.n, note)
+			continue
+		case !db.first(f.name):
 			continue
 		}
 		g := model.Group{Name: f.name, GID: f.gid, Members: f.members}
