@@ -1,0 +1,5 @@
+telltale: web01 (Debian 12, amd64)   2026-11-22 14:05
+Compared against: snapshot of 2026-11-02, Debian packages, checklist (74 items)
+Could not rule out: kernel-level rootkits (any on-machine check can be fooled)
+
+No findings.

@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>telltale report: {{esc .Host.Hostname}}</title>
+<style>
+:root{--bg:#fafafa;--fg:#1b1f23;--dim:#5b6570;--card:#fff;--line:#d8dde3;--tampering:#b00020;--backdoor:#c2410c;--weak:#8a6100;--note:#0b6a80;--explained:#4b5563;--code:#eef1f4}
+@media (prefers-color-scheme: dark){:root{--bg:#14171a;--fg:#e6e9ec;--dim:#98a2ad;--card:#1d2125;--line:#323a42;--tampering:#ff6b7f;--backdoor:#ff9a62;--weak:#e8c15a;--note:#5fc7dd;--explained:#9aa5b1;--code:#262c32}}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:60rem;margin:0 auto}
+h1{font-size:1.3rem;margin:0 0 .25rem}
+.meta{color:var(--dim);margin:0 0 1rem}
+.meta p{margin:.15rem 0}
+.finding,.panel{background:var(--card);border:1px solid var(--line);border-left-width:6px;border-radius:6px;padding:.75rem 1rem;margin:.75rem 0}
+.finding.tampering{border-left-color:var(--tampering)}.finding.backdoor{border-left-color:var(--backdoor)}.finding.weak{border-left-color:var(--weak)}.finding.note{border-left-color:var(--note)}
+.badge{display:inline-block;font-weight:700;font-size:.8rem;letter-spacing:.04em;margin-right:.5rem}
+.tampering .badge{color:var(--tampering)}.backdoor .badge{color:var(--backdoor)}.weak .badge{color:var(--weak)}.note .badge{color:var(--note)}
+.title{font-weight:600}
+code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9rem;overflow-wrap:anywhere}
+.ev{margin:.4rem 0 0;padding-left:.75rem;border-left:2px solid var(--line)}
+.ev div{margin:.1rem 0}
+.dim{color:var(--dim)}
+pre{background:var(--code);padding:.5rem .75rem;border-radius:4px;overflow-x:auto;margin:.4rem 0 0;white-space:pre-wrap;overflow-wrap:anywhere}
+details{margin:.5rem 0}
+summary{cursor:pointer}
+h2{font-size:1.05rem;margin:1.5rem 0 .25rem}
+</style>
+</head>
+<body>
+<main>
+<h1>telltale: {{esc .Host.Hostname}} ({{esc .Host.OSPretty}}, {{esc .Host.Arch}})</h1>
+<div class="meta">
+{{- if not .Time.IsZero}}<p>{{time .}}</p>{{end}}
+{{- if .ComparedAgainst}}<p><strong>Compared against:</strong> {{joined .ComparedAgainst}}</p>{{end}}
+{{- if .CouldNotRuleOut}}<p><strong>Could not rule out:</strong></p><ul>{{range .CouldNotRuleOut}}<li>{{esc .}}</li>{{end}}</ul>{{end}}
+</div>
+{{if not .Findings}}<div class="panel">No findings.</div>{{end}}
+{{range .Findings}}
+<section class="finding {{class .Severity}}">
+<div><span class="badge">{{label .Severity}}</span><span class="title">{{esc .Title}}</span></div>
+{{range .Evidence}}<div class="ev">
+{{- with where .}}<div class="mono">{{.}}</div>{{end}}
+{{- if or .Before .After}}<div class="mono">{{if .Before}}{{esc .Before}}{{end}}{{if and .Before .After}} &rarr; {{else if .After}}&rarr; {{end}}{{if .After}}{{esc .After}}{{end}}{{if not .After}} &rarr; (gone){{end}}</div>{{end}}
+{{- if .When}}<div class="dim">changed {{when .}}</div>{{end}}
+{{- if .Detail}}<div class="dim">{{esc .Detail}}</div>{{end}}
+</div>{{end}}
+{{if .Why}}<p><strong>Why:</strong> {{esc .Why}}</p>{{end}}
+{{if .Fix}}<p><strong>Fix:</strong></p><pre>{{esc .Fix}}</pre>{{end}}
+</section>
+{{end}}
+{{if .Explained}}
+<h2>Explained</h2>
+<p class="dim">{{len .Explained}} {{if eq (len .Explained) 1}}group{{else}}groups{{end}} of changes explained by their packages:
+{{range $i, $g := .Explained}}{{if $i}}, {{end}}{{name $g.Key}}{{end}}</p>
+{{range .Explained}}<details><summary>{{esc .Title}}</summary>
+{{if .Why}}<p class="dim">{{esc .Why}}</p>{{end}}
+<div class="ev">{{range .Evidence}}{{with where .}}<div class="mono">{{.}}</div>{{else}}{{if .Detail}}<div class="dim">{{esc .Detail}}</div>{{end}}{{end}}{{end}}</div>
+</details>{{end}}
+{{end}}
+{{if .Exceptions}}
+<h2>Exceptions in force</h2>
+<div class="panel"><ul>{{range .Exceptions}}<li><code>{{esc .FindingKey}}</code> = <code>{{esc .AcceptedValue}}</code>{{if .Note}} ({{esc .Note}}){{end}}, accepted {{day .}}</li>{{end}}</ul></div>
+{{end}}
+{{if .Skipped}}
+<h2>Skipped checks</h2>
+<div class="panel"><ul>{{range .Skipped}}<li><code>{{esc .Check}}</code>: {{esc .Reason}}</li>{{end}}</ul></div>
+{{end}}
+</main>
+</body>
+</html>

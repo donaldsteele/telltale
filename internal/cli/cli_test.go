@@ -53,7 +53,7 @@ func TestHelpListsVisibleCommandsOnly(t *testing.T) {
 }
 
 func TestStubExit3(t *testing.T) {
-	code, _, errs := run("scan")
+	code, _, errs := run("server")
 	if code != 3 || !strings.Contains(errs, "not implemented yet") {
 		t.Fatalf("code=%d err=%q", code, errs)
 	}

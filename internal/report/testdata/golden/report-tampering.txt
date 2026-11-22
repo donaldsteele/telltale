@@ -1,0 +1,33 @@
+telltale: web01 (Debian 12, amd64)   2026-11-22 14:05
+Compared against: snapshot of 2026-11-02, Debian packages, checklist (74 items)
+Could not rule out: kernel-level rootkits (any on-machine check can be fooled)
+
+TAMPERING   SSH root login was turned back on   sshd_config:32
+            PermitRootLogin no  ->  PermitRootLogin yes   changed 2026-11-21 03:12
+            Why: an attacker who has the root password can now log in directly.
+            Fix: sed -i 's/^PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config && systemctl reload ssh
+
+BACKDOOR    New SSH key for root, not in the snapshot   /root/.ssh/authorized_keys:3
+            -> ssh-ed25519 AAAA... mallory   changed 2026-11-21 03:10
+            Why: whoever holds this key can log in as root without a password.
+            Fix: sed -i '3d' /root/.ssh/authorized_keys
+
+WEAK        Default umask is permissive   /etc/login.defs:151
+            UMASK 022  ->  UMASK 022
+            Why: new files are readable by every user.
+            Fix: echo 'UMASK 027' >> /etc/login.defs
+
+NOTE        The machine's clock is out of date
+            Why: package verification took its time from the signed indexes.
+
+EXPLAINED   1 group of changes explained by their packages (openssl)
+            - openssl upgraded from 3.0.14 to 3.0.15; 2 files changed with it
+                upgraded
+                /usr/bin/openssl
+                /usr/lib/x86_64-linux-gnu/libssl.so.3
+
+Exceptions in force (accepted by the owner):
+  check:umask = UMASK 022   (intentional)   accepted 2026-11-10
+
+Skipped checks:
+  firewall: needs root
