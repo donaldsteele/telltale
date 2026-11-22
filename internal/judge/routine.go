@@ -1,6 +1,8 @@
 package judge
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"path"
 	"regexp"
@@ -424,7 +426,7 @@ func (j *judge) finishPackages() {
 			f.Evidence[0].After = strings.Join(append([]string{ch.Pkg.New}, reasons...), "; ")
 		}
 	}
-	j.uncheckedNote(unchecked)
+	j.uncheckedPkgs = unchecked
 }
 
 func unverifiedWhy(unver []model.Evidence) string {
@@ -435,24 +437,33 @@ func unverifiedWhy(unver []model.Evidence) string {
 	return why + ". A package \"update\" from an unofficial source is a way to slip in replaced programs, so they count as unexplained."
 }
 
-// uncheckedNote lists, in one note, the changed packages whose changed
-// programs could not be checked because a package source could not be read
-// or used. Not being able to check is not evidence of tampering, so a
-// network failure must not raise a backdoor sign per package; the reasons
-// go into what the report could not rule out.
-func (j *judge) uncheckedNote(names []string) {
-	if len(names) == 0 {
-		return
-	}
-	n := len(names)
-	f := &model.Finding{
-		Key: "pkg.unchecked_changes", ID: "TT-PKG-007", Source: srcPackage, Severity: model.SevNote,
-		Title: fmt.Sprintf("%d changed %s could not be checked against a trusted source", n, plural(n, "package", "packages")),
-		Fix:   "Scan again when the package archive can be reached, or run telltale fetch-refs on a machine with network access and scan with --refs DIR.",
-	}
-	var ids, reasons []string
+// uncheckedNote lists, in one note, the package files that could not be
+// checked because a package source could not be read or used: the changed
+// programs of packages that changed since the snapshot, and setuid
+// programs, kernel modules, PAM modules and boot files, with or without a
+// snapshot. Not being able to check is not evidence of tampering, so a
+// network failure must not raise a backdoor sign per file or package; the
+// reasons go into what the report could not rule out.
+func (j *judge) uncheckedNote() {
 	var items []model.Evidence
-	for _, name := range names {
+	var ids, reasons, paths []string
+	listed := map[string]bool{}
+	unreachable := true
+	add := func(e model.Evidence) {
+		items = append(items, e)
+		if e.Path == "" || listed[e.Path] {
+			return
+		}
+		listed[e.Path] = true
+		paths = append(paths, e.Path)
+		if r := j.unverReason[e.Path]; r != "" && !slices.Contains(reasons, r) {
+			reasons = append(reasons, r)
+		}
+		if j.unverKind[e.Path] != pkgverify.KindUnreachable {
+			unreachable = false
+		}
+	}
+	for _, name := range j.uncheckedPkgs {
 		ch := j.pkgChange[name]
 		ev := model.Evidence{Detail: name + ": " + strings.TrimPrefix(ch.Kind, "pkg_"), When: j.listWhen(name)}
 		if ch.Pkg != nil {
@@ -461,27 +472,47 @@ func (j *judge) uncheckedNote(names []string) {
 		}
 		items = append(items, ev)
 		for _, e := range j.unchecked[name] {
-			items = append(items, e)
-			if r := j.unverReason[e.Path]; r != "" && !slices.Contains(reasons, r) {
-				reasons = append(reasons, r)
-			}
+			add(e)
 		}
 	}
+	for _, e := range j.uncheckedFiles {
+		if !listed[e.Path] {
+			add(e)
+		}
+	}
+	n := len(paths)
+	if n == 0 {
+		return
+	}
+	files := fmt.Sprintf("%d package %s", n, plural(n, "file", "files"))
+	f := &model.Finding{
+		Key: "pkg.unchecked_changes", ID: "TT-PKG-007", Source: srcPackage, Severity: model.SevNote,
+		Title: files + " could not be checked against a trusted source",
+		Fix:   "Scan again when the package archive can be reached, or run telltale fetch-refs on a machine with network access and scan with --refs DIR.",
+	}
+	if unreachable {
+		f.Title = files + " could not be checked because the package archive could not be reached"
+	}
 	sort.Strings(reasons)
-	shown := reasons
-	more := ""
+	shown, more := reasons, ""
 	if len(shown) > 3 {
 		shown, more = shown[:3], fmt.Sprintf("; and %d more", len(reasons)-3)
 	}
-	f.Why = "These packages changed since the snapshot, but the programs they changed could not be checked: " + strings.Join(shown, "; ") + more +
-		". That is not evidence of tampering, but those programs stay unverified until a scan can use the package archive or a reference bundle."
-	// The value an exception accepts names every package and version.
-	f.Evidence = []model.Evidence{{After: strings.Join(ids, "; "), Detail: "packages that could not be checked"}}
+	f.Why = "These programs, modules and boot files could not be checked: " + strings.Join(shown, "; ") + more +
+		". That is not evidence of tampering, but they stay unverified until a scan can use the package archive or a reference bundle."
+	if len(ids) > 0 {
+		f.Why += fmt.Sprintf(" %d of the packages they belong to changed since the snapshot.", len(ids))
+	}
+	// The value an exception accepts names every changed package and
+	// version, and the exact set of files.
+	sort.Strings(paths)
+	sum := sha256.Sum256([]byte(strings.Join(paths, "\n")))
+	f.Evidence = []model.Evidence{{After: strings.Join(append(ids, "files "+hex.EncodeToString(sum[:])), "; "), Detail: files + " that could not be checked"}}
 	for _, e := range items {
 		j.attach(f, e, maxEvidence)
 	}
 	j.add(f)
-	j.couldNot = append(j.couldNot, fmt.Sprintf("changes to the programs of %d changed %s that could not be checked (%s%s)", n, plural(n, "package", "packages"), strings.Join(shown, "; "), more))
+	j.couldNot = append(j.couldNot, fmt.Sprintf("changes to %s that could not be checked (%s%s)", files, strings.Join(shown, "; "), more))
 }
 
 // unexplain turns an explained package change into a finding.

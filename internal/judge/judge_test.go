@@ -331,7 +331,7 @@ func TestJudgeMismatchIsTampering(t *testing.T) {
 	res := archive()
 	res.Mismatch = []pkgverify.FileVerdict{
 		{Path: "/usr/bin/ls", Package: "coreutils", Version: "9.1-1", Expected: h("ls 9.1"), Actual: h("evil ls"), Reason: "differs from the file in the signed package", Source: "archive"},
-		{Path: "/usr/bin/openssl", Package: "openssl", Version: "3.0.14-1~deb12u2", Expected: h("openssl 3.0.14"), Actual: h("openssl 3.0.14"), Reason: "mode differs: deb 0755, disk 4755", Source: "snapshot"},
+		{Path: "/usr/bin/openssl", Package: "openssl", Version: "3.0.14-1~deb12u2", Expected: h("openssl 3.0.14"), Actual: h("openssl 3.0.14"), Reason: "mode differs: deb 0755, disk 4755", Source: "snapshot", Kind: pkgverify.KindModeAddsPrivilege},
 	}
 	r := run(c, nil, res)
 	f := must(t, r, "pkg.mismatch:/usr/bin/ls", model.SevTampering)
@@ -346,6 +346,9 @@ func TestJudgeMismatchIsTampering(t *testing.T) {
 		t.Errorf("fix %q, want prefix %q", f.Fix, want)
 	}
 	m := must(t, r, "pkg.mismatch:/usr/bin/openssl", model.SevTampering)
+	if !strings.Contains(m.Title, "privileges its signed openssl package does not give it") {
+		t.Errorf("mode mismatch title %q", m.Title)
+	}
 	if !strings.Contains(m.Evidence[0].Detail, "mode differs: deb 0755, disk 4755") {
 		t.Errorf("mode evidence %+v", m.Evidence[0])
 	}
@@ -371,7 +374,7 @@ func TestJudgeUnverifiableGrouped(t *testing.T) {
 	notOfficial := pkgverify.ReasonNotOfficial + " or a snapshot of it"
 	res := archive()
 	for _, e := range special {
-		res.Unverifiable = append(res.Unverifiable, pkgverify.FileVerdict{Path: e.Path, Package: "localpkg", Version: "1", Reason: notOfficial})
+		res.Unverifiable = append(res.Unverifiable, pkgverify.FileVerdict{Path: e.Path, Package: "localpkg", Version: "1", Reason: notOfficial, Kind: pkgverify.KindNotFound})
 	}
 	res.Unverifiable = append(res.Unverifiable,
 		pkgverify.FileVerdict{Path: "/usr/bin/a", Package: "localpkg", Reason: notOfficial},
@@ -593,7 +596,7 @@ func TestJudgeNoSnapshotComparedAgainstText(t *testing.T) {
 
 	// Verification ran but could reach no reference: nothing is claimed.
 	unreachable := &pkgverify.Result{Mode: pkgverify.ModeArchive, Errors: []string{"fetch https://deb.debian.org/debian/dists/bookworm/InRelease: no route to host"},
-		Unverifiable: []pkgverify.FileVerdict{{Path: "/usr/bin/ls", Package: "coreutils", Reason: "no route to host"}}}
+		Unverifiable: []pkgverify.FileVerdict{{Path: "/usr/bin/ls", Package: "coreutils", Reason: "no route to host", Kind: pkgverify.KindUnreachable}}}
 	r = run(clean(), nil, unreachable)
 	if !slices.Equal(r.ComparedAgainst, []string{items}) {
 		t.Errorf("unreachable archive: %q", r.ComparedAgainst)
@@ -623,7 +626,7 @@ func itoa(n int) string {
 func TestJudgeSuspiciousIsBackdoor(t *testing.T) {
 	res := archive()
 	reason := "privilege granted by a local statoverride: deb 0755, disk 4755"
-	res.Suspicious = []pkgverify.FileVerdict{{Path: "/usr/bin/ls", Package: "coreutils", Version: "9.1-1", Expected: h("ls 9.1"), Actual: h("ls 9.1"), Reason: reason, Source: "archive"}}
+	res.Suspicious = []pkgverify.FileVerdict{{Path: "/usr/bin/ls", Package: "coreutils", Version: "9.1-1", Expected: h("ls 9.1"), Actual: h("ls 9.1"), Reason: reason, Source: "archive", Kind: pkgverify.KindStatOverride}}
 	r := run(clean(), nil, res)
 	f := must(t, r, "pkg.suspicious:/usr/bin/ls", model.SevBackdoor)
 	if !strings.Contains(f.Why, reason) || !strings.Contains(f.Evidence[0].Detail, reason) {
@@ -632,12 +635,15 @@ func TestJudgeSuspiciousIsBackdoor(t *testing.T) {
 	if !strings.HasPrefix(f.Fix, evidenceCopy+"'/usr/bin/ls' /root/telltale-evidence/ && ") {
 		t.Errorf("fix %q", f.Fix)
 	}
+	if !strings.Contains(f.Fix, "dpkg-statoverride --remove -- '/usr/bin/ls'") {
+		t.Errorf("statoverride fix %q", f.Fix)
+	}
 }
 
 func TestJudgeModeRelaxedIsNote(t *testing.T) {
 	ls := clean().Files[1]
 	res := archive(
-		pkgverify.FileVerdict{Path: "/usr/bin/ls", Package: "coreutils", Expected: ls.SHA256, Actual: ls.SHA256, Reason: "mode differs (less permissive): deb 4755, disk 0755", Source: "archive"},
+		pkgverify.FileVerdict{Path: "/usr/bin/ls", Package: "coreutils", Expected: ls.SHA256, Actual: ls.SHA256, Reason: "mode differs (less permissive): deb 4755, disk 0755", Source: "archive", Kind: pkgverify.KindModeLessPermissive},
 		pkgverify.FileVerdict{Path: "/usr/bin/openssl", Package: "openssl", Expected: "x", Actual: "x", Source: "archive"})
 	r := run(clean(), nil, res)
 	must(t, r, "pkg.mode_relaxed:/usr/bin/ls", model.SevNote)
@@ -1215,8 +1221,8 @@ func TestJudgeUnofficialUpgradeIsBackdoor(t *testing.T) {
 	setFile(cur, file("/usr/share/doc/openssh-server/README", "r2", 0o644))
 	res := archive()
 	res.Unverifiable = []pkgverify.FileVerdict{
-		{Path: "/usr/sbin/sshd", Package: "openssh-server", Version: "1:9.2p1-2+deb12u9", Actual: h("trojan sshd"), Reason: pkgverify.ReasonNotOfficial},
-		{Path: "/usr/share/doc/openssh-server/README", Package: "openssh-server", Version: "1:9.2p1-2+deb12u9", Actual: h("r2"), Reason: pkgverify.ReasonNotOfficial}}
+		{Path: "/usr/sbin/sshd", Package: "openssh-server", Version: "1:9.2p1-2+deb12u9", Actual: h("trojan sshd"), Reason: pkgverify.ReasonNotOfficial, Kind: pkgverify.KindNotFound},
+		{Path: "/usr/share/doc/openssh-server/README", Package: "openssh-server", Version: "1:9.2p1-2+deb12u9", Actual: h("r2"), Reason: pkgverify.ReasonNotOfficial, Kind: pkgverify.KindNotFound}}
 
 	r := run(cur, snapOf(old), res)
 	f := must(t, r, "snap.pkg_upgraded:openssh-server", model.SevBackdoor)
@@ -1241,7 +1247,7 @@ func TestJudgeUnofficialUpgradeIsBackdoor(t *testing.T) {
 	cur2.Packages.Installed = append(cur2.Packages.Installed, pkg("tool", "1.0", "/usr/bin/tool"))
 	cur2.Files = append(cur2.Files, file("/usr/bin/tool", "tool", 0o755))
 	res2 := archive()
-	res2.Unverifiable = []pkgverify.FileVerdict{{Path: "/usr/bin/tool", Package: "tool", Version: "1.0", Reason: pkgverify.ReasonNotOfficial}}
+	res2.Unverifiable = []pkgverify.FileVerdict{{Path: "/usr/bin/tool", Package: "tool", Version: "1.0", Reason: pkgverify.ReasonNotOfficial, Kind: pkgverify.KindNotFound}}
 	n := must(t, run(cur2, snapOf(old), res2), "snap.pkg_installed:tool", model.SevBackdoor)
 	if !hasEvidencePath(n, "/usr/bin/tool") {
 		t.Errorf("unverified program not on the package: %+v", n.Evidence)
@@ -1255,7 +1261,7 @@ func TestJudgeUnofficialUpgradeIsBackdoor(t *testing.T) {
 	cur3.Packages.Installed = append(cur3.Packages.Installed, pkg("linux-image-6.1.0-99-amd64", "6.1.999-1", ko))
 	cur3.Files = append(cur3.Files, file(ko, "ko", 0o644))
 	res3 := archive()
-	res3.Unverifiable = []pkgverify.FileVerdict{{Path: ko, Package: "linux-image-6.1.0-99-amd64", Reason: pkgverify.ReasonNotOfficial}}
+	res3.Unverifiable = []pkgverify.FileVerdict{{Path: ko, Package: "linux-image-6.1.0-99-amd64", Reason: pkgverify.ReasonNotOfficial, Kind: pkgverify.KindNotFound}}
 	r = run(cur3, snapOf(old3), res3)
 	must(t, r, "snap.pkg_installed:linux-image-6.1.0-99-amd64", model.SevBackdoor)
 	if explained(r, "explained:linux-image-6.1.0-99-amd64") != nil {
@@ -1595,15 +1601,15 @@ func TestJudgeUncheckedPackagesAreOneNote(t *testing.T) {
 	setFile(cur, file("/usr/bin/sudo", "sudo 2", 0o4755))
 	timeout := `could not check the package: Get "https://deb.debian.org/debian/pool/main/o/openssh/x.deb": dial tcp 151.101.2.132:443: i/o timeout`
 	res := &pkgverify.Result{Mode: pkgverify.ModeArchive, Unverifiable: []pkgverify.FileVerdict{
-		{Path: "/usr/sbin/sshd", Package: "openssh-server", Version: "1:9.2p1-2+deb12u4", Reason: timeout},
-		{Path: "/usr/bin/sudo", Package: "sudo", Version: "1.9.13p3-1+deb12u2", Reason: "could not read the official archive index: 503 Service Unavailable"}}}
+		{Path: "/usr/sbin/sshd", Package: "openssh-server", Version: "1:9.2p1-2+deb12u4", Reason: timeout, Kind: pkgverify.KindUnreachable},
+		{Path: "/usr/bin/sudo", Package: "sudo", Version: "1.9.13p3-1+deb12u2", Reason: "could not read the official archive index: 503 Service Unavailable", Kind: pkgverify.KindUnreachable}}}
 
 	r := run(cur, snapOf(old), res)
 	for _, k := range []string{"snap.pkg_upgraded:openssh-server", "snap.pkg_upgraded:sudo", "pkg.unverifiable:/usr/bin/sudo", "snap.file_modified:/usr/sbin/sshd"} {
 		absent(t, r, k)
 	}
 	f := must(t, r, "pkg.unchecked_changes", model.SevNote)
-	if !strings.Contains(f.Title, "2 changed packages") || !hasEvidencePath(f, "/usr/sbin/sshd") || !hasEvidencePath(f, "/usr/bin/sudo") {
+	if f.Title != "2 package files could not be checked because the package archive could not be reached" || !hasEvidencePath(f, "/usr/sbin/sshd") || !hasEvidencePath(f, "/usr/bin/sudo") {
 		t.Errorf("unchecked note %q %+v", f.Title, f.Evidence)
 	}
 	if explained(r, "explained:openssh-server") != nil || explained(r, "explained:sudo") != nil {
@@ -1619,14 +1625,14 @@ func TestJudgeUncheckedPackagesAreOneNote(t *testing.T) {
 	// A reference bundle that lacks the package could not check it; one
 	// whose builder found the version in no trusted source did.
 	res2 := &pkgverify.Result{Mode: pkgverify.ModeRefs, SourcesUsed: []string{"reference bundle /mnt/refs"}, Unverifiable: []pkgverify.FileVerdict{
-		{Path: "/usr/sbin/sshd", Package: "openssh-server", Reason: "package not in the reference bundle"},
-		{Path: "/usr/bin/sudo", Package: "sudo", Reason: "not in the reference bundle: " + pkgverify.ReasonNotOfficial}}}
+		{Path: "/usr/sbin/sshd", Package: "openssh-server", Reason: "package not in the reference bundle", Kind: pkgverify.KindNotInBundle},
+		{Path: "/usr/bin/sudo", Package: "sudo", Reason: "not in the reference bundle: " + pkgverify.ReasonNotOfficial, Kind: pkgverify.KindNotFound}}}
 	r = run(cur, snapOf(old), res2)
 	absent(t, r, "snap.pkg_upgraded:openssh-server")
 	must(t, r, "snap.pkg_upgraded:sudo", model.SevBackdoor)
 	must(t, r, "pkg.unverifiable:/usr/bin/sudo", model.SevBackdoor)
 	u := must(t, r, "pkg.unchecked_changes", model.SevNote)
-	if !strings.Contains(u.Title, "1 changed package ") {
+	if u.Title != "1 package file could not be checked against a trusted source" {
 		t.Errorf("title %q", u.Title)
 	}
 }
@@ -1708,7 +1714,7 @@ func TestJudgeUncheckedNewPackageKeepsItsReasons(t *testing.T) {
 	cur.Packages.Installed = append(cur.Packages.Installed, pkg("helperpkg", "1.0-1", "/usr/bin/helper"))
 	cur.Files = append(cur.Files, file("/usr/bin/helper", "helper", 0o4755))
 	res := &pkgverify.Result{Mode: pkgverify.ModeArchive, Unverifiable: []pkgverify.FileVerdict{
-		{Path: "/usr/bin/helper", Package: "helperpkg", Version: "1.0-1", Reason: "could not check the package: connection refused"}}}
+		{Path: "/usr/bin/helper", Package: "helperpkg", Version: "1.0-1", Reason: "could not check the package: connection refused", Kind: pkgverify.KindUnreachable}}}
 	r := run(cur, snapOf(old), res)
 	f := must(t, r, "snap.pkg_installed:helperpkg", model.SevBackdoor)
 	if !strings.Contains(f.Evidence[0].After, "setuid/setgid program") {
@@ -1716,4 +1722,43 @@ func TestJudgeUncheckedNewPackageKeepsItsReasons(t *testing.T) {
 	}
 	must(t, r, "pkg.unchecked_changes", model.SevNote)
 	absent(t, r, "pkg.unverifiable:/usr/bin/helper")
+}
+
+// R55: without a snapshot too, a setuid program, module, PAM module or boot
+// file that could not be checked because the archive could not be used
+// goes into the one note; a version no trusted source has, or an untrusted
+// source, stays a backdoor sign each.
+func TestJudgeUncheckedSpecialFilesWithoutSnapshot(t *testing.T) {
+	c := clean()
+	su := file("/usr/bin/su", "su", 0o4755)
+	ko := file("/lib/modules/6.1.0-25-amd64/kernel/fs/x.ko", "ko", 0o644)
+	c.Files = append(c.Files, su, ko)
+	c.Packages.Installed = append(c.Packages.Installed, pkg("login", "1:4.13", su.Path), pkg("linux-image-6.1.0-25-amd64", "6.1.106-3", ko.Path))
+	down := "could not read the official archive index: Get \"https://deb.debian.org/debian/dists/bookworm/InRelease\": dial tcp: lookup deb.debian.org: no such host"
+	verdicts := func(kind string) *pkgverify.Result {
+		return &pkgverify.Result{Mode: pkgverify.ModeArchive, Unverifiable: []pkgverify.FileVerdict{
+			{Path: su.Path, Package: "login", Version: "1:4.13", Reason: down, Kind: kind},
+			{Path: ko.Path, Package: "linux-image-6.1.0-25-amd64", Version: "6.1.106-3", Reason: down, Kind: kind}}}
+	}
+
+	r := run(c, nil, verdicts(pkgverify.KindUnreachable))
+	absent(t, r, "pkg.unverifiable:"+su.Path)
+	absent(t, r, "pkg.unverifiable:"+ko.Path)
+	f := must(t, r, "pkg.unchecked_changes", model.SevNote)
+	if f.Title != "2 package files could not be checked because the package archive could not be reached" || !hasEvidencePath(f, su.Path) || !hasEvidencePath(f, ko.Path) {
+		t.Errorf("note %q %+v", f.Title, f.Evidence)
+	}
+	if !slices.ContainsFunc(r.CouldNotRuleOut, func(s string) bool { return strings.Contains(s, "no such host") }) {
+		t.Errorf("reason not stated: %q", r.CouldNotRuleOut)
+	}
+	if r.ExitCode != 1 {
+		t.Errorf("exit %d (%v)", r.ExitCode, keys(r))
+	}
+
+	for _, kind := range []string{pkgverify.KindNotFound, pkgverify.KindUntrusted} {
+		r = run(c, nil, verdicts(kind))
+		must(t, r, "pkg.unverifiable:"+su.Path, model.SevBackdoor)
+		must(t, r, "pkg.unverifiable:"+ko.Path, model.SevBackdoor)
+		absent(t, r, "pkg.unchecked_changes")
+	}
 }

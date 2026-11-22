@@ -103,7 +103,7 @@ func (j *judge) packages() {
 		if v.Source == pkgverify.SourceSnapshot || v.Source == pkgverify.SourceLaunchpad {
 			lower[v.Source]++
 		}
-		if strings.HasPrefix(v.Reason, "mode differs (less permissive)") {
+		if v.Kind == pkgverify.KindModeLessPermissive {
 			j.add(j.modeRelaxed(v))
 		}
 	}
@@ -178,7 +178,7 @@ func (j *judge) mismatch(v pkgverify.FileVerdict) *model.Finding {
 	title := fmt.Sprintf("%s does not match the signed %s package", v.Path, v.Package)
 	why := "This file differs from the copy in the distribution's package for the version installed (" + strings.TrimSpace(v.Package+" "+v.Version) + "). " +
 		"A routine update would match the package; replacing system programs and libraries is how rootkits and backdoors hide."
-	if strings.HasPrefix(v.Reason, "mode differs") {
+	if v.Kind == pkgverify.KindModeAddsPrivilege {
 		title = fmt.Sprintf("%s has privileges its signed %s package does not give it", v.Path, v.Package)
 		why = "The file's content matches the package, but its mode adds privilege the package does not set (" + v.Reason +
 			"). A setuid bit or a writable system file added after installation is a classic way back to root."
@@ -201,11 +201,11 @@ func (j *judge) mismatch(v pkgverify.FileVerdict) *model.Finding {
 func (j *judge) suspicious(v pkgverify.FileVerdict) *model.Finding {
 	var fix string
 	switch {
-	case strings.Contains(v.Reason, "statoverride"):
+	case v.Kind == pkgverify.KindStatOverride:
 		fix = command([]string{v.Path, v.Package}, func(q []string) string {
 			return keep(q[0]) + " && dpkg-statoverride --remove -- " + q[0] + " && apt-get install --reinstall -- " + q[1] + "   # only if you did not add the override yourself"
 		})
-	case strings.Contains(v.Reason, "diverted by"):
+	case v.Kind == pkgverify.KindDiversion:
 		fix = fixKeepOnly(v.Path, "then compare it with the package's own copy; dpkg-divert --list shows the diversion")
 	default:
 		fix = fixReinstall(v.Path, v.Package, j.exists(v.Path))
@@ -243,17 +243,24 @@ func (j *judge) unverifiable(vs []pkgverify.FileVerdict) {
 	byReason := map[string]*bucket{}
 	n := 0
 	for _, v := range vs {
-		j.unverReason[v.Path] = v.Reason
+		j.unverReason[v.Path], j.unverKind[v.Path] = v.Reason, v.Kind
 		owner := v.Package
 		if owner == "" {
 			owner = j.owned[v.Path]
 		}
-		// A special file of a package that changed since the snapshot and
-		// could not be checked at all goes with that package into the
-		// note on unchecked changes: a network failure during a kernel
-		// update must not raise one backdoor sign per module.
-		uncheckedChange := j.pkgChanged(owner) && !notInTrustedSource(v.Reason)
-		if cat := j.specialCategory(v.Path); cat != "" && !uncheckedChange {
+		cat := j.specialCategory(v.Path)
+		// A special file that could not be checked because a source could
+		// not be used (or, for a package that changed since the snapshot,
+		// for any reason but "no trusted source has this version") goes
+		// into the one note on unchecked files: a network failure must not
+		// raise one backdoor sign per module or setuid program.
+		if cat != "" && ((j.pkgChanged(owner) && !notInTrustedSource(v.Kind)) || (!j.pkgChanged(owner) && sourceUnusable(v.Kind))) {
+			j.uncheckedSpecial[v.Path] = true
+			j.uncheckedFiles = append(j.uncheckedFiles, model.Evidence{Path: v.Path, After: v.Actual,
+				Detail: strings.TrimSpace(v.Package+" "+v.Version) + ": could not be checked: " + v.Reason, When: j.whenFor(v.Path)})
+			continue
+		}
+		if cat != "" {
 			j.pkgPath[v.Path] = j.add(&model.Finding{
 				Key: "pkg.unverifiable:" + v.Path, ID: "TT-PKG-003", Source: srcPackage, Severity: model.SevBackdoor,
 				Title: fmt.Sprintf("%s (a %s) could not be verified against its package", v.Path, cat),
@@ -291,7 +298,7 @@ func (j *judge) unverifiable(vs []pkgverify.FileVerdict) {
 		Key: "pkg.unverifiable", ID: "TT-PKG-003", Source: srcPackage, Severity: model.SevNote,
 		Title: fmt.Sprintf("%d package %s could not be verified", n, plural(n, "file", "files")),
 		Why: "These files belong to packages telltale could not check against a trusted copy, so a change to them would go unnoticed. " +
-			"Setuid programs, kernel modules, PAM modules and boot files are reported on their own, unless their package changed since the snapshot and could not be checked at all.",
+			"Setuid programs, kernel modules, PAM modules and boot files are reported on their own, or with the files that could not be checked at all.",
 		Fix:      "Run telltale fetch-refs on a machine with network access and scan again with --refs DIR; pass third-party repository keys with --keys DIR.",
 		Evidence: []model.Evidence{{After: fmt.Sprintf("%d %s", n, plural(n, "file", "files")), Detail: "grouped by reason below"}},
 	}

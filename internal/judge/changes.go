@@ -407,7 +407,7 @@ func (j *judge) placed(ch diff.Change, e, old, cur *model.FileEntry, owner strin
 		ev.Detail = "dpkg's record of the package"
 		j.foldIntoPackage(dpkgInfoPackage(p), ev, model.SevNote)
 		return true
-	case j.unverified[p] && j.pkgChanged(owner):
+	case (j.unverified[p] || j.uncheckedSpecial[p]) && j.pkgChanged(owner):
 		// A program goes on its package's change, which it makes a
 		// backdoor sign; anything else is counted in the grouped note.
 		if e.Type == "file" && pkgverify.InScope(p, e.Mode) {
@@ -438,7 +438,7 @@ func (j *judge) placed(ch diff.Change, e, old, cur *model.FileEntry, owner strin
 // every such package).
 func (j *judge) unverifiedProgram(pkg, p string, ev model.Evidence) {
 	r := j.unverReason[p]
-	if notInTrustedSource(r) {
+	if notInTrustedSource(j.unverKind[p]) {
 		ev.Detail = "changed; no trusted source has this version: " + r
 		j.unverIn[pkg] = append(j.unverIn[pkg], ev)
 		return
@@ -450,13 +450,23 @@ func (j *judge) unverifiedProgram(pkg, p string, ev model.Evidence) {
 	j.unchecked[pkg] = append(j.unchecked[pkg], ev)
 }
 
-// notInTrustedSource reports whether an unverifiable reason says that
-// verification ran and found the installed version in no trusted source
-// (directly, or when the reference bundle was built), as opposed to a
-// source that could not be read or used.
-func notInTrustedSource(reason string) bool {
-	r := strings.TrimPrefix(reason, "not in the reference bundle: ")
-	return strings.HasPrefix(r, pkgverify.ReasonNotOfficial) || strings.Contains(r, "source not trusted:")
+// notInTrustedSource reports whether an unverifiable verdict's kind says
+// that verification ran and found the installed version in no trusted
+// source, or only in a source whose key was not given. A verdict without a
+// kind counts too: that is the cautious reading.
+func notInTrustedSource(kind string) bool {
+	return kind == pkgverify.KindNotFound || kind == pkgverify.KindUntrusted || kind == ""
+}
+
+// sourceUnusable reports whether a file could not be checked because a
+// package source could not be read or used: unreachable, failing its
+// signature, missing from the reference bundle, or not checked at all.
+func sourceUnusable(kind string) bool {
+	switch kind {
+	case pkgverify.KindUnreachable, pkgverify.KindBadSignature, pkgverify.KindNotInBundle, pkgverify.KindNotChecked:
+		return true
+	}
+	return false
 }
 
 // fullHash puts the entry's whole hash in place of the shortened one diff

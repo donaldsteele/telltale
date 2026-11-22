@@ -70,7 +70,13 @@ type judge struct {
 	pkgPath     map[string]*model.Finding // path -> the package finding about it
 	unverified  map[string]bool           // grouped unverifiable paths
 	unverReason map[string]string         // every unverifiable path -> why
-	reported    map[string]bool           // every path package verification named
+	unverKind   map[string]string         // every unverifiable path -> pkgverify Kind*
+	// Special files that could not be checked (a source could not be used),
+	// for the one note on unchecked files instead of a backdoor sign each.
+	uncheckedSpecial map[string]bool
+	uncheckedFiles   []model.Evidence
+	uncheckedPkgs    []string        // changed packages whose programs could not be checked
+	reported         map[string]bool // every path package verification named
 
 	// From the snapshot comparison.
 	pkgChange   map[string]diff.Change      // package name -> its change
@@ -91,7 +97,7 @@ func newJudge(in Input, c *model.Collection) *judge {
 		in: in, c: c, ctx: in.Context,
 		byKey: map[string]*model.Finding{}, groups: map[string]*model.Finding{}, omitted: map[*model.Finding]int{},
 		verified: map[string]pkgverify.FileVerdict{}, pkgPath: map[string]*model.Finding{},
-		unverified: map[string]bool{}, unverReason: map[string]string{}, reported: map[string]bool{},
+		unverified: map[string]bool{}, unverReason: map[string]string{}, unverKind: map[string]string{}, uncheckedSpecial: map[string]bool{}, reported: map[string]bool{},
 		pkgChange: map[string]diff.Change{}, pkgFinding: map[string]*model.Finding{}, persistDone: map[string]*model.Finding{},
 		pkgReasons: map[string][]string{}, unverIn: map[string][]model.Evidence{}, unchecked: map[string][]model.Evidence{}, unconfirmed: map[string]bool{},
 		acctChanged: map[string]bool{}, foldedMax: map[*model.Finding]model.Severity{},
@@ -154,6 +160,7 @@ func Judge(in Input) *model.Report {
 	} else if in.Snapshot != nil {
 		j.skipped = append(j.skipped, model.Skip{Check: "snapshot", Reason: "the snapshot holds no collected data, so nothing was compared with it"})
 	}
+	j.uncheckedNote()
 	j.duplicateAccounts()
 	j.heuristics()
 	j.fillWhen()
