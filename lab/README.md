@@ -24,5 +24,5 @@ Hostnames default to `<distro>-<variant>`; set `Opts.Hostname` for the made-up n
 
 - The `noexec` variant is the plain image run with `--tmpfs /tmp:noexec --tmpfs /dev/shm:noexec`; `labkit.Start` adds those flags for it.
 - `Opts.Systemd` runs `/sbin/init` as PID 1 and needs an image with systemd, which the images do not carry yet.
-- `Opts.Ext4Volume` asks the Docker daemon for a loop-backed ext4 volume at `/lab-ext4`. On hosts where the daemon cannot do that (the local volume driver cannot pass `loop`), the test skips with a message. Inode-flag tests then need a host with a real ext4 mount.
+- `Opts.Ext4Volume` creates a 64 MiB ext4 image on the host (no sudo), bind-mounts it into a privileged container and runs `mount -o loop` inside, giving a real ext4 at `/lab-ext4` for inode flags. (Docker's local volume driver cannot do this: it passes `loop` to mount(2) as data.) If the loop mount fails, the test skips with the reason.
 - Cleanup removes only the containers, volumes and files a test created; nothing is pruned.

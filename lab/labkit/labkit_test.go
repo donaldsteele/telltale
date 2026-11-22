@@ -122,9 +122,18 @@ func TestVariants(t *testing.T) {
 }
 
 func TestExt4Volume(t *testing.T) {
-	m := labkit.Start(t, labkit.Build(t, "debian12", "clean"), labkit.Opts{Ext4Volume: true, Caps: []string{"LINUX_IMMUTABLE"}})
-	out, code := m.Exec(t, "sh", "-c", "touch /lab-ext4/f && chattr +i /lab-ext4/f && lsattr /lab-ext4/f; chattr -i /lab-ext4/f")
-	if code != 0 || !strings.Contains(out, "i") {
-		t.Fatalf("inode flags unavailable (exit %d): %s", code, out)
+	m := labkit.Start(t, labkit.Build(t, "debian12", "clean"), labkit.Opts{Ext4Volume: true})
+	if out, _ := m.Exec(t, "stat", "-f", "-c", "%T", "/lab-ext4"); strings.TrimSpace(out) != "ext2/ext3" {
+		t.Fatalf("/lab-ext4 is %q, want ext2/ext3 (ext4)", strings.TrimSpace(out))
+	}
+	if out, code := m.Exec(t, "sh", "-c", "touch /lab-ext4/f && chattr +i /lab-ext4/f"); code != 0 {
+		t.Fatalf("chattr +i failed (exit %d): %s", code, out)
+	}
+	out, _ := m.Exec(t, "lsattr", "/lab-ext4/f")
+	flags := strings.Fields(out)
+	// Clear the flag first so cleanup can unmount and remove.
+	m.Exec(t, "chattr", "-i", "/lab-ext4/f")
+	if len(flags) < 1 || !strings.Contains(flags[0], "i") {
+		t.Fatalf("lsattr shows no immutable flag: %q", out)
 	}
 }

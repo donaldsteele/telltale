@@ -40,7 +40,7 @@ type Opts struct {
 	Privileged bool     // docker run --privileged
 	Systemd    bool     // run /sbin/init as PID 1 (the image must contain systemd)
 	Caps       []string // extra capabilities, e.g. "LINUX_IMMUTABLE"
-	Ext4Volume bool     // loop-backed ext4 volume at /lab-ext4 (test skips if the host cannot)
+	Ext4Volume bool     // loop-mounted ext4 image at /lab-ext4; implies Privileged (test skips if the mount fails)
 	Hostname   string   // container hostname; default <distro>-<variant>
 }
 
@@ -236,7 +236,9 @@ func Start(t testing.TB, image string, opts Opts) *Machine {
 			"-v", "/sys/fs/cgroup:/sys/fs/cgroup:rw", "--cgroupns", "host", "--stop-signal", "SIGRTMIN+3")
 	}
 	if opts.Ext4Volume {
-		args = append(args, "-v", ext4Volume(t)+":/lab-ext4")
+		// A loop mount inside the container needs privileges; the image file is
+		// bind-mounted and mounted at /lab-ext4 after start.
+		args = append(args, "--privileged", "-v", ext4Volume(t)+":/lab-ext4.img")
 	}
 	args = append(args, image)
 
@@ -246,20 +248,34 @@ func Start(t testing.TB, image string, opts Opts) *Machine {
 			so, _, _ := docker("logs", "--tail", "40", name)
 			t.Logf("last output of %s:\n%s", name, so)
 		}
+		if opts.Ext4Volume {
+			docker("exec", name, "umount", "/lab-ext4") // best effort
+		}
 		docker("rm", "-f", "-v", name)
 	})
 	if so, se, code := docker(args...); code != 0 {
-		if opts.Ext4Volume {
-			t.Skipf("cannot start a container with a loop-mounted ext4 volume on this host: %s%s", so, se)
-		}
 		t.Fatalf("docker run: exit %d\n%s%s", code, so, se)
 	}
 	m.waitSSH(t)
+	if opts.Ext4Volume {
+		var so, se string
+		var code int
+		for try := 0; try < 4; try++ { // loop device allocation can race with other users of the host
+			so, se, code = docker("exec", name, "sh", "-c", "mkdir -p /lab-ext4 && mount -o loop /lab-ext4.img /lab-ext4")
+			if code == 0 {
+				break
+			}
+			time.Sleep(time.Second)
+		}
+		if code != 0 {
+			t.Skipf("privileged loop mount of the ext4 image failed on this host (exit %d): %s%s", code, so, se)
+		}
+	}
 	return m
 }
 
-// ext4Volume creates a sparse ext4 image and a Docker local volume that loop
-// mounts it (the daemon does the mount, so the host needs no sudo).
+// ext4Volume creates a sparse ext4 image file on the host (no sudo needed) and
+// returns its path. Start bind-mounts it and loop-mounts it inside the container.
 func ext4Volume(t testing.TB) string {
 	t.Helper()
 	mkfs, err := exec.LookPath("mkfs.ext4")
@@ -286,13 +302,7 @@ func ext4Volume(t testing.TB) string {
 	if out, err := exec.Command(mkfs, "-F", "-q", img).CombinedOutput(); err != nil {
 		t.Skipf("mkfs.ext4 failed: %v\n%s", err, out)
 	}
-	vol := "telltale-lab-ext4-" + randHex()
-	if _, se, code := docker("volume", "create", "--driver", "local", "--opt", "type=ext4",
-		"--opt", "device="+img, "--opt", "o=loop", vol); code != 0 {
-		t.Skipf("docker cannot create a loop-backed ext4 volume here: %s", se)
-	}
-	t.Cleanup(func() { docker("volume", "rm", "-f", vol) })
-	return vol
+	return img
 }
 
 func (m *Machine) waitSSH(t testing.TB) {

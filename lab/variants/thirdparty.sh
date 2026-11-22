@@ -10,6 +10,6 @@ curl -fsSL "https://pkgs.tailscale.com/stable/$LAB_FAMILY/$LAB_CODENAME.noarmor.
 echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/$LAB_FAMILY $LAB_CODENAME main" \
   > /etc/apt/sources.list.d/tailscale.list
 apt-get update
-apt-get install -y --no-install-recommends tailscale
+apt-get install -y --no-install-recommends tailscale=1.104.7
 apt-get purge -y curl
 rm -rf /var/lib/apt/lists/*
