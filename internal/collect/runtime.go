@@ -79,6 +79,9 @@ func Runtime(procRoot, sysRoot, root string) (model.Runtime, map[string]string, 
 	sort.Ints(pids)
 	exeDenied, partial := 0, 0
 	for _, pid := range pids {
+		if pid == os.Getpid() {
+			continue // telltale does not examine itself
+		}
 		p, ok, denied, part := readProcess(procRoot, pid, skip)
 		if denied {
 			exeDenied++

@@ -5,7 +5,10 @@ import (
 	"encoding/hex"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -142,16 +145,22 @@ func TestRuntimeSysctl(t *testing.T) {
 
 func TestRuntimeLiveSmoke(t *testing.T) {
 	rt, _, _ := Runtime("/proc", "/sys", "/")
-	pid := os.Getpid()
+	pid, ppid := os.Getpid(), os.Getppid()
+	found := false
 	for _, p := range rt.Processes {
 		if p.PID == pid {
-			if p.ExeSHA256 == "" || p.Exe == "" {
-				t.Fatalf("own process missing exe: %+v", p)
+			t.Fatalf("own process %d is in the collection", pid)
+		}
+		if p.PID == ppid {
+			found = true
+			if p.Comm == "" {
+				t.Fatalf("parent process unreadable: %+v", p)
 			}
-			return
 		}
 	}
-	t.Fatalf("own pid %d not found", pid)
+	if !found {
+		t.Fatalf("parent pid %d not found", ppid)
+	}
 }
 
 // fakeNlink makes fstat report zero links for exe paths containing substr, as
@@ -305,5 +314,26 @@ func TestRuntimeModulePrefersUpdates(t *testing.T) {
 	_, _, skips = Runtime("testdata/proc1", t.TempDir(), root)
 	if !hasSkip(skips, "module ext4_mod: ambiguous") {
 		t.Fatalf("%+v", skips)
+	}
+}
+
+// R51: the collector leaves its own process out, so telltale never reports
+// itself (its temp-dir working files looked like a backdoor).
+func TestRuntimeOmitsOwnProcess(t *testing.T) {
+	proc := t.TempDir()
+	if out, err := exec.Command("cp", "-a", "testdata/proc1/.", proc).CombinedOutput(); err != nil {
+		t.Fatalf("cp: %v %s", err, out)
+	}
+	self := filepath.Join(proc, strconv.Itoa(os.Getpid()))
+	if err := exec.Command("cp", "-a", filepath.Join(proc, "100"), self).Run(); err != nil {
+		t.Fatal(err)
+	}
+	rt, _, _ := Runtime(proc, t.TempDir(), t.TempDir())
+	var got []int
+	for _, p := range rt.Processes {
+		got = append(got, p.PID)
+	}
+	if !slices.Contains(got, 100) || slices.Contains(got, os.Getpid()) {
+		t.Fatalf("pids %v: want 100 present and own pid %d absent", got, os.Getpid())
 	}
 }
