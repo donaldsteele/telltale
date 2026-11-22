@@ -1,0 +1,496 @@
+package checklist
+
+import (
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/donaldsteele/telltale/internal/model"
+)
+
+func boolp(b bool) *bool { return &b }
+
+func dirEntry(p string, mode uint32) model.FileEntry {
+	return model.FileEntry{Path: p, Type: "dir", Mode: 0o040000 | mode}
+}
+
+func fileEntry(p string, mode, uid, gid uint32) model.FileEntry {
+	return model.FileEntry{Path: p, Type: "file", Mode: 0o100000 | mode, UID: uid, GID: gid}
+}
+
+// hardened returns a collection on which every item passes.
+func hardened() *model.Collection {
+	set := model.PasswordState{Set: true, Algo: "yescrypt", LastChange: 19000, MaxDays: 99999}
+	locked := model.PasswordState{Locked: true, Algo: "none", LastChange: 19000, MaxDays: 99999}
+	return &model.Collection{
+		AsRoot: true,
+		Accounts: model.Accounts{
+			Users: []model.User{
+				{Name: "root", UID: 0, Shell: "/bin/bash", Password: locked},
+				{Name: "daemon", UID: 1, Shell: "/usr/sbin/nologin", Password: locked},
+				{Name: "sync", UID: 4, Shell: "/bin/sync", Password: locked},
+				{Name: "sshd", UID: 105, Shell: "/bin/false", Password: locked},
+				{Name: "alice", UID: 1000, Shell: "/bin/bash", Password: set},
+				{Name: "nobody", UID: 65534, Shell: "/usr/sbin/nologin", Password: locked},
+			},
+			Groups: []model.Group{{Name: "root", GID: 0}, {Name: "shadow", GID: 42}},
+		},
+		Persist: []model.PersistFile{
+			sshdFile("/etc/ssh/sshd_config",
+				"Include /etc/ssh/sshd_config.d/*.conf",
+				"PermitRootLogin no",
+				"MaxAuthTries 4",
+			),
+			{Path: "/etc/sudoers", Kind: model.PersistKindSudoers, Mode: 0o100440, Lines: []string{
+				"Defaults env_reset",
+				"root ALL=(ALL:ALL) ALL",
+				"%sudo ALL=(ALL:ALL) ALL",
+				"# bob ALL=(ALL) NOPASSWD: ALL",
+				"@includedir /etc/sudoers.d",
+			}},
+		},
+		Files: []model.FileEntry{
+			fileEntry("/etc/shadow", 0o640, 0, 42),
+			fileEntry("/etc/gshadow", 0o640, 0, 42),
+			fileEntry("/etc/passwd", 0o644, 0, 0),
+			fileEntry("/etc/group", 0o644, 0, 0),
+			fileEntry("/etc/ssh/sshd_config", 0o644, 0, 0),
+			fileEntry("/etc/sudoers", 0o440, 0, 0),
+			fileEntry("/usr/bin/ls", 0o755, 0, 0),
+			dirEntry("/etc/cron.d", 0o700),
+			dirEntry("/etc/cron.daily", 0o700),
+			{Path: "/usr/bin/vi", Type: "symlink", Mode: 0o120777, Target: "/etc/alternatives/vi"},
+		},
+		Firewall: model.Firewall{Backend: "nftables", InputPolicy: "drop", InputRules: 3, UFWEnabled: boolp(false)},
+		Packages: model.Packages{Installed: []model.Package{
+			{Name: "openssh-server"}, {Name: "auditd"}, {Name: "unattended-upgrades"}, {Name: "apparmor"},
+		}},
+		Sysctl: map[string]string{
+			"kernel.randomize_va_space":             "2",
+			"fs.suid_dumpable":                      "0",
+			"kernel.kptr_restrict":                  "1",
+			"kernel.dmesg_restrict":                 "1",
+			"net.ipv4.conf.all.accept_redirects":    "0",
+			"net.ipv4.conf.all.send_redirects":      "0",
+			"net.ipv4.conf.all.accept_source_route": "0",
+			"net.ipv4.tcp_syncookies":               "1",
+			"fs.protected_symlinks":                 "1",
+			"fs.protected_hardlinks":                "1",
+			"net.ipv6.conf.all.accept_redirects":    "0",
+			"kernel.yama.ptrace_scope":              "1",
+			"apparmor.enabled":                      "Y",
+		},
+	}
+}
+
+func result(t *testing.T, c *model.Collection, ctx model.ScanContext, id string) model.CheckResult {
+	t.Helper()
+	for _, r := range Evaluate(c, ctx) {
+		if r.ID == id {
+			return r
+		}
+	}
+	t.Fatalf("no result for %s", id)
+	return model.CheckResult{}
+}
+
+func setSSHD(c *model.Collection, lines ...string) {
+	for i, pf := range c.Persist {
+		if pf.Path == "/etc/ssh/sshd_config" {
+			c.Persist[i].Lines = lines
+		}
+	}
+}
+
+func TestHardenedCollectionPassesEverything(t *testing.T) {
+	results := Evaluate(hardened(), model.ScanContext{})
+	if len(results) != len(Items()) {
+		t.Fatalf("%d results for %d items", len(results), len(Items()))
+	}
+	for _, r := range results {
+		if !r.Pass || r.Skipped != "" {
+			t.Errorf("%s: pass=%v skipped=%q observed=%q", r.ID, r.Pass, r.Skipped, r.Observed)
+		}
+	}
+}
+
+func TestRootLoginItemAllowsTelltaleServer(t *testing.T) {
+	c := hardened()
+	setSSHD(c,
+		"PermitRootLogin no",
+		"Match Address 10.0.0.5",
+		"    PermitRootLogin prohibit-password",
+	)
+	ctx := model.ScanContext{ServerAddr: "10.0.0.5"}
+	r := result(t, c, ctx, "TT-SSH-001")
+	if !r.Pass || r.Skipped != "" {
+		t.Fatalf("root login with telltale's Match block: %+v", r)
+	}
+	// The server's own block is not a loosening Match block either.
+	if r := result(t, c, ctx, "TT-SSH-009"); !r.Pass {
+		t.Errorf("telltale's Match block flagged: %+v", r)
+	}
+	// The same block without the server context (carry mode) is a
+	// loosening Match block, though global root login stays off.
+	if r := result(t, c, model.ScanContext{}, "TT-SSH-001"); !r.Pass {
+		t.Errorf("carry mode root login: %+v", r)
+	}
+	if r := result(t, c, model.ScanContext{}, "TT-SSH-009"); r.Pass {
+		t.Errorf("carry mode Match block not flagged: %+v", r)
+	}
+	// A broader block than the server's own address is a finding.
+	setSSHD(c,
+		"PermitRootLogin no",
+		"Match Address 10.0.0.0/8",
+		"    PermitRootLogin prohibit-password",
+	)
+	if r := result(t, c, ctx, "TT-SSH-009"); r.Pass {
+		t.Errorf("broader Match block not flagged: %+v", r)
+	}
+}
+
+func TestRootLoginItemFailsOnYes(t *testing.T) {
+	c := hardened()
+	setSSHD(c, "PermitRootLogin yes")
+	r := result(t, c, model.ScanContext{}, "TT-SSH-001")
+	if r.Pass || r.Skipped != "" || !strings.Contains(r.Observed, "yes") {
+		t.Fatalf("PermitRootLogin yes: %+v", r)
+	}
+	it, _ := ByID("TT-SSH-001")
+	if fix := it.FixFor(c, model.ScanContext{}); fix != `sed -i '1s/.*/PermitRootLogin no/' /etc/ssh/sshd_config && systemctl reload ssh` {
+		t.Errorf("fix = %q", fix)
+	}
+
+	// The OpenSSH default (prohibit-password) is not "no".
+	setSSHD(c, "# PermitRootLogin prohibit-password")
+	if r := result(t, c, model.ScanContext{}, "TT-SSH-001"); r.Pass {
+		t.Errorf("default prohibit-password passed: %+v", r)
+	}
+	if fix := it.FixFor(c, model.ScanContext{}); fix != `sed -i '1i PermitRootLogin no' /etc/ssh/sshd_config && systemctl reload ssh` {
+		t.Errorf("fix for unset = %q", fix)
+	}
+
+	// Root password login from the server's own address fails too.
+	setSSHD(c, "PermitRootLogin no", "Match Address 10.0.0.5", "  PermitRootLogin yes")
+	ctx := model.ScanContext{ServerAddr: "10.0.0.5"}
+	if r := result(t, c, ctx, "TT-SSH-001"); r.Pass {
+		t.Errorf("yes for server address passed: %+v", r)
+	}
+	if fix := it.FixFor(c, ctx); fix != `sed -i '3s/.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config && systemctl reload ssh` {
+		t.Errorf("fix for server block = %q", fix)
+	}
+	// Both wrong, global unset: the line edit runs before the insert that
+	// would shift it.
+	setSSHD(c, "# PermitRootLogin prohibit-password", "Match Address 10.0.0.5", "  PermitRootLogin yes")
+	want := `sed -i '3s/.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config && sed -i '1i PermitRootLogin no' /etc/ssh/sshd_config && systemctl reload ssh`
+	if fix := it.FixFor(c, ctx); fix != want {
+		t.Errorf("fix for unset + server block = %q", fix)
+	}
+}
+
+func TestEveryItemHasIDTitleWhyFix(t *testing.T) {
+	idRe := regexp.MustCompile(`^TT-[A-Z]+-[0-9]{3}$`)
+	refRe := regexp.MustCompile(`^STIG V-[0-9]+ \(UBTU-22-[0-9]+\)$`)
+	seen := map[string]bool{}
+	items := Items()
+	if len(items) < 40 {
+		t.Fatalf("%d items, want at least 40", len(items))
+	}
+	for _, it := range items {
+		if !idRe.MatchString(it.ID) {
+			t.Errorf("bad ID %q", it.ID)
+		}
+		if seen[it.ID] {
+			t.Errorf("duplicate ID %s", it.ID)
+		}
+		seen[it.ID] = true
+		if it.Title == "" || it.Why == "" || it.Fix == "" || it.Check == nil {
+			t.Errorf("%s: missing title, why, fix or check", it.ID)
+		}
+		for _, r := range it.Refs {
+			if !refRe.MatchString(r) {
+				t.Errorf("%s: bad ref %q", it.ID, r)
+			}
+		}
+		got, ok := ByID(it.ID)
+		if !ok || got.ID != it.ID {
+			t.Errorf("ByID(%s) = %v, %v", it.ID, got.ID, ok)
+		}
+	}
+	for id := range stigRefs {
+		if !seen[id] {
+			t.Errorf("stig_refs.go maps unknown item %s", id)
+		}
+	}
+	if _, ok := ByID("TT-NOPE-999"); ok {
+		t.Error("ByID found an unknown ID")
+	}
+	// Items returns copies: changing one does not change the table.
+	items[0].Refs = append(items[0].Refs, "x")
+	items[0].Title = "changed"
+	if again := Items(); again[0].Title == "changed" || len(again[0].Refs) == len(items[0].Refs) {
+		t.Error("Items shares state between calls")
+	}
+}
+
+func TestEvaluateSkipsWhenDataMissing(t *testing.T) {
+	// Nothing collected at all: every item is skipped, none guessed.
+	results := Evaluate(&model.Collection{}, model.ScanContext{ServerAddr: "10.0.0.5"})
+	if len(results) != len(Items()) {
+		t.Fatalf("%d results for %d items", len(results), len(Items()))
+	}
+	for _, r := range results {
+		if r.Skipped == "" || r.Pass {
+			t.Errorf("%s on empty collection: pass=%v skipped=%q observed=%q", r.ID, r.Pass, r.Skipped, r.Observed)
+		}
+	}
+	if got := Evaluate(nil, model.ScanContext{}); len(got) != len(results) {
+		t.Errorf("nil collection: %d results", len(got))
+	}
+
+	// Not root: passwd was read, shadow was not.
+	c := hardened()
+	c.AsRoot = false
+	c.Skipped = []model.Skip{{Check: "accounts", Reason: "/etc/shadow: open /etc/shadow: permission denied"}}
+	for i := range c.Accounts.Users {
+		c.Accounts.Users[i].Password = model.PasswordState{Algo: "none", LastChange: -1, MaxDays: -1}
+	}
+	for _, id := range []string{"TT-ACCT-002", "TT-ACCT-004"} {
+		r := result(t, c, model.ScanContext{}, id)
+		if r.Skipped == "" || r.Pass {
+			t.Errorf("%s without shadow: %+v", id, r)
+		}
+	}
+	// Items that only need passwd still run.
+	for _, id := range []string{"TT-ACCT-001", "TT-ACCT-003"} {
+		if r := result(t, c, model.ScanContext{}, id); r.Skipped != "" || !r.Pass {
+			t.Errorf("%s without shadow: %+v", id, r)
+		}
+	}
+	// Shadow absent without a Skip (no password data at all) is skipped too.
+	c.Skipped = nil
+	if r := result(t, c, model.ScanContext{}, "TT-ACCT-002"); r.Skipped == "" {
+		t.Errorf("no password data: %+v", r)
+	}
+
+	// sshd_config too large to keep: SSH items skip.
+	c = hardened()
+	c.Persist[0].Lines = nil
+	if r := result(t, c, model.ScanContext{}, "TT-SSH-001"); r.Skipped == "" {
+		t.Errorf("unreadable sshd_config: %+v", r)
+	}
+}
+
+func TestNoPasswdSudoFails(t *testing.T) {
+	c := hardened()
+	c.Persist = append(c.Persist, model.PersistFile{
+		Path: "/etc/sudoers.d/90-cloud-init-users", Kind: model.PersistKindSudoers, Mode: 0o100440,
+		// As collected: the redactor treats "NOPASSWD:" as a secret key.
+		Lines: []string{"# Created by cloud-init", "ubuntu ALL=(ALL) NOPASSWD: <redacted h:0123456789abcdef01234567>"},
+	})
+	c.Files = append(c.Files, fileEntry("/etc/sudoers.d/90-cloud-init-users", 0o440, 0, 0))
+	r := result(t, c, model.ScanContext{}, "TT-SUDO-001")
+	if r.Pass || r.Skipped != "" || !strings.Contains(r.Observed, "/etc/sudoers.d/90-cloud-init-users") {
+		t.Fatalf("NOPASSWD rule: %+v", r)
+	}
+	it, _ := ByID("TT-SUDO-001")
+	if fix := it.FixFor(c, model.ScanContext{}); fix != `sed -i 's/NOPASSWD[[:space:]]*:/PASSWD:/g' /etc/sudoers.d/90-cloud-init-users && visudo -c` {
+		t.Errorf("fix = %q", fix)
+	}
+	if r := result(t, c, model.ScanContext{}, "TT-SUDO-002"); !r.Pass {
+		t.Errorf("!authenticate item failed on NOPASSWD only: %+v", r)
+	}
+}
+
+func TestAuthenticateSudoFails(t *testing.T) {
+	c := hardened()
+	c.Persist[1].Lines = append(c.Persist[1].Lines, "Defaults:deploy env_keep+=SSH_AUTH_SOCK, !authenticate")
+	if r := result(t, c, model.ScanContext{}, "TT-SUDO-002"); r.Pass {
+		t.Errorf("!authenticate: %+v", r)
+	}
+}
+
+func TestSudoersModeFails(t *testing.T) {
+	c := hardened()
+	c.Files[5] = fileEntry("/etc/sudoers", 0o640, 0, 0)
+	if r := result(t, c, model.ScanContext{}, "TT-SUDO-003"); r.Pass || !strings.Contains(r.Observed, "0640") {
+		t.Errorf("sudoers 0640: %+v", r)
+	}
+}
+
+func TestFirewallItem(t *testing.T) {
+	cases := []struct {
+		name     string
+		fw       model.Firewall
+		pass     bool
+		skipped  bool
+		observed string
+	}{
+		{"drop policy", model.Firewall{Backend: "nftables", InputPolicy: "drop"}, true, false, ""},
+		{"accept policy with reject rules", model.Firewall{Backend: "nftables", InputPolicy: "accept", InputRules: 2}, true, false, ""},
+		{"ufw enabled", model.Firewall{Backend: "unknown", InputPolicy: "none", UFWEnabled: boolp(true)}, true, false, ""},
+		{"nothing", model.Firewall{Backend: "nftables", InputPolicy: "none"}, false, false, "none"},
+		{"ufw disabled", model.Firewall{Backend: "unknown", InputPolicy: "none", UFWEnabled: boolp(false)}, false, false, "ufw disabled"},
+		{"unreadable", model.Firewall{Backend: "unknown", InputPolicy: "none"}, false, true, ""},
+	}
+	for _, tc := range cases {
+		c := hardened()
+		c.Firewall = tc.fw
+		r := result(t, c, model.ScanContext{}, "TT-FW-001")
+		if r.Pass != tc.pass || (r.Skipped != "") != tc.skipped || !strings.Contains(r.Observed, tc.observed) {
+			t.Errorf("%s: %+v", tc.name, r)
+		}
+	}
+}
+
+func TestSysctlItems(t *testing.T) {
+	c := hardened()
+	c.Sysctl["kernel.randomize_va_space"] = "1"
+	c.Sysctl["kernel.kptr_restrict"] = "2"
+	delete(c.Sysctl, "kernel.yama.ptrace_scope")
+	if r := result(t, c, model.ScanContext{}, "TT-KERN-001"); r.Pass || r.Observed != "kernel.randomize_va_space = 1" {
+		t.Errorf("randomize_va_space 1: %+v", r)
+	}
+	if r := result(t, c, model.ScanContext{}, "TT-KERN-003"); !r.Pass {
+		t.Errorf("kptr_restrict 2: %+v", r)
+	}
+	if r := result(t, c, model.ScanContext{}, "TT-KERN-012"); r.Skipped == "" {
+		t.Errorf("missing ptrace_scope: %+v", r)
+	}
+	it, _ := ByID("TT-KERN-001")
+	if it.Fix != `sysctl -w kernel.randomize_va_space=2 && echo 'kernel.randomize_va_space = 2' > /etc/sysctl.d/99-telltale-kernel.randomize_va_space.conf` {
+		t.Errorf("fix = %q", it.Fix)
+	}
+	c.Sysctl["apparmor.enabled"] = "N"
+	if r := result(t, c, model.ScanContext{}, "TT-SVC-006"); r.Pass {
+		t.Errorf("apparmor N: %+v", r)
+	}
+}
+
+func TestAccountItems(t *testing.T) {
+	c := hardened()
+	c.Accounts.Users = append(c.Accounts.Users,
+		model.User{Name: "toor", UID: 0, Shell: "/bin/sh", Password: model.PasswordState{Set: true, Algo: "md5", LastChange: 19000}},
+		model.User{Name: "games", UID: 5, Shell: "/bin/bash", Password: model.PasswordState{Locked: true, LastChange: 19000}},
+		model.User{Name: "bob", UID: 1001, Shell: "/bin/bash", Password: model.PasswordState{Algo: "none", LastChange: 19000}},
+		// A NIS compat line is not an account.
+		model.User{Name: "+", UID: 0, Shell: ""},
+	)
+	checks := map[string]string{
+		"TT-ACCT-001": "toor",
+		"TT-ACCT-002": "bob",
+		"TT-ACCT-003": "games",
+		"TT-ACCT-004": "toor",
+	}
+	for id, who := range checks {
+		r := result(t, c, model.ScanContext{}, id)
+		if r.Pass || r.Skipped != "" || !strings.Contains(r.Observed, who) {
+			t.Errorf("%s: %+v", id, r)
+		}
+		if strings.Contains(r.Observed, "+") {
+			t.Errorf("%s counts the NIS line: %+v", id, r)
+		}
+	}
+	it, _ := ByID("TT-ACCT-002")
+	if fix := it.FixFor(c, model.ScanContext{}); fix != "passwd -l bob" {
+		t.Errorf("fix = %q", fix)
+	}
+}
+
+func TestFileItems(t *testing.T) {
+	c := hardened()
+	c.Files[0] = fileEntry("/etc/shadow", 0o644, 0, 42)
+	c.Files = append(c.Files,
+		fileEntry("/etc/evil it's.sh", 0o777, 0, 0),
+		dirEntry("/usr/local/drop", 0o777),
+		dirEntry("/usr/local/tmp", 0o1777),
+		dirEntry("/etc/cron.weekly", 0o755),
+	)
+	if r := result(t, c, model.ScanContext{}, "TT-FILE-001"); r.Pass || !strings.Contains(r.Observed, "0644") {
+		t.Errorf("shadow 0644: %+v", r)
+	}
+	r := result(t, c, model.ScanContext{}, "TT-FILE-005")
+	if r.Pass || !strings.Contains(r.Observed, "/usr/local/drop") || strings.Contains(r.Observed, "/usr/local/tmp") {
+		t.Errorf("world-writable: %+v", r)
+	}
+	it, _ := ByID("TT-FILE-005")
+	if fix := it.FixFor(c, model.ScanContext{}); fix != `chmod o-w '/etc/evil it'\''s.sh' /usr/local/drop` {
+		t.Errorf("fix = %q", fix)
+	}
+	if r := result(t, c, model.ScanContext{}, "TT-FILE-006"); r.Pass || !strings.Contains(r.Observed, "/etc/cron.weekly") {
+		t.Errorf("cron dir 0755: %+v", r)
+	}
+}
+
+func TestServiceItems(t *testing.T) {
+	c := hardened()
+	c.Packages.Installed = []model.Package{{Name: "inetutils-telnetd"}, {Name: "tftpd-hpa"}, {Name: "nis"}, {Name: "rsh-server"}}
+	for _, id := range []string{"TT-SVC-001", "TT-SVC-002", "TT-SVC-003", "TT-SVC-004", "TT-SVC-005", "TT-SVC-007"} {
+		if r := result(t, c, model.ScanContext{}, id); r.Pass || r.Skipped != "" {
+			t.Errorf("%s: %+v", id, r)
+		}
+	}
+	it, _ := ByID("TT-SVC-001")
+	if fix := it.FixFor(c, model.ScanContext{}); fix != "apt-get purge inetutils-telnetd" {
+		t.Errorf("fix = %q", fix)
+	}
+}
+
+func TestSSHKeywordItems(t *testing.T) {
+	c := hardened()
+	setSSHD(c,
+		"PermitRootLogin no",
+		"PermitEmptyPasswords yes",
+		"X11Forwarding yes",
+		"MaxAuthTries 10",
+		"HostbasedAuthentication yes",
+		"IgnoreRhosts no",
+		"PermitUserEnvironment yes",
+		"StrictModes no",
+		"PasswordAuthentication yes",
+	)
+	for _, id := range []string{"TT-SSH-002", "TT-SSH-004", "TT-SSH-005", "TT-SSH-006", "TT-SSH-007", "TT-SSH-010", "TT-SSH-011"} {
+		if r := result(t, c, model.ScanContext{}, id); r.Pass || r.Skipped != "" {
+			t.Errorf("%s: %+v", id, r)
+		}
+	}
+	// Password login is noted, never failed.
+	if r := result(t, c, model.ScanContext{}, "TT-SSH-003"); !r.Pass || r.Observed != "PasswordAuthentication yes" {
+		t.Errorf("TT-SSH-003: %+v", r)
+	}
+	// A redacted value cannot be judged.
+	setSSHD(c, "PermitRootLogin no", "PermitEmptyPasswords=<redacted h:0123456789abcdef01234567>")
+	if r := result(t, c, model.ScanContext{}, "TT-SSH-002"); r.Skipped == "" {
+		t.Errorf("redacted value: %+v", r)
+	}
+	// A loosening Match block for some users is caught.
+	setSSHD(c, "PermitRootLogin no", "Match User deploy", "  PermitEmptyPasswords yes")
+	r := result(t, c, model.ScanContext{}, "TT-SSH-009")
+	if r.Pass || !strings.Contains(r.Observed, "PermitEmptyPasswords yes") {
+		t.Errorf("TT-SSH-009: %+v", r)
+	}
+	it, _ := ByID("TT-SSH-009")
+	if fix := it.FixFor(c, model.ScanContext{}); fix != `sed -i -e '3s/^/#/' /etc/ssh/sshd_config && systemctl reload ssh` {
+		t.Errorf("fix = %q", fix)
+	}
+	// sshd_config writable by others.
+	c = hardened()
+	c.Files[4] = fileEntry("/etc/ssh/sshd_config", 0o666, 0, 0)
+	if r := result(t, c, model.ScanContext{}, "TT-SSH-008"); r.Pass {
+		t.Errorf("TT-SSH-008: %+v", r)
+	}
+}
+
+func TestSSHDFileModeFallsBackToPersistMeta(t *testing.T) {
+	c := hardened()
+	inc := sshdFile("/etc/ssh/sshd_config.d/50-local.conf", "MaxAuthTries 3")
+	c.Persist = append(c.Persist, inc)
+	if r := result(t, c, model.ScanContext{}, "TT-SSH-008"); !r.Pass {
+		t.Errorf("0644 include outside the inventory: %+v", r)
+	}
+	c.Persist[len(c.Persist)-1].Mode = 0o100666
+	r := result(t, c, model.ScanContext{}, "TT-SSH-008")
+	if r.Pass || !strings.Contains(r.Observed, "50-local.conf mode 0666") {
+		t.Errorf("0666 include outside the inventory: %+v", r)
+	}
+}
