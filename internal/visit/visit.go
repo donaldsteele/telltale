@@ -49,6 +49,10 @@ var (
 	// ErrNoHostKey means the machine has no pinned host key yet. Visit
 	// never trusts a key on first use; see FetchHostKey.
 	ErrNoHostKey = errors.New("the machine has no pinned host key; confirm its fingerprint at enrolment first")
+	// ErrLoginRefused means the machine was reached, showed the host key
+	// the caller accepts, and then did not let the server log in. That is
+	// what removing the server's key line or its Match block looks like.
+	ErrLoginRefused = errors.New("the machine answered with its pinned host key and refused the server's login")
 	// ErrNoExecDir means the collector could not run from a temporary
 	// directory in any of /run, /var/tmp, /root and /tmp.
 	ErrNoExecDir = errors.New("no temporary directory on the machine lets the collector run")

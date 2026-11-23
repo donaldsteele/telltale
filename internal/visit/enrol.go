@@ -167,6 +167,19 @@ func handshake(ctx context.Context, hostport string, cfg *ssh.ClientConfig) (*ss
 		nc.SetDeadline(dl)
 	}
 	stop := context.AfterFunc(ctx, func() { nc.Close() })
+	// Whether the machine got as far as showing a host key the caller
+	// accepts: a failure after that is a refused login, not an unreachable
+	// machine and not a changed host key.
+	accepted := false
+	if check := cfg.HostKeyCallback; check != nil {
+		c := *cfg
+		c.HostKeyCallback = func(host string, addr net.Addr, k ssh.PublicKey) error {
+			err := check(host, addr, k)
+			accepted = err == nil
+			return err
+		}
+		cfg = &c
+	}
 	conn, chans, reqs, err := ssh.NewClientConn(nc, hostport, cfg)
 	if !stop() {
 		// ctx ended during the handshake and closed the connection.
@@ -176,6 +189,9 @@ func handshake(ctx context.Context, hostport string, cfg *ssh.ClientConfig) (*ss
 		return nil, ctx.Err()
 	}
 	if err != nil {
+		if accepted {
+			return nil, fmt.Errorf("%w: %w", ErrLoginRefused, escaped{err})
+		}
 		return nil, escaped{err}
 	}
 	nc.SetDeadline(time.Time{})

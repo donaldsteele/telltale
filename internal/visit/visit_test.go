@@ -1605,3 +1605,35 @@ func TestBinariesForWarnsWhenItFallsBackToTheFullBinary(t *testing.T) {
 		t.Errorf("For(%s) with a collector: %v, logged %q", own, err, buf.String())
 	}
 }
+
+// A machine that shows its pinned host key and then refuses the server's key
+// is told apart from one that cannot be reached: the first is what removing
+// the server's key line or Match block looks like.
+func TestVisitMarksARefusedLogin(t *testing.T) {
+	f := newFake(t)
+	stranger := newSigner(t, "ed25519")
+	_, err := Visit(testCtx(t), f.machine(), stranger, testContext(), f.binaries(t))
+	if !errors.Is(err, ErrLoginRefused) {
+		t.Fatalf("err = %v, want ErrLoginRefused", err)
+	}
+	noRawControl(t, err.Error())
+	f.check(t)
+
+	// Nothing listens: unreachable, not refused.
+	l, lerr := net.Listen("tcp", "127.0.0.1:0")
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	m := f.machine()
+	m.Addr = l.Addr().String()
+	l.Close()
+	if _, err := Visit(testCtx(t), m, f.client, testContext(), f.binaries(t)); err == nil || errors.Is(err, ErrLoginRefused) || errors.Is(err, ErrHostKeyChanged) {
+		t.Fatalf("closed port: err = %v", err)
+	}
+	// Another host key is a changed host key, never a refused login.
+	m = f.machine()
+	m.HostKey = authorizedLine(stranger.PublicKey())
+	if _, err := Visit(testCtx(t), m, stranger, testContext(), f.binaries(t)); !errors.Is(err, ErrHostKeyChanged) || errors.Is(err, ErrLoginRefused) {
+		t.Fatalf("changed host key: err = %v", err)
+	}
+}

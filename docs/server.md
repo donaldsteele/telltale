@@ -221,8 +221,16 @@ the settings page, so you can audit each machine's
   a module you built) can be accepted as an exception. It stays accepted
   only while its value stays exactly the same.
 - **A visit that fails** is recorded; after three failures in a row the
-  machine's report says so. A temporary directory a broken connection left
-  behind is removed on the next visit.
+  machine's report says so. For a machine that was visited successfully
+  before, that report is a **backdoor sign** when the machine still answers
+  with its pinned host key but refuses the server's login (the server's key
+  line or Match block was removed, or its access is gone some other way),
+  and a **weak setting** when the machine cannot be reached or the visit
+  breaks off. Either way an alert is sent, once per outage, whatever the
+  alert level; the next visit that works resolves it. A changed host key is
+  reported as tampering at once. A machine that never had a successful
+  visit gets a note. A temporary directory a broken connection left behind
+  is removed on the next visit.
 - **The audit log** records every visit, enrolment, snapshot, accepted
   change and exception, every login and every settings change. Nothing in it
   can be changed or removed from the UI.
@@ -250,7 +258,8 @@ it shows and picks a channel.
 
 An alert goes out when a visit finds new tampering or a new backdoor sign
 (the default) or any new finding (an option), and a resolved alert when it
-is gone. An alert holds the finding, the machine and at most the one changed
+is gone. A machine that was being checked and no longer can be (three
+failed visits in a row) is always alerted, at either setting. An alert holds the finding, the machine and at most the one changed
 line, redacted, never file contents. If bubbles cannot be reached, alerts
 wait in an encrypted queue (the most serious are kept when it is full) and
 are sent later.

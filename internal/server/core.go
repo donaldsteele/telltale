@@ -90,7 +90,8 @@ var ErrVisitRunning = errors.New("a visit to this machine is running; try again 
 // Settings the core reads. Durations are Go durations ("45m").
 const (
 	// SettingAlertLevel is "urgent" (tampering and backdoor signs, the
-	// default) or "all" (every finding).
+	// default) or "all" (every finding). A machine that stops being
+	// checkable is alerted at either level.
 	SettingAlertLevel = "alert_level"
 	// SettingVisitTimeout bounds each visit, package verification
 	// included; 30 minutes when unset or unreadable.
@@ -293,6 +294,7 @@ func digestKeySetting(id int64) string { return "digest_key:" + strconv.FormatIn
 func leftoverSetting(id int64) string  { return "leftover:" + strconv.FormatInt(id, 10) }
 func errorSetting(id int64) string     { return "visit_error:" + strconv.FormatInt(id, 10) }
 func failuresSetting(id int64) string  { return "visit_failures:" + strconv.FormatInt(id, 10) }
+func outageSetting(id int64) string    { return "visit_outage:" + strconv.FormatInt(id, 10) }
 func attemptSetting(id int64) string   { return "last_attempt:" + strconv.FormatInt(id, 10) }
 func rebaseSetting(id int64) string    { return "rebase:" + strconv.FormatInt(id, 10) }
 func alertSetting(id int64) string     { return "alert_state:" + strconv.FormatInt(id, 10) }
@@ -324,8 +326,10 @@ type pendingAlert struct {
 //     is judged as usual, with a note visit.left_on_machine; the next visit
 //     removes the directory first;
 //   - any other failure, a bad ServerAddr included, is recorded on the
-//     machine (VisitError), and the third in a row stores a report with the
-//     note visit.failing.
+//     machine (VisitError), and the third in a row stores a report with
+//     the finding visit.failing: a backdoor sign or a weak setting for a
+//     machine that was visited before (see visitFailing), which is always
+//     alerted, and a note for one that never was.
 //
 // At most four visits run at once and one per machine (ErrVisitRunning).
 // The visit is bounded by the visit_timeout setting; the alert is sent
@@ -543,6 +547,9 @@ func (c *Core) visitSucceeded(id int64) error {
 	if err := c.Store.SetSetting(failuresSetting(id), "0"); err != nil {
 		return err
 	}
+	if err := c.Store.SetSetting(outageSetting(id), ""); err != nil {
+		return err
+	}
 	if err := c.Store.SetSecretSetting(errorSetting(id), []byte{}); err != nil {
 		return err
 	}
@@ -558,7 +565,13 @@ func (c *Core) visitSucceeded(id int64) error {
 }
 
 // visitFailed records a failed visit (m is nil when the machine could not
-// be read); the third in a row stores a report.
+// be read); the third in a row stores a report about the outage.
+//
+// For a machine that had a good visit, the report's severity says what kind
+// of outage it is (visitFailing), and the owner is alerted once per outage
+// whatever the alert level (diffAlerts). Further failures of the same outage
+// store nothing, unless the outage turns into a worse kind: a machine that
+// was out of reach and now answers and refuses the login is said once more.
 func (c *Core) visitFailed(id int64, m *store.Machine, verr error) outcome {
 	unlock := c.lock(id)
 	defer unlock()
@@ -575,13 +588,21 @@ func (c *Core) visitFailed(id int64, m *store.Machine, verr error) outcome {
 	if err := c.audit(actorServer, "visit failed", "machine %d", id); err != nil {
 		fail = errors.Join(fail, err)
 	}
-	if n != failingAfter {
+	if n < failingAfter {
 		return outcome{err: fail}
 	}
-	rep := c.syntheticReport(visitFailing(n))
+	f := visitFailing(n, m != nil && m.LastVisit != nil, errors.Is(verr, visit.ErrLoginRefused))
+	told, _ := c.Store.Setting(outageSetting(id))
+	if was, err := strconv.Atoi(told); n != failingAfter && (err != nil || int(f.Severity) <= was) {
+		return outcome{err: fail} // the owner knows about this outage
+	}
+	rep := c.syntheticReport(f)
 	rid, err := c.Store.PutReport(id, rep, &model.Collection{})
 	if err != nil {
 		return outcome{err: errors.Join(fail, err)}
+	}
+	if err := c.Store.SetSetting(outageSetting(id), strconv.Itoa(int(f.Severity))); err != nil {
+		return outcome{rid: rid, err: errors.Join(fail, err)}
 	}
 	if err := c.audit(actorServer, "visits failing", "machine %d report %d", id, rid); err != nil {
 		fail = errors.Join(fail, err)
@@ -655,8 +676,20 @@ func hostKeyFinding(hk *visit.HostKeyMismatchError) model.Finding {
 	}
 }
 
-func visitFailing(n int) model.Finding {
-	return model.Finding{
+// visitFailing is the finding for n failed visits in a row. visited says
+// the machine had a visit that worked; refused that it answered with its
+// pinned host key and did not let the server log in.
+//
+//   - A machine never visited successfully: a note. Enrolment is not done.
+//   - Visited before, and now it refuses the login: a backdoor sign. The
+//     server's key line or Match block was removed, or its access is gone
+//     some other way, which is what someone who wants to stay unseen does.
+//   - Visited before, and now it cannot be reached or the visit fails some
+//     other way: a weak setting. Nothing on it is being checked.
+//
+// Every text here is fixed: nothing from the machine or the error goes in.
+func visitFailing(n int, visited, refused bool) model.Finding {
+	f := model.Finding{
 		Key: KeyVisitFailing, ID: "TT-VISIT-002", Source: sourceVisit, Severity: model.SevNote,
 		Title: fmt.Sprintf("The last %d visits to the machine failed", n),
 		Why: "Nothing on the machine has been checked since the last visit that worked. The machine may be down or unreachable, sshd may be stopped or reconfigured, " +
@@ -664,6 +697,26 @@ func visitFailing(n int) model.Finding {
 		Fix:      "# Check that the machine is up and reachable from the server, that sshd runs, and that the enrolment snippets are still in place; the machine page shows the last error.",
 		Evidence: []model.Evidence{{After: "failing", Detail: fmt.Sprintf("%d visits in a row failed", n)}},
 	}
+	switch {
+	case !visited:
+	case refused:
+		f.Severity = model.SevBackdoor
+		f.Title = "The machine no longer lets the telltale server log in"
+		f.Why = "The machine answers with the SSH host key pinned at enrolment and refuses the server's login, after visits that worked. " +
+			"The server's key line in root's authorized_keys or its Match block in the SSH server configuration was removed or changed, or root login was closed some other way. " +
+			"Someone who wants to stay unseen does exactly that. Nothing on the machine has been checked since the last visit that worked."
+		f.Fix = "# On the machine's console, look at /root/.ssh/authorized_keys and the SSH server configuration, and at who changed them and when.\n" +
+			"# If you did not change them, treat the machine as compromised. To let the server in again, put the enrolment snippets back (the machine page shows them) and visit again."
+		f.Evidence = []model.Evidence{{Before: "visits worked", After: "login refused", Detail: fmt.Sprintf("%d visits in a row failed; the machine showed its pinned host key and refused the server's key", n)}}
+		f.Refs = []string{"T1562", "T1098.004"}
+	default:
+		f.Severity = model.SevWeak
+		f.Title = "The machine can no longer be checked"
+		f.Why = "The machine was visited before and the visits now fail: it is down or out of reach, or the visit breaks off. " +
+			"Nothing on it has been checked since the last visit that worked, and a machine nobody is checking is where an intruder would rather be."
+		f.Evidence = []model.Evidence{{Before: "visits worked", After: "failing", Detail: fmt.Sprintf("%d visits in a row failed", n)}}
+	}
+	return f
 }
 
 func leftOnMachine(dirs []string) model.Finding {
@@ -1029,7 +1082,11 @@ func (c *Core) urgentOnly() bool {
 func diffAlerts(st alertState, rep *model.Report, urgent, isSynthetic bool) (fresh, resolved []model.Finding, next alertState) {
 	var cur []model.Finding
 	for _, f := range rep.Findings {
-		if !urgent || f.Severity >= model.SevBackdoor {
+		// A machine that was being checked and no longer can be is always
+		// said, whatever the alert level: silence about it would be the
+		// worst gap an alert level could leave.
+		outage := isSynthetic && f.Key == KeyVisitFailing && f.Severity >= model.SevWeak
+		if !urgent || f.Severity >= model.SevBackdoor || outage {
 			cur = append(cur, f)
 		}
 	}
