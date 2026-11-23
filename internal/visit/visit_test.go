@@ -1580,6 +1580,7 @@ func TestBinariesForWarnsWhenItFallsBackToTheFullBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	set(t, &executable, func() (string, error) { return exe, nil })
+	set(t, &fallbackWarned, new(sync.Once))
 	var buf bytes.Buffer
 	b := Binaries{Log: log.New(&buf, "", 0)}
 	if p, err := b.For(own); err != nil || p != exe {
@@ -1589,6 +1590,11 @@ func TestBinariesForWarnsWhenItFallsBackToTheFullBinary(t *testing.T) {
 	if !strings.Contains(logged, "warning") || !strings.Contains(logged, "full binary") ||
 		!strings.Contains(logged, filepath.Join(filepath.Dir(exe), "telltale-linux-"+runtime.GOARCH)) {
 		t.Errorf("the fallback to the full binary is not logged as a warning with where the collector was looked for: %q", logged)
+	}
+	// Every visit comes here; the log says it once per process.
+	buf.Reset()
+	if p, err := b.For(own); err != nil || p != exe || buf.Len() != 0 {
+		t.Errorf("a second fallback: %q, %v, logged %q; want the executable and no second warning", p, err, buf.String())
 	}
 	// A collector that is there is used without a word.
 	buf.Reset()

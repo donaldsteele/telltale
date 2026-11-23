@@ -173,6 +173,22 @@ func TestHTMLSelfContained(t *testing.T) {
 	}
 }
 
+// The page carries its own content security policy: it may use its inline
+// style and nothing else, so even served from a shared origin (the project
+// site) it can run no script and load nothing.
+func TestHTMLContentSecurityPolicy(t *testing.T) {
+	var b bytes.Buffer
+	if err := HTML(&b, tampering()); err != nil {
+		t.Fatal(err)
+	}
+	h := b.String()
+	const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:">`
+	at, style := strings.Index(h, csp), strings.Index(h, "<style>")
+	if at < 0 || style < 0 || at > style || at > strings.Index(h, "</head>") {
+		t.Errorf("no content security policy in the head before the style:\n%.600s", h)
+	}
+}
+
 func TestJSONNamesSeverity(t *testing.T) {
 	var b bytes.Buffer
 	if err := JSON(&b, tampering()); err != nil {

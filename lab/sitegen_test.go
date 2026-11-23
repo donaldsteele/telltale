@@ -6,19 +6,16 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
-	"os/user"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
-	"unicode"
 
 	"github.com/donaldsteele/telltale/internal/escape"
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/lab/labkit"
+	"github.com/donaldsteele/telltale/tools/sitecheck"
 )
 
 // The project site shows real telltale reports of lab machines, not
@@ -28,13 +25,14 @@ import (
 // terminal output and the JSON) to site/reports, or to
 // $TELLTALE_SITE_REPORTS, with index.json holding each report's story.
 // scripts/site-reports.sh runs it, and the Pages workflow runs that script
-// for every release, so the site always shows what the current version
-// prints.
+// for every release tag and publishes the result, so the site shows what
+// the release's telltale prints; index.json names the build.
 //
 // The machines have fixed made-up names (web01, files02, build03). Nothing
-// from the computer running the lab may reach the site: the test fails when
-// a file it wrote holds this computer's host name, user name, home
-// directory or network addresses.
+// that identifies the computer running the lab (its host name, user, home
+// directory, addresses) may reach the site: the test fails when a file it
+// wrote holds one. The kernel version and kernel settings in the reports
+// are that computer's, as the reports say.
 
 // siteReports are the reports the site shows, in the order it shows them.
 var siteReports = []siteReport{
@@ -482,16 +480,19 @@ func checkSiteReports(t *testing.T, out string) {
 	checkPrivate(t, out)
 }
 
-// checkPrivate fails the test when a file in dir holds anything of the
-// computer running the lab: its host name, its user's name and home
-// directory, the parts of those names (split at anything that is not a
-// letter or digit, four characters or longer, with a letter), its network
-// addresses, and the words in
-// $TELLTALE_SITE_PRIVATE (comma separated). They are worked out here rather
-// than written down, so the repository does not hold them either.
+// checkPrivate fails the test when a file in dir holds anything that
+// identifies the computer running the lab: its host name, user name, home
+// directory or network addresses, or a word in $TELLTALE_SITE_PRIVATE
+// (comma separated). tools/sitecheck works them out here, so the
+// repository does not hold them either. The kernel version and the kernel
+// settings in the reports are that computer's, as the reports say: a lab
+// machine is a container on its kernel.
 func checkPrivate(t *testing.T, dir string) {
 	t.Helper()
-	words, ips := privateWords(t)
+	private, err := sitecheck.This(strings.Split(os.Getenv("TELLTALE_SITE_PRIVATE"), ","))
+	if err != nil {
+		t.Fatalf("the privacy check cannot run: %v", err)
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -506,76 +507,11 @@ func checkPrivate(t *testing.T, dir string) {
 			t.Fatal(err)
 		}
 		checked++
-		low := bytes.ToLower(data)
-		for i, w := range words {
-			if bytes.Contains(low, []byte(strings.ToLower(w))) {
-				t.Errorf("%s holds something of this computer (private word %d of %d): it must never reach the site", e.Name(), i+1, len(words))
-			}
-		}
-		for _, re := range ips {
-			if re.Match(data) {
-				t.Errorf("%s holds one of this computer's network addresses: it must never reach the site", e.Name())
+		for _, p := range private {
+			if p.In(data) {
+				t.Errorf("%s holds %s: it must never reach the site", e.Name(), p.Kind)
 			}
 		}
 	}
-	t.Logf("privacy: %d files checked against %d private words and %d addresses of this computer", checked, len(words), len(ips))
-}
-
-// privateWords works out what identifies the computer running the test.
-func privateWords(t *testing.T) ([]string, []*regexp.Regexp) {
-	t.Helper()
-	host, err := os.Hostname()
-	if err != nil || host == "" {
-		t.Fatalf("cannot tell this computer's host name (%v), so the privacy check cannot run", err)
-	}
-	seen := map[string]bool{}
-	var words []string
-	add := func(s string) {
-		s = strings.TrimSpace(s)
-		if len(s) < 3 || seen[strings.ToLower(s)] {
-			return
-		}
-		// Names every Linux machine has, the lab's included.
-		switch strings.ToLower(s) {
-		case "root", "localhost", "/root", "debian", "ubuntu", "user", "admin", "home":
-			return
-		}
-		seen[strings.ToLower(s)] = true
-		words = append(words, s)
-	}
-	parts := func(s string) {
-		for _, p := range strings.FieldsFunc(s, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
-			if len(p) >= 4 && strings.ContainsFunc(p, unicode.IsLetter) {
-				add(p)
-			}
-		}
-	}
-	add(host)
-	parts(host)
-	if u, err := user.Current(); err == nil {
-		add(u.Username)
-		parts(u.Username)
-		if strings.HasPrefix(u.HomeDir, "/home/") {
-			add(u.HomeDir)
-		}
-	}
-	if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(home, "/home/") {
-		add(home)
-	}
-	for _, w := range strings.Split(os.Getenv("TELLTALE_SITE_PRIVATE"), ",") {
-		add(w)
-	}
-	var ips []*regexp.Regexp
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		t.Fatalf("cannot list this computer's addresses (%v), so the privacy check cannot run", err)
-	}
-	for _, a := range addrs {
-		n, ok := a.(*net.IPNet)
-		if !ok || n.IP.IsLoopback() || n.IP.IsLinkLocalUnicast() {
-			continue
-		}
-		ips = append(ips, regexp.MustCompile(fmt.Sprintf(`(^|[^0-9a-fA-F.:])%s($|[^0-9a-fA-F])`, regexp.QuoteMeta(n.IP.String()))))
-	}
-	return words, ips
+	t.Logf("privacy: %d files checked against %d private words and addresses of this computer", checked, len(private))
 }

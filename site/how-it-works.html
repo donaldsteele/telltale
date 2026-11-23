@@ -88,7 +88,7 @@
 <section id="report">
 <h2>Reading a report</h2>
 <p>The report starts with the machine, what it was compared against and what it could not rule out. Then the findings, most serious first, each with its evidence, why it matters and the command that would fix it. The <a href="reports.html">reports page</a> has real ones.</p>
-<div class="sevs" aria-label="The severities">
+<div class="sevs" role="group" aria-label="The severities">
 <div><span class="sev tampering">Tampering</span><p>A checklist item that held in the snapshot and fails now, a system file that does not match its signed package, or something the machine's own tools hide.</p></div>
 <div><span class="sev backdoor">Backdoor sign</span><p>A new root SSH key, a second account with user id 0, a cron job or systemd unit that calls out, an unknown PAM module, a setuid program no package ships.</p></div>
 <div><span class="sev weak">Weak setting</span><p>A checklist item that is not met (and, with a snapshot, was not met then either).</p></div>

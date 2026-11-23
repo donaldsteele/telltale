@@ -2,11 +2,16 @@ name: pages
 
 # The project site (site/), with real reports: scripts/site-reports.sh runs
 # the lab's scenario machines (Docker, which the runner has) with telltale
-# built from this commit and writes their reports into site/reports/. It
-# runs on every push to main and on every release tag, so the site always
-# shows what the current version prints, and it fails if any report is
-# missing, if a link in the site leads nowhere, or if anything of the
-# computer that made the reports got into them.
+# built from the commit and writes their reports into site/reports/. It
+# fails if any report is missing, if a link in the site leads nowhere, or if
+# anything that identifies the computer that made the reports got into
+# them.
+#
+# Only a release tag (vX.Y.Z) publishes the site, so the reports are always
+# the release's telltale; the reports page names the build. A push to main
+# runs the same build and checks as a test, and publishes nothing. The
+# github-pages environment needs a deployment rule for v* tags (by default
+# it allows only the default branch).
 
 on:
   push:
@@ -16,11 +21,6 @@ on:
 
 permissions:
   contents: read
-
-# One deployment at a time; a newer one waits rather than cutting one off.
-concurrency:
-  group: pages
-  cancel-in-progress: false
 
 # Third-party actions are pinned to full commit SHAs; the comment names the
 # version each SHA is.
@@ -48,12 +48,21 @@ jobs:
       - name: links and privacy
         run: go run ./tools/linkcheck site
 
-      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: site
 
   deploy:
     needs: build
+    # Releases only: between releases the site keeps the last release's
+    # reports.
+    if: startsWith(github.ref, 'refs/tags/v')
+    # One deployment at a time; a newer one waits rather than cutting one
+    # off.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Only this job may deploy.

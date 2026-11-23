@@ -469,7 +469,7 @@ func crossView(c *model.Collection) []model.Finding {
 		}
 		f := model.Finding{
 			Key: "heur.crossview:" + r.Tool, ID: idCrossView, Source: source, Severity: model.SevTampering,
-			Title: fmt.Sprintf("`%s` hides %d item(s) that telltale can see directly", r.Tool, len(r.HiddenFromTool)),
+			Title: fmt.Sprintf("`%s` hides %d %s that telltale can see directly", r.Tool, len(r.HiddenFromTool), plural(len(r.HiddenFromTool), "item", "items")),
 			Why:   "Two independent ways of looking at the machine disagree. Something is filtering this tool's output, which is what rootkits do to hide themselves.",
 			Fix:   "Do not trust this machine's own tools. Check `cat /etc/ld.so.preload`, copy telltale's collection off the host, then inspect or rebuild the machine from rescue media.",
 			Refs:  []string{"T1014"},
@@ -597,4 +597,12 @@ func packagedSetuid(c *model.Collection, owned map[string]string) map[string]str
 		}
 	}
 	return m
+}
+
+// plural is one when n is 1 and many otherwise.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }

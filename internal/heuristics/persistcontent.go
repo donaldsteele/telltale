@@ -42,7 +42,7 @@ func persistCallbacks(c *model.Collection) []model.Finding {
 		}
 		ev := []model.Evidence{{Path: p.Path, Line: first.Line, After: strings.Join(all, "\n"), Detail: "matched: " + first.Pattern}}
 		if len(p.Signals) > 1 {
-			ev[0].Detail += fmt.Sprintf("; %d more matching line(s) in this file, first at line %d", len(p.Signals)-1, p.Signals[1].Line)
+			ev[0].Detail += fmt.Sprintf("; %d more matching %s in this file, first at line %d", len(p.Signals)-1, plural(len(p.Signals)-1, "line", "lines"), p.Signals[1].Line)
 		}
 		out = append(out, model.Finding{
 			Key: "heur.persist_callback:" + p.Path, ID: idPersistCallback, Source: source, Severity: model.SevBackdoor,

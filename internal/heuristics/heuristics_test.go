@@ -237,6 +237,14 @@ func TestHeuristicCrossViewHidden(t *testing.T) {
 	if len(f.Evidence) != 2 {
 		t.Errorf("evidence %v", f.Evidence)
 	}
+	if f.Title != "`ss -t -4` hides 2 items that telltale can see directly" {
+		t.Errorf("title %q", f.Title)
+	}
+	one := cleanCollection()
+	one.CrossView = append(one.CrossView, model.CrossViewResult{Tool: "ps", Ran: true, HiddenFromTool: []string{"pid 94 (lab-hidden)"}})
+	if f := want(t, one, "heur.crossview:ps", model.SevTampering); f.Title != "`ps` hides 1 item that telltale can see directly" {
+		t.Errorf("title %q", f.Title)
+	}
 	if find(Run(inventoried(c), ctx, cleanOwned()), "heur.crossview:lsmod") != nil {
 		t.Error("not-run tool flagged")
 	}

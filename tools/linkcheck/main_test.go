@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/donaldsteele/telltale/tools/sitecheck"
 )
 
 func write(t *testing.T, dir, name, content string) {
@@ -88,17 +90,26 @@ func TestLinks(t *testing.T) {
 }
 
 func TestPrivate(t *testing.T) {
-	host, err := os.Hostname()
-	if err != nil || host == "" {
-		t.Skip("no host name")
-	}
 	t.Setenv("TELLTALE_SITE_PRIVATE", "Secret-Word")
 	dir := t.TempDir()
-	write(t, dir, "index.html", `<p>made on `+strings.ToUpper(host)+`</p>`)
+	write(t, dir, "index.html", `<p>made by SECRET-WORD</p>`)
 	write(t, dir, "data/report.json", `{"note": "a secret-word here"}`)
-	write(t, dir, "ok.txt", "nothing of this computer")
-	if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(home, "/home/") {
-		write(t, dir, "home.txt", "found in "+home+"/code")
+	// Every file is read except images, whatever its name.
+	write(t, dir, "NOTES", "the secret-word again")
+	write(t, dir, "fonts/x.woff2", "secret-word")
+	write(t, dir, "shot.png", "secret-word")
+	write(t, dir, "ok.txt", "secret-words and nothing of this computer")
+	ps, err := sitecheck.This(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, _ := os.Hostname()
+	hostCounts := false
+	for _, p := range ps {
+		hostCounts = hostCounts || p.Kind == "this computer's host name"
+	}
+	if hostCounts {
+		write(t, dir, "host.txt", "made on "+strings.ToUpper(host)+".")
 	}
 	var ip string
 	if addrs, err := net.InterfaceAddrs(); err == nil {
@@ -113,39 +124,51 @@ func TestPrivate(t *testing.T) {
 		write(t, dir, "ip.txt", "connected to "+ip+".")
 		write(t, dir, "notip.txt", "version "+ip+"5 is not the address")
 	}
-	// A binary file is not read: its bytes are no text.
-	write(t, dir, "shot.png", host)
 
 	got, code := problems(t, dir)
 	joined := strings.Join(got, "\n")
-	if code != 1 || !strings.Contains(joined, "index.html: holds this computer's host name") || !strings.Contains(joined, "data/report.json: holds a word from TELLTALE_SITE_PRIVATE") {
-		t.Errorf("exit %d, problems:\n%s", code, joined)
+	for _, f := range []string{"index.html", "data/report.json", "NOTES", "fonts/x.woff2"} {
+		if !strings.Contains(joined, f+": holds a word from TELLTALE_SITE_PRIVATE") {
+			t.Errorf("%s is not reported:\n%s", f, joined)
+		}
+	}
+	if code != 1 {
+		t.Errorf("exit %d", code)
 	}
 	if strings.Contains(joined, "ok.txt") || strings.Contains(joined, "shot.png") || strings.Contains(joined, "notip.txt") {
 		t.Errorf("reports a file that holds nothing private:\n%s", joined)
 	}
-	if strings.HasPrefix(os.Getenv("HOME"), "/home/") && !strings.Contains(joined, "home.txt: holds this computer's home directory") {
-		t.Errorf("the home directory is not found:\n%s", joined)
+	if hostCounts && !strings.Contains(joined, "host.txt: holds this computer's host name") {
+		t.Errorf("the host name is not found:\n%s", joined)
 	}
 	if ip != "" && !strings.Contains(joined, "ip.txt: holds this computer's address") {
 		t.Errorf("the address %s is not found:\n%s", ip, joined)
 	}
 	// What is private is never printed: the problems say what kind of
 	// thing was found, not the thing.
-	if strings.Contains(strings.ToLower(joined), strings.ToLower(host)) || (ip != "" && strings.Contains(joined, ip)) {
+	if strings.Contains(strings.ToLower(joined), "secret-word") || (hostCounts && strings.Contains(strings.ToLower(joined), strings.ToLower(host))) || (ip != "" && strings.Contains(joined, ip)) {
 		t.Errorf("the problems repeat what they found:\n%s", joined)
 	}
 }
 
-func TestPrivateWordParts(t *testing.T) {
-	words := nameParts("lab-host01.example")
-	want := []string{"example", "host01"}
-	sort.Strings(words)
-	if strings.Join(words, ",") != strings.Join(want, ",") {
-		t.Errorf("nameParts = %q, want %q (parts of four or more characters with a letter)", words, want)
+// url() in a style sheet or a page's style leads to a file too.
+func TestCSSLinks(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "styles.css", `body { background: url(img/a.png); }
+.x { background: url( "missing.png" ); }
+.y { background: url(data:image/png;base64,AAAA); }
+@font-face { src: url('https://fonts.example/x.woff2'); }`)
+	write(t, dir, "img/a.png", "png")
+	write(t, dir, "sub/more.css", `.z { background: url(../img/a.png) } .w { background: url(b.png) }`)
+	write(t, dir, "index.html", `<style>body{background:url(gone.png)}</style><p style="background: url('img/a.png')">x</p>`)
+	got, code := problems(t, dir)
+	want := []string{
+		"index.html: gone.png: no such file",
+		"styles.css: missing.png: no such file",
+		"sub/more.css: b.png: no such file",
 	}
-	if got := nameParts("fv-az1-3456"); len(got) != 0 {
-		t.Errorf("nameParts of a name whose long parts are numbers = %q, want none", got)
+	if code != 1 || strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("exit %d, problems:\n%s\nwant:\n%s", code, strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 }
 

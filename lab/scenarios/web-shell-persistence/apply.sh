@@ -9,8 +9,8 @@
 #   is not in the report; what the attacker did next is.
 # - They add a systemd service and timer, lab-sync, that connect out to their
 #   machine every five minutes, and enable the timer.
-# - They leave a setuid copy of bash at /var/tmp/.s: any account that runs it
-#   becomes root.
+# - They leave a setuid copy of bash at /var/tmp/.s: anyone who runs it with
+#   -p gets a root shell.
 #
 # Runs as root inside a lab machine; /lab/breaks and /lab/standins are in place.
 set -eu

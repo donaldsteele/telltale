@@ -274,8 +274,8 @@ must and must not report, and the tests check every report against it, with
 a snapshot and without one.
 
 The [project site](https://donaldsteele.github.io/telltale/) shows the
-reports telltale prints for the lab's break-in stories, made by CI for
-every release with telltale built from that release.
+reports telltale prints for the lab's break-in stories, made by CI with
+each release's telltale; the reports page names the build.
 [docs/lab.md](docs/lab.md) describes the lab and how to run it.
 
 ## Alerts and AI assistants
@@ -330,8 +330,8 @@ bash scripts/site-reports.sh               # the project site's real reports fro
 CI runs the unit tests, the race detector, the build and its checks, the
 lab on Debian 12 and Ubuntu 24.04, and the Debian 12 lab on arm64 under
 emulation. A tag `vX.Y.Z` builds and publishes a release, and the project
-site is rebuilt with fresh reports from the lab on every push to `main` and
-every tag.
+site is published with fresh reports from the lab for every tag (a push to
+`main` builds it as a check).
 
 ## Security
 

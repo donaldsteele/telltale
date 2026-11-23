@@ -149,17 +149,26 @@ scenario is the list of steps in the header of its `apply.sh`.
 
 They are not mock-ups. `scripts/site-reports.sh` builds telltale the way a
 release is built and runs `TestGenerateSiteReports` (build tags `lab site`)
-with it, which writes `site/reports/`. The Pages workflow runs it on every
-push to `main` and every release tag, so the site shows what the current
-version prints, and fails when a report is missing:
+with it, which writes `site/reports/`. The Pages workflow runs it for every
+release tag and publishes the site, so the reports are made by the
+release's telltale (the reports page names the build). A push to `main`
+runs the same build and checks as a test and publishes nothing. Either way
+the workflow fails when a report is missing:
 
 ```
 bash scripts/site-reports.sh      # needs Docker; writes site/reports/, not committed
 go run ./tools/linkcheck site     # every link leads somewhere, nothing private in it
 ```
 
-The machines have the made-up names web01, files02 and build03. Nothing of
-the computer running the lab may reach the site: the test and the link
-check both fail when a file holds that computer's host name, user name,
-home directory or network addresses (worked out where they run, so they are
-not written down in the repository).
+The machines have the made-up names web01, files02 and build03. Nothing
+that identifies the computer running the lab (its host name, user, home
+directory, addresses) may reach the site: the test and the link check both
+fail when a file holds one. They are worked out where the check runs, so
+they are not written down in the repository either. The kernel version and
+the kernel settings in the reports are that computer's, as the reports
+say: a lab machine is a container on its kernel.
+
+**Publishing.** GitHub's `github-pages` environment lets only the default
+branch deploy, until it is given a deployment rule for `v*` tags. Add that
+rule (and set the repository's Pages source to GitHub Actions) before the
+first release, or the release's deploy job is refused.

@@ -1949,7 +1949,7 @@ func (s *session) finish() {
 		if s.bundle != nil {
 			what = "read from the reference bundle"
 		}
-		s.errs = append(s.errs, fmt.Sprintf("could not %s %d package(s); first error: %s", what, s.dlFailed, s.dlFirst))
+		s.errs = append(s.errs, fmt.Sprintf("could not %s %d %s; first error: %s", what, s.dlFailed, plural(s.dlFailed, "package", "packages"), s.dlFirst))
 	}
 	r.Errors = append(append(append(r.Errors, s.warn...), s.alerts...), s.errs...)
 	for src := range s.sources {
@@ -2189,4 +2189,12 @@ func validVersion(v string) bool {
 		return false
 	}
 	return strings.Trim(upstream, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.+~-") == ""
+}
+
+// plural is one when n is 1 and many otherwise.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }

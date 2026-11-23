@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 
 	"github.com/donaldsteele/telltale/internal/escape"
 )
@@ -34,6 +35,10 @@ func (b Binaries) logf(format string, args ...any) {
 	}
 	log.Printf(format, args...)
 }
+
+// fallbackWarned makes the warning about the full binary standing in for a
+// collector come once per process. A pointer, so tests can start afresh.
+var fallbackWarned = new(sync.Once)
 
 // executable is os.Executable, a variable for tests.
 var executable = os.Executable
@@ -71,7 +76,10 @@ func (b Binaries) For(arch string) (string, error) {
 		}
 	}
 	if runtime.GOOS == "linux" && runtime.GOARCH == goarch {
-		b.logf("telltale server: warning: no collector for %s (neither %s nor %s is there); copying this server's full binary to the machine instead, which works but is larger and has the server in it. Install the collectors (the .deb has them) or set bin_dir.", arch, tried[0], tried[1])
+		// Every visit to such a machine comes here: the log says it once.
+		fallbackWarned.Do(func() {
+			b.logf("telltale server: warning: no collector for %s (neither %s nor %s is there); copying this server's full binary to the machine instead, which works but is larger and has the server in it. Install the collectors (the .deb has them) or set bin_dir.", arch, tried[0], tried[1])
+		})
 		return exe, nil
 	}
 	return "", fmt.Errorf("no collector for %s: neither %s nor %s is there and this server is %s/%s; build them with scripts/build.sh and give their directory as bin_dir", arch, tried[0], tried[1], runtime.GOOS, runtime.GOARCH)

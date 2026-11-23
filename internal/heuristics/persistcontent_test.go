@@ -67,7 +67,7 @@ func TestPersistCallbackFileLevel(t *testing.T) {
 	if f.Evidence[0].Path != pf.Path || f.Evidence[0].Line != 2 || !strings.Contains(f.Evidence[0].After, "/dev/tcp/sink/4444") {
 		t.Errorf("evidence: %+v", f.Evidence[0])
 	}
-	if !strings.Contains(evidenceText(f), "1 more") {
+	if !strings.Contains(evidenceText(f), "; 1 more matching line in this file, first at line 3") {
 		t.Errorf("other matches not counted: %+v", f)
 	}
 	// the fix saves the file first and quotes the path

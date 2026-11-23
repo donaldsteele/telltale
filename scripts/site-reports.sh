@@ -4,14 +4,16 @@
 # linked in), runs the lab's TestGenerateSiteReports with it, and checks that
 # every report is there. The test runs the two break-in scenarios, a clean
 # machine and a scan without a snapshot on Debian 12 lab machines with the
-# made-up names web01, files02 and build03, and fails if anything of the
-# computer running it gets into a report. Then, when Chrome or Chromium is at
-# hand, it takes the screenshots of an HTML report the site's home page shows
+# made-up names web01, files02 and build03, and fails if a report holds
+# anything that identifies the computer running it (host name, user, home
+# directory, addresses). Then, when Chrome or Chromium is at hand, it takes
+# the screenshots of an HTML report the site's home page shows
 # (site/assets/report-*.png).
 #
-# Needs Docker, like the lab. The Pages workflow runs it on every push to
-# main and every release tag, so the site always shows what the current
-# version prints. site/reports/ is not committed.
+# Needs Docker, like the lab. The Pages workflow runs it for every release
+# tag and publishes the result, so the site shows what the release's
+# telltale prints; a push to main runs it as a check. site/reports/ is not
+# committed.
 #
 # Usage: bash scripts/site-reports.sh
 #        VERSION=0.1.0 bash scripts/site-reports.sh        (default: git describe)
