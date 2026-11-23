@@ -2374,3 +2374,118 @@ func TestBundleCarriesTrustedThirdPartySources(t *testing.T) {
 	res = Verify(context.Background(), r.c, ropt)
 	wantPaths(t, "Verified without the key", res.Verified)
 }
+
+// A trusted third-party index offers a superseded version of a package the
+// distribution's archive knows. The distribution's own history says what
+// that version was: it is asked first, and the third-party copy does not
+// confirm files that differ from it.
+func TestDistributionHistoryIsAskedBeforeAThirdPartyIndex(t *testing.T) {
+	real := buildDeb(t, "xz", nil, []debEntry{{name: "./usr/bin/hello", body: "hello 2.10\n", mode: 0o755}})
+	newer := buildDeb(t, "xz", nil, []debEntry{{name: "./usr/bin/hello", body: "hello 2.12\n", mode: 0o755}})
+	trojan := buildDeb(t, "xz", nil, []debEntry{{name: "./usr/bin/hello", body: "trojan\n", mode: 0o755}})
+	pkg := model.Package{Name: "hello", Version: "2.10-3", Arch: "amd64", Status: "install ok installed", Files: []string{"/usr/bin/hello"}}
+	repoKey := otherKey(t)
+
+	f := newFixture(t, map[string][]fakePkg{"bookworm": {{"hello", "2.12-1", "amd64", newer}}})
+	for k, v := range debianSnapshot(t, readFakeKey(t), real) {
+		f.srv.set(k, v)
+	}
+	f.srv.set("/archive/debian/20221227T032939Z/pool/main/h/hello/hello_2.10-3_amd64.deb", real)
+	idx := stanza("hello", "2.10-3", "amd64", "pool/main/h/hello/hello_2.10-3_amd64.deb", trojan) +
+		stanza("vendortool", "1.0", "amd64", "pool/main/v/vendortool/vendortool_1.0_amd64.deb", trojan)
+	repo := newArchiveServer(t, fakeSuite(t, repoKey, recordedNow, "/repo", "stable", "", map[string][]byte{"main/binary-amd64/Packages.xz": xzBytes(t, []byte(idx))}))
+	repo.set("/repo/pool/main/h/hello/hello_2.10-3_amd64.deb", trojan)
+	repo.set("/repo/pool/main/v/vendortool/vendortool_1.0_amd64.deb", trojan)
+	sources := []model.AptSource{{File: "/etc/apt/sources.list.d/v.list", Types: []string{"deb"}, URIs: []string{repo.URL + "/repo"}, Suites: []string{"stable"}, Components: []string{"main"}}}
+	opt := f.opts()
+	opt.Vendors = &vendorkeys.Table{}
+	opt.RepoTrust = []model.RepoTrust{trustOf(t, repo.URL+"/repo", "stable", repoKey)}
+
+	c := collectionOf(map[string]string{"/usr/bin/hello": "trojan\n"}, pkg)
+	c.Packages.Sources = sources
+	res := Verify(context.Background(), c, opt)
+	wantPaths(t, "Verified", res.Verified)
+	if m, ok := find(res.Mismatch, "/usr/bin/hello"); !ok || m.Source == SourceThirdParty {
+		t.Errorf("the third-party copy of a distribution package confirmed it: Verified %v, Mismatch %+v, Unverifiable %+v", paths(res.Verified), res.Mismatch, res.Unverifiable)
+	}
+	// A package the distribution does not know is the repository's own.
+	own := model.Package{Name: "vendortool", Version: "1.0", Arch: "amd64", Status: "install ok installed", Files: []string{"/usr/bin/hello"}}
+	c = collectionOf(map[string]string{"/usr/bin/hello": "trojan\n"}, own)
+	c.Packages.Sources = sources
+	res = Verify(context.Background(), c, opt)
+	if v, ok := find(res.Verified, "/usr/bin/hello"); !ok || v.Source != SourceThirdParty {
+		t.Errorf("the repository's own package: Verified %+v, Unverifiable %+v", res.Verified, res.Unverifiable)
+	}
+}
+
+func TestThirdPartyAddressesAreNormalisedBeforeTheyAreTrusted(t *testing.T) {
+	// Dot segments: the address apt would really fetch from is another one.
+	for _, u := range []string{
+		"https://dl.google.com/linux/chrome/deb/../../earth/deb",
+		"https://dl.google.com/linux/chrome/deb/./x",
+		"https://dl.google.com/linux/chrome/deb/%2e%2e/%2E%2E/earth/deb",
+		"https://dl.google.com/linux/chrome/deb/..",
+	} {
+		if n, ok := model.RepoURL(u); ok {
+			t.Errorf("RepoURL(%q) = %q, want it refused", u, n)
+		}
+		if vendorkeys.Covers("https://dl.google.com/linux/chrome/deb", u) {
+			t.Errorf("the Chrome pattern covers %q", u)
+		}
+	}
+	repoKey := otherKey(t)
+	r := newThirdRepo(t, repoKey)
+	// A source spelled with dot segments is not the repository the
+	// snapshot's key is for, and is not read.
+	c := r.machine(r.body, "2.0")
+	c.Packages.Sources[1].URIs = []string{r.srv.URL + "/repo/x/.."}
+	opt := r.f.opts()
+	opt.Vendors = &vendorkeys.Table{}
+	opt.RepoTrust = []model.RepoTrust{trustOf(t, r.url, "stable", repoKey)}
+	res := Verify(context.Background(), c, opt)
+	if len(res.Verified) != 0 || r.srv.totalHits() != 0 {
+		t.Errorf("a source with dot segments was read: Verified %v, %d requests", paths(res.Verified), r.srv.totalHits())
+	}
+	// The snapshot recorded the repository under https; the source says
+	// http now (or the other way round): the same repository.
+	tr := trustOf(t, r.url, "stable", repoKey)
+	tr.URL = "https://" + strings.TrimPrefix(tr.URL, "http://")
+	opt.RepoTrust = []model.RepoTrust{tr}
+	res = Verify(context.Background(), r.c, opt)
+	wantPaths(t, "Verified across http and https", res.Verified, "/usr/bin/thirdtool")
+	// The request goes to the normalised address: no user name or password
+	// from the source line is sent.
+	c = r.machine(r.body, "2.0")
+	c.Packages.Sources[1].URIs = []string{strings.Replace(r.url, "http://", "http://user:secret@", 1) + "/"}
+	opt.RepoTrust = []model.RepoTrust{trustOf(t, r.url, "stable", repoKey)}
+	res = Verify(context.Background(), c, opt)
+	wantPaths(t, "Verified", res.Verified, "/usr/bin/thirdtool")
+	if r.srv.sawAuth() {
+		t.Errorf("credentials from the source line were sent to the repository")
+	}
+}
+
+// The files a signed package has behind a moved directory are reported once,
+// however many times the tables are placed.
+func TestMovedUnseenIsReportedOnce(t *testing.T) {
+	f := toolFixture(t)
+	const to = "/srv/lib"
+	const lit, phys = libDir + "/libtool.so.1", to + "/libtool.so.1"
+	c := movedLib(to, "evil lib\n", 0o644)
+	c.Files = slices.DeleteFunc(c.Files, func(e model.FileEntry) bool { return e.Path == phys })
+	opt := f.opts()
+	opt.OnlyPaths = map[string]bool{lit: true, "/usr/bin/tool": true}
+	opt.CacheDir = t.TempDir()
+	for i := 0; i < 2; i++ {
+		res := Verify(context.Background(), c, opt)
+		n := 0
+		for _, m := range res.MovedUnseen {
+			if m.Path == lit {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("run %d: %s reported %d times: %+v", i, lit, n, res.MovedUnseen)
+		}
+	}
+}

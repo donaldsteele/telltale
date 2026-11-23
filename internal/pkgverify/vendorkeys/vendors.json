@@ -42,7 +42,9 @@
     "key_file": "hashicorp.asc",
     "key_source_url": "https://apt.releases.hashicorp.com/gpg",
     "fingerprint_source_url": "https://www.hashicorp.com/en/trust/security",
-    "retrieved": "2026-11-22"
+    "retrieved": "2026-11-22",
+    "provisional": true,
+    "note": "second source read via web fetch after HTTP 429; re-check before release"
   },
   {
     "name": "GitHub CLI",

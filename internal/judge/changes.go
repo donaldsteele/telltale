@@ -877,7 +877,12 @@ func (j *judge) persistExplained(p string, cur, old *model.PersistFile) string {
 		return pf != nil && pf.Mode&0o170000 == 0o120000 && len(pf.Lines) > 0
 	}
 	if isLink(cur) && isLink(old) && cur.Lines[0] == old.Lines[0] {
-		if t, ok := heuristics.LinkFile(j.files, *cur); ok {
+		// The file the link opens must also be the one it opened at the
+		// snapshot: with a directory on the way turned into a link, the
+		// same text leads to another file.
+		t, ok := heuristics.LinkFile(j.files, *cur)
+		was, wasOK := heuristics.LinkFile(j.oldFiles, *old)
+		if ok && wasOK && t == was {
 			if v, ok := j.verified[t]; ok && j.verifiedNow(v, j.files[t]) && j.pkgChanged(v.Package) {
 				return v.Package
 			}

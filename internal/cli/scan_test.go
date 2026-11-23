@@ -4,17 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"github.com/ProtonMail/go-crypto/openpgp"
-	"github.com/ProtonMail/go-crypto/openpgp/packet"
-	"github.com/donaldsteele/telltale/internal/repokeys"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
+
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/internal/pkgverify"
+	"github.com/donaldsteele/telltale/internal/repokeys"
 )
 
 func scanArgs(root string, extra ...string) []string {

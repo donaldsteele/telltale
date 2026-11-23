@@ -3558,6 +3558,30 @@ func TestMovedDirectoryIsBoundedByTheSignedPackageNotTheFileList(t *testing.T) {
 	// A file reported for another place does not count against this link.
 	res.MovedUnseen = []pkgverify.MovedFile{{Path: "/opt/x/y", At: "/data/x/y", Package: "x", Version: "1"}}
 	must(t, run(mk(), nil, res), key, model.SevNote)
+
+	// The directory is linked to the root directory: the listed files were
+	// copied to /, a replaced one planted there and its line deleted from
+	// the file list. The file the signed package ships is at /sudoers.so.
+	const sudo = "/usr/libexec/sudo"
+	root := func(extra ...model.FileEntry) *model.Collection {
+		c := clean()
+		c.Files = append(c.Files, dirAt("/usr/libexec"), symlinkAt(sudo, "/", changed), file("/sudo_noexec.so", "noexec", 0o644))
+		c.Files = append(c.Files, extra...)
+		c.Packages.Installed = append(c.Packages.Installed, pkg("sudo-plugins", "1.9", sudo, sudo+"/sudo_noexec.so")) // the sudoers.so line is gone
+		return c
+	}
+	res = archive(verdict("/sudo_noexec.so", "sudo-plugins", "1.9", "noexec"))
+	res.MovedUnseen = []pkgverify.MovedFile{{Path: sudo + "/sudoers.so", At: "/sudoers.so", Package: "sudo-plugins", Version: "1.9"}}
+	f = must(t, run(root(), nil, res), "pkg.dir_now_link:"+sudo, model.SevBackdoor)
+	if !hasEvidencePath(f, sudo+"/sudoers.so") {
+		t.Errorf("a signed file below a directory linked to / is not named: %+v", f.Evidence)
+	}
+	// A package directory that is the root directory now is a backdoor sign
+	// by itself, with every listed file present and verified.
+	f = must(t, run(root(), nil, archive(verdict("/sudo_noexec.so", "sudo-plugins", "1.9", "noexec"))), "pkg.dir_now_link:"+sudo, model.SevBackdoor)
+	if !strings.Contains(f.Why, "root directory") {
+		t.Errorf("Why does not say the link leads to the root directory: %s", f.Why)
+	}
 }
 
 // A PAM module or kernel module that is really behind a moved directory is

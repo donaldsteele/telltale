@@ -12,6 +12,7 @@ package vendorkeys
 
 import (
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -53,6 +54,10 @@ type Vendor struct {
 	FingerprintSourceURL string `json:"fingerprint_source_url"`
 	// Retrieved is the date (YYYY-MM-DD) both were fetched and compared.
 	Retrieved string `json:"retrieved"`
+	// Provisional marks an entry whose second source was not read first
+	// hand and must be checked again before a release; Note says why.
+	Provisional bool   `json:"provisional,omitempty"`
+	Note        string `json:"note,omitempty"`
 
 	keys openpgp.EntityList
 }
@@ -176,13 +181,8 @@ func Covers(pattern, repoURL string) bool {
 	if !ok1 || !ok2 {
 		return false
 	}
-	p, u = schemeless(p), schemeless(u)
+	p, u = model.RepoAddress(p), model.RepoAddress(u)
 	return u == p || strings.HasPrefix(u, p+"/")
-}
-
-func schemeless(u string) string {
-	_, rest, _ := strings.Cut(u, "://")
-	return rest
 }
 
 // Match returns the vendors with a pattern that covers repoURL. A nil table
@@ -200,18 +200,30 @@ func (t *Table) Match(repoURL string) []*Vendor {
 	return out
 }
 
-// Expiry returns when a key can no longer sign a repository index: the
-// latest expiry among its signing-capable keys (the primary key and its
-// signing subkeys that are not revoked), no later than the primary key's
-// own. never is true when that is unbounded. A revoked key has expired at
-// its creation.
-func Expiry(e *openpgp.Entity) (t time.Time, never bool) {
+// SigningKey is one key of an OpenPGP key that can sign a repository index:
+// the primary key, when it may sign, or a signing subkey that is not
+// revoked.
+type SigningKey struct {
+	Fingerprint string // upper-case hex
+	Subkey      bool
+	// Expires is when it stops being valid, no later than the primary
+	// key's own expiry; Never is true when that is unbounded.
+	Expires time.Time
+	Never   bool
+}
+
+// Expired reports whether the key is past its expiry at now.
+func (k SigningKey) Expired(now time.Time) bool { return !k.Never && !k.Expires.After(now) }
+
+// SigningKeys lists the keys of e that can sign, each with its own expiry.
+// A revoked key, or one without a usable self-signature, has none.
+func SigningKeys(e *openpgp.Entity) []SigningKey {
 	if len(e.Revocations) > 0 {
-		return e.PrimaryKey.CreationTime, false
+		return nil
 	}
 	id := e.PrimaryIdentity()
 	if id == nil || id.SelfSignature == nil {
-		return e.PrimaryKey.CreationTime, false
+		return nil
 	}
 	end := func(created time.Time, sig *packet.Signature) (time.Time, bool) {
 		if sig.KeyLifetimeSecs == nil || *sig.KeyLifetimeSecs == 0 {
@@ -220,37 +232,52 @@ func Expiry(e *openpgp.Entity) (t time.Time, never bool) {
 		return created.Add(time.Duration(*sig.KeyLifetimeSecs) * time.Second), false
 	}
 	primary, primaryNever := end(e.PrimaryKey.CreationTime, id.SelfSignature)
-	var best time.Time
-	bestNever, any := false, false
-	consider := func(t time.Time, never bool) {
-		any = true
-		if never {
-			bestNever = true
-		} else if t.After(best) {
-			best = t
-		}
+	var out []SigningKey
+	if !id.SelfSignature.FlagsValid || id.SelfSignature.FlagSign {
+		out = append(out, SigningKey{Fingerprint: repokeys.Fingerprint(e), Expires: primary, Never: primaryNever})
 	}
-	if id.SelfSignature.FlagsValid && id.SelfSignature.FlagSign || !id.SelfSignature.FlagsValid {
-		consider(primary, primaryNever)
-	}
-	for _, s := range e.Subkeys {
-		if s.Sig == nil || len(s.Revocations) > 0 || !s.Sig.FlagsValid || !s.Sig.FlagSign {
+	for _, sk := range e.Subkeys {
+		if sk.Sig == nil || len(sk.Revocations) > 0 || !sk.Sig.FlagsValid || !sk.Sig.FlagSign {
 			continue
 		}
-		consider(end(s.PublicKey.CreationTime, s.Sig))
+		t, never := end(sk.PublicKey.CreationTime, sk.Sig)
+		// A subkey is no good after its primary key has expired.
+		if !primaryNever && (never || t.After(primary)) {
+			t, never = primary, false
+		}
+		out = append(out, SigningKey{Fingerprint: strings.ToUpper(hex.EncodeToString(sk.PublicKey.Fingerprint)), Subkey: true, Expires: t, Never: never})
 	}
-	if !any {
-		return e.PrimaryKey.CreationTime, false // nothing in it can sign
+	return out
+}
+
+// Expiry returns when a key can no longer sign a repository index. A vendor
+// whose key has signing subkeys signs with those (Google adds one about
+// every year), so the answer is then the latest expiry among the subkeys,
+// whatever the primary key could do by itself; otherwise it is the primary
+// key's. never is true when that is unbounded. A key with nothing that can
+// sign has expired at its creation.
+func Expiry(e *openpgp.Entity) (t time.Time, never bool) {
+	keys := SigningKeys(e)
+	hasSub := slices.ContainsFunc(keys, func(k SigningKey) bool { return k.Subkey })
+	found := false
+	for _, k := range keys {
+		if hasSub && !k.Subkey {
+			continue
+		}
+		found = true
+		if k.Never {
+			never = true
+		} else if k.Expires.After(t) {
+			t = k.Expires
+		}
 	}
-	switch {
-	case bestNever && primaryNever:
+	if !found {
+		return e.PrimaryKey.CreationTime, false
+	}
+	if never {
 		return time.Time{}, true
-	case bestNever:
-		return primary, false
-	case primaryNever || best.Before(primary):
-		return best, false
 	}
-	return primary, false
+	return t, false
 }
 
 // Expires is the earliest Expiry among the vendor's pinned keys.

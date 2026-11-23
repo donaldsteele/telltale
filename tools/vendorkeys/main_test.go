@@ -76,6 +76,30 @@ func TestCheckReportsExpiryAndRotation(t *testing.T) {
 	if e, w, out := run(vendor("rotated", good)); e != 0 || w != 2 || !strings.Contains(out, "no longer serves the pinned key") || !strings.Contains(out, "not pinned") {
 		t.Errorf("a rotated key: %d expired, %d warnings\n%s", e, w, out)
 	}
+	// An entry marked provisional is said every time.
+	prov := vendor("good", good)
+	prov.Provisional, prov.Note = true, "second source not read first hand"
+	if e, w, out := run(prov); e != 0 || w != 1 || !strings.Contains(out, "PROVISIONAL") || !strings.Contains(out, prov.Note) {
+		t.Errorf("a provisional entry: %d expired, %d warnings\n%s", e, w, out)
+	}
+	// A key that signs with subkeys: its primary key never expires, the one
+	// signing subkey has 30 days left (a warning), then none (an error).
+	withSub := func(left time.Duration) *openpgp.Entity {
+		e := key(t, now.Add(-400*day), 0)
+		created := now.Add(-100 * day)
+		if err := e.AddSigningSubkey(&packet.Config{Algorithm: packet.PubKeyAlgoEdDSA, Time: func() time.Time { return created }, KeyLifetimeSecs: uint32((100*day + left) / time.Second)}); err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	subSoon, subGone := withSub(30*day), withSub(-10*day)
+	served["https://subsoon.example.test/key"], served["https://subgone.example.test/key"] = serialized(t, subSoon), serialized(t, subGone)
+	if e, w, out := run(vendor("subsoon", subSoon)); e != 0 || w != 2 || !strings.Contains(out, "signing subkey") {
+		t.Errorf("a signing subkey with 30 days left: %d expired, %d warnings\n%s", e, w, out)
+	}
+	if e, _, out := run(vendor("subgone", subGone)); e != 1 {
+		t.Errorf("a key whose only signing subkey expired: %d expired\n%s", e, out)
+	}
 	// An address that cannot be fetched is a warning, not a failure.
 	if e, w, _ := run(vendor("gone", good)); e != 0 || w != 1 {
 		t.Errorf("an unreachable key address: %d expired, %d warnings", e, w)

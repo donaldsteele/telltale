@@ -59,7 +59,7 @@ func (j *judge) repoKeys() {
 	for _, t := range cur {
 		now := t.Fingerprints()
 		for _, o := range old {
-			if o.URL != t.URL || o.Suite != t.Suite {
+			if !model.SameRepo(o.URL, t.URL) || o.Suite != t.Suite {
 				continue
 			}
 			was := o.Fingerprints()

@@ -11,8 +11,10 @@
 // pinned key expires. It exits 1 when a pinned key has expired. A pin that
 // expires within 90 days, a key the vendor no longer serves, a key the
 // vendor serves that is not pinned (a rotation), new subkeys on a pinned key
-// that the embedded copy lacks, and a key address that cannot be fetched are
-// warnings.
+// that the embedded copy lacks, a signing subkey that expires within 90
+// days, an entry marked provisional, and a key address that cannot be
+// fetched are warnings. A key that signs with subkeys has expired when its
+// last signing subkey has, whatever its primary key allows.
 //
 // show is for adding a vendor: it prints the fingerprint, user IDs and
 // expiry of every key at a URL. An entry may be added to vendors.json only
@@ -89,6 +91,10 @@ func expiryText(t time.Time, never bool, now time.Time) string {
 func check(ctx context.Context, w io.Writer, t *vendorkeys.Table, fetch fetcher, now time.Time) (expired, warnings int) {
 	for _, v := range t.Vendors {
 		fmt.Fprintf(w, "%s\n", v.Name)
+		if v.Provisional {
+			warnings++
+			fmt.Fprintf(w, "  WARNING: PROVISIONAL entry: %s (check %s against %s)\n", v.Note, v.KeySourceURL, v.FingerprintSourceURL)
+		}
 		for _, e := range v.Keys() {
 			fp := repokeys.Fingerprint(e)
 			exp, never := vendorkeys.Expiry(e)
@@ -102,13 +108,17 @@ func check(ctx context.Context, w io.Writer, t *vendorkeys.Table, fetch fetcher,
 				warnings++
 				fmt.Fprintf(w, "  WARNING: the pinned key %s expires within 90 days\n", fp)
 			}
-			// A vendor that signs with subkeys adds a new one from time
-			// to time; the embedded copy must have it.
-			if t, ok := newestSigningSubkey(e); ok {
-				fmt.Fprintf(w, "    newest signing subkey %s\n", expiryText(t, false, now))
-				if t.After(now) && t.Sub(now) < warnWithin {
+			// Each key in it that can sign, with its own expiry: a vendor
+			// that signs with subkeys adds a new one from time to time,
+			// and the embedded copy must have it.
+			for _, k := range vendorkeys.SigningKeys(e) {
+				if !k.Subkey {
+					continue // the line above
+				}
+				fmt.Fprintf(w, "    signing subkey %s  %s\n", k.Fingerprint, expiryText(k.Expires, k.Never, now))
+				if !k.Never && k.Expires.After(now) && k.Expires.Sub(now) < warnWithin {
 					warnings++
-					fmt.Fprintf(w, "  WARNING: the newest signing subkey of %s expires within 90 days; fetch the key again once the vendor has added one\n", fp)
+					fmt.Fprintf(w, "  WARNING: the signing subkey %s of %s expires within 90 days; fetch the key again once the vendor has added a newer one\n", k.Fingerprint, fp)
 				}
 			}
 		}
@@ -155,24 +165,6 @@ func check(ctx context.Context, w io.Writer, t *vendorkeys.Table, fetch fetcher,
 		}
 	}
 	return expired, warnings
-}
-
-// newestSigningSubkey returns the latest expiry among the key's signing
-// subkeys that have one. ok is false when the key has no signing subkey, or
-// one that never expires.
-func newestSigningSubkey(e *openpgp.Entity) (t time.Time, ok bool) {
-	for _, s := range e.Subkeys {
-		if s.Sig == nil || len(s.Revocations) > 0 || !s.Sig.FlagsValid || !s.Sig.FlagSign {
-			continue
-		}
-		if s.Sig.KeyLifetimeSecs == nil || *s.Sig.KeyLifetimeSecs == 0 {
-			return time.Time{}, false
-		}
-		if end := s.PublicKey.CreationTime.Add(time.Duration(*s.Sig.KeyLifetimeSecs) * time.Second); end.After(t) {
-			t, ok = end, true
-		}
-	}
-	return t, ok
 }
 
 // subkeysNotIn lists the subkeys of served that mine does not have.

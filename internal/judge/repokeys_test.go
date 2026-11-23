@@ -1,6 +1,7 @@
 package judge
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -219,4 +220,17 @@ func TestCronLinkToAPackageFileFollowsAConfirmedUpgrade(t *testing.T) {
 	// The link was pointed at another file, however well that one verifies.
 	moved := machine("2.0", "#!/bin/sh\n# 2.0\nexit 0", "/opt/lab-vendor/cron/../cron/lab-vendor")
 	must(t, runWith(moved, snapOf(clone(old)), confirmed(), &vendorkeys.Table{}), key, model.SevBackdoor)
+
+	// The link reads as before, but a directory on the way to its target is
+	// a link now and leads elsewhere: the job the link runs is another file
+	// than at the snapshot, even one that matches the package.
+	const elsewhere = "/srv/x/lab-vendor"
+	redirected := machine("2.0", "#!/bin/sh\n# 2.0\nexit 0", job)
+	redirected.Files = slices.DeleteFunc(redirected.Files, func(e model.FileEntry) bool { return e.Path == job })
+	there := file(elsewhere, "#!/bin/sh\n# 2.0\nexit 0", 0o755)
+	there.CTime, there.MTime = changed, changed
+	redirected.Files = append(redirected.Files, dirAt("/opt"), dirAt("/opt/lab-vendor"), symlinkAt("/opt/lab-vendor/cron", "/srv/x", changed), dirAt("/srv"), dirAt("/srv/x"), there)
+	res = confirmed()
+	res.Verified[0].Path, res.Verified[0].Listed = elsewhere, []string{job}
+	must(t, runWith(redirected, snapOf(clone(old)), res, &vendorkeys.Table{}), key, model.SevBackdoor)
 }

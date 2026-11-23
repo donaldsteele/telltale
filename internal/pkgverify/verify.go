@@ -465,12 +465,17 @@ type session struct {
 	archives []*Archive
 	clock    *signedClock // shared by every archive of the run
 	third    []thirdSource
-	vendors  *vendorkeys.Table
-	old      *OldFinder
-	client   *http.Client
-	source   string        // replaces DebRef.Source in verdicts (refs)
-	bundle   *bundleReader // refs mode
-	bw       *bundleWriter // WriteBundle
+	// movedSeen holds the package paths already in Result.MovedUnseen.
+	movedSeen map[string]bool
+	// distroNames holds the wanted package names the distribution's own
+	// indexes list, at any version (written by loadIndexes).
+	distroNames map[string]bool
+	vendors     *vendorkeys.Table
+	old         *OldFinder
+	client      *http.Client
+	source      string        // replaces DebRef.Source in verdicts (refs)
+	bundle      *bundleReader // refs mode
+	bw          *bundleWriter // WriteBundle
 
 	// Written by loadIndexes, read-only afterwards.
 	found      map[PkgKey]DebRef
@@ -918,7 +923,7 @@ func (s *session) thirdPartyKeys(uri, suite string) (openpgp.EntityList, string)
 	if u, ok := model.RepoURL(uri); ok {
 		n := len(kr)
 		for _, t := range s.opt.RepoTrust {
-			if t.URL == u && t.Suite == suite {
+			if model.SameRepo(t.URL, u) && t.Suite == suite {
 				kr = append(kr, repokeys.Entities(t.Keys)...)
 			}
 		}
@@ -967,8 +972,11 @@ func (s *session) setupThirdParty(wrap func(*http.Client) *http.Client, cache st
 			if esmURI(uri) {
 				continue
 			}
-			u, err := url.Parse(uri)
-			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			// The address that is matched with keys is the address that
+			// is fetched: normalised, with no user name or password from
+			// the source line.
+			base, ok := model.RepoURL(uri)
+			if !ok {
 				continue
 			}
 			var sus, comps []string
@@ -1007,7 +1015,7 @@ func (s *session) setupThirdParty(wrap func(*http.Client) *http.Client, cache st
 			// the keys bound to that suite and no others.
 			for _, su := range sus {
 				s.third = append(s.third, thirdSource{uri: uri, how: hows[su], a: &Archive{
-					BaseURL: strings.TrimRight(uri, "/"), Suites: []string{su}, Components: comps,
+					BaseURL: base, Suites: []string{su}, Components: comps,
 					Keyring: keys[su], Client: client, Cache: cache, Now: s.opt.Now, Historical: refs,
 					memo: &releaseMemo{}, clock: s.clock,
 				}})
@@ -1046,8 +1054,18 @@ func (s *session) loadIndexes(ctx context.Context, wanted []*model.Package) {
 		}
 		want[[2]string{p.Name, p.Version}] = true
 	}
+	wantName := map[string]bool{}
+	for _, p := range wanted {
+		wantName[p.Name] = true
+	}
+	if s.distroNames == nil {
+		s.distroNames = map[string]bool{}
+	}
 	keep := func(idx map[PkgKey]DebRef, dst map[PkgKey]DebRef, source string) {
 		for k, ref := range idx {
+			if source == "" && wantName[k.Name] {
+				s.distroNames[k.Name] = true
+			}
 			if want[[2]string{k.Name, k.Version}] {
 				if _, dup := dst[k]; !dup {
 					if source != "" {
@@ -1152,6 +1170,13 @@ func (s *session) syncClock(ctx context.Context) {
 }
 
 // lookup finds a package in the signed indexes read so far.
+//
+// A package the distribution's archive knows by name belongs to the
+// distribution: a version of it that the current indexes lack is looked for
+// in the distribution's own history first (onePackage), and only then in a
+// third-party index. Otherwise a trusted third-party repository could offer
+// a superseded version of, say, openssh-server and have its copy confirm
+// files the distribution never shipped.
 func (s *session) lookup(p *model.Package) (DebRef, bool) {
 	arch := p.Arch
 	if arch == "" {
@@ -1159,6 +1184,18 @@ func (s *session) lookup(p *model.Package) (DebRef, bool) {
 	}
 	if ref, ok := Lookup(s.found, p.Name, p.Version, arch); ok {
 		return ref, true
+	}
+	if s.distroNames[p.Name] {
+		return DebRef{}, false
+	}
+	return Lookup(s.thirdFound, p.Name, p.Version, arch)
+}
+
+// lookupThird finds a package in the third-party indexes alone.
+func (s *session) lookupThird(p *model.Package) (DebRef, bool) {
+	arch := p.Arch
+	if arch == "" {
+		arch = s.c.Host.Arch
 	}
 	return Lookup(s.thirdFound, p.Name, p.Version, arch)
 }
@@ -1251,6 +1288,10 @@ func (s *session) onePackage(ctx context.Context, r *pkgResult) {
 		case tampered(oldErr):
 			s.problem(oldErr)
 		}
+	}
+	if !ok && s.distroNames[p.Name] {
+		// The distribution's history does not have it either.
+		ref, ok = s.lookupThird(p)
 	}
 	if !ok {
 		r.fail(s.notFound(p, oldErr))
@@ -1458,7 +1499,11 @@ func (s *session) judge(results []*pkgResult) {
 // path, and both merged-/usr spellings are entered.
 func (s *session) placeTables(results []*pkgResult) map[string][]expect {
 	idx := map[string][]expect{}
-	unseen := map[string]bool{}
+	// placeTables runs more than once in a scan with a snapshot.
+	if s.movedSeen == nil {
+		s.movedSeen = map[string]bool{}
+	}
+	unseen := s.movedSeen
 	defer func() {
 		sort.Slice(s.res.MovedUnseen, func(i, j int) bool { return s.res.MovedUnseen[i].Path < s.res.MovedUnseen[j].Path })
 	}()

@@ -78,6 +78,13 @@ type archiveServer struct {
 	hits  map[string]int
 	query map[string]string
 	down  bool
+	auth  bool // a request carried an Authorization header
+}
+
+func (s *archiveServer) sawAuth() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.auth
 }
 
 func newArchiveServer(t *testing.T, files map[string][]byte) *archiveServer {
@@ -94,6 +101,7 @@ func (s *archiveServer) serve(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
 	s.hits[p]++
 	s.query[p] = r.URL.RawQuery
+	s.auth = s.auth || r.Header.Get("Authorization") != ""
 	if s.down {
 		http.Error(w, "down", http.StatusServiceUnavailable)
 		return

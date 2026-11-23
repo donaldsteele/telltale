@@ -10,7 +10,7 @@
 # Each tree is served as the site root: /lab-vendor is the repository
 # (dists/stable, pool) and /keys holds both public keys, armored.
 set -eu
-arch=amd64
+arch=$(dpkg --print-architecture)
 
 # lab-vendor: a stand-in for a vendor package that links a cron job into
 # /etc/cron.daily from its postinst, the way Chrome's package does, and ships

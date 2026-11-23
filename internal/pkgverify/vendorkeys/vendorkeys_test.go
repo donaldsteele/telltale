@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
 
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/internal/repokeys"
@@ -43,6 +44,9 @@ func TestVendorKeysFileValid(t *testing.T) {
 		if ku != nil && fu != nil && strings.EqualFold(ku.Host, fu.Host) {
 			t.Errorf("%s: the key and its fingerprint come from the same host %s; that is one source, not two", v.Name, ku.Host)
 		}
+		if v.Provisional && v.Note == "" {
+			t.Errorf("%s: a provisional entry must say why in its note", v.Name)
+		}
 		if !isDate.MatchString(v.Retrieved) {
 			t.Errorf("%s: retrieved %q is not a date", v.Name, v.Retrieved)
 		}
@@ -75,9 +79,20 @@ func TestVendorKeysFileValid(t *testing.T) {
 			if e.PrivateKey != nil {
 				t.Errorf("%s: %s is a private key", v.Name, fp)
 			}
-			// No pinned key is expired when telltale is built.
+			// No pinned key is expired when telltale is built: something
+			// in it that can sign repository metadata is still valid, a
+			// signing subkey when the key has those. A primary key that
+			// may sign does not stand in for expired subkeys.
 			if exp, never := Expiry(e); !never && !exp.After(now) {
 				t.Errorf("%s: the pinned key %s expired on %s", v.Name, fp, exp.Format("2006-01-02"))
+			}
+			keys := SigningKeys(e)
+			if len(keys) == 0 || !slices.ContainsFunc(keys, func(k SigningKey) bool { return !k.Expired(now) }) {
+				t.Errorf("%s: nothing in the pinned key %s can sign any more: %+v", v.Name, fp, keys)
+			}
+			if subs := slices.DeleteFunc(slices.Clone(keys), func(k SigningKey) bool { return !k.Subkey }); len(subs) > 0 &&
+				!slices.ContainsFunc(subs, func(k SigningKey) bool { return !k.Expired(now) }) {
+				t.Errorf("%s: every signing subkey of %s has expired: %+v", v.Name, fp, subs)
 			}
 		}
 	}
@@ -104,5 +119,42 @@ func TestVendorKeysFileValid(t *testing.T) {
 		if got != want {
 			t.Errorf("Match(%s) = %q, want %q", u, got, want)
 		}
+	}
+}
+
+// A key that signs with subkeys has expired when its last signing subkey
+// has, even though its primary key may sign and never expires.
+func TestExpiryFollowsSigningSubkeys(t *testing.T) {
+	now := time.Date(2026, 11, 22, 0, 0, 0, 0, time.UTC)
+	day := 24 * time.Hour
+	at := func(t time.Time) func() time.Time { return func() time.Time { return t } }
+	e, err := openpgp.NewEntity("v", "", "v@example.test", &packet.Config{Algorithm: packet.PubKeyAlgoEdDSA, Time: at(now.Add(-1000 * day))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No signing subkey: the primary key's expiry (none).
+	if _, never := Expiry(e); !never {
+		t.Errorf("a primary key without expiry and no signing subkey: want never")
+	}
+	sub := func(created time.Time, life time.Duration) {
+		t.Helper()
+		if err := e.AddSigningSubkey(&packet.Config{Algorithm: packet.PubKeyAlgoEdDSA, Time: at(created), KeyLifetimeSecs: uint32(life / time.Second)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sub(now.Add(-900*day), 365*day) // expired long ago
+	sub(now.Add(-300*day), 200*day) // expired 100 days ago
+	exp, never := Expiry(e)
+	if never || !exp.Equal(now.Add(-100*day)) {
+		t.Errorf("Expiry = %v (never %v), want the last signing subkey's, 100 days ago", exp, never)
+	}
+	keys := SigningKeys(e)
+	if len(keys) != 3 || keys[0].Subkey || !keys[0].Never || !keys[1].Expired(now) || !keys[2].Expired(now) {
+		t.Errorf("SigningKeys = %+v", keys)
+	}
+	// A newer subkey makes it valid again.
+	sub(now.Add(-10*day), 365*day)
+	if exp, never := Expiry(e); never || !exp.Equal(now.Add(355*day)) {
+		t.Errorf("Expiry = %v (never %v), want the newest subkey's", exp, never)
 	}
 }

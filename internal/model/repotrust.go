@@ -52,7 +52,9 @@ func (t RepoTrust) Fingerprints() []string {
 // RepoURL normalises an APT source URI for comparison: lower-case scheme and
 // host, the path without trailing slashes, and nothing else (no user name
 // or password, query or fragment). ok is false for anything that is not an
-// http or https URL with a host.
+// http or https URL with a host, and for a path with a "." or ".." segment
+// (after percent-decoding): such an address names another place than it
+// reads as, and is never matched with a key.
 func RepoURL(uri string) (string, bool) {
 	u, err := url.Parse(strings.TrimSpace(uri))
 	if err != nil || u.Host == "" {
@@ -62,9 +64,29 @@ func RepoURL(uri string) (string, bool) {
 	if scheme != "http" && scheme != "https" {
 		return "", false
 	}
+	for _, seg := range strings.Split(u.Path, "/") {
+		if seg == "." || seg == ".." {
+			return "", false
+		}
+	}
 	p := strings.TrimRight(u.EscapedPath(), "/")
 	return scheme + "://" + strings.ToLower(u.Host) + p, true
 }
+
+// RepoAddress is a normalised repository URL (RepoURL) without its scheme:
+// http and https name the same repository, since what is trusted is the
+// signature on its index, not the transport.
+func RepoAddress(repoURL string) string {
+	_, rest, ok := strings.Cut(repoURL, "://")
+	if !ok {
+		return repoURL
+	}
+	return rest
+}
+
+// SameRepo reports whether two normalised repository URLs name the same
+// repository (RepoAddress).
+func SameRepo(a, b string) bool { return a != "" && RepoAddress(a) == RepoAddress(b) }
 
 // OfficialAptURI reports whether an APT source URI is an official Debian or
 // Ubuntu archive host, which telltale verifies with its built-in archive

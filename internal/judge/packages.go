@@ -518,7 +518,8 @@ func (j *judge) packageDirLinks() {
 				}
 			}
 			for _, m := range signed {
-				if strings.HasPrefix(m.At, to+"/") && !at[m.At] && j.files[m.At] == nil {
+				// Everything is below the root directory.
+				if (to == "/" || strings.HasPrefix(m.At, to+"/")) && !at[m.At] && j.files[m.At] == nil {
 					at[m.At] = true
 					unlisted = append(unlisted, m)
 				}
@@ -530,16 +531,27 @@ func (j *judge) packageDirLinks() {
 			reason = "it leads nowhere telltale could follow"
 			f.Title = fmt.Sprintf("%s, a directory of package %s, is now a link that cannot be followed", d, pkgName)
 			f.Evidence[0].Detail = "listed as a directory by package " + pkgName + "; where the link leads cannot be told"
+		case to == "/":
+			// No package keeps its files in the root directory. Every name
+			// the package has below this directory is now looked up from
+			// the top of the filesystem, where nothing else is checked.
+			reason = "it leads to the root directory, so every file the package has below it is looked for at the top of the filesystem"
 		case underTemp(to) != "":
 			reason = "it leads into " + underTemp(to)
 		case hiddenPath(to):
 			reason = "it leads into a hidden directory"
-		case len(unseen)+len(unlisted) > 0:
+		}
+		// The files nobody looked at are named whatever else is wrong with
+		// where the link leads.
+		if len(unseen)+len(unlisted) > 0 && to != "" {
+			if reason != "" {
+				reason += ", and "
+			}
 			if len(unseen) > 0 {
-				reason = fmt.Sprintf("%d of the %d files the package lists below it could not be checked where the link leads (they are missing there, or telltale could not look)", len(unseen), len(l.Below))
+				reason += fmt.Sprintf("%d of the %d files the package lists below it could not be checked where the link leads (they are missing there, or telltale could not look)", len(unseen), len(l.Below))
 			}
 			if len(unlisted) > 0 {
-				if reason != "" {
+				if len(unseen) > 0 {
 					reason += ", and "
 				}
 				reason += fmt.Sprintf("%d %s the signed package installs below it %s not in the machine's file list any more and could not be checked where the link leads",

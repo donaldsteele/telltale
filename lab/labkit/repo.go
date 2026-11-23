@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -91,7 +92,8 @@ func buildRepoImage() (string, string, error) {
 	defer os.RemoveAll(dir)
 	for bin, pkg := range map[string]string{"repo-server": "server", "lab-vendord": "vendord"} {
 		cmd := exec.Command("go", "build", "-tags", "lab", "-trimpath", "-ldflags", "-s -w", "-o", filepath.Join(dir, bin), filepath.Join(src, pkg))
-		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
+		// For the architecture the images are built for: the host's.
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return "", "", fmt.Errorf("build %s: %v\n%s", bin, err, out)
 		}
