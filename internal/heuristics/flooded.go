@@ -24,5 +24,22 @@ func flooded(c *model.Collection) []model.Finding {
 			Evidence: []model.Evidence{{Path: dir, Detail: "reading stopped at the budget for a user's unit directory"}},
 		})
 	}
+	// The world-writable temporary directories: anyone can fill those, and
+	// a setuid file planted behind the flood was not looked at.
+	for _, dir := range c.SweepFlooded {
+		if (dir != "/tmp" && dir != "/var/tmp" && dir != "/dev/shm") || seen["sweep\x00"+dir] {
+			continue
+		}
+		seen["sweep\x00"+dir] = true
+		out = append(out, model.Finding{
+			Key: "heur.sweep_flooded:" + dir, ID: idFlooded, Source: source, Severity: model.SevNote,
+			Title: dir + " holds more files than telltale looks through for setuid programs",
+			Why:   "telltale looks through every local filesystem for setuid, setgid and capability files, and stops at a fixed number of entries in each world-writable temporary directory so that nobody can make a scan run for ever by filling one. It stopped in this one: a setuid file among the rest was not seen. That many files in a temporary directory are themselves unusual.",
+			Fix: fix([]string{dir}, func(q []string) string {
+				return "find " + q[0] + " -xdev -maxdepth 2 | head -50; find " + q[0] + " -xdev -perm /6000 -ls   # see what fills it, and look for setuid files there yourself"
+			}),
+			Evidence: []model.Evidence{{Path: dir, Detail: "the search for setuid files stopped at this directory's budget"}},
+		})
+	}
 	return out
 }

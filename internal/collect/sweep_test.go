@@ -486,3 +486,24 @@ func TestSweepRealisticMountTableOnPAMEnsure(t *testing.T) {
 		t.Error("ordinary scan rule changed")
 	}
 }
+
+// A priority directory whose budget ran out is named, so the report can say
+// so in a finding and not only among the skipped checks.
+func TestSweepNamesFloodedDirectories(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < 40; i++ {
+		plant(t, root, fmt.Sprintf("tmp/.x/f%02d", i), 0o644)
+	}
+	plant(t, root, "var/tmp/.s", os.ModeSetuid|0o755)
+	old := sweepFirstBudget
+	sweepFirstBudget = 10
+	defer func() { sweepFirstBudget = old }()
+	_, _, _, flooded := sweepAll(root, []model.Mount{{Path: "/", FSType: "ext4"}}, nil, FileOptions{})
+	if len(flooded) != 1 || flooded[0] != "/tmp" {
+		t.Errorf("flooded = %v, want [/tmp]", flooded)
+	}
+	sweepFirstBudget = old
+	if _, _, _, flooded := sweepAll(root, []model.Mount{{Path: "/", FSType: "ext4"}}, nil, FileOptions{}); len(flooded) != 0 {
+		t.Errorf("flooded = %v within the budget", flooded)
+	}
+}

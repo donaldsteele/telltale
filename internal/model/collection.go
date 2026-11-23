@@ -21,6 +21,10 @@ type Collection struct {
 	// SweepIncomplete lists path prefixes where the setuid/capability sweep
 	// stopped early, so files under them were not all looked at.
 	SweepIncomplete []string `json:"sweep_incomplete,omitempty"`
+	// SweepFlooded lists the directories the sweep walks first (/tmp,
+	// /var/tmp, /dev/shm and the like) in which it stopped at that
+	// directory's own budget.
+	SweepFlooded []string `json:"sweep_flooded,omitempty"`
 	// PersistFlooded lists the per-user unit directories
 	// (~/.config/systemd/user and the like) whose reading stopped at a
 	// budget: their owner filled them, and what lies past the budget was

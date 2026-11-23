@@ -86,8 +86,16 @@ func Sweep(root string, mounts []model.Mount, have []model.FileEntry, opt FileOp
 // early (the entry bound or a directory budget ran out): files there were not
 // all looked at, so a snapshot comparison must not call them added or removed.
 func sweepFull(root string, mounts []model.Mount, have []model.FileEntry, opt FileOptions) ([]model.FileEntry, []model.Skip, []string) {
+	e, s, incomplete, _ := sweepAll(root, mounts, have, opt)
+	return e, s, incomplete
+}
+
+// sweepAll is sweepFull, also naming the priority directories (sweepFirst)
+// whose own budget ran out: someone filled them.
+func sweepAll(root string, mounts []model.Mount, have []model.FileEntry, opt FileOptions) ([]model.FileEntry, []model.Skip, []string, []string) {
 	var entries []model.FileEntry
 	var skips []model.Skip
+	var flooded []string
 	root = strings.TrimRight(root, "/")
 
 	haveSet := make(map[string]bool, len(have))
@@ -225,6 +233,7 @@ func sweepFull(root string, mounts []model.Mount, have []model.FileEntry, opt Fi
 			if visited++; visited > limit {
 				if inFirst {
 					phaseStop = true
+					flooded = append(flooded, phaseDir)
 					skips = append(skips, model.Skip{Check: checkName, Reason: fmt.Sprintf("sweep: %s: stopped after %d entries; the rest of it was not looked at", phaseDir, sweepFirstBudget)})
 				} else {
 					stopped = true
@@ -336,5 +345,5 @@ func sweepFull(root string, mounts []model.Mount, have []model.FileEntry, opt Fi
 		incomplete = append(incomplete, p)
 	}
 	sort.Strings(incomplete)
-	return entries, skips, incomplete
+	return entries, skips, incomplete, flooded
 }

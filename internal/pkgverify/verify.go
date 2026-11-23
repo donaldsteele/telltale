@@ -1340,8 +1340,12 @@ func (s *session) onePackage(ctx context.Context, r *pkgResult) {
 			s.problem(oldErr)
 		}
 	}
-	if !ok && s.distroNames[p.Name] {
-		// The distribution's history does not have it either.
+	if !ok && s.distroNames[p.Name] && (s.old == nil || errors.Is(oldErr, ErrNotFound)) {
+		// The distribution's history answered, and does not have it
+		// either: the version is the third party's own build. A history
+		// that could not be asked (the network, a garbage answer, the
+		// lookup budget) leaves that open, and then a third-party copy
+		// confirms nothing about a package the distribution names.
 		ref, ok = s.lookupThird(p)
 	}
 	if !ok {

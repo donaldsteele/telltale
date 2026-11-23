@@ -74,7 +74,7 @@ fix it on that machine. telltale never runs a fix itself.
 - **TT-SUDO-001** No sudo rule skips the password (NOPASSWD).
   A NOPASSWD rule turns anyone who gets into that account, even without its password, into root. Before removing it, give each account it covers a password, or nobody may be able to become root. *STIG V-274860 (UBTU-22-432011).*
 - **TT-SUDO-002** sudo always asks for authentication (no !authenticate).
-  A Defaults !authenticate line makes sudo hand out root without asking for any password. *STIG V-260558 (UBTU-22-432010).*
+  A Defaults !authenticate line makes sudo hand out root without asking for any password. Before removing it, give each account that uses sudo a password, or nobody may be able to become root. *STIG V-260558 (UBTU-22-432010).*
 - **TT-SUDO-003** sudoers files are mode 0440 and owned by root.
   Anyone who can write a sudoers file can give themselves root.
 
@@ -144,7 +144,7 @@ fix it on that machine. telltale never runs a fix itself.
 
 ## Suspicious on any machine
 
-25 kinds of finding, under 17 IDs. These need no snapshot. The finding key (the ID a report shows for each finding) starts as given here and ends with the account, path or program it is about.
+26 kinds of finding, under 17 IDs. These need no snapshot. The finding key (the ID a report shows for each finding) starts as given here and ends with the account, path or program it is about.
 
 - **TT-HEUR-001** An account other than root has user id 0. *Backdoor sign.*
   User id 0 is root, whatever the account is called. A second account with id 0 is a classic hidden way back in: it logs in as root under another name.
@@ -218,6 +218,9 @@ fix it on that machine. telltale never runs a fix itself.
 - **TT-HEUR-016** The PAM configuration names a module that is not on the machine. *Note.*
   Usually left over from a removed package. Whoever can create the file decides what runs at login.
   Key: `heur.pam_missing:`
+- **TT-HEUR-017** A temporary directory holds more files than telltale looks through. *Note.*
+  The search for setuid, setgid and capability files stops at a fixed number of entries in /tmp, /var/tmp and /dev/shm, so that nobody can make a scan run for ever by filling one. Where it stopped, a setuid file among the rest was not seen.
+  Key: `heur.sweep_flooded:`
 - **TT-HEUR-017** A user's systemd unit directory holds more than telltale reads. *Note.*
   Anyone can fill their own unit directory. telltale reads at most 2,000 entries and 8 MiB of text from one user's directory, and 64 MiB from all users' together, so that no user can make a scan run out of memory or time. What lies past that was not read, and a unit hidden there was not seen. Thousands of files in such a directory are themselves unusual: look at what fills it.
   Key: `heur.persist_flooded:`

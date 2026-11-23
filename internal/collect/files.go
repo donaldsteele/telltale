@@ -207,7 +207,9 @@ func statEntry(p, mp string, opt FileOptions, skips *[]model.Skip) (model.FileEn
 		}
 		var r io.Reader = f
 		if opt.MaxHashBytes > 0 {
-			r = io.LimitReader(f, opt.MaxHashBytes) // file may have grown since Lstat
+			// The file may have grown since Lstat: one byte past the limit
+			// is read to notice.
+			r = io.LimitReader(f, opt.MaxHashBytes+1)
 		}
 		h := sha256.New()
 		m := md5.New()
@@ -215,8 +217,15 @@ func statEntry(p, mp string, opt FileOptions, skips *[]model.Skip) (model.FileEn
 		if opt.MD5 {
 			w = io.MultiWriter(h, m)
 		}
-		if _, err := io.Copy(w, r); err != nil {
+		n, err := io.Copy(w, r)
+		if err != nil {
 			e.Err = fmt.Sprintf("read: %v", err)
+			return e, true
+		}
+		if opt.MaxHashBytes > 0 && n > opt.MaxHashBytes {
+			// A hash of the first bytes would stand for content nobody
+			// read: no hash at all.
+			e.Err = "grew past the hash limit while reading"
 			return e, true
 		}
 		e.SHA256 = hex.EncodeToString(h.Sum(nil))

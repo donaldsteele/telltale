@@ -340,3 +340,36 @@ func TestFilesMissingStartPathIsSilent(t *testing.T) {
 		t.Fatalf("entries %+v", entries)
 	}
 }
+
+// A file that grows past the hash limit after it was measured gets no hash:
+// the hash of its first bytes would stand for content nobody read.
+func TestFilesGrewPastHashLimitWhileReading(t *testing.T) {
+	root := t.TempDir()
+	p := filepath.Join(root, "log")
+	if err := os.WriteFile(p, make([]byte, 8), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testHookBeforeOpen = func(q string) {
+		if q == p {
+			os.WriteFile(p, make([]byte, 64), 0o644)
+		}
+	}
+	defer func() { testHookBeforeOpen = nil }()
+	entries, _ := Files(root, []string{"/log"}, FileOptions{MaxHashBytes: 10, MD5: true})
+	if len(entries) != 1 || entries[0].SHA256 != "" || entries[0].MD5 != "" || entries[0].Err != "grew past the hash limit while reading" {
+		t.Fatalf("%+v", entries)
+	}
+	// Exactly at the limit is still hashed.
+	if err := os.WriteFile(p, make([]byte, 8), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testHookBeforeOpen = func(q string) {
+		if q == p {
+			os.WriteFile(p, make([]byte, 10), 0o644)
+		}
+	}
+	entries, _ = Files(root, []string{"/log"}, FileOptions{MaxHashBytes: 10})
+	if len(entries) != 1 || entries[0].SHA256 == "" || entries[0].Err != "" {
+		t.Fatalf("at the limit: %+v", entries)
+	}
+}
