@@ -21,7 +21,7 @@ func sourceWords(src string) string {
 	case pkgverify.SourceLaunchpad:
 		return "Launchpad over HTTPS (lower trust than a signed index)"
 	case pkgverify.SourceRefs:
-		return "a reference bundle, checked with the built-in archive keys"
+		return "a reference bundle, checked again with the keys telltale trusts (built in, or for a third-party repository from the snapshot or --keys)"
 	case pkgverify.SourceOfflineLocal:
 		return OfflineReference
 	case pkgverify.SourceThirdParty:

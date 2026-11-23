@@ -161,7 +161,7 @@ func (j *judge) repoKeys() {
 
 func snapshotKeys(removed []string, origin string) string {
 	if len(removed) == 0 {
-		return "the same keys and fewer (" + origin + ")"
+		return "only keys that are still trusted (" + origin + ")"
 	}
 	return strings.Join(removed, ", ") + " (" + origin + ")"
 }

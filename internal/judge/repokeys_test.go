@@ -172,3 +172,51 @@ func evidenceText(f *model.Finding) string {
 	}
 	return b.String()
 }
+
+// A vendor package links a job into /etc/cron.daily from its postinst, the
+// way Chrome's does: the link is nobody's, the job it runs is the package's
+// file. An upgrade that changes the job changes what the link runs. When a
+// trusted source confirms the new job, that is the package's upgrade, not a
+// changed scheduled job; when nothing confirms it, or the link itself leads
+// somewhere else now, it stays a backdoor sign.
+func TestCronLinkToAPackageFileFollowsAConfirmedUpgrade(t *testing.T) {
+	const link, job = "/etc/cron.daily/lab-vendor", "/opt/lab-vendor/cron/lab-vendor"
+	const key = "snap.persist:" + link
+	machine := func(version, content, target string) *model.Collection {
+		c := clean()
+		c.Packages.Installed = append(c.Packages.Installed, pkg("lab-vendor", version, job))
+		f := file(job, content, 0o755)
+		if version != "1.0" {
+			f.CTime, f.MTime = changed, changed
+		}
+		c.Files = append(c.Files, f)
+		lines := append([]string{target}, strings.Split(content, "\n")...)
+		c.Persist = append(c.Persist, model.PersistFile{Path: link, Kind: model.PersistKindCron, Mode: 0o120777, SHA256: h(content), Lines: lines, MTime: taken})
+		return c
+	}
+	old := machine("1.0", "#!/bin/sh\n# 1.0\nexit 0", job)
+	cur := machine("2.0", "#!/bin/sh\n# 2.0\nexit 0", job)
+	confirmed := func() *pkgverify.Result {
+		return archive(pkgverify.FileVerdict{Path: job, Package: "lab-vendor", Version: "2.0", Expected: h("#!/bin/sh\n# 2.0\nexit 0"), Actual: h("#!/bin/sh\n# 2.0\nexit 0"), Source: pkgverify.SourceThirdParty})
+	}
+
+	r := runWith(clone(cur), snapOf(clone(old)), confirmed(), &vendorkeys.Table{})
+	absent(t, r, key)
+	if e := explained(r, "explained:lab-vendor"); e == nil || !hasEvidencePath(e, link) {
+		t.Errorf("the link's changed job is not shown with the confirmed upgrade: %+v", r.Explained)
+	}
+
+	// No trusted source confirmed the new version.
+	res := archive()
+	res.Unverifiable = []pkgverify.FileVerdict{{Path: job, Package: "lab-vendor", Version: "2.0", Actual: h("#!/bin/sh\n# 2.0\nexit 0"), Reason: pkgverify.ReasonNotOfficial, Kind: pkgverify.KindUntrusted}}
+	must(t, runWith(clone(cur), snapOf(clone(old)), res, &vendorkeys.Table{}), key, model.SevBackdoor)
+
+	// The verdict is about other content than the job has now.
+	stale := confirmed()
+	stale.Verified[0].Actual, stale.Verified[0].Expected = h("other"), h("other")
+	must(t, runWith(clone(cur), snapOf(clone(old)), stale, &vendorkeys.Table{}), key, model.SevBackdoor)
+
+	// The link was pointed at another file, however well that one verifies.
+	moved := machine("2.0", "#!/bin/sh\n# 2.0\nexit 0", "/opt/lab-vendor/cron/../cron/lab-vendor")
+	must(t, runWith(moved, snapOf(clone(old)), confirmed(), &vendorkeys.Table{}), key, model.SevBackdoor)
+}

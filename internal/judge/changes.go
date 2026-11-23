@@ -859,12 +859,29 @@ func (j *judge) unreported(p string) bool {
 // persistExplained names the package that explains a changed persistence
 // file: its content matches the signed package installed now, or it is a
 // conffile that an upgrade replaced with the new default.
-func (j *judge) persistExplained(p string, cur *model.PersistFile) string {
+func (j *judge) persistExplained(p string, cur, old *model.PersistFile) string {
 	if cur == nil {
 		return ""
 	}
 	if v, ok := j.verified[p]; ok && j.verifiedNow(v, j.files[p]) && (v.Source != pkgverify.SourceOfflineLocal || j.pkgChanged(v.Package)) {
 		return v.Package
+	}
+	// A link that reads as it did in the snapshot and opens a package's
+	// file, which changed with that package and matches the version
+	// installed now: a vendor package that links its own job into
+	// /etc/cron.daily from its postinst (Chrome's does) changes what the
+	// link runs with every upgrade. The link is not the package's, so only
+	// the file it really opens being the verified one explains it; a link
+	// whose text changed, or one to a file nothing confirmed, is not this.
+	isLink := func(pf *model.PersistFile) bool {
+		return pf != nil && pf.Mode&0o170000 == 0o120000 && len(pf.Lines) > 0
+	}
+	if isLink(cur) && isLink(old) && cur.Lines[0] == old.Lines[0] {
+		if t, ok := heuristics.LinkFile(j.files, *cur); ok {
+			if v, ok := j.verified[t]; ok && j.verifiedNow(v, j.files[t]) && j.pkgChanged(v.Package) {
+				return v.Package
+			}
+		}
 	}
 	if name := conffileOwner(j.c.Packages.Installed, p); name != "" && j.pkgChange[name].Kind == diff.PkgUpgraded && j.unreported(p) {
 		return name
@@ -997,7 +1014,7 @@ func (j *judge) persistChange(ch diff.Change) {
 	}
 
 	if !meta {
-		if name := j.persistExplained(p, cur); name != "" {
+		if name := j.persistExplained(p, cur, old); name != "" {
 			ev := summary(ch.Lines)
 			ev.Detail = strings.TrimPrefix(ev.Detail+"; the package's own version", "; ")
 			j.explain(name, ev)
