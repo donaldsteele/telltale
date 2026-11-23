@@ -71,7 +71,6 @@ func TestOnlineVendorRepositoriesVerifyWithPinnedKeys(t *testing.T) {
 		{"Microsoft (2025 key)", "https://packages.microsoft.com/debian/13/prod", "trixie", "main"},
 		{"Docker", "https://download.docker.com/linux/debian", "bookworm", "stable"},
 		{"Docker", "https://download.docker.com/linux/ubuntu", "jammy", "stable"},
-		{"HashiCorp", "https://apt.releases.hashicorp.com", "bookworm", "main"},
 		{"GitHub CLI", "https://cli.github.com/packages", "stable", "main"},
 		{"PostgreSQL PGDG", "https://apt.postgresql.org/pub/repos/apt", "bookworm-pgdg", "main"},
 		{"Grafana", "https://apt.grafana.com", "stable", "main"},

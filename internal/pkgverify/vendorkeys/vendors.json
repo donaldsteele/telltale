@@ -36,17 +36,6 @@
     "retrieved": "2026-11-22"
   },
   {
-    "name": "HashiCorp",
-    "url_patterns": ["https://apt.releases.hashicorp.com"],
-    "fingerprints": ["D55C0D1AC78A8D8126CB631CFC9CA96ACA026560"],
-    "key_file": "hashicorp.asc",
-    "key_source_url": "https://apt.releases.hashicorp.com/gpg",
-    "fingerprint_source_url": "https://www.hashicorp.com/en/trust/security",
-    "retrieved": "2026-11-22",
-    "provisional": true,
-    "note": "second source read via web fetch after HTTP 429; re-check before release"
-  },
-  {
     "name": "GitHub CLI",
     "url_patterns": ["https://cli.github.com/packages"],
     "fingerprints": ["7F38BBB59D064DBCB3D84D725612B36462313325"],

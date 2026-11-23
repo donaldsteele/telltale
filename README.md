@@ -234,15 +234,17 @@ model, package verification and which changes count as routine.
   that changes files is a backdoor sign for you to review.
 - **Third-party repositories need a key telltale trusts.** A repository is
   verified only with a key telltale has for it: one the snapshot recorded
-  for that repository, a built-in key of a well-known vendor (Google Chrome,
-  Microsoft, Docker, GitHub CLI, Grafana and others) for that vendor's
-  addresses, a key you add in the server's settings for the addresses you
+  for that repository, a built-in key of one of ten well-known vendors (Google
+  Chrome, Microsoft, Docker, GitHub CLI, PostgreSQL PGDG, Grafana, Elastic,
+  Mozilla, Brave, 1Password) for that vendor's addresses, a key you add in the server's settings for the addresses you
   give it, or a key you pass with `--keys`, which is tried for every
   third-party repository rather than bound to one. Never the machine's
   current keyrings. Without one, an upgrade from that repository cannot be
   confirmed, and after a snapshot it is reported as a backdoor sign.
   Repositories that need a login are fetched without it, so they count as
-  having no key.
+  having no key. HashiCorp's repository has no built-in key: trust it by
+  adding its key as an owner key in the server's settings, or with `--keys`
+  in carry mode.
 - **Kernel modules and the kernel command line are tested in a virtual
   machine only.** The Docker lab shares its host's kernel, so these checks
   are tested in a QEMU virtual machine, by hand rather than in CI.

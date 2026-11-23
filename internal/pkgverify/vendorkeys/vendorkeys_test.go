@@ -158,3 +158,20 @@ func TestExpiryFollowsSigningSubkeys(t *testing.T) {
 		t.Errorf("Expiry = %v (never %v), want the newest subkey's", exp, never)
 	}
 }
+
+// No entry ships unless a second source confirmed its fingerprint: a
+// provisional one is left out of a release. HashiCorp's was not confirmed.
+func TestVendorKeysNoneProvisional(t *testing.T) {
+	table, err := Builtin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range table.Vendors {
+		if v.Provisional {
+			t.Errorf("%s is provisional: confirm its fingerprint from a second source or remove it", v.Name)
+		}
+	}
+	if m := table.Match("https://apt.releases.hashicorp.com"); len(m) != 0 {
+		t.Errorf("HashiCorp's repository is covered by a built-in key: %s", m[0].Name)
+	}
+}

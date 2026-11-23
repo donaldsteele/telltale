@@ -65,8 +65,9 @@ three places, and never with a key the machine holds:
 
 - the snapshot, which records the keys the machine trusted for each
   third-party repository when it was clean;
-- the keys of well-known vendors built into telltale, each pinned to its
-  vendor's repository addresses;
+- the keys of ten well-known vendors built into telltale, each pinned to
+  its vendor's repository addresses (HashiCorp is not one of them: pass its
+  key with `--keys`, or add it as an owner key in the server's settings);
 - `--keys DIR`, keys you fetched from the vendors' own sites yourself
   (compare each fingerprint with one the vendor publishes somewhere else).
 

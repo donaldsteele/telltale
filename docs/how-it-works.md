@@ -43,12 +43,16 @@ built around that.
   (root can edit both); the one exception is `scan --offline`, which says so
   at the top of the report.
 - **Third-party repositories are trusted only with a key bound to them.**
-  telltale has the keys of about a dozen well-known vendors built in
-  (Google Chrome, Microsoft, Docker, GitHub CLI, Grafana, Elastic, Mozilla
-  and others; the list is in `internal/pkgverify/vendorkeys/vendors.json`),
-  each pinned by fingerprint to its vendor's repository addresses, and
-  added only when the key served on the vendor's site matched a fingerprint
-  the vendor publishes somewhere else. The snapshot records the keys the
+  telltale has the keys of ten well-known vendors built in (Google Chrome,
+  Microsoft, Docker, GitHub CLI, PostgreSQL PGDG, Grafana, Elastic,
+  Mozilla, Brave and 1Password; the list is in
+  `internal/pkgverify/vendorkeys/vendors.json`), each pinned by fingerprint
+  to its vendor's repository addresses, and added only when the key served
+  on the vendor's site matched a fingerprint the vendor publishes somewhere
+  else. HashiCorp's key is not among them, because its fingerprint could
+  not be confirmed that way; to trust HashiCorp's repository, add its key
+  as an owner key in the server's settings, or pass it with `--keys` in
+  carry mode. The snapshot records the keys the
   machine trusted for each third-party repository when it was clean, and
   later upgrades from that repository are verified with those keys (key
   continuity); if the machine trusts a different key now, that is reported.
