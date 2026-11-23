@@ -46,7 +46,7 @@ TELLTALE_LAB_ARCH=arm64 TELLTALE_LAB_DISTROS=debian12 go test -tags lab ./lab/ -
 
 - `TestCleanMachinesAreClean`: every variant of every distro, nothing planted.
 - `TestEveryBreakDetected` and `TestScenarios`: each break and each scenario on each distro.
-- `TestUpdateNoiseIsExplained`: a clean machine is snapshotted and upgraded from the older pinned package snapshot to the newer one; nothing above a note may come of it. This machine has nothing planted and is the only one with a route out: it runs on `telltale-lab-egress`, because it needs the package archive.
+- `TestUpdateNoiseIsExplained`: a clean machine is snapshotted and upgraded from the older pinned package snapshot to the newer one; nothing above a note may come of it, except the APT source file the test itself repoints to get there, which must be reported as a backdoor sign (a changed package source is one). This machine has nothing planted and is the only one with a route out: it runs on `telltale-lab-egress`, because it needs the package archive.
 - `TestOfflineFallbackWarns`: `scan --offline` says it used the machine's own checksums.
 - `TestSystemdLiveUnit`: one machine with systemd as PID 1, where the callback unit's timer really runs.
 

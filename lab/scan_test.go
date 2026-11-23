@@ -187,6 +187,11 @@ func TestScenarios(t *testing.T) {
 // newer pinned package versions and scans it: an ordinary update must not
 // raise anything. The machine has nothing planted and is the only one with a
 // route out (it needs the package archive).
+//
+// To reach the newer versions the test itself points the machine's APT
+// source at a later archive snapshot. Changing where packages come from is
+// a backdoor sign, and must be reported as one here; it is the one finding
+// above a note that the test expects.
 func TestUpdateNoiseIsExplained(t *testing.T) {
 	eachDistro(t, func(t *testing.T, distro string) {
 		t.Run("upgrade", func(t *testing.T) {
@@ -218,8 +223,13 @@ func TestUpdateNoiseIsExplained(t *testing.T) {
 			refs, col := refsFor(t, m)
 			r, code := scan(t, m, "--snapshot", snapInside, "--refs", refs)
 			saveReport(t, distro, "update-noise.with-snapshot", r)
-			if code != 0 && code != 1 {
-				t.Errorf("exit code %d after an ordinary upgrade, want 0 or 1", code)
+			const labSource = "snap.file_modified:/etc/apt/sources.list.d/lab-snapshot.sources"
+			if f := findKey(r, labSource); f == nil || f.Key != labSource || f.Severity != model.SevBackdoor {
+				t.Errorf("the APT source the test repointed is not a backdoor sign: %+v", f)
+			}
+			// 2 is for that finding; nothing may say tampering (3).
+			if code != 2 {
+				t.Errorf("exit code %d after an ordinary upgrade from a repointed APT source, want 2", code)
 			}
 			if findKey(r, "explained:") == nil {
 				t.Errorf("no upgraded package is in the explained group")
@@ -227,6 +237,9 @@ func TestUpdateNoiseIsExplained(t *testing.T) {
 			// Checklist items that were not met before the upgrade either
 			// stay weak settings; nothing else may rank above a note.
 			for _, f := range r.Findings {
+				if f.Key == labSource {
+					continue
+				}
 				if f.Severity > model.SevNote && !(f.Severity == model.SevWeak && strings.HasPrefix(f.Key, "check:")) {
 					t.Errorf("an ordinary upgrade raised %q: %s (%s)", f.Severity, f.Key, f.Title)
 				}

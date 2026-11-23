@@ -53,7 +53,9 @@ whose key was swapped.
 
 **Update noise**: a clean machine is snapshotted, then upgraded to newer
 pinned packages. Every changed package file must come back explained, with
-nothing above a note.
+nothing above a note, except the one change the test makes itself: it
+repoints the machine's APT source at a later archive snapshot, and a
+changed package source is reported as a backdoor sign.
 
 ## Everything planted is inert
 
