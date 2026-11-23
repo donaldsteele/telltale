@@ -25,6 +25,11 @@ type Collection struct {
 	// /var/tmp, /dev/shm and the like) in which it stopped at that
 	// directory's own budget.
 	SweepFlooded []string `json:"sweep_flooded,omitempty"`
+	// PersistRefused lists the symbolic links at or on the way to a user's
+	// startup paths that the collector did not follow (another account's
+	// link, or one leading where its owner could not read). Each is also in
+	// Persist, by its target text; what lies behind it was not read.
+	PersistRefused []string `json:"persist_refused,omitempty"`
 	// PersistFlooded lists the per-user unit directories
 	// (~/.config/systemd/user and the like) whose reading stopped at a
 	// budget: their owner filled them, and what lies past the budget was

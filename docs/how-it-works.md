@@ -90,22 +90,25 @@ built around that.
   files, systemd user units). Where one of those is a symbolic link, the
   text behind it is kept only when the link's owner could have read it
   anyway: root owns the link, or the link's owner owns the target, or
-  everyone may read it. A link on the way that a non-root account owns is
-  not followed (except a user's own link on the way to that user's own
-  start-up file or key file, such as `~/.ssh` kept in a dotfiles directory,
-  and then only to files that user could read), nothing is read through
-  `/proc`, and the password files,
-  their backups and anything holding a private key are never kept. The
-  link itself is still recorded and reported, with a note that its content
-  was not read.
+  everyone may read it. A user's own link on the way to that user's own
+  start-up files, key file or unit directory (`~/.config` or `~/.ssh` kept
+  in a dotfiles directory) is followed, and what it leads to is read only
+  where that user could read it. Any other link on the way that a non-root
+  account owns is not followed. A file in a directory the user can write
+  is kept only if the user could read it (it may be a hard link to someone
+  else's file). Nothing is read through `/proc`, and the password files,
+  their backups and anything holding a private key are never kept. A link
+  that is not followed is never silent: the link itself is recorded with
+  its target and ranked like any link at a startup path, and a note
+  (`heur.persist_link_refused`) says what is behind it was not read.
 - **A user cannot make a scan fail by filling a directory.** From one
   user's systemd unit directory telltale reads at most 2,000 entries and
   8 MiB of text, and from all users' unit directories together 64 MiB;
   text is kept only for files systemd reads as units, and anything else
   there is recorded by hash. Past a limit the directory is reported as a
   note (`heur.persist_flooded`) and listed among what could not be
-  checked. A unit directory that is itself a symbolic link is read only
-  when root made the link and it leads into the system directories.
+  checked. A system unit directory that is itself a symbolic link is read
+  only when root made the link and it leads into the system directories.
 
 What no on-machine check can rule out is a **kernel-level rootkit**: code in
 the kernel can hide anything from anything that runs on top of it, telltale

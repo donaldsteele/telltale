@@ -103,5 +103,8 @@ func Rules() []Rule {
 		{ID: idFlooded, Key: "heur.persist_flooded:", Severity: model.SevNote,
 			Title: "A user's systemd unit directory holds more than telltale reads",
 			Why:   "Anyone can fill their own unit directory. telltale reads at most 2,000 entries and 8 MiB of text from one user's directory, and 64 MiB from all users' together, so that no user can make a scan run out of memory or time. What lies past that was not read, and a unit hidden there was not seen. Thousands of files in such a directory are themselves unusual: look at what fills it."},
+		{ID: idRefusedLink, Key: "heur.persist_link_refused:", Severity: model.SevNote,
+			Title: "A link at a user's startup path was not followed",
+			Why:   "A scan running as root reads through a link at a user's startup path only when the link is root's, or the user's own and leads to files that user could read. Any other link is not followed, so that no user can aim the scan at files that are not theirs; what is behind it was not read. The link itself is listed and compared."},
 	}
 }

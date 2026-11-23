@@ -246,11 +246,29 @@ func TestPersistenceUserHardLinkToRootFile(t *testing.T) {
 	if !persistSkip(skips, "/home/mallory/.bashrc", skipHardLink) {
 		t.Errorf("skips %+v", skips)
 	}
-	// A file with one name that root left in the home is read as before.
-	rootOnly(t, root, "home/mallory/.profile", "umask 077\n")
-	pf, _ = Persistence(root, mallory(), testKey)
-	if f, ok := findPersist(pf, "/home/mallory/.profile"); !ok || len(f.Lines) != 1 {
-		t.Errorf("root's own file in the home: %+v", f)
+	// The link count proves nothing: once passwd has replaced /etc/shadow,
+	// the old file the user linked has one name left. Any file in a
+	// directory the user controls that the user could not read is not kept.
+	if err := os.Remove(filepath.Join(root, "etc/shadow")); err != nil {
+		t.Fatal(err)
+	}
+	pf, skips = Persistence(root, mallory(), testKey)
+	leaked(t, pf, skips, "SECRETHASHVALUE")
+	if f, ok := findPersist(pf, "/home/mallory/.bashrc"); !ok || len(f.Lines) != 0 || f.SHA256 != "" {
+		t.Errorf("the last name of a root-only file: %+v ok=%v", f, ok)
+	}
+	if !persistSkip(skips, "/home/mallory/.bashrc", skipNotReadable) {
+		t.Errorf("skips %+v", skips)
+	}
+
+	// A user's key file in a directory only root writes (AuthorizedKeysFile
+	// /etc/ssh/keys/%u, root-owned, 0600) is not the user's to plant: read.
+	root = t.TempDir()
+	rootOnly(t, root, "etc/ssh/sshd_config", "AuthorizedKeysFile /etc/ssh/keys/%u\n")
+	rootOnly(t, root, "etc/ssh/keys/mallory", "ssh-ed25519 AAAA mallory@laptop\n")
+	pf, skips = Persistence(root, mallory(), testKey)
+	if f, ok := findPersist(pf, "/etc/ssh/keys/mallory"); !ok || len(f.Lines) != 1 {
+		t.Errorf("root-managed key file: %+v ok=%v skips %+v", f, ok, skips)
 	}
 }
 

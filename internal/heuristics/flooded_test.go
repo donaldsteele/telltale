@@ -48,3 +48,18 @@ func TestSweepFloodedIsNoted(t *testing.T) {
 		t.Error("/srv reported as flooded")
 	}
 }
+
+// A link at a user's startup path that the collector did not follow is said
+// in the report: what is behind it was not read.
+func TestRefusedPersistLinkIsNoted(t *testing.T) {
+	c := cleanCollection()
+	const link = "/home/mallory/.config/systemd/user"
+	c.PersistRefused = []string{link}
+	f := find(runOwned(c, cleanOwned()), "heur.persist_link_refused:"+link)
+	if f == nil || f.Severity != model.SevNote || f.ID != "TT-HEUR-018" || len(f.Evidence) != 1 || f.Evidence[0].Path != link || !strings.Contains(f.Fix, "'"+link+"'") {
+		t.Fatalf("note = %+v", f)
+	}
+	if find(runOwned(cleanCollection(), cleanOwned()), "heur.persist_link_refused:"+link) != nil {
+		t.Error("note on a clean machine")
+	}
+}

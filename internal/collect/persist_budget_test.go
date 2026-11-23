@@ -137,20 +137,98 @@ func TestPersistenceUserUnitDirKeepsTextOnlyForUnits(t *testing.T) {
 }
 
 // ~/.config/systemd -> /run makes ~/.config/systemd/user read as /run/user,
-// every user's runtime directory. A user's link on the way is not followed.
+// every user's runtime directory. The user's own link is followed, but only
+// into what that user could read: another user's runtime directory is not.
 func TestPersistenceUserUnitDirBehindUserLink(t *testing.T) {
 	root := t.TempDir()
-	writeFile(t, root, "run/user/1000/systemd/private.service", "[Service]\nExecStart=/bin/secret\n")
-	writeFile(t, root, "run/user/1000/token", "SECRETHASHVALUE\n")
+	writeFile(t, root, "run/user/1000/systemd/private.service", "[Service]\nExecStart=/bin/SECRETHASHVALUE\n")
+	writeFile(t, root, "run/user/1000/token.service", "SECRETHASHVALUE\n")
+	if err := os.Chmod(filepath.Join(root, "run/user/1000"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	symlinkAt(t, root, "home/mallory/.config/systemd", "/run")
 	ownedBy(t, malloryUID, filepath.Join(root, "home/mallory"), filepath.Join(root, "home/mallory/.config"), filepath.Join(root, "home/mallory/.config/systemd"))
 	res := PersistenceScan(root, mallory(), testKey)
 	leaked(t, res.Files, res.Skips, "SECRETHASHVALUE")
-	if n, _ := under(res.Files, malloryUnits); n != 0 {
-		t.Errorf("%d entries read through the user's link", n)
+	for _, f := range res.Files {
+		if strings.HasPrefix(f.Path, malloryUnits+"/1000/") {
+			t.Errorf("read inside another user's closed directory: %+v", f)
+		}
 	}
-	if !persistSkip(res.Skips, malloryUnits, skipUserLinkPath) {
-		t.Errorf("skips %+v", res.Skips)
+}
+
+// The reviewer's probe: one ln -s must not hide a user's unit. A user's own
+// link on the way to that user's unit directory (~/.config kept in a
+// dotfiles directory), or the unit directory itself being the user's link,
+// is followed, and the unit is read like any other.
+func TestPersistenceUserUnitBehindOwnLinkIsRead(t *testing.T) {
+	for _, tc := range []struct{ name, link, target, unit string }{
+		{"~/.config is a link", "home/mallory/.config", "dotfiles/config", "home/mallory/dotfiles/config/systemd/user/evil.service"},
+		{"the unit directory is a link", "home/mallory/.config/systemd/user", "../../units", "home/mallory/units/evil.service"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeFile(t, root, tc.unit, "[Service]\nExecStart=/tmp/.x\n")
+			symlinkAt(t, root, tc.link, tc.target)
+			owned := []string{filepath.Join(root, tc.link)}
+			for d := filepath.Dir(filepath.Join(root, tc.unit)); d != filepath.Join(root, "home"); d = filepath.Dir(d) {
+				owned = append(owned, d)
+			}
+			owned = append(owned, filepath.Join(root, tc.unit))
+			for d := filepath.Dir(filepath.Join(root, tc.link)); d != filepath.Join(root, "home"); d = filepath.Dir(d) {
+				owned = append(owned, d)
+			}
+			ownedBy(t, malloryUID, owned...)
+			res := PersistenceScan(root, mallory(), testKey)
+			f, ok := findPersist(res.Files, malloryUnits+"/evil.service")
+			if !ok || len(f.Lines) != 2 || f.Lines[1] != "ExecStart=/tmp/.x" {
+				t.Errorf("the unit behind the user's own link was not read: %+v ok=%v\nskips %+v", f, ok, res.Skips)
+			}
+			if len(res.Refused) != 0 {
+				t.Errorf("refused %v", res.Refused)
+			}
+		})
+	}
+}
+
+// A link that is not followed is never silent: the link is recorded as a
+// persistence entry with its target, and named for a note in the report.
+func TestPersistenceRefusedUnitLinkIsRecorded(t *testing.T) {
+	// The user's own link into a directory of /etc the user cannot read.
+	root := t.TempDir()
+	writeFile(t, root, "etc/private/units/x.service", "[Service]\nExecStart=/bin/SECRETHASHVALUE\n")
+	if err := os.Chmod(filepath.Join(root, "etc/private"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "home/mallory/.config/systemd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	symlinkAt(t, root, "home/mallory/.config/systemd/user", "/etc/private/units")
+	ownedBy(t, malloryUID, filepath.Join(root, "home/mallory"), filepath.Join(root, "home/mallory/.config"), filepath.Join(root, "home/mallory/.config/systemd"), filepath.Join(root, "home/mallory/.config/systemd/user"))
+	res := PersistenceScan(root, mallory(), testKey)
+	leaked(t, res.Files, res.Skips, "SECRETHASHVALUE")
+	f, ok := findPersist(res.Files, malloryUnits)
+	if !ok || f.Kind != model.PersistKindSystemdUnit || len(f.Lines) != 1 || f.Lines[0] != "/etc/private/units" {
+		t.Errorf("the refused link is not recorded: %+v ok=%v", f, ok)
+	}
+	if !slices.Contains(res.Refused, malloryUnits) {
+		t.Errorf("Refused = %v", res.Refused)
+	}
+	if n, _ := under(res.Files, malloryUnits); n != 0 {
+		t.Errorf("%d entries read behind the refused link", n)
+	}
+
+	// Another account's link on the way.
+	root = t.TempDir()
+	writeFile(t, root, "home/mallory/real/systemd/user/evil.service", "[Service]\nExecStart=/tmp/.x\n")
+	symlinkAt(t, root, "home/mallory/.config", "real")
+	ownedBy(t, malloryUID+1, filepath.Join(root, "home/mallory/.config"))
+	res = PersistenceScan(root, mallory(), testKey)
+	if f, ok := findPersist(res.Files, "/home/mallory/.config"); !ok || len(f.Lines) != 1 || f.Lines[0] != "real" {
+		t.Errorf("another account's link is not recorded: %+v ok=%v", f, ok)
+	}
+	if !slices.Contains(res.Refused, "/home/mallory/.config") || !persistSkip(res.Skips, malloryUnits, skipUserLinkPath) {
+		t.Errorf("Refused = %v, skips %+v", res.Refused, res.Skips)
 	}
 }
 
@@ -183,10 +261,10 @@ func TestPersistenceLinkedUnitDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	symlinkAt(t, root, "home/mallory/.config/systemd/user", "../../units")
-	ownedBy(t, malloryUID, filepath.Join(root, "home/mallory/.config/systemd/user"))
+	ownedBy(t, malloryUID+1, filepath.Join(root, "home/mallory/.config/systemd/user"))
 	res = PersistenceScan(root, mallory(), testKey)
 	if n, _ := under(res.Files, malloryUnits); n != 0 {
-		t.Errorf("a user's linked unit directory was walked")
+		t.Errorf("a unit directory linked by another account was walked")
 	}
 	if !persistSkip(res.Skips, malloryUnits, skipLinkedUnitDir) {
 		t.Errorf("skips %+v", res.Skips)

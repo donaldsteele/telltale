@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -98,8 +99,9 @@ type collector struct {
 	// hashOnly makes file record a regular file without its text, and
 	// without reading one too large to keep.
 	hashOnly bool
-	// flooded lists the user unit directories cut short at a budget.
-	flooded []string
+	// flooded lists the user unit directories cut short at a budget;
+	// refused the links that were not followed.
+	flooded, refused []string
 }
 
 func (c *collector) skip(mp, reason string) {
@@ -137,7 +139,7 @@ func (c *collector) file(mp, kind string) {
 			// Not followed, but not lost either: the link is recorded, so
 			// it is seen and compared like any link at a persistence path.
 			c.skip(mp, skipUserLinkPath)
-			c.refusedLink(pl.link, kind)
+			c.refuse(pl.link, kind)
 		case !isNotExist(err) && !errors.Is(err, unix.ENOTDIR):
 			c.skip(mp, err.Error())
 		}
@@ -169,12 +171,28 @@ func (c *collector) file(mp, kind string) {
 		// Nothing of the file is recorded, not even its size or dates:
 		// the user could not have seen those either.
 		c.skip(mp, skipOwnLinkPath)
-		c.refusedLink(pl.link, kind)
+		c.refuse(pl.link, kind)
 		return
 	}
 
 	pf := model.PersistFile{Path: mp, Kind: kind}
 	c.meta(st, &pf)
+	// A user's own path, in a directory that user (or anyone) can make
+	// names in: the file may be a hard link the user made to a file the
+	// user cannot read, so its content is kept only if the user could read
+	// it. The link count proves nothing (once the original is replaced,
+	// one name is left). A directory only root writes is different: a
+	// root-owned key file there (AuthorizedKeysFile /etc/ssh/keys/%u) is
+	// root's to place and is read.
+	if c.user != nil && pl.userControlled() && !readableBy(uid, &st, pl.shut) {
+		reason := skipNotReadable
+		if st.Nlink > 1 {
+			reason = skipHardLink
+		}
+		c.skip(mp, reason)
+		c.out = append(c.out, pf)
+		return
+	}
 	if c.hashOnly && st.Size > maxPersistBytes {
 		c.out = append(c.out, pf)
 		return
@@ -376,12 +394,30 @@ func (c *collector) enabledLink(mp string) {
 	c.refusedLink(mp, model.PersistKindSystemdEnabled)
 }
 
+// refuse records a link that was not followed: as a persistence entry with
+// its target text (refusedLink), so it is compared and ranked like any link
+// at a startup path, and by name for a note in the report. A link that is
+// not followed is never only a Skip.
+func (c *collector) refuse(link, kind string) {
+	if link == "" {
+		return
+	}
+	c.refusedLink(link, kind)
+	if !slices.Contains(c.refused, link) {
+		c.refused = append(c.refused, link)
+	}
+}
+
 // refusedLink records the symbolic link at mp by its target text alone.
 func (c *collector) refusedLink(mp, kind string) {
 	if mp == "" || c.seen[kind+"\x00"+mp] {
 		return
 	}
-	pl, err := walkTo(c.root, mp, 0, false)
+	var uid uint32
+	if c.user != nil {
+		uid = uint32(c.user.UID)
+	}
+	pl, err := walkTo(c.root, mp, uid, c.user != nil)
 	if err != nil {
 		return
 	}
@@ -409,6 +445,10 @@ type unitBudget struct {
 	dir           string
 	entries, text int
 	stopped       bool
+	// own is set when the tree was reached through a link of the user's
+	// own: every directory in it is then entered only if uid could.
+	own bool
+	uid uint32
 }
 
 // maxUnitDepth is how deep a unit tree is walked.
@@ -439,11 +479,21 @@ func unitDirInSystem(real string) bool {
 // that a non-root account owns is never followed.
 func (c *collector) systemd(dir string, all bool, b *unitBudget) {
 	dir = path.Clean(dir)
-	pl, err := walkTo(c.root, dir, 0, false)
+	const kind = model.PersistKindSystemdUnit
+	// A user's own unit directory: links that user owns on the way are
+	// followed (~/.config kept in a dotfiles directory), and what is
+	// reached is read only where that user could read it.
+	var uid uint32
+	own := c.user != nil && b != nil
+	if own {
+		uid = uint32(c.user.UID)
+	}
+	pl, err := walkTo(c.root, dir, uid, own)
 	if err != nil {
 		switch {
 		case errors.Is(err, errUserLink):
 			c.skip(dir, skipUserLinkPath)
+			c.refuse(pl.link, kind)
 		case !isNotExist(err) && !errors.Is(err, unix.ENOTDIR):
 			c.skip(dir, err.Error())
 		}
@@ -458,26 +508,39 @@ func (c *collector) systemd(dir string, all bool, b *unitBudget) {
 		return
 	}
 	var fd int
+	via, shut, link := pl.own, pl.shut, pl.link
 	switch lst.Mode & unix.S_IFMT {
 	case unix.S_IFLNK:
-		if !trustedOwner(ownerOf(&lst)) {
+		owner := ownerOf(&lst)
+		byRoot := trustedOwner(owner)
+		if !byRoot && !(own && owner == uid) {
 			c.skip(dir, skipLinkedUnitDir)
+			c.refuse(dir, kind)
 			return
 		}
-		rp, err := walkTo(c.root, dir+"/.", 0, false)
+		rp, err := walkTo(c.root, dir+"/.", uid, own)
 		if err != nil {
 			switch {
 			case errors.Is(err, errUserLink):
 				c.skip(dir, skipLinkedUnitDir)
+				c.refuse(dir, kind)
 			case !isNotExist(err) && !errors.Is(err, unix.ENOTDIR):
 				c.skip(dir, err.Error())
 			}
 			return // a dangling link: nothing to walk
 		}
 		defer rp.close()
-		if !unitDirInSystem(rp.real) {
-			c.skip(dir, skipLinkedUnitDir)
-			return
+		if byRoot && !rp.own {
+			if !unitDirInSystem(rp.real) {
+				c.skip(dir, skipLinkedUnitDir)
+				c.refuse(dir, kind)
+				return
+			}
+		} else {
+			via, shut = true, rp.shut
+			if link == "" {
+				link = dir
+			}
 		}
 		fd, err = unix.Openat(rp.dir, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 		if err != nil {
@@ -492,6 +555,18 @@ func (c *collector) systemd(dir string, all bool, b *unitBudget) {
 		}
 	default:
 		return
+	}
+	if via {
+		// Reached through the user's own link: listed only if the user
+		// could list it.
+		var st unix.Stat_t
+		if err := unix.Fstat(fd, &st); err != nil || !dirReadableBy(uid, &st, shut) {
+			unix.Close(fd)
+			c.skip(dir, skipOwnLinkPath)
+			c.refuse(link, kind)
+			return
+		}
+		b.own, b.uid = true, uid
 	}
 	c.unitTree(fd, dir, all, b, 0)
 }
@@ -580,6 +655,14 @@ func (c *collector) unitTree(fd int, mp string, all bool, b *unitBudget, depth i
 				}
 				continue
 			}
+			if b != nil && b.own {
+				var st unix.Stat_t
+				if err := unix.Fstat(sub, &st); err != nil || !dirReadableBy(b.uid, &st, false) {
+					unix.Close(sub)
+					c.skip(child, skipOwnLinkPath)
+					continue
+				}
+			}
 			c.unitTree(sub, child, all, b, depth+1)
 		}
 		if b != nil {
@@ -658,7 +741,8 @@ func PersistenceScan(root string, users []model.User, key []byte) PersistResult 
 		return c.out[i].Kind < c.out[j].Kind
 	})
 	sort.Strings(c.flooded)
-	return PersistResult{Files: c.out, Skips: c.skips, Flooded: c.flooded}
+	sort.Strings(c.refused)
+	return PersistResult{Files: c.out, Skips: c.skips, Flooded: c.flooded, Refused: c.refused}
 }
 
 // expandAKF expands %h, %u and %% in an AuthorizedKeysFile pattern; relative
@@ -711,6 +795,10 @@ type PersistResult struct {
 	// Flooded lists the user unit directories whose walk stopped at a
 	// budget, sorted.
 	Flooded []string
+	// Refused lists the symbolic links at or on the way to a user's
+	// startup paths that were not followed, sorted. Each is also among
+	// Files, by its target text.
+	Refused []string
 }
 
 // Persistence is PersistenceScan without the list of directories cut short.

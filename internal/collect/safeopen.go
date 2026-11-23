@@ -42,6 +42,7 @@ const (
 	skipHardLink       = "has more than one hard link and belongs to another account, content not kept"
 	skipUserLinkPath   = "a directory on the way is a symbolic link owned by a non-root user: not followed"
 	skipOwnLinkPath    = "reached through the account's own symbolic link and not readable by that account, content not kept"
+	skipNotReadable    = "in a directory the account controls and not readable by that account, content not kept"
 )
 
 const (
@@ -86,6 +87,24 @@ func (p place) close() {
 	if p.dir >= 0 {
 		unix.Close(p.dir)
 	}
+}
+
+// userControlled reports whether an account other than root can make names
+// in the directory reached: it is not root's, or its group or everyone may
+// write it. A file found there may be a hard link the user made to a file
+// the user cannot read.
+func (p place) userControlled() bool {
+	var st unix.Stat_t
+	if err := unix.Fstat(p.dir, &st); err != nil {
+		return true
+	}
+	return !trustedOwner(ownerOf(&st)) || st.Mode&0o022 != 0
+}
+
+// dirReadableBy reports whether the account uid could list and enter the
+// directory st describes, reached by a walk with the given shut.
+func dirReadableBy(uid uint32, st *unix.Stat_t, shut bool) bool {
+	return ownerOf(st) == uid || (st.Mode&0o005 == 0o005 && !shut)
 }
 
 // path is the machine path of the name really reached.

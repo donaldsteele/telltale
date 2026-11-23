@@ -24,6 +24,22 @@ func flooded(c *model.Collection) []model.Finding {
 			Evidence: []model.Evidence{{Path: dir, Detail: "reading stopped at the budget for a user's unit directory"}},
 		})
 	}
+	// Links at a user's startup paths that were not followed.
+	for _, link := range c.PersistRefused {
+		if seen["link\x00"+link] {
+			continue
+		}
+		seen["link\x00"+link] = true
+		out = append(out, model.Finding{
+			Key: "heur.persist_link_refused:" + link, ID: idRefusedLink, Source: source, Severity: model.SevNote,
+			Title: link + " is a link telltale did not follow, so what is behind it was not read",
+			Why:   "This symbolic link is at, or on the way to, a user's startup files (shell start-up files, SSH keys, systemd user units). It belongs to another account than the one whose files those are, or it leads somewhere that user could not read, so a scan running as root does not read through it: doing so would let a user aim the scan at files that are not theirs. Units, keys or start-up lines behind it were not seen. The link itself is listed among the startup entries and compared with the snapshot.",
+			Fix: fix([]string{link}, func(q []string) string {
+				return "ls -ld " + q[0] + "; ls -la " + q[0] + "/ 2>/dev/null | head -50   # see where it leads and what is there; replace the link with a real directory if you want its contents checked"
+			}),
+			Evidence: []model.Evidence{{Path: link, Detail: "a symbolic link the scan did not follow"}},
+		})
+	}
 	// The world-writable temporary directories: anyone can fill those, and
 	// a setuid file planted behind the flood was not looked at.
 	for _, dir := range c.SweepFlooded {

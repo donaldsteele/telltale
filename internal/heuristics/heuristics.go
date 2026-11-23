@@ -34,6 +34,7 @@ const (
 	idDiversion    = "TT-HEUR-014"
 	idPAM          = "TT-HEUR-016"
 	idFlooded      = "TT-HEUR-017"
+	idRefusedLink  = "TT-HEUR-018"
 	evidenceDir    = "/root/telltale-evidence"
 	saveEvidence   = "mkdir -p " + evidenceDir
 	flagImmutable  = 0x10
