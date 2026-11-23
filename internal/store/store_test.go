@@ -475,3 +475,58 @@ func TestReportMetaSealed(t *testing.T) {
 		t.Fatalf("plaintext metadata columns: %d %v", n, err)
 	}
 }
+
+func TestConcurrentFirstOpen(t *testing.T) {
+	p := tmpDB(t)
+	const n = 6
+	type res struct {
+		s   *Store
+		err error
+	}
+	out := make(chan res, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		pw := "one"
+		if i%2 == 1 {
+			pw = "two"
+		}
+		go func() {
+			<-start
+			s, err := Open(p, Unlock{Passphrase: pw})
+			out <- res{s, err}
+		}()
+	}
+	close(start)
+	ok := 0
+	for i := 0; i < n; i++ {
+		r := <-out
+		switch {
+		case r.err == nil:
+			ok++
+			defer r.s.Close()
+		case strings.Contains(r.err.Error(), "disk I/O"), strings.Contains(r.err.Error(), "BUSY"), strings.Contains(r.err.Error(), "locked"):
+			t.Errorf("opener failed: %v", r.err)
+		case !errors.Is(r.err, ErrWrongUnlock):
+			t.Errorf("unexpected error: %v", r.err)
+		}
+	}
+	if ok == 0 {
+		t.Fatal("nobody opened")
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Fatal(err)
+	}
+	// Exactly one key: the survivors share it, and the stored one is single.
+	db, err := Open(p, Unlock{Passphrase: "one"})
+	if err != nil {
+		db, err = Open(p, Unlock{Passphrase: "two"})
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n2 int
+	if err := db.db.QueryRow(`SELECT count(*) FROM settings WHERE key='wrapped_key'`).Scan(&n2); err != nil || n2 != 1 {
+		t.Fatalf("keys = %d %v", n2, err)
+	}
+}

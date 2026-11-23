@@ -223,3 +223,21 @@ func loadOrCreateIdentity(path string) (*age.X25519Identity, error) {
 	}
 	return id, nil
 }
+
+// checkKeyFile fails early on a key file that cannot work: unreadable, too
+// open, or absent with no directory to create it in.
+func checkKeyFile(path string) error {
+	if path == "" {
+		return nil
+	}
+	if _, err := os.Stat(path); err == nil {
+		_, err := readIdentity(path)
+		return err
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("store: key file: %w", err)
+	}
+	if fi, err := os.Stat(filepath.Dir(path)); err != nil || !fi.IsDir() {
+		return fmt.Errorf("store: key file %s cannot be created: its directory does not exist", path)
+	}
+	return nil
+}

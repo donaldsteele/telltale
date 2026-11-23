@@ -84,16 +84,27 @@ func Open(path string, u Unlock) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	_, statErr := os.Stat(path)
-	created := errors.Is(statErr, os.ErrNotExist)
+	// Check the key file up front, so a bad one never costs us a half-made
+	// database (and nothing has to be removed after another opener may be
+	// using it).
+	if err := checkKeyFile(u.KeyFile); err != nil {
+		return nil, err
+	}
 	// Create the file 0600 ourselves so SQLite (which gives -wal and -shm the
-	// main file's mode) never makes a wider one.
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	// main file's mode) never makes a wider one. Only the opener whose
+	// O_EXCL create succeeds owns the file and may remove it on failure.
+	created := true
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		created = false
+		f, err = os.OpenFile(path, os.O_RDWR, 0o600)
+	}
 	if err != nil {
 		return nil, err
 	}
 	f.Close()
 	fail := func(err error) (*Store, error) {
+		// Only before any SQL ran, and only by the opener that created the file.
 		if created {
 			for _, suf := range []string{"", "-wal", "-shm"} {
 				os.Remove(path + suf)
@@ -117,8 +128,9 @@ func Open(path string, u Unlock) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
 	if err := s.init(u); err != nil {
+		// Other openers may already be using the file: never remove it here.
 		db.Close()
-		return fail(err)
+		return nil, err
 	}
 	for _, suf := range []string{"-wal", "-shm"} {
 		if _, err := os.Stat(path + suf); err == nil {
