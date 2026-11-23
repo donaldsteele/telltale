@@ -221,7 +221,11 @@ rules telltale follows, in plain words:
   initramfs, module indexes, the boot menu, the dynamic linker's cache) are
   explained only by a confirmed change of a package that rebuilds them, and
   the linker cache only when every library it newly lists was in the
-  snapshot's cache or is verified now.
+  snapshot's cache or is verified now. Removing an old kernel (`apt
+  autoremove`) rewrites the boot menu and re-points the `vmlinuz.old` and
+  `initrd.img.old` links; with a kernel removal in the same comparison
+  those changes are notes for you to accept, and they do not roll forward
+  by themselves, because a removal is only the machine's own record.
 - **A newly installed package is a note**, raised to a backdoor sign when it
   adds something that runs with special rights or reaches the network: a
   setuid or setgid program, a file capability, a kernel module, a PAM

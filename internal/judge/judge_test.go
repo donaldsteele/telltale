@@ -2768,7 +2768,16 @@ func TestJudgeRemovalExplainsNoPresentBootFile(t *testing.T) {
 	if strings.Contains(f.Why, "no trusted source confirmed") || !strings.Contains(f.Why, "removed") {
 		t.Errorf("why %q", f.Why)
 	}
-	must(t, r, "snap.file_modified:/boot/grub/grub.cfg", model.SevBackdoor)
+	// The boot menu is what removing a kernel rewrites: a note for the owner
+	// to accept, never explained by the removal. What the machine boots with
+	// is compared on its own (snap.cmdline).
+	g := must(t, r, "snap.file_modified:/boot/grub/grub.cfg", model.SevNote)
+	if !strings.Contains(g.Why, "removed") {
+		t.Errorf("why %q", g.Why)
+	}
+	if ex := explained(r, "explained:linux-image-6.1.0-25-amd64"); ex != nil && hasEvidencePath(ex, "/boot/grub/grub.cfg") {
+		t.Errorf("the boot menu is folded into the removal: %+v", ex)
+	}
 
 	// The real removal: the kernel's boot files are gone with it.
 	cur.Files = slices.DeleteFunc(cur.Files, func(e model.FileEntry) bool { return strings.Contains(e.Path, "6.1.0-25") })
@@ -2781,8 +2790,10 @@ func TestJudgeRemovalExplainsNoPresentBootFile(t *testing.T) {
 }
 
 // A removed (rc) kernel package is never the rebuilder "that could not be
-// checked" for a present, changed initrd and grub.cfg during an outage:
-// both stay backdoor signs.
+// checked" for a present, changed initrd and grub.cfg during an outage: the
+// initramfs stays a backdoor sign, and the boot menu is the note of its own
+// that any kernel removal makes it, never one of the files the outage left
+// unchecked.
 func TestJudgeRemovedPackageDoesNotExcuseBootFilesDuringOutage(t *testing.T) {
 	old := clean()
 	old.Packages.Installed = append(old.Packages.Installed, pkg("linux-image-6.1.0-25-amd64", "6.1.106-3"))
@@ -2795,7 +2806,12 @@ func TestJudgeRemovedPackageDoesNotExcuseBootFilesDuringOutage(t *testing.T) {
 		Unverifiable: []pkgverify.FileVerdict{{Path: "/boot/vmlinuz-6.1.0-25-amd64", Package: "linux-image-6.1.0-25-amd64", Version: "6.1.106-3", Reason: "could not read the official archive index: dial tcp: i/o timeout", Kind: pkgverify.KindUnreachable}}}
 	r := run(cur, snapOf(old), res)
 	must(t, r, "snap.file_modified:/boot/initrd.img-6.1.0-25-amd64", model.SevBackdoor)
-	must(t, r, "snap.file_modified:/boot/grub/grub.cfg", model.SevBackdoor)
+	must(t, r, "snap.file_modified:/boot/grub/grub.cfg", model.SevNote)
+	for _, f := range append(slices.Clone(r.Findings), r.Explained...) {
+		if !strings.HasPrefix(f.Key, "snap.file_modified:") && hasEvidencePath(&f, "/boot/grub/grub.cfg") {
+			t.Errorf("the boot menu is set aside with %s", f.Key)
+		}
+	}
 }
 
 // R71b: accept records the first evidence's After (or the title). For grouped

@@ -213,7 +213,22 @@ const (
 	catAccount
 	catHandedOff
 	catMaintScript
+	catKernelRemoval
 )
+
+// kernelRemovalRewrites names the kernel image package removed since the
+// snapshot when p is a boot file that removing a kernel rewrites: the boot
+// menu, and the links to the current and the previous kernel and
+// initramfs. An initramfs or a module index is not among them: removing a
+// kernel deletes its own and leaves the others alone.
+func (j *judge) kernelRemovalRewrites(p string) string {
+	switch p {
+	case "/boot/grub/grub.cfg", "/boot/grub/grubenv", "/boot/vmlinuz", "/boot/vmlinuz.old", "/boot/initrd.img", "/boot/initrd.img.old":
+		return j.changedPackage(func(n string) bool { return j.pkgChange[n].Kind == diff.PkgRemoved },
+			func(n string) bool { return strings.HasPrefix(n, "linux-image") })
+	}
+	return ""
+}
 
 // maintainerScript reports whether p is a dpkg maintainer script (or a
 // triggers file), which dpkg runs as root at the next package operation.
@@ -415,6 +430,8 @@ func (j *judge) fileChange(ch diff.Change) {
 		return
 	case maintainerScript(p) && cur != nil:
 		cat = catMaintScript
+	case cur != nil && j.kernelRemovalRewrites(p) != "":
+		cat = catKernelRemoval
 	case generatedFile(p):
 		cat = catGenerated
 	case j.isPersistLocation(p):
@@ -471,6 +488,18 @@ func (j *judge) fileChange(ch diff.Change) {
 		why = fmt.Sprintf("This link now points to %s: %s. A program or file replaced by a link runs or reads whatever sits at the other end, so it no longer matters what the package installed here.",
 			to, linkWhy)
 		refs = []string{"T1574"}
+	case catKernelRemoval:
+		// A note of its own, never part of the removal's explained group:
+		// that group rolls forward by itself, and a removal is only dpkg's
+		// word, which root can edit. The owner looks and accepts.
+		sev = model.SevNote
+		why = "The kernel package " + j.kernelRemovalRewrites(p) + " was removed since the snapshot, and removing a kernel (apt autoremove does it) rewrites the boot menu and re-points the links to the current and the previous kernel. " +
+			"That a package was removed is the machine's own record, which nothing confirms, so this change is listed for you to accept rather than set aside by itself. " +
+			"What the machine actually boots with, the kernel command line, is compared with the snapshot on its own."
+		refs = []string{"T1542"}
+		if cur != nil {
+			fix = fixKeepOnly(p, "then rebuild it from the installed packages if you did not remove a kernel: update-grub for the boot menu; the vmlinuz and initrd.img links are made by linux-update-symlinks (check /etc/default/grub and /etc/grub.d first)")
+		}
 	case catMaintScript:
 		why = "This dpkg maintainer script runs as root the next time the package is upgraded, reconfigured or removed, and nothing confirmed a package change that would explain the edit. A planted line here is a way back in that waits for routine maintenance."
 		refs = []string{"T1546"}

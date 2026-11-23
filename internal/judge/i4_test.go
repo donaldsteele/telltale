@@ -192,3 +192,69 @@ func TestJudgeCACertificates(t *testing.T) {
 		t.Errorf("bundle changed with no upgrade: %v", ks)
 	}
 }
+
+// apt autoremove of an old kernel, on its own: the boot menu is rewritten
+// and the .old links move. That is a note the owner accepts, never a
+// critical alert, and never something that rolls forward by itself.
+func TestJudgeKernelAutoremoveBootFilesAreNotes(t *testing.T) {
+	old := clean()
+	old.Runtime.Cmdline = strings.Replace(bootLine, "6.1.0-25", "6.1.0-27", 1)
+	old.Packages.Installed = append(old.Packages.Installed,
+		pkg("linux-image-6.1.0-25-amd64", "6.1.106-3", "/boot/vmlinuz-6.1.0-25-amd64"),
+		pkg("linux-image-6.1.0-27-amd64", "6.1.115-1", "/boot/vmlinuz-6.1.0-27-amd64"))
+	old.Files = append(old.Files,
+		file("/boot/vmlinuz-6.1.0-25-amd64", "k25", 0o644), file("/boot/initrd.img-6.1.0-25-amd64", "initrd 25", 0o644),
+		file("/boot/vmlinuz-6.1.0-27-amd64", "k27", 0o644), file("/boot/initrd.img-6.1.0-27-amd64", "initrd 27", 0o644),
+		file("/boot/grub/grub.cfg", "menu 25 27", 0o444),
+		symlinkAt("/boot/vmlinuz.old", "vmlinuz-6.1.0-25-amd64", taken), symlinkAt("/boot/initrd.img.old", "initrd.img-6.1.0-25-amd64", taken))
+
+	cur := clone(old)
+	removePkg(cur, "linux-image-6.1.0-25-amd64")
+	cur.Files = slices.DeleteFunc(cur.Files, func(e model.FileEntry) bool { return strings.Contains(e.Path, "6.1.0-25") })
+	setFile(cur, file("/boot/grub/grub.cfg", "menu 27", 0o444))
+	setFile(cur, symlinkAt("/boot/vmlinuz.old", "vmlinuz-6.1.0-27-amd64", changed))
+	setFile(cur, symlinkAt("/boot/initrd.img.old", "initrd.img-6.1.0-27-amd64", changed))
+
+	r, rb := rebaseRun(cur, snapOf(old), archive())
+	boot := []string{"/boot/grub/grub.cfg", "/boot/vmlinuz.old", "/boot/initrd.img.old"}
+	for _, p := range boot {
+		f := must(t, r, "snap.file_modified:"+p, model.SevNote)
+		if !strings.Contains(f.Why, "linux-image-6.1.0-25-amd64") || !strings.Contains(f.Why, "removed") {
+			t.Errorf("%s: why %q", p, f.Why)
+		}
+		if slices.Contains(rb.Routine.Paths, p) {
+			t.Errorf("%s rolls forward by itself", p)
+		}
+		if s, ok := rb.Accept["snap.file_modified:"+p]; !ok || !slices.Contains(s.Paths, p) {
+			t.Errorf("%s cannot be accepted: %+v", p, s)
+		}
+	}
+	if sev := severest(r); sev > model.SevWeak {
+		t.Errorf("a kernel autoremove raised %s: %v", sev, keys(r))
+	}
+	if g := explained(r, "explained:linux-image-6.1.0-25-amd64"); g != nil {
+		for _, p := range boot {
+			if hasEvidencePath(g, p) {
+				t.Errorf("%s is folded into the removal, which rolls forward by itself", p)
+			}
+		}
+	}
+
+	// A malicious boot change made under cover of the removal still shows:
+	// the command line the machine boots with is compared on its own.
+	evil := clone(cur)
+	evil.Runtime.Cmdline += " init=/dev/shm/.i"
+	must(t, run(evil, snapOf(old), archive()), "snap.cmdline", model.SevBackdoor)
+
+	// No kernel was removed: the same boot files changing is a backdoor sign.
+	same := clone(cur)
+	same.Packages.Installed = clone(old).Packages.Installed
+	rr := run(same, snapOf(old), archive())
+	for _, p := range boot {
+		must(t, rr, "snap.file_modified:"+p, model.SevBackdoor)
+	}
+
+	// Another kernel's initramfs is not what a removal rewrites.
+	setFile(cur, file("/boot/initrd.img-6.1.0-27-amd64", "initrd 27 + implant", 0o644))
+	must(t, run(cur, snapOf(old), archive()), "snap.file_modified:/boot/initrd.img-6.1.0-27-amd64", model.SevBackdoor)
+}
