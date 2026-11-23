@@ -349,7 +349,7 @@ func TestCompareDirectoryBookkeepingIsNotAChange(t *testing.T) {
 	cur := &model.Collection{Files: []model.FileEntry{
 		{Path: "/var/lib/dpkg/info", Type: "dir", Mode: 0755, Size: 4096, Flags: 0x80000},
 		{Path: "/etc/cron.d", Type: "dir", Mode: 0777, Size: 8192, Flags: 0x80010},
-		{Path: "/etc/x", Type: "file", Mode: 0644, Size: 11, Flags: 0x81000},
+		{Path: "/etc/x", Type: "file", Mode: 0644, Size: 11, Flags: 0x80020},
 	}}
 	cs := Compare(snap(old), cur, nil)
 	for _, c := range cs {
@@ -360,8 +360,53 @@ func TestCompareDirectoryBookkeepingIsNotAChange(t *testing.T) {
 	if m := find(t, cs, "file_modified", "/etc/cron.d"); m.After != "mode 0777 flags 0x80010" {
 		t.Errorf("directory mode and immutable flag: got %q -> %q", m.Before, m.After)
 	}
-	if m := find(t, cs, "file_modified", "/etc/x"); m.After != "size 11 flags 0x81000" {
+	if m := find(t, cs, "file_modified", "/etc/x"); m.After != "size 11 flags 0x80020" {
 		t.Errorf("a file's size and flags still count: got %q -> %q", m.Before, m.After)
+	}
+}
+
+// The flags a filesystem keeps for its own bookkeeping (extents, inline
+// data, huge file, hash index) move when a file is rewritten or the machine
+// is restored onto another filesystem: on ext4 every file has extents, on
+// xfs none does. A file whose only difference is one of them has not
+// changed. The flags an owner sets still count, whatever else moved.
+func TestCompareFilesystemLayoutFlagsAreNotAChange(t *testing.T) {
+	entry := func(p string, flags uint32) model.FileEntry {
+		return model.FileEntry{Path: p, Type: "file", Mode: 0o100755, SHA256: "aa", Size: 3, Flags: flags}
+	}
+	old := &model.Collection{Files: []model.FileEntry{
+		entry("/usr/bin/restored", 0),       // from xfs onto ext4
+		entry("/usr/bin/blockmapped", 0),    // an ext3-era file, rewritten
+		entry("/etc/inline", 0x10000000),    // inline data, now in extents
+		entry("/usr/lib/huge", 0x80000),     // now a huge file
+		entry("/usr/bin/locked", 0x80000),   // made immutable
+		entry("/var/log/kept", 0x10000000),  // made append-only as it moved to extents
+		entry("/usr/bin/unlocked", 0x80010), // immutable no more
+	}}
+	cur := &model.Collection{Files: []model.FileEntry{
+		entry("/usr/bin/restored", 0x80000),
+		entry("/usr/bin/blockmapped", 0x80000),
+		entry("/etc/inline", 0x80000),
+		entry("/usr/lib/huge", 0xc0000),
+		entry("/usr/bin/locked", 0x80010),
+		entry("/var/log/kept", 0x80020),
+		entry("/usr/bin/unlocked", 0x80000),
+	}}
+	cs := Compare(snap(old), cur, nil)
+	for _, c := range cs {
+		switch c.Subject {
+		case "/usr/bin/restored", "/usr/bin/blockmapped", "/etc/inline", "/usr/lib/huge":
+			t.Errorf("filesystem bookkeeping reported as a change: %+v", c)
+		}
+	}
+	for p, want := range map[string]string{
+		"/usr/bin/locked":   "flags 0x80000 -> flags 0x80010",
+		"/var/log/kept":     "flags 0x10000000 -> flags 0x80020",
+		"/usr/bin/unlocked": "flags 0x80010 -> flags 0x80000",
+	} {
+		if m := find(t, cs, FileModified, p); m.Before+" -> "+m.After != want {
+			t.Errorf("%s: got %q -> %q, want %s", p, m.Before, m.After, want)
+		}
 	}
 }
 

@@ -174,16 +174,17 @@ func (j *judge) changes(chs []diff.Change) {
 
 // --- files ---
 
-// sameMeta reports whether two entries differ in at most content.
+// sameMeta reports whether two entries differ in at most content (and the
+// filesystem's layout flags, model.LayoutFlags).
 func sameMeta(a, b *model.FileEntry) bool {
 	return a.Type == b.Type && a.Target == b.Target && a.Mode&0o7777 == b.Mode&0o7777 && a.UID == b.UID && a.GID == b.GID &&
-		a.Flags == b.Flags && a.Caps == b.Caps && a.Err == b.Err
+		a.ComparedFlags() == b.ComparedFlags() && a.Caps == b.Caps && a.Err == b.Err
 }
 
 // metaOnly reports whether only mode and owner changed.
 func metaOnly(a, b *model.FileEntry) bool {
 	return a.Type == b.Type && a.Target == b.Target && a.SHA256 == b.SHA256 && a.Size == b.Size &&
-		a.Flags == b.Flags && a.Caps == b.Caps && a.Err == b.Err
+		a.ComparedFlags() == b.ComparedFlags() && a.Caps == b.Caps && a.Err == b.Err
 }
 
 // verifiedNow reports whether a verified verdict covers the file as it is

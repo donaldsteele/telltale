@@ -198,14 +198,24 @@ func TestHeuristicImmutableFlag(t *testing.T) {
 	c.Files = append(c.Files,
 		model.FileEntry{Path: "/etc/cron.d/x", Type: "file", Flags: 0x10},
 		model.FileEntry{Path: "/etc/y", Type: "file", Flags: 0x20},
-		model.FileEntry{Path: "/etc/z", Type: "file", Flags: 0x80})
+		model.FileEntry{Path: "/etc/z", Type: "file", Flags: 0x80},
+		// On ext4: extents beside the immutable bit, and the filesystem's
+		// own bookkeeping alone (extents, huge file, inline data, index).
+		model.FileEntry{Path: "/etc/e", Type: "file", Flags: 0x80010},
+		model.FileEntry{Path: "/etc/w", Type: "file", Flags: 0x80000},
+		model.FileEntry{Path: "/etc/h", Type: "file", Flags: 0xc0000},
+		model.FileEntry{Path: "/etc/n", Type: "file", Flags: 0x10000000},
+		model.FileEntry{Path: "/etc/d", Type: "dir", Flags: 0x81000})
 	f := want(t, c, "heur.immutable:/etc/cron.d/x", model.SevBackdoor)
 	if !strings.Contains(f.Fix, "chattr -i '/etc/cron.d/x'") {
 		t.Errorf("fix: %s", f.Fix)
 	}
 	want(t, c, "heur.immutable:/etc/y", model.SevBackdoor)
-	if find(Run(inventoried(c), ctx, cleanOwned()), "heur.immutable:/etc/z") != nil {
-		t.Error("other flag flagged")
+	want(t, c, "heur.immutable:/etc/e", model.SevBackdoor)
+	for _, p := range []string{"/etc/z", "/etc/w", "/etc/h", "/etc/n", "/etc/d"} {
+		if find(Run(inventoried(c), ctx, cleanOwned()), "heur.immutable:"+p) != nil {
+			t.Errorf("%s: other flag flagged", p)
+		}
 	}
 }
 

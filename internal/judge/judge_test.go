@@ -1849,6 +1849,39 @@ func TestJudgeGShadowChangesWithGroups(t *testing.T) {
 	must(t, run(cur2, snapOf(old2), nil), "snap.file_modified:/etc/shadow", model.SevNote)
 }
 
+// The flags a filesystem keeps for its own bookkeeping (extents, inline
+// data, huge file, hash index) move when a file is rewritten or the machine
+// is restored onto another filesystem. They are not a change to a file and
+// do not make a routine change look like more; the immutable and
+// append-only flags still count.
+func TestJudgeFilesystemLayoutFlagsAreNotAChange(t *testing.T) {
+	old := clean()
+	old.Files = append(old.Files, file("/etc/shadow", "root:$y$a:20000", 0o640))
+	cur := clone(old)
+	// Restored from xfs onto ext4, where every file has extents.
+	for i := range cur.Files {
+		cur.Files[i].Flags |= 0x80000
+	}
+	// An ageing change, the file small enough to have been inline before.
+	old.Files[len(old.Files)-1].Flags = 0x10000000
+	shadow := file("/etc/shadow", "root:$y$a:20001", 0o640)
+	shadow.Flags = 0x80000
+	setFile(cur, shadow)
+	r := run(cur, snapOf(old), nil)
+	for _, p := range []string{"/usr/bin/ls", "/usr/bin/openssl", "/etc/hostname"} {
+		absent(t, r, "snap.file_modified:"+p)
+	}
+	must(t, r, "snap.file_modified:/etc/shadow", model.SevNote)
+
+	// An owner's flag still counts, with extents beside it.
+	ls := file("/usr/bin/ls", "ls 9.1", 0o755)
+	ls.Flags = 0x80010
+	setFile(cur, ls)
+	r = run(cur, snapOf(old), nil)
+	must(t, r, "snap.file_modified:/usr/bin/ls", model.SevBackdoor)
+	must(t, r, "heur.immutable:/usr/bin/ls", model.SevBackdoor)
+}
+
 // R54: firmware and microcode updates rebuild the initramfs.
 func TestJudgeFirmwareRebuildsInitramfs(t *testing.T) {
 	for _, name := range []string{"firmware-misc-nonfree", "linux-firmware", "intel-microcode", "amd64-microcode"} {

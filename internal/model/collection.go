@@ -134,6 +134,18 @@ type FileEntry struct {
 	MD5   string `json:"md5,omitempty"` // only for supplementary entries
 }
 
+// LayoutFlags are the inode flags a filesystem keeps for its own
+// bookkeeping: FS_INDEX_FL (a hash-indexed directory), FS_HUGE_FILE_FL,
+// FS_EXTENT_FL and FS_INLINE_DATA_FL (how the data is laid out). They move
+// when a file is rewritten or the machine is restored onto another
+// filesystem (every ext4 file has extents, no xfs file does) and say nothing
+// about tampering, so comparisons leave them out. The flags an owner sets
+// (immutable, append-only and the rest) are compared.
+const LayoutFlags uint32 = 0x00001000 | 0x00040000 | 0x00080000 | 0x10000000
+
+// ComparedFlags is f's inode flags without LayoutFlags.
+func (f FileEntry) ComparedFlags() uint32 { return f.Flags &^ LayoutFlags }
+
 // Accounts holds local users and groups, read the way glibc's files
 // backend reads them: the first line for a name is the one that counts.
 // Duplicates lists "<file>:<name>" for every name that appears on more than
