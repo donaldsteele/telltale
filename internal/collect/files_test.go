@@ -14,7 +14,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const fsAppendFL = 0x20 // FS_APPEND_FL
+const (
+	fsImmutableFL = 0x10 // FS_IMMUTABLE_FL
+	fsAppendFL    = 0x20 // FS_APPEND_FL
+)
 
 func byPath(es []model.FileEntry) map[string]model.FileEntry {
 	m := make(map[string]model.FileEntry, len(es))
@@ -207,6 +210,11 @@ func flagsDirs(t *testing.T) []string {
 	return dirs
 }
 
+// The inode flags are recorded as the filesystem reports them. A plain file
+// may carry the filesystem's own bookkeeping bits (FS_EXTENT_FL on every
+// ext4 file, FS_INLINE_DATA_FL, FS_HUGE_FILE_FL), which say nothing about
+// tampering; what matters is that it has neither the immutable nor the
+// append-only bit, and that setting one is seen.
 func TestFilesInodeFlagsWhenSupported(t *testing.T) {
 	var supported string
 	for _, d := range flagsDirs(t) {
@@ -227,26 +235,33 @@ func TestFilesInodeFlagsWhenSupported(t *testing.T) {
 		t.Skip("no filesystem here supports FS_IOC_GETFLAGS")
 	}
 	plain := filepath.Join(supported, "plain")
-	entries, _ := Files("/", []string{plain}, FileOptions{})
-	if len(entries) != 1 || entries[0].Flags != 0 {
-		t.Fatalf("plain: %+v", entries)
-	}
 	fd, err := unix.Open(plain, unix.O_RDONLY, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer unix.Close(fd)
-	err = unix.IoctlSetPointerInt(fd, unix.FS_IOC_SETFLAGS, fsAppendFL)
+	own, err := unix.IoctlGetUint32(fd, unix.FS_IOC_GETFLAGS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if own&(fsImmutableFL|fsAppendFL) != 0 {
+		t.Fatalf("a new file is born with flags %#x", own)
+	}
+	entries, _ := Files("/", []string{plain}, FileOptions{})
+	if len(entries) != 1 || entries[0].Flags != own || entries[0].Flags&(fsImmutableFL|fsAppendFL) != 0 {
+		t.Fatalf("plain (the filesystem reports %#x): %+v", own, entries)
+	}
+	err = unix.IoctlSetPointerInt(fd, unix.FS_IOC_SETFLAGS, int(own|fsAppendFL))
 	if err != nil {
 		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.EACCES) {
 			t.Skipf("cannot set append-only flag: %v (reading flags verified)", err)
 		}
 		t.Fatal(err)
 	}
-	defer unix.IoctlSetPointerInt(fd, unix.FS_IOC_SETFLAGS, 0)
+	defer unix.IoctlSetPointerInt(fd, unix.FS_IOC_SETFLAGS, int(own))
 	entries, _ = Files("/", []string{plain}, FileOptions{})
-	if len(entries) != 1 || entries[0].Flags&fsAppendFL == 0 {
-		t.Fatalf("flags not reported: %+v", entries)
+	if len(entries) != 1 || entries[0].Flags&fsAppendFL == 0 || entries[0].Flags&fsImmutableFL != 0 {
+		t.Fatalf("append-only not reported: %+v", entries)
 	}
 }
 
