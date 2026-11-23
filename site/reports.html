@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Real reports - telltale</title>
+<meta name="description" content="Real telltale reports from the project's Docker test lab: two break-ins told step by step, the same machine checked without a snapshot, and a clean machine. Made by CI for every release.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" type="image/png" href="assets/favicon.png">
+<link rel="apple-touch-icon" href="assets/icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500..700;1,9..144,500&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+<script src="assets/reports.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+<div class="wrap">
+<a class="brand" href="index.html"><img src="assets/icon.svg" width="32" height="32" alt="">telltale</a>
+<nav aria-label="Pages"><a href="how-it-works.html">How it works</a><a href="reports.html" aria-current="page">Reports</a><a href="install.html">Install</a><a href="https://github.com/donaldsteele/telltale" class="opt">GitHub</a></nav>
+</div>
+</header>
+<main id="main">
+<div class="wrap doc">
+<p class="folio"><svg class="mark" viewBox="0 0 20 20" aria-hidden="true"><path fill="currentColor" d="M1.5 6.5H9L7.8 8.3L9.6 10L7.8 11.7L9 13.5H1.5Z"/><path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M10.2 7.3H18.5V14.3H10.2L9 12.5L10.8 10.8L9 9.1Z"/></svg><span>Real reports</span></p>
+<h1>What telltale printed.</h1>
+<p class="lede">These are not mock-ups. Each report below is what telltale wrote for a machine in the project's Docker test lab: the HTML report, the terminal output and the JSON, as they came out.</p>
+<p class="prose">CI makes them again for every release, with that release's telltale, so they show what the current version prints. The machines' names are made up. Everything planted on them is a harmless stand-in written for the lab: it leaves the traces a real backdoor would, and its call-outs only reach a container on a network with no way out.</p>
+<div class="notice" id="made"><p>The stories are read from <a href="reports/index.json">reports/index.json</a>, with a little JavaScript. The reports themselves are linked below.</p></div>
+<ul class="jump" id="jump" aria-label="The reports on this page"></ul>
+</div>
+<div class="wrap" id="cases">
+<section class="case" id="weak-password-to-root"><p class="meta-line">files02, with a snapshot: <a href="reports/weak-password-to-root.html">the HTML report</a>, <a href="reports/weak-password-to-root.txt">the terminal output</a>, <a href="reports/weak-password-to-root.json">the JSON</a></p></section>
+<section class="case" id="no-snapshot"><p class="meta-line">files02, without a snapshot: <a href="reports/no-snapshot.html">the HTML report</a>, <a href="reports/no-snapshot.txt">the terminal output</a>, <a href="reports/no-snapshot.json">the JSON</a></p></section>
+<section class="case" id="web-shell-persistence"><p class="meta-line">web01, with a snapshot: <a href="reports/web-shell-persistence.html">the HTML report</a>, <a href="reports/web-shell-persistence.txt">the terminal output</a>, <a href="reports/web-shell-persistence.json">the JSON</a></p></section>
+<section class="case" id="clean"><p class="meta-line">build03, a clean machine, with a snapshot: <a href="reports/clean.html">the HTML report</a>, <a href="reports/clean.txt">the terminal output</a>, <a href="reports/clean.json">the JSON</a></p></section>
+</div>
+</main>
+<footer>
+<div class="wrap">
+<div>
+<p>telltale is released under the <a href="https://github.com/donaldsteele/telltale/blob/main/LICENSE">Apache License 2.0</a>.</p>
+<p>The lab and the scripts that make these reports are in the repository: <a href="https://github.com/donaldsteele/telltale/tree/main/lab">lab/</a> and <a href="https://github.com/donaldsteele/telltale/blob/main/scripts/site-reports.sh">scripts/site-reports.sh</a>.</p>
+</div>
+<ul aria-label="More">
+<li><a href="index.html">Home</a></li>
+<li><a href="how-it-works.html">How it works</a></li>
+<li><a href="install.html">Install</a></li>
+<li><a href="https://github.com/donaldsteele/telltale">GitHub</a></li>
+</ul>
+</div>
+</footer>
+</body>
+</html>

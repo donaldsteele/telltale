@@ -139,8 +139,27 @@ end-to-end test builds the bubbles server from a checkout of the version
 ## Real reports on the site
 
 The [project site](https://donaldsteele.github.io/telltale/) shows reports
-from the lab's scenario machines, printed by the released binary: the
-terminal text, the HTML report and the JSON, with the story of what was
-done to each machine. They are not mock-ups, and they are made again for
-every release, so they show what the current version prints. The lab's
-machines have made-up names and addresses.
+from lab machines: the terminal text, the HTML report and the JSON, as
+telltale wrote them, with the story of what was done to each machine. They
+are the two break-in scenarios (`weak-password-to-root` and
+`web-shell-persistence`), the first of them scanned again without a
+snapshot, and a clean machine (the hardened variant, whose owner accepts
+as exceptions the checklist items a container cannot meet). The story of a
+scenario is the list of steps in the header of its `apply.sh`.
+
+They are not mock-ups. `scripts/site-reports.sh` builds telltale the way a
+release is built and runs `TestGenerateSiteReports` (build tags `lab site`)
+with it, which writes `site/reports/`. The Pages workflow runs it on every
+push to `main` and every release tag, so the site shows what the current
+version prints, and fails when a report is missing:
+
+```
+bash scripts/site-reports.sh      # needs Docker; writes site/reports/, not committed
+go run ./tools/linkcheck site     # every link leads somewhere, nothing private in it
+```
+
+The machines have the made-up names web01, files02 and build03. Nothing of
+the computer running the lab may reach the site: the test and the link
+check both fail when a file holds that computer's host name, user name,
+home directory or network addresses (worked out where they run, so they are
+not written down in the repository).

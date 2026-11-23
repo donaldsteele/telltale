@@ -274,9 +274,9 @@ must and must not report, and the tests check every report against it, with
 a snapshot and without one.
 
 The [project site](https://donaldsteele.github.io/telltale/) shows the
-reports telltale prints for the lab's break-in stories, made with the
-released binary. [docs/lab.md](docs/lab.md) describes the lab and how to run
-it.
+reports telltale prints for the lab's break-in stories, made by CI for
+every release with telltale built from that release.
+[docs/lab.md](docs/lab.md) describes the lab and how to run it.
 
 ## Alerts and AI assistants
 
@@ -312,6 +312,7 @@ Docker), and `scripts/check-dist.sh` checks the result.
 go test ./...                              # unit tests (no Docker, no network)
 go test -tags lab -timeout 60m ./lab/...   # the Docker lab (needs Docker)
 go run ./tools/docgen                      # regenerate docs/checks.md after changing a check
+bash scripts/site-reports.sh               # the project site's real reports from the lab (needs Docker)
 ```
 
 | Path | What it is |
@@ -323,11 +324,14 @@ go run ./tools/docgen                      # regenerate docs/checks.md after cha
 | `internal/alerts/`, `internal/mcpserver/` | bubbles alerts and the MCP server |
 | `lab/` | The Docker lab, and the kernel checks in a QEMU VM (`lab/vm/`) |
 | `deploy/` | The systemd unit, the example configuration and the Debian package scripts |
-| `tools/` | Generators: `docs/checks.md`, the STIG references, the vendor keys |
+| `tools/` | Generators: `docs/checks.md`, the STIG references, the vendor keys; the site's link and privacy check |
+| `site/` | The project site; `site/reports/` is made by `scripts/site-reports.sh` |
 
 CI runs the unit tests, the race detector, the build and its checks, the
 lab on Debian 12 and Ubuntu 24.04, and the Debian 12 lab on arm64 under
-emulation. A tag `vX.Y.Z` builds and publishes a release.
+emulation. A tag `vX.Y.Z` builds and publishes a release, and the project
+site is rebuilt with fresh reports from the lab on every push to `main` and
+every tag.
 
 ## Security
 

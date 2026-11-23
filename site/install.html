@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install - telltale</title>
+<meta name="description" content="Download telltale, check the download, carry it to a machine or run the server that visits your machines over SSH, or build it from source.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" type="image/png" href="assets/favicon.png">
+<link rel="apple-touch-icon" href="assets/icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500..700;1,9..144,500&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+<div class="wrap">
+<a class="brand" href="index.html"><img src="assets/icon.svg" width="32" height="32" alt="">telltale</a>
+<nav aria-label="Pages"><a href="how-it-works.html">How it works</a><a href="reports.html">Reports</a><a href="install.html" aria-current="page">Install</a><a href="https://github.com/donaldsteele/telltale" class="opt">GitHub</a></nav>
+</div>
+</header>
+<main id="main" class="wrap doc">
+<p class="folio"><svg class="mark" viewBox="0 0 20 20" aria-hidden="true"><path fill="currentColor" d="M1.5 6.5H9L7.8 8.3L9.6 10L7.8 11.7L9 13.5H1.5Z"/><path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M10.2 7.3H18.5V14.3H10.2L9 12.5L10.8 10.8L9 9.1Z"/></svg><span>Install</span></p>
+<h1>Get telltale.</h1>
+<p class="lede">It checks Debian 12 and 13 and Ubuntu 22.04 and 24.04, on amd64 and arm64. Every binary is static and runs on any of them.</p>
+<p><a class="btn primary" href="https://github.com/donaldsteele/telltale/releases/latest">Releases on GitHub</a></p>
+
+<section id="downloads">
+<h2>Which download</h2>
+<p>Every release has these files, and <code>SHA256SUMS</code> for all of them. <code>&lt;arch&gt;</code> is <code>amd64</code> or <code>arm64</code>.</p>
+<table class="flags">
+<thead><tr><th>File</th><th>What it is</th></tr></thead>
+<tbody>
+<tr><td><code>telltale-carry_&lt;version&gt;_linux_&lt;arch&gt;.tar.gz</code></td><td>The collector build: <code>scan</code>, <code>snapshot</code>, <code>accept</code>, <code>fetch-refs</code> and <code>collect</code>. Take this one to carry telltale to machines. About 14 MB unpacked. It cannot run the server.</td></tr>
+<tr><td><code>telltale_&lt;version&gt;_linux_&lt;arch&gt;.tar.gz</code></td><td>The full build: everything above plus <code>server</code> and <code>mcp</code>. About 23 MB unpacked.</td></tr>
+<tr><td><code>telltale_&lt;version&gt;-1_&lt;arch&gt;.deb</code></td><td>The server package: the full build, the collectors for both architectures (what the server copies to machines), a systemd unit and an example configuration.</td></tr>
+</tbody>
+</table>
+<p>Check the download on a machine you trust before you unpack it:</p>
+<pre class="term" role="region" tabindex="0" aria-label="Check the download"><code><span class="p">$ </span>sha256sum --check --ignore-missing SHA256SUMS</code></pre>
+</section>
+
+<section id="carry">
+<h2>Carry it</h2>
+<p>Unpack it on a machine you trust, then copy the binary to the machine you want to check:</p>
+<pre class="term" role="region" tabindex="0" aria-label="Unpack and copy"><code><span class="p">$ </span>tar xzf telltale-carry_0.1.0_linux_amd64.tar.gz
+<span class="p">$ </span>scp telltale web01:</code></pre>
+<p>On the machine, as root (without root it still runs, and lists what it had to skip):</p>
+<pre class="term" role="region" tabindex="0" aria-label="First scan and the snapshot"><code><span class="p">$ </span>sudo ./telltale scan                                  <span class="c"># no snapshot yet</span>
+<span class="p">$ </span>sudo ./telltale snapshot --out /media/usb/web01.snap  <span class="c"># once you believe it is clean</span></code></pre>
+<p><code>snapshot</code> asks for a passphrase and encrypts the file. Keep it off the machine: a snapshot left there could be edited by whoever you are looking for. Next time, bring it back:</p>
+<pre class="term" role="region" tabindex="0" aria-label="Later scans"><code><span class="p">$ </span>sudo ./telltale scan --snapshot /media/usb/web01.snap
+<span class="p">$ </span>sudo ./telltale scan --snapshot /media/usb/web01.snap --html web01.html</code></pre>
+<p>The exit code says what it found: 0 nothing, 1 notes or weak settings only, 2 tampering or a backdoor sign, 3 the scan could not run. A finding you meant to have is accepted with <code>telltale accept ID --snapshot FILE</code>, using the ID the report prints under it.</p>
+<h3>A machine with no network</h3>
+<p>A scan downloads the packages it checks from the distribution's archive. For a machine cut off the network, collect on it, build a reference bundle on a machine that has a connection, and carry the bundle back:</p>
+<pre class="term" role="region" tabindex="0" aria-label="Reference bundle"><code><span class="p">$ </span>sudo ./telltale collect &gt; web01.json                     <span class="c"># on the isolated machine</span>
+<span class="p">$ </span>telltale fetch-refs --for web01.json --out web01-refs    <span class="c"># on a machine with network access</span>
+<span class="p">$ </span>sudo ./telltale scan --refs web01-refs                   <span class="c"># back on the isolated machine</span></code></pre>
+</section>
+
+<section id="server">
+<h2>The server</h2>
+<p>Run the server on a small machine of its own: it holds SSH access as root to every machine it visits. With the package:</p>
+<pre class="term" role="region" tabindex="0" aria-label="Install and start the server"><code><span class="p">$ </span>sudo apt install ./telltale_0.1.0-1_amd64.deb
+<span class="p">$ </span>sudo install -m 0640 -o root -g telltale /etc/telltale/telltale.toml.example /etc/telltale/telltale.toml
+<span class="p">$ </span>sudoedit /etc/telltale/telltale.toml     <span class="c"># listen: this machine's LAN address and a port</span>
+<span class="p">$ </span>sudo install -m 0600 /dev/null /etc/telltale/passphrase
+<span class="p">$ </span>sudoedit /etc/telltale/passphrase        <span class="c"># the passphrase that encrypts the database</span>
+<span class="p">$ </span>sudo systemctl enable --now telltale
+<span class="p">$ </span>sudo journalctl -u telltale              <span class="c"># the setup code and the certificate fingerprint</span></code></pre>
+<p>Open <code>https://&lt;listen address&gt;/</code>, check that the certificate fingerprint matches the one in the log, and set the admin password with the setup code. Then, for each machine:</p>
+<ol class="steps">
+<li><strong>Enrol it</strong> by name and address, and compare its SSH host key fingerprint with what the machine's own console says before you confirm.</li>
+<li><strong>Add the two snippets</strong> the server shows: an <code>authorized_keys</code> line for root that works only from the server's address, and a <code>Match Address</code> block that lets root log in with a key from that address only.</li>
+<li><strong>Press Check now</strong>, read the first report, and when you believe the machine is clean, take the snapshot. Every later visit is compared with it.</li>
+</ol>
+<p>Visits happen daily by default. <a href="https://github.com/donaldsteele/telltale/blob/main/docs/server.md">docs/server.md</a> covers enrolment, the sshd block and why, backups, alerts to bubbles and the MCP server.</p>
+</section>
+
+<section id="source">
+<h2>Build from source</h2>
+<p>You need Go 1.26 or newer.</p>
+<pre class="term" role="region" tabindex="0" aria-label="Build from source"><code><span class="p">$ </span>git clone https://github.com/donaldsteele/telltale
+<span class="p">$ </span>cd telltale
+<span class="p">$ </span>go build -o telltale ./cmd/telltale                   <span class="c"># the full build</span>
+<span class="p">$ </span>go build -tags collector -o telltale ./cmd/telltale   <span class="c"># the collector build</span></code></pre>
+<p>Every command and flag is in <a href="https://github.com/donaldsteele/telltale/blob/main/docs/usage.md">docs/usage.md</a>.</p>
+</section>
+</main>
+<footer>
+<div class="wrap">
+<div>
+<p>telltale is released under the <a href="https://github.com/donaldsteele/telltale/blob/main/LICENSE">Apache License 2.0</a>. To report a vulnerability, see <a href="https://github.com/donaldsteele/telltale/blob/main/SECURITY.md">SECURITY.md</a>.</p>
+</div>
+<ul aria-label="More">
+<li><a href="index.html">Home</a></li>
+<li><a href="how-it-works.html">How it works</a></li>
+<li><a href="reports.html">Reports</a></li>
+<li><a href="https://github.com/donaldsteele/telltale">GitHub</a></li>
+</ul>
+</div>
+</footer>
+</body>
+</html>

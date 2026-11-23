@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How it works - telltale</title>
+<meta name="description" content="How telltale checks a Linux machine that may be lying: collection and judging, the trust model, package verification, the regression rule, which changes count as routine, and what no on-machine check can rule out.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" type="image/png" href="assets/favicon.png">
+<link rel="apple-touch-icon" href="assets/icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500..700;1,9..144,500&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+<div class="wrap">
+<a class="brand" href="index.html"><img src="assets/icon.svg" width="32" height="32" alt="">telltale</a>
+<nav aria-label="Pages"><a href="how-it-works.html" aria-current="page">How it works</a><a href="reports.html">Reports</a><a href="install.html">Install</a><a href="https://github.com/donaldsteele/telltale" class="opt">GitHub</a></nav>
+</div>
+</header>
+<main id="main" class="wrap doc">
+<p class="folio"><svg class="mark" viewBox="0 0 20 20" aria-hidden="true"><path fill="currentColor" d="M1.5 6.5H9L7.8 8.3L9.6 10L7.8 11.7L9 13.5H1.5Z"/><path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M10.2 7.3H18.5V14.3H10.2L9 12.5L10.8 10.8L9 9.1Z"/></svg><span>How it works</span></p>
+<h1>Checking a machine that may be lying.</h1>
+<p class="lede">A machine worth checking may already belong to someone else, and whoever has root on it can change any file, program or database on it. telltale is built around that.</p>
+<ol class="toc">
+<li><a href="#halves">Two halves: collection and judging</a></li>
+<li><a href="#trust">The machine may lie</a></li>
+<li><a href="#packages">Package verification</a></li>
+<li><a href="#rule">The regression rule</a></li>
+<li><a href="#routine">Which changes count as routine</a></li>
+<li><a href="#report">Reading a report</a></li>
+<li><a href="#exceptions">Exceptions</a></li>
+<li><a href="#limits">What no check on the machine can rule out</a></li>
+</ol>
+
+<section id="halves">
+<h2>Two halves: collection and judging</h2>
+<p><strong>Collection</strong> runs on the machine and reads everything telltale needs into one record. <strong>Judging</strong> compares that record with the snapshot, with the distribution's signed packages, with the checklist and with the suspicious-on-any-machine rules, and ranks what it finds.</p>
+<p>When you carry telltale to a machine, both halves run there. In server mode only collection runs on the machine: the server copies the collector over, reads the record back over SSH and does all the judging itself. The machine needs no internet access, and the judging and the package cache stay on the trusted side.</p>
+</section>
+
+<section id="trust">
+<h2>The machine may lie</h2>
+<ul>
+<li><strong>It brings its own code.</strong> telltale is one static binary that loads none of the machine's libraries, so a replaced libc or an <code>/etc/ld.so.preload</code> entry cannot hook it. It uses Go's own DNS resolver and TLS.</li>
+<li><strong>It reads the kernel's and the filesystem's view directly.</strong> Processes come from <code>/proc</code>, sockets from <code>/proc/net</code>, files from the filesystem and packages from <code>/var/lib/dpkg/status</code>. It does not ask the machine's programs.</li>
+<li><strong>It compares with the machine's own tools.</strong> It runs <code>ps</code>, <code>ss</code>, <code>ls</code> and <code>lsmod</code> from the system directories with a clean environment and compares what they print with what it reads itself. Something telltale sees and a tool hides is tampering: it is what a userland rootkit does.</li>
+<li><strong>The snapshot never lives on the machine.</strong> You keep it somewhere else, encrypted with a passphrase, or the server keeps it, encrypted at rest. It is never written to the machine's disk.</li>
+<li><strong>Keys are built in.</strong> The Debian and Ubuntu archive keys are built into telltale. The machine's current keyrings and its package database's checksums are never proof of anything; the one exception is <code>scan --offline</code>, which says so at the top of the report.</li>
+<li><strong>The machine's clock is not trusted either.</strong> Signature dates are checked against the newest date the archive itself signed.</li>
+<li><strong>No secrets are kept.</strong> Password hashes become a keyed digest, private key files are recorded by hash, permissions and owner only, and secrets in startup files are replaced by keyed digests before anything is stored or reported.</li>
+</ul>
+</section>
+
+<section id="packages">
+<h2>Package verification</h2>
+<p>For each installed package, telltale wants to know whether the files on disk are the ones the distribution shipped.</p>
+<ol class="steps">
+<li>It reads the installed packages and versions from <code>/var/lib/dpkg/status</code>.</li>
+<li>It fetches the distribution's signed index from the official archive, checks the signature with the keys built into telltale, and follows the chain of hashes to each package.</li>
+<li>It downloads each package it needs, checks its hash, unpacks it, and compares every file with the one on disk: its content, and the mode bits that grant privilege.</li>
+<li>A version the archive no longer has comes from snapshot.debian.org or Ubuntu's snapshot service, which keep signed indexes.</li>
+</ol>
+<p>Without a snapshot it verifies the package files in security-relevant places (programs, libraries, PAM and kernel modules, <code>/boot</code>) and the packages' maintainer scripts; with a snapshot, the package files that changed since. A mismatch is tampering. A file that cannot be verified (the version is in no trusted source, its repository has no key telltale trusts, the archive could not be reached) goes into one note, except setuid programs, kernel and PAM modules and boot files, which are each a backdoor sign.</p>
+<p>A machine that is cut off the network is checked with a <strong>reference bundle</strong>: collect on the machine, build the bundle on one that has a connection, and carry it back. Everything in the bundle is checked again against the built-in keys when it is used.</p>
+</section>
+
+<section id="rule">
+<h2>The regression rule</h2>
+<p>Attackers loosen settings to keep their way back in: they turn root login over SSH back on, add a sudo rule without a password, switch the firewall off. So a checklist item that <strong>passed in the snapshot and fails now</strong> is reported as <strong>tampering</strong>, not as a weak setting. The same holds for an item you accepted as an exception, if its value changes from the one you accepted. Items that were already failing when the snapshot was taken stay weak settings.</p>
+</section>
+
+<section id="routine">
+<h2>Which changes count as routine</h2>
+<p>Without a rule for routine changes, every package update would bury the real findings, and a report people learn to ignore has failed.</p>
+<ul>
+<li><strong>An upgrade to a newer version from a trusted source is explained.</strong> Its changed files go into one quiet "explained" group, and only when their new hashes match the new signed package.</li>
+<li><strong>A version nothing trusted confirms explains nothing.</strong> Typing a new version into <code>dpkg/status</code> does not make a replaced file look like an update.</li>
+<li><strong>A newly installed package is a note</strong>, and a backdoor sign when it adds something that runs with special rights or reaches the network.</li>
+<li><strong>A downgrade is a backdoor sign</strong>: going back to an old, vulnerable version is a known way back in.</li>
+<li><strong>Everything else that changed is unexplained</strong>, and ranked by where it is: a change to cron, systemd, SSH, sudo, PAM, shell start-up files or <code>ld.so.preload</code> ranks higher than a change to a data file.</li>
+</ul>
+</section>
+
+<section id="report">
+<h2>Reading a report</h2>
+<p>The report starts with the machine, what it was compared against and what it could not rule out. Then the findings, most serious first, each with its evidence, why it matters and the command that would fix it. The <a href="reports.html">reports page</a> has real ones.</p>
+<div class="sevs" aria-label="The severities">
+<div><span class="sev tampering">Tampering</span><p>A checklist item that held in the snapshot and fails now, a system file that does not match its signed package, or something the machine's own tools hide.</p></div>
+<div><span class="sev backdoor">Backdoor sign</span><p>A new root SSH key, a second account with user id 0, a cron job or systemd unit that calls out, an unknown PAM module, a setuid program no package ships.</p></div>
+<div><span class="sev weak">Weak setting</span><p>A checklist item that is not met (and, with a snapshot, was not met then either).</p></div>
+<div><span class="sev note">Note</span><p>Worth a look, not a sign of trouble on its own.</p></div>
+</div>
+<p>After the findings come the explained changes, the exceptions in force and the checks it had to skip. The exit code says what it found: 0 nothing, 1 notes or weak settings only, 2 tampering or a backdoor sign, 3 the scan could not run.</p>
+</section>
+
+<section id="exceptions">
+<h2>Exceptions</h2>
+<p>Some findings are intended: a checklist item you leave failing on purpose, a module you built yourself. You can accept a finding as an exception (in the web UI, or <code>telltale accept</code> when you carry it). The exception records the exact value it accepted, and the finding comes back as soon as the value changes. Every report lists the exceptions in force. The clean machine on the <a href="reports.html#clean">reports page</a> has some.</p>
+</section>
+
+<section id="limits">
+<h2>What no check on the machine can rule out</h2>
+<p>A <strong>kernel-level rootkit</strong> can hide anything from anything that runs on top of the kernel, telltale included. Every report says so. Checking the disk from another, trusted machine is the only answer, and it is planned for a later version.</p>
+<p>The full details are in the repository: <a href="https://github.com/donaldsteele/telltale/blob/main/docs/how-it-works.md">docs/how-it-works.md</a>, and every check in <a href="https://github.com/donaldsteele/telltale/blob/main/docs/checks.md">docs/checks.md</a>.</p>
+</section>
+</main>
+<footer>
+<div class="wrap">
+<div>
+<p>telltale is released under the <a href="https://github.com/donaldsteele/telltale/blob/main/LICENSE">Apache License 2.0</a>.</p>
+</div>
+<ul aria-label="More">
+<li><a href="index.html">Home</a></li>
+<li><a href="reports.html">Reports</a></li>
+<li><a href="install.html">Install</a></li>
+<li><a href="https://github.com/donaldsteele/telltale">GitHub</a></li>
+</ul>
+</div>
+</footer>
+</body>
+</html>

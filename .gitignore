@@ -1,3 +1,5 @@
 dist/
 *.test
 lab/sink/sink
+# Made by scripts/site-reports.sh (and the Pages workflow), never committed.
+site/reports/
