@@ -186,8 +186,8 @@ pre { margin: 0; }
 
 /* numbered steps */
 .steps { margin: 0 0 1em; padding: 0; list-style: none; counter-reset: s; color: var(--ink-2); }
-.steps li { counter-increment: s; display: grid; grid-template-columns: 2rem minmax(0, 1fr); margin-bottom: 8px; }
-.steps li::before { content: counter(s) "."; font: 500 0.85rem/1.9 var(--mono); color: var(--signal-text); }
+.steps li { counter-increment: s; position: relative; padding-left: 2rem; margin-bottom: 8px; }
+.steps li::before { content: counter(s) "."; position: absolute; left: 0; top: 0; font: 500 0.85rem/1.9 var(--mono); color: var(--signal-text); }
 
 /* tables */
 .flags { width: 100%; border-collapse: collapse; border-top: 2px solid var(--ink); }

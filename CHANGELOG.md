@@ -14,7 +14,9 @@ Two fixes in the server's web UI, and the site now shows it.
 - **Fixed:** on the machines page, the Check now cell's bottom border did
   not line up with the rest of its row.
 - **Site:** screenshots and a recorded walk-through of the web UI and the
-  alerts it sends to bubbles, made with the server in the test lab.
+  alerts it sends to bubbles, made with the server in the test lab. In the
+  numbered steps on How it works and Install, inline code no longer drops
+  into a narrow column of its own.
 
 The downloads are as in v0.1.0, named for 0.1.1.
 
