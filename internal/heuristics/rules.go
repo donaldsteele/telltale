@@ -97,5 +97,8 @@ func Rules() []Rule {
 		{ID: idPAM, Key: "heur.pam_missing:", Severity: model.SevNote,
 			Title: "The PAM configuration names a module that is not on the machine",
 			Why:   "Usually left over from a removed package. Whoever can create the file decides what runs at login."},
+		{ID: idFlooded, Key: "heur.persist_flooded:", Severity: model.SevNote,
+			Title: "A user's systemd unit directory holds more than telltale reads",
+			Why:   "Anyone can fill their own unit directory. telltale reads at most 2,000 entries and 8 MiB of text from one user's directory, and 64 MiB from all users' together, so that no user can make a scan run out of memory or time. What lies past that was not read, and a unit hidden there was not seen. Thousands of files in such a directory are themselves unusual: look at what fills it."},
 	}
 }

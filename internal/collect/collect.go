@@ -65,8 +65,9 @@ func All(opt Options) (*model.Collection, error) {
 	var s []model.Skip
 	c.Accounts, s = Accounts(opt.Root, key)
 	add(s)
-	c.Persist, s = Persistence(opt.Root, c.Accounts.Users, key)
-	add(s)
+	persist := PersistenceScan(opt.Root, c.Accounts.Users, key)
+	c.Persist, c.PersistFlooded = persist.Files, persist.Flooded
+	add(persist.Skips)
 	// Runtime must run before Files: Files needs the mount table to avoid
 	// crossing into network and proc mounts.
 	c.Runtime, c.Sysctl, s = Runtime(opt.ProcRoot, opt.SysRoot, opt.Root)

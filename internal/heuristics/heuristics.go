@@ -33,6 +33,7 @@ const (
 	idPersistLink  = "TT-HEUR-013"
 	idDiversion    = "TT-HEUR-014"
 	idPAM          = "TT-HEUR-016"
+	idFlooded      = "TT-HEUR-017"
 	evidenceDir    = "/root/telltale-evidence"
 	saveEvidence   = "mkdir -p " + evidenceDir
 	flagImmutable  = 0x10
@@ -58,6 +59,7 @@ func Run(c *model.Collection, ctx model.ScanContext, owned map[string]string) []
 	out = append(out, persistCallbacks(c)...)
 	out = append(out, pamModules(c, owned)...)
 	out = append(out, localDiversions(c)...)
+	out = append(out, flooded(c)...)
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out
 }

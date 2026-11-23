@@ -92,6 +92,14 @@ type collector struct {
 	// user is set while a user's own paths are read: the account they
 	// belong to.
 	user *model.User
+	// kept counts the bytes of text kept so far; userText those from the
+	// users' unit directories.
+	kept, userText int
+	// hashOnly makes file record a regular file without its text, and
+	// without reading one too large to keep.
+	hashOnly bool
+	// flooded lists the user unit directories cut short at a budget.
+	flooded []string
 }
 
 func (c *collector) skip(mp, reason string) {
@@ -167,6 +175,10 @@ func (c *collector) file(mp, kind string) {
 
 	pf := model.PersistFile{Path: mp, Kind: kind}
 	c.meta(st, &pf)
+	if c.hashOnly && st.Size > maxPersistBytes {
+		c.out = append(c.out, pf)
+		return
+	}
 	// A second name for a file of another account that not everyone may
 	// read (ln /etc/shadow ~/.bashrc, where the kernel still allows it):
 	// the user chose what is read here.
@@ -196,10 +208,11 @@ func (c *collector) file(mp, kind string) {
 		c.skip(mp, fmt.Sprintf("larger than %d bytes: hash and metadata only", maxPersistBytes))
 	}
 	pf.SHA256 = hex.EncodeToString(h.Sum(nil))
-	if !large {
+	if !large && !c.hashOnly {
 		// Matched on the raw text: redaction can swallow the rest of a line.
 		pf.Signals = persistsig.Detect(kind, splitLines(buf))
 		pf.Lines = c.redactLines(buf, &pf)
+		c.kept += len(buf)
 	}
 	c.out = append(c.out, pf)
 }
@@ -337,6 +350,7 @@ func (c *collector) link(pl place, mp, kind string, lst unix.Stat_t, readContent
 	raw := sha256.Sum256(buf)
 	pf.SHA256 = hex.EncodeToString(raw[:])
 	pf.Lines = append(pf.Lines, c.redactLines(buf, &pf)...)
+	c.kept += len(buf)
 }
 
 // dir records the files and symlinks directly inside dir; subdirectories
@@ -380,8 +394,9 @@ func (c *collector) refusedLink(mp, kind string) {
 	c.link(pl, mp, kind, st, false)
 }
 
+// isUnitName reports whether systemd reads a file of this name as a unit.
 func isUnitName(n string) bool {
-	for _, s := range []string{".service", ".timer", ".socket", ".path"} {
+	for _, s := range []string{".service", ".timer", ".socket", ".path", ".mount", ".target"} {
 		if strings.HasSuffix(n, s) {
 			return true
 		}
@@ -389,44 +404,194 @@ func isUnitName(n string) bool {
 	return false
 }
 
-// systemd walks a unit tree without following symlinks. When all is true
-// every regular file counts as a unit, otherwise only unit-named files and
-// drop-in .conf files do.
-func (c *collector) systemd(dir string, all bool) {
-	base := filepath.Join(c.root, dir)
-	_ = filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
+// unitBudget counts what one walk of a user's unit directory has used.
+type unitBudget struct {
+	dir           string
+	entries, text int
+	stopped       bool
+}
+
+// maxUnitDepth is how deep a unit tree is walked.
+const maxUnitDepth = 8
+
+// unitDirInSystem reports whether a unit directory that is a link leads
+// somewhere only root and packages write.
+func unitDirInSystem(real string) bool {
+	for _, pre := range []string{"/usr/", "/lib/", "/etc/", "/run/systemd/"} {
+		if strings.HasPrefix(real+"/", pre) {
+			return true
+		}
+	}
+	return false
+}
+
+// systemd walks a unit tree without following symbolic links inside it.
+// Unit-named files and drop-in .conf files are read; with all, every regular
+// file is.
+//
+// With a budget b the tree is a user's own (anyone can fill theirs): the
+// walk stops at the budget, with a Skip and an entry in c.flooded, and a
+// file that is no unit is recorded by hash only.
+//
+// The directory itself may be a symbolic link. It is walked where it leads
+// when root made the link and it leads into the system directories;
+// otherwise it is not walked and a Skip says so. A link on the way to it
+// that a non-root account owns is never followed.
+func (c *collector) systemd(dir string, all bool, b *unitBudget) {
+	dir = path.Clean(dir)
+	pl, err := walkTo(c.root, dir, 0, false)
+	if err != nil {
+		switch {
+		case errors.Is(err, errUserLink):
+			c.skip(dir, skipUserLinkPath)
+		case !isNotExist(err) && !errors.Is(err, unix.ENOTDIR):
+			c.skip(dir, err.Error())
+		}
+		return
+	}
+	defer pl.close()
+	lst, err := pl.lstat()
+	if err != nil {
+		if !errors.Is(err, unix.ENOENT) && !errors.Is(err, unix.ENOTDIR) {
+			c.skip(dir, err.Error())
+		}
+		return
+	}
+	var fd int
+	switch lst.Mode & unix.S_IFMT {
+	case unix.S_IFLNK:
+		if !trustedOwner(ownerOf(&lst)) {
+			c.skip(dir, skipLinkedUnitDir)
+			return
+		}
+		rp, err := walkTo(c.root, dir+"/.", 0, false)
 		if err != nil {
-			if p == base && !isNotExist(err) && !errors.Is(err, unix.ENOTDIR) {
+			switch {
+			case errors.Is(err, errUserLink):
+				c.skip(dir, skipLinkedUnitDir)
+			case !isNotExist(err) && !errors.Is(err, unix.ENOTDIR):
 				c.skip(dir, err.Error())
 			}
-			if d != nil && d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
+			return // a dangling link: nothing to walk
 		}
-		mp := path.Join("/", filepath.ToSlash(p[len(strings.TrimRight(c.root, "/")):]))
-		parent := path.Base(path.Dir(mp))
+		defer rp.close()
+		if !unitDirInSystem(rp.real) {
+			c.skip(dir, skipLinkedUnitDir)
+			return
+		}
+		fd, err = unix.Openat(rp.dir, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			c.skip(dir, err.Error())
+			return
+		}
+	case unix.S_IFDIR:
+		fd, err = unix.Openat(pl.dir, pl.name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			c.skip(dir, err.Error())
+			return
+		}
+	default:
+		return
+	}
+	c.unitTree(fd, dir, all, b, 0)
+}
+
+// flood stops a budgeted walk and says so.
+func (c *collector) flood(b *unitBudget, why string) {
+	if b.stopped {
+		return
+	}
+	b.stopped = true
+	c.skip(b.dir, fmt.Sprintf("stopped after %d entries and %d bytes of kept text (%s); the rest of this directory was not read", b.entries, b.text, why))
+	c.flooded = append(c.flooded, b.dir)
+}
+
+// unitTree walks the open directory fd, which is the machine path mp, and
+// closes it.
+func (c *collector) unitTree(fd int, mp string, all bool, b *unitBudget, depth int) {
+	f := os.NewFile(uintptr(fd), mp)
+	defer f.Close()
+	if kernelFS(fd) {
+		c.skip(mp, errKernelFS.Error())
+		return
+	}
+	// No more names are read than the budget leaves room for.
+	var ents []fs.DirEntry
+	for {
+		batch, err := f.ReadDir(512)
+		ents = append(ents, batch...)
+		if err != nil || len(batch) == 0 {
+			if err != nil && !errors.Is(err, io.EOF) {
+				c.skip(mp, err.Error())
+			}
+			break
+		}
+		if b != nil && len(ents) > userDirMaxEntries {
+			break
+		}
+	}
+	sort.Slice(ents, func(i, j int) bool { return ents[i].Name() < ents[j].Name() })
+	parent := path.Base(mp)
+	for _, d := range ents {
+		if b != nil {
+			switch {
+			case b.stopped:
+				return
+			case b.entries >= userDirMaxEntries:
+				c.flood(b, fmt.Sprintf("the limit is %d entries for one user's unit directory", userDirMaxEntries))
+				return
+			case b.text >= userDirMaxText:
+				c.flood(b, fmt.Sprintf("the limit is %d bytes of text for one user's unit directory", userDirMaxText))
+				return
+			case c.userText >= usersMaxText:
+				c.flood(b, fmt.Sprintf("the limit is %d bytes of text for all users' unit directories together", usersMaxText))
+				return
+			}
+			b.entries++
+		}
+		child := path.Join(mp, d.Name())
+		before := c.kept
 		switch {
 		case d.Type()&fs.ModeSymlink != 0:
 			if strings.HasSuffix(parent, ".wants") || strings.HasSuffix(parent, ".requires") || strings.HasSuffix(parent, ".upholds") {
-				c.enabledLink(mp)
+				c.enabledLink(child)
 			} else {
-				c.file(mp, model.PersistKindSystemdUnit)
+				c.file(child, model.PersistKindSystemdUnit)
 			}
 		case d.Type().IsRegular():
-			name := d.Name()
-			dropin := strings.HasSuffix(parent, ".d") && strings.HasSuffix(name, ".conf")
-			if all || isUnitName(name) || dropin {
-				c.file(mp, model.PersistKindSystemdUnit)
+			dropin := strings.HasSuffix(parent, ".d") && strings.HasSuffix(d.Name(), ".conf")
+			switch {
+			case all || isUnitName(d.Name()) || dropin:
+				c.file(child, model.PersistKindSystemdUnit)
+			case b != nil:
+				c.hashOnly = true
+				c.file(child, model.PersistKindSystemdUnit)
+				c.hashOnly = false
 			}
+		case d.IsDir():
+			if depth >= maxUnitDepth {
+				c.skip(child, fmt.Sprintf("more than %d directories deep: not walked", maxUnitDepth))
+				continue
+			}
+			sub, err := unix.Openat(fd, d.Name(), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+			if err != nil {
+				if !errors.Is(err, unix.ENOENT) && !errors.Is(err, unix.ENOTDIR) && !errors.Is(err, unix.ELOOP) {
+					c.skip(child, err.Error())
+				}
+				continue
+			}
+			c.unitTree(sub, child, all, b, depth+1)
 		}
-		return nil
-	})
+		if b != nil {
+			b.text += c.kept - before
+			c.userText += c.kept - before
+		}
+	}
 }
 
-// Persistence reads every place a backdoor typically hides, with text
+// PersistenceScan reads every place a backdoor typically hides, with text
 // redacted. users supplies the home directories for per-user files.
-func Persistence(root string, users []model.User, key []byte) ([]model.PersistFile, []model.Skip) {
+func PersistenceScan(root string, users []model.User, key []byte) PersistResult {
 	c := &collector{root: strings.TrimRight(root, "/"), key: key, seen: map[string]bool{}}
 
 	c.file("/etc/sudoers", model.PersistKindSudoers)
@@ -447,8 +612,8 @@ func Persistence(root string, users []model.User, key []byte) ([]model.PersistFi
 	c.dir("/var/spool/cron/crontabs", model.PersistKindCron)
 	c.dir("/var/spool/cron/atjobs", model.PersistKindAt)
 
-	c.systemd("/etc/systemd/system", false)
-	c.systemd("/run/systemd/system", true)
+	c.systemd("/etc/systemd/system", false, nil)
+	c.systemd("/run/systemd/system", true, nil)
 
 	c.file("/etc/rc.local", model.PersistKindRC)
 	c.dir("/etc/init.d", model.PersistKindRC)
@@ -476,8 +641,10 @@ func Persistence(root string, users []model.User, key []byte) ([]model.PersistFi
 		for _, n := range []string{".bashrc", ".profile", ".bash_profile", ".bash_login", ".zshrc"} {
 			c.file(path.Join(home, n), model.PersistKindShellRC)
 		}
-		c.systemd(path.Join(home, ".config/systemd/user"), true)
-		c.systemd(path.Join(home, ".local/share/systemd/user"), true)
+		for _, d := range []string{".config/systemd/user", ".local/share/systemd/user"} {
+			dir := path.Join(home, d)
+			c.systemd(dir, false, &unitBudget{dir: dir})
+		}
 		for _, pat := range akf {
 			c.file(expandAKF(pat, home, u.Name), model.PersistKindAuthorizedKeys)
 		}
@@ -490,7 +657,8 @@ func Persistence(root string, users []model.User, key []byte) ([]model.PersistFi
 		}
 		return c.out[i].Kind < c.out[j].Kind
 	})
-	return c.out, c.skips
+	sort.Strings(c.flooded)
+	return PersistResult{Files: c.out, Skips: c.skips, Flooded: c.flooded}
 }
 
 // expandAKF expands %h, %u and %% in an AuthorizedKeysFile pattern; relative
@@ -520,4 +688,33 @@ func expandAKF(pat, home, user string) string {
 		p = path.Join(home, p)
 	}
 	return path.Clean(p)
+}
+
+// Budgets for what one user can make a scan keep from the user's own unit
+// directories (anyone can fill those).
+var (
+	// userDirMaxEntries is how many entries of one user unit directory
+	// tree are looked at.
+	userDirMaxEntries = 2000
+	// userDirMaxText is how much text is kept from one such tree.
+	userDirMaxText = 8 << 20
+	// usersMaxText is how much text is kept from all of them together.
+	usersMaxText = 64 << 20
+)
+
+const skipLinkedUnitDir = "the unit directory is a symbolic link that root did not make or that leads outside the system directories: not walked"
+
+// PersistResult is what PersistenceScan found.
+type PersistResult struct {
+	Files []model.PersistFile
+	Skips []model.Skip
+	// Flooded lists the user unit directories whose walk stopped at a
+	// budget, sorted.
+	Flooded []string
+}
+
+// Persistence is PersistenceScan without the list of directories cut short.
+func Persistence(root string, users []model.User, key []byte) ([]model.PersistFile, []model.Skip) {
+	r := PersistenceScan(root, users, key)
+	return r.Files, r.Skips
 }

@@ -144,7 +144,7 @@ fix it on that machine. telltale never runs a fix itself.
 
 ## Suspicious on any machine
 
-24 kinds of finding, under 16 IDs. These need no snapshot. The finding key (the ID a report shows for each finding) starts as given here and ends with the account, path or program it is about.
+25 kinds of finding, under 17 IDs. These need no snapshot. The finding key (the ID a report shows for each finding) starts as given here and ends with the account, path or program it is about.
 
 - **TT-HEUR-001** An account other than root has user id 0. *Backdoor sign.*
   User id 0 is root, whatever the account is called. A second account with id 0 is a classic hidden way back in: it logs in as root under another name.
@@ -218,3 +218,6 @@ fix it on that machine. telltale never runs a fix itself.
 - **TT-HEUR-016** The PAM configuration names a module that is not on the machine. *Note.*
   Usually left over from a removed package. Whoever can create the file decides what runs at login.
   Key: `heur.pam_missing:`
+- **TT-HEUR-017** A user's systemd unit directory holds more than telltale reads. *Note.*
+  Anyone can fill their own unit directory. telltale reads at most 2,000 entries and 8 MiB of text from one user's directory, and 64 MiB from all users' together, so that no user can make a scan run out of memory or time. What lies past that was not read, and a unit hidden there was not seen. Thousands of files in such a directory are themselves unusual: look at what fills it.
+  Key: `heur.persist_flooded:`

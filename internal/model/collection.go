@@ -20,15 +20,20 @@ type Collection struct {
 	Skipped []Skip    `json:"skipped,omitempty"`
 	// SweepIncomplete lists path prefixes where the setuid/capability sweep
 	// stopped early, so files under them were not all looked at.
-	SweepIncomplete []string          `json:"sweep_incomplete,omitempty"`
-	Files           []FileEntry       `json:"files"`
-	Accounts        Accounts          `json:"accounts"`
-	Persist         []PersistFile     `json:"persist"`
-	Runtime         Runtime           `json:"runtime"`
-	Packages        Packages          `json:"packages"`
-	Firewall        Firewall          `json:"firewall"`
-	CrossView       []CrossViewResult `json:"cross_view,omitempty"`
-	Sysctl          map[string]string `json:"sysctl,omitempty"`
+	SweepIncomplete []string `json:"sweep_incomplete,omitempty"`
+	// PersistFlooded lists the per-user unit directories
+	// (~/.config/systemd/user and the like) whose reading stopped at a
+	// budget: their owner filled them, and what lies past the budget was
+	// not read.
+	PersistFlooded []string          `json:"persist_flooded,omitempty"`
+	Files          []FileEntry       `json:"files"`
+	Accounts       Accounts          `json:"accounts"`
+	Persist        []PersistFile     `json:"persist"`
+	Runtime        Runtime           `json:"runtime"`
+	Packages       Packages          `json:"packages"`
+	Firewall       Firewall          `json:"firewall"`
+	CrossView      []CrossViewResult `json:"cross_view,omitempty"`
+	Sysctl         map[string]string `json:"sysctl,omitempty"`
 	// LinkerCache lists every file the dynamic linker's cache
 	// (/etc/ld.so.cache) sends programs to, sorted; nil when there is no
 	// cache or it could not be parsed.

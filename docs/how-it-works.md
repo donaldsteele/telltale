@@ -81,6 +81,14 @@ built around that.
   their backups and anything holding a private key are never kept. The
   link itself is still recorded and reported, with a note that its content
   was not read.
+- **A user cannot make a scan fail by filling a directory.** From one
+  user's systemd unit directory telltale reads at most 2,000 entries and
+  8 MiB of text, and from all users' unit directories together 64 MiB;
+  text is kept only for files systemd reads as units, and anything else
+  there is recorded by hash. Past a limit the directory is reported as a
+  note (`heur.persist_flooded`) and listed among what could not be
+  checked. A unit directory that is itself a symbolic link is read only
+  when root made the link and it leads into the system directories.
 
 What no on-machine check can rule out is a **kernel-level rootkit**: code in
 the kernel can hide anything from anything that runs on top of it, telltale
