@@ -135,6 +135,7 @@ func runScan(ctx *Context) int {
 	// repositories (the snapshot's, never the collection's). The server
 	// uses the same function.
 	judge.VerifyScope(&opt, snap, c)
+	opt.SignedOnly = signedSourcesOnly(*root, *refs, *offline)
 	if *refs == "" && !*offline {
 		// Never leave a package cache on the machine being examined.
 		// Written before the directory exists: a closed stderr (SIGPIPE) then
@@ -223,6 +224,19 @@ func writeTo(path string, fill func(io.Writer) error) error {
 // SSH session), so the deferred clean-up of the temporary cache always runs.
 var scanContext = func() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+}
+
+// signedSourcesOnly reports whether a scan may use only sources whose
+// signed indexes telltale's keys verify: when it examines the machine it
+// runs on and fetches from the archives itself. HTTPS is then checked with
+// the examined machine's own CA store and names are resolved by its own
+// resolver, and root on that machine controls both, so a source trusted
+// through HTTPS alone (snapshot.debian.org's file API, Launchpad) proves
+// nothing there. The server, a reference bundle (--refs) built on another
+// machine, and a filesystem mounted on the machine that examines it are
+// not affected. Tests replace it.
+var signedSourcesOnly = func(root, refs string, offline bool) bool {
+	return refs == "" && !offline && filepath.Clean("/"+root) == "/"
 }
 
 // verifyPackages is pkgverify.Verify; tests replace it.

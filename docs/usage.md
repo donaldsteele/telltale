@@ -48,14 +48,22 @@ scan could not run.
 ### Where package references come from
 
 Without `--refs` or `--offline`, a scan downloads what it needs from the
-distribution's official archive (and, for older versions, from
-snapshot.debian.org, Ubuntu's snapshot service or Launchpad) into a
+distribution's official archive (and, for older versions, from the signed
+indexes of snapshot.debian.org or Ubuntu's snapshot service) into a
 temporary directory, and removes it when the scan is done: carry mode never
 leaves a package cache on the machine. Without a snapshot it verifies the
 security-relevant files of every installed package (programs, libraries,
 PAM and kernel modules, `/boot`), which on a large machine can mean a few
 hundred megabytes of packages. With a snapshot it verifies only the
 package files that changed since.
+
+A scan of the machine it runs on uses signed indexes only. Two sources
+that can confirm a few older versions, snapshot.debian.org's file API and
+Launchpad, are trusted through HTTPS alone, and on the examined machine
+HTTPS is checked with that machine's own certificate store and resolver.
+They are used only by the server, or through a reference bundle
+(`fetch-refs`) built on another machine. A version only they could confirm
+is reported as not found.
 
 ### Third-party repositories
 

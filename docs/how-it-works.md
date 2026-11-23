@@ -114,8 +114,16 @@ are the ones the distribution shipped.
    counts as shipped, and so does a mode that grants less than the package's.
 4. A version the current archive no longer has comes from
    snapshot.debian.org or Ubuntu's snapshot service, which keep signed
-   indexes, with Launchpad as Ubuntu's last resort (reported as a lower
-   level of trust than the signed archive chain).
+   indexes. Where no signed index has it, snapshot.debian.org's file API
+   and, for Ubuntu, Launchpad can still give its hash, but those two are
+   trusted through HTTPS alone (reported as a lower level of trust than
+   the signed archive chain). They are used only by the server, or with a
+   reference bundle built on another machine. A `telltale scan` that runs
+   on the machine it examines never uses them: there HTTPS is checked with
+   that machine's own certificate store and resolver, which root on it
+   controls. Such a version is then reported as not found, and the
+   report's "Compared against" line says the scan used signed indexes
+   only.
 5. Configuration files (`conffiles`) are expected to differ from the
    package's defaults. Their changes are judged by the checklist and the
    snapshot comparison, not reported as tampering.
@@ -183,7 +191,7 @@ rules telltale follows, in plain words:
 
 - **An upgrade to a newer version from a trusted source is explained.**
   Trusted means the version is in the signed archive (or a snapshot of it,
-  or Launchpad), or in a third-party repository verified with a key bound
+  or, on the server or with a reference bundle, Launchpad), or in a third-party repository verified with a key bound
   to it. The files that changed with it are shown in one quiet
   "explained" group, and only when their new hashes match the new signed
   package.

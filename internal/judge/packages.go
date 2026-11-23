@@ -178,6 +178,8 @@ func (j *judge) packages() {
 		}
 	case r.Mode == pkgverify.ModeRefs:
 		j.compared = append(j.compared, "reference bundle")
+	case r.SignedOnly:
+		j.compared = append(j.compared, distroPackages(j.c.Host.OSID)+SignedOnlyNote)
 	default:
 		j.compared = append(j.compared, distroPackages(j.c.Host.OSID))
 	}
@@ -234,6 +236,10 @@ func (j *judge) pkgNeeded() bool {
 	r := j.in.Pkg
 	return len(r.Errors) > 0 || len(r.Unverifiable) > 0 || j.old == nil || j.ownedChanged
 }
+
+// SignedOnlyNote follows the reference in "Compared against" when the scan
+// ran on the machine it examined (pkgverify.Options.SignedOnly).
+const SignedOnlyNote = " (signed indexes only: sources trusted through HTTPS alone, snapshot.debian.org's file API and Launchpad, are used only by the server or with a reference bundle built on another machine)"
 
 func distroPackages(osID string) string {
 	switch osID {

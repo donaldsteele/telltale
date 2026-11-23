@@ -224,6 +224,13 @@ type Options struct {
 	// vendor's repository addresses. Nil means the built-in table; an
 	// empty table turns them off.
 	Vendors *vendorkeys.Table
+	// SignedOnly uses only sources whose signed indexes the built-in (or
+	// given) keys verify. A version that only snapshot.debian.org's file API
+	// or Launchpad could confirm, both trusted through HTTPS alone, is then
+	// not found. A scan that runs on the machine it examines sets it: there
+	// HTTPS is checked with that machine's own CA store and names are
+	// resolved by its own resolver, and root on it controls both.
+	SignedOnly bool
 	// Root is where the examined filesystem is mounted, for offline-local
 	// mode, which reads the files to compute their MD5. "" means "/".
 	Root string
@@ -255,7 +262,10 @@ type OwnerKey struct {
 
 // Result is the outcome of verifying a collection's files.
 type Result struct {
-	Mode         string        `json:"mode"`
+	Mode string `json:"mode"`
+	// SignedOnly is true when sources trusted through HTTPS alone were left
+	// out (Options.SignedOnly).
+	SignedOnly   bool          `json:"signed_only,omitempty"`
 	Verified     []FileVerdict `json:"verified,omitempty"`
 	Mismatch     []FileVerdict `json:"mismatch,omitempty"`
 	Unverifiable []FileVerdict `json:"unverifiable,omitempty"`
@@ -360,6 +370,7 @@ func Verify(ctx context.Context, c *model.Collection, opt Options) *Result {
 	case opt.Offline:
 		res.Mode = ModeOfflineLocal
 	}
+	res.SignedOnly = opt.SignedOnly && res.Mode == ModeArchive
 	if c == nil {
 		res.Errors = []string{"no collection to verify"}
 		return res
@@ -917,6 +928,9 @@ func (s *session) setup() error {
 		o := *old
 		if wrap != nil {
 			o.Client, o.Cache, o.SignedOnly = wrap(old.client()), "", true
+		}
+		if s.opt.SignedOnly {
+			o.SignedOnly = true
 		}
 		if o.Now == nil {
 			o.Now = s.opt.Now

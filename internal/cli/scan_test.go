@@ -317,3 +317,48 @@ func TestScanTrustsOnlyTheSnapshotsRepoKeys(t *testing.T) {
 		t.Errorf("no pkg.repo_key_changed finding in the report")
 	}
 }
+
+// A scan of the machine it runs on uses only signed sources: HTTPS there is
+// checked with that machine's own CA store and resolver. With --refs,
+// --offline, or a filesystem mounted somewhere else, nothing changes.
+func TestScanOfTheLiveMachineUsesSignedSourcesOnly(t *testing.T) {
+	for _, tc := range []struct {
+		root, refs string
+		offline    bool
+		want       bool
+	}{
+		{"/", "", false, true},
+		{"", "", false, true},
+		{"//", "", false, true},
+		{"/mnt/disk", "", false, false},
+		{"/", "/media/refs", false, false},
+		{"/", "", true, false},
+	} {
+		if got := signedSourcesOnly(tc.root, tc.refs, tc.offline); got != tc.want {
+			t.Errorf("signedSourcesOnly(%q, %q, %v) = %v, want %v", tc.root, tc.refs, tc.offline, got, tc.want)
+		}
+	}
+
+	// The option reaches package verification as scan computes it.
+	old, oldLive := verifyPackages, signedSourcesOnly
+	var got []bool
+	verifyPackages = func(_ context.Context, _ *model.Collection, opt pkgverify.Options) *pkgverify.Result {
+		got = append(got, opt.SignedOnly)
+		return &pkgverify.Result{Mode: pkgverify.ModeArchive, SignedOnly: opt.SignedOnly, SourcesUsed: []string{"https://deb.debian.org/debian bookworm"}}
+	}
+	t.Cleanup(func() { verifyPackages, signedSourcesOnly = old, oldLive })
+	args := []string{"scan", "--no-color", "--root", "../collect/testdata/root1", "--proc-root", "../collect/testdata/proc1", "--sys-root", "../collect/testdata/root1"}
+	var out, errb bytes.Buffer
+	Run(args, strings.NewReader(""), &out, &errb)
+	// Stand in for a scan of "/": the fixture tree is the machine.
+	signedSourcesOnly = func(string, string, bool) bool { return true }
+	var live bytes.Buffer
+	Run(args, strings.NewReader(""), &live, &errb)
+	if len(got) != 2 || got[0] || !got[1] {
+		t.Fatalf("SignedOnly passed to package verification: %v", got)
+	}
+	const said = "sources trusted through HTTPS alone"
+	if strings.Contains(out.String(), said) || !strings.Contains(live.String(), said) {
+		t.Errorf("the report must say so exactly when they were left out:\nmounted: %v\nlive: %v", strings.Contains(out.String(), said), strings.Contains(live.String(), said))
+	}
+}
