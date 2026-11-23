@@ -110,6 +110,40 @@ func TestFilesRecordsSymlinkWithoutFollowing(t *testing.T) {
 	}
 }
 
+// A server visit that falls back to /root runs the collector from
+// /root/telltale.XXXXXXXX: that directory is telltale's, not the machine's,
+// and must not show up in the inventory (each visit's has another name, so
+// a snapshot would call it added and removed every time). Only that exact
+// directory is left out.
+func TestFilesExcludesTheCollectorsOwnDirectory(t *testing.T) {
+	root := t.TempDir()
+	for _, f := range []string{"root/telltale.AbCd1234/telltale", "root/telltale.AbCd12345/payload", "root/.bashrc"} {
+		p := filepath.Join(root, f)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, _ := Files(root, []string{"/root"}, FileOptions{Exclude: "/root/telltale.AbCd1234"})
+	m := byPath(entries)
+	for _, p := range []string{"/root/telltale.AbCd1234", "/root/telltale.AbCd1234/telltale"} {
+		if _, ok := m[p]; ok {
+			t.Errorf("%s is in the inventory", p)
+		}
+	}
+	for _, p := range []string{"/root", "/root/.bashrc", "/root/telltale.AbCd12345", "/root/telltale.AbCd12345/payload"} {
+		if _, ok := m[p]; !ok {
+			t.Errorf("%s is missing from the inventory", p)
+		}
+	}
+	// Without Exclude everything is there.
+	if all, _ := Files(root, []string{"/root"}, FileOptions{}); len(all) != 6 {
+		t.Errorf("without Exclude: %d entries, want 6", len(all))
+	}
+}
+
 func TestFilesVanishingEntryIsSkipped(t *testing.T) {
 	root := t.TempDir()
 	f := filepath.Join(root, "gone")

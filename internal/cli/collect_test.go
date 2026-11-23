@@ -91,3 +91,23 @@ func TestCollectHelp(t *testing.T) {
 		}
 	}
 }
+
+// Only a directory a server visit made for the collector is its own.
+func TestVisitDir(t *testing.T) {
+	for exe, want := range map[string]string{
+		"/root/telltale.AbCd1234/telltale":    "/root/telltale.AbCd1234",
+		"/run/telltale.zz99ZZ99/telltale":     "/run/telltale.zz99ZZ99",
+		"/var/tmp/telltale.a1b2c3d4/telltale": "/var/tmp/telltale.a1b2c3d4",
+		"/tmp/telltale.QWERTYUI/telltale":     "/tmp/telltale.QWERTYUI",
+		"/usr/local/bin/telltale":             "",
+		"/home/me/telltale.AbCd1234/telltale": "",
+		"/root/telltale.AbCd123/telltale":     "",
+		"/root/telltale.AbCd1234/x/telltale":  "",
+		"/root/telltale.AbCd1234-x/telltale":  "",
+	} {
+		d, ok := visitDir(exe)
+		if ok != (want != "") || (ok && d != want) {
+			t.Errorf("visitDir(%q) = %q, %v; want %q", exe, d, ok, want)
+		}
+	}
+}

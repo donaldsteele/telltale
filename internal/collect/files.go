@@ -33,6 +33,10 @@ type FileOptions struct {
 	Mounts       []model.Mount
 	// MD5 also records the md5 of regular files, to compare with dpkg.
 	MD5 bool
+	// Exclude is a directory left out of the walk, itself and everything
+	// in it (a machine path; "" leaves nothing out). Only that exact
+	// directory: a sibling with a longer name is walked as usual.
+	Exclude string
 }
 
 // testHookBeforeOpen, when non-nil, runs just before a file is opened for
@@ -71,6 +75,10 @@ func Files(root string, paths []string, opt FileOptions) ([]model.FileEntry, []m
 		skips = append(skips, model.Skip{Check: checkName, Reason: path + ": " + reason})
 	}
 
+	exclude := ""
+	if opt.Exclude != "" {
+		exclude = filepath.Clean("/" + opt.Exclude)
+	}
 	seen := make(map[string]int)
 	add := func(e model.FileEntry) {
 		seen[e.Path] = len(entries)
@@ -103,6 +111,9 @@ func Files(root string, paths []string, opt FileOptions) ([]model.FileEntry, []m
 					return fs.SkipDir
 				}
 				return nil
+			}
+			if d.IsDir() && exclude != "" && mp == exclude {
+				return fs.SkipDir
 			}
 			if d.IsDir() && mp != start {
 				if t, ok := skipMounts[mp]; ok {

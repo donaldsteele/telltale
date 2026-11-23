@@ -184,6 +184,13 @@ kill -HUP "$(pgrep -o -x sshd)"`, "enrol", authorizedKeys, match)
 			t.Errorf("the collector's own process is in the collection: pid %d %s", p.PID, p.Exe)
 		}
 	}
+	// Nor its directory: under /root it would be in the file inventory,
+	// with a new name on every visit.
+	for _, f := range c.Files {
+		if tempDirRE.MatchString(f.Path + "/") {
+			t.Errorf("the collector's own directory is in the collection: %s", f.Path)
+		}
+	}
 }
 
 // rootLogin reports whether the server key logs in as root and runs a

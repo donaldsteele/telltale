@@ -7,9 +7,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 
 	"github.com/donaldsteele/telltale/internal/collect"
 	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/visit"
 )
 
 const (
@@ -60,6 +63,13 @@ func runCollect(ctx *Context) int {
 			return fail(fmt.Errorf("digest key too short: %d bytes, need at least %d", len(sc.DigestKey), minKeyBytes))
 		}
 		opt.DigestKey = sc.DigestKey
+		// A server visit runs the collector from a temporary directory it
+		// made for it, which is not part of the machine.
+		if exe, err := os.Executable(); err == nil && filepath.Clean(*root) == "/" {
+			if d, ok := visitDir(exe); ok {
+				opt.OwnDir = d
+			}
+		}
 	}
 	c, err := collect.All(opt)
 	if err != nil {
@@ -80,4 +90,12 @@ func runCollect(ctx *Context) int {
 		}
 	}
 	return 0
+}
+
+// visitDir is the directory of the collector at exe when it is one a server
+// visit made for it (visit.IsTempDir: telltale.XXXXXXXX in /run, /var/tmp,
+// /root or /tmp).
+func visitDir(exe string) (string, bool) {
+	d := filepath.Dir(exe)
+	return d, visit.IsTempDir(d)
 }
