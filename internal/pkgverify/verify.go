@@ -1340,12 +1340,15 @@ func (s *session) onePackage(ctx context.Context, r *pkgResult) {
 			s.problem(oldErr)
 		}
 	}
-	if !ok && s.distroNames[p.Name] && (s.old == nil || errors.Is(oldErr, ErrNotFound)) {
-		// The distribution's history answered, and does not have it
-		// either: the version is the third party's own build. A history
-		// that could not be asked (the network, a garbage answer, the
-		// lookup budget) leaves that open, and then a third-party copy
-		// confirms nothing about a package the distribution names.
+	if !ok && s.distroNames[p.Name] && (s.old == nil || s.bundle != nil || historyHasNone(oldErr)) {
+		// The distribution's history answered, and no source it may use
+		// has the version: a third-party index verified with a key bound
+		// to it may confirm it. A history that could not be asked (the
+		// network, a garbage answer, the lookup budget) leaves that open,
+		// and then a third-party copy confirms nothing about a package the
+		// distribution names. A reference bundle holds what was decided
+		// when it was built, with the history at hand; reading one, the
+		// history cannot be asked again.
 		ref, ok = s.lookupThird(p)
 	}
 	if !ok {
@@ -1367,6 +1370,24 @@ func (s *session) onePackage(ctx context.Context, r *pkgResult) {
 		return
 	}
 	r.ref, r.table, r.source = ref, table, s.sourceOf(ref)
+}
+
+// historyHasNone reports whether the distribution's history answered that
+// it has no usable copy of a version: it is not found, or (with sources
+// trusted through HTTPS alone left out) no signed index has it and the
+// signed lookups ended in "not found", not in an error.
+func historyHasNone(err error) bool {
+	if err == nil || errors.Is(err, errOldBudget) {
+		return false
+	}
+	if errors.Is(err, ErrNotFound) {
+		return true
+	}
+	var so *signedOnlyErr
+	if errors.As(err, &so) {
+		return so.last == nil || errors.Is(so.last, errHTTPNotFound)
+	}
+	return false
 }
 
 func oldSource(ref DebRef) string {

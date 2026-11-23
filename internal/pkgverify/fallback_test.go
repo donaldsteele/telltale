@@ -2,6 +2,8 @@ package pkgverify
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/donaldsteele/telltale/internal/model"
@@ -132,4 +134,32 @@ func TestThirdPartyFallbackOnlyWhenHistoryHasNoSuchVersion(t *testing.T) {
 			}
 		}
 	})
+}
+
+// Which answers of the distribution's history leave room for a third-party
+// copy: "no such version", and "no signed index has it" when sources trusted
+// through HTTPS alone are not used and the signed lookups themselves said
+// not found. A history that could not be asked leaves none.
+func TestHistoryHasNone(t *testing.T) {
+	key := PkgKey{"hello", "2.10-3", "amd64"}
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"not found", fmt.Errorf("x: %w", ErrNotFound), true},
+		{"signed only, nothing tried", signedOnlyError(key, nil), true},
+		{"signed only, index lacks it", signedOnlyError(key, fmt.Errorf("dists: %w", ErrNotFound)), true},
+		{"signed only, no such index", signedOnlyError(key, fmt.Errorf("u: %w", errHTTPNotFound)), true},
+		{"signed only, network", signedOnlyError(key, errors.New("dial tcp: i/o timeout")), false},
+		{"network", errors.New("dial tcp: i/o timeout"), false},
+		{"API answer missing", fmt.Errorf("u: %w", errHTTPNotFound), false},
+		{"garbage", errors.New("invalid character '<'"), false},
+		{"budget", errOldBudget, false},
+		{"no error", nil, false},
+	} {
+		if got := historyHasNone(tc.err); got != tc.want {
+			t.Errorf("%s: historyHasNone = %v, want %v", tc.name, got, tc.want)
+		}
+	}
 }

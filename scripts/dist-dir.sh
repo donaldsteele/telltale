@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Sourced by build.sh (bash).
 #
 # prepare_dist DIR makes DIR ready for build.sh's output. It empties DIR
