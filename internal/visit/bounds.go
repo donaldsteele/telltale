@@ -47,8 +47,14 @@ type entryCaps struct {
 }
 
 // maxEntries is far above what a real machine has (a large server has a few
-// hundred thousand files and a few thousand packages) and bounds the heap
-// one visit's collection can take to a few hundred MiB.
+// hundred thousand files and a few thousand packages). It bounds how many
+// entries the decoder creates. It does not bound the server's memory: a
+// collection at the caps decodes to several hundred MiB, and judging it
+// (package verification, the comparison with the snapshot) takes several
+// times that again, so a hostile machine can still make the server use
+// several GiB and be killed. What then holds is outside this package: the
+// service's memory limit, its restart, and the server reporting the machine
+// after three visits that ended that way.
 var maxEntries = entryCaps{
 	Files: 1_000_000, Persist: 20_000, Processes: 100_000, Sockets: 200_000, Packages: 20_000,
 	Other: 500_000, Strings: 6_000_000, MapMembers: 1_500_000, Depth: 16,

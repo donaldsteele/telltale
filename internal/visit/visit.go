@@ -342,7 +342,12 @@ func (r *remote) visit(ctx context.Context, input []byte, bins Binaries) (*model
 	}
 	var c model.Collection
 	err = r.run(ctx, "collect", quote(d+"/telltale")+" collect --context-stdin --gzip", collectTimeout,
-		bytes.NewReader(input), maxOutput, func(rd io.Reader) error { return decodeOutput(rd, &c) })
+		bytes.NewReader(input), maxOutput, func(rd io.Reader) error {
+			if hook, ok := ctx.Value(decodeHookKey{}).(func()); ok && hook != nil {
+				hook()
+			}
+			return decodeOutput(rd, &c)
+		})
 	if err != nil {
 		// The machine let the server in and ran the collector; what came
 		// back is its doing, unless the connection broke or time ran out.
@@ -662,6 +667,16 @@ func outcome(what string, rerr, werr error, errs *tail) error {
 		return fmt.Errorf("%s: %w%s", what, escaped{werr}, errs.suffix())
 	}
 	return nil
+}
+
+type decodeHookKey struct{}
+
+// WithDecodeHook returns a context that makes Visit call hook once, right
+// before it starts to read what the machine's collector sent. From then on
+// the machine's data is in the caller's memory; a caller that wants to know
+// which visit it was holding when it died records it there.
+func WithDecodeHook(ctx context.Context, hook func()) context.Context {
+	return context.WithValue(ctx, decodeHookKey{}, hook)
 }
 
 // decodeOutput is decodeCollection; tests replace it.

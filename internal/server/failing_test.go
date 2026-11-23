@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/pkgverify"
 	"github.com/donaldsteele/telltale/internal/store"
 	"github.com/donaldsteele/telltale/internal/visit"
 )
@@ -149,33 +151,81 @@ func failures(t *testing.T, fx *fixture) string {
 	return v
 }
 
+func decoding(t *testing.T, fx *fixture, id int64) string {
+	t.Helper()
+	v, _ := fx.st.Setting(decodingSetting(id))
+	return v
+}
+
 // A visit that kills the server (a collection that exhausts its memory) is
-// never seen to fail. So the attempt is counted before the visit starts and
-// the count is cleared only by a visit that works: a server that dies three
-// times in a row on one machine says so at its next start, instead of
-// visiting again.
-func TestAVisitThatKillsTheServerIsCounted(t *testing.T) {
+// never seen to fail. So the server writes down which machine's collection
+// it is decoding or judging, and removes the mark when that visit ends, in
+// success or in failure. A mark still there at the next start means the
+// server died on that machine's collection: that is a failed visit of that
+// machine, and of no other. Visits to other machines that were merely under
+// way (connecting, collecting) when the server died are not counted.
+func TestOnlyTheVisitBeingDecodedCountsWhenTheServerDies(t *testing.T) {
 	fx, fail := failingFixture(t)
-	if got := failures(t, fx); got != "0" {
-		t.Fatalf("after a good visit: %q", got)
-	}
-	// While a visit runs, the attempt is already on disk.
+	other := fx.addMachine(t, "files02", "")
+	fx.visitOK(t, other)
+
+	// The mark is there while the collection is judged, and gone after.
 	var during string
-	fx.vis.collect = func(store.Machine, int) (*model.Collection, error) {
-		during = failures(t, fx)
-		return base(), nil
+	verify := fx.core.Verify
+	fx.core.Verify = func(ctx context.Context, c *model.Collection, opt pkgverify.Options) *pkgverify.Result {
+		during = decoding(t, fx, fx.id)
+		return verify(ctx, c, opt)
 	}
 	fx.visitOK(t, fx.id)
-	if during != "1" || failures(t, fx) != "0" {
-		t.Fatalf("during the visit %q, after it %q", during, failures(t, fx))
+	if during == "" || decoding(t, fx, fx.id) != "" || failures(t, fx) != "0" {
+		t.Fatalf("mark while judging %q, after %q; failures %q", during, decoding(t, fx, fx.id), failures(t, fx))
 	}
-	_ = fail
+	// A visit that fails in the ordinary way leaves no mark either.
+	*fail = unreachable
+	fx.core.VisitNow(context.Background(), fx.id)
+	if decoding(t, fx, fx.id) != "" || failures(t, fx) != "1" {
+		t.Fatalf("after a recorded failure: mark %q, failures %q", decoding(t, fx, fx.id), failures(t, fx))
+	}
+	*fail = nil
+	fx.visitOK(t, fx.id)
 
-	// Three attempts that never came back: the count is all that is left.
-	if err := fx.st.SetSetting(failuresSetting(fx.id), "3"); err != nil {
-		t.Fatal(err)
+	// The server dies while it decodes this machine's collection: the mark
+	// is what is left. The other machine was only being connected to.
+	die := func() {
+		if err := fx.st.SetSetting(decodingSetting(fx.id), "1"); err != nil {
+			t.Fatal(err)
+		}
 	}
+	die()
+	*fail = unreachable
+	fx.core.VisitNow(context.Background(), fx.id)
+	fx.core.VisitNow(context.Background(), other)
+	if got := failures(t, fx); got != "2" {
+		t.Errorf("the machine whose collection killed the server: %q failures, want 2 (the crash and this visit)", got)
+	}
+	if v, _ := fx.st.Setting(failuresSetting(other)); v != "1" {
+		t.Errorf("a machine that was only in flight: %q failures, want 1 (this visit alone)", v)
+	}
+	*fail = nil
+	fx.visitOK(t, fx.id)
+	fx.visitOK(t, other)
+
+	// Three deaths in a row on this machine's collection, with nothing
+	// recorded in between: reported before the machine is visited again.
+	for i := 0; i < 2; i++ {
+		die()
+		fx.vis.collect = func(store.Machine, int) (*model.Collection, error) {
+			die()
+			return nil, errors.New("not reached in a real crash")
+		}
+		// Stand in for the restart: only the mark and the count survive.
+		if err := fx.st.SetSetting(failuresSetting(fx.id), strconv.Itoa(i+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	die()
 	before := fx.vis.visits(fx.id)
+	alerts := len(fx.alerts.all())
 	rid, err := fx.core.VisitNow(context.Background(), fx.id)
 	if rid == 0 || err == nil {
 		t.Fatalf("report %d, err %v", rid, err)
@@ -184,17 +234,17 @@ func TestAVisitThatKillsTheServerIsCounted(t *testing.T) {
 		t.Error("the machine was visited again before the owner was told")
 	}
 	r, _, _ := fx.st.Report(rid)
-	if f := find(r, "visit.failing"); f == nil || f.Severity != model.SevBackdoor {
+	if f := find(r, "visit.failing"); f == nil || f.Severity != model.SevBackdoor || !strings.Contains(f.Title, "stopped") {
 		t.Fatalf("report %+v", r.Findings)
 	}
-	if got := fx.alerts.all(); len(got) != 1 || !slices.Equal(got[0].fresh, []string{"visit.failing"}) {
+	if got := fx.alerts.all(); len(got) != alerts+1 || !slices.Equal(got[len(got)-1].fresh, []string{"visit.failing"}) {
 		t.Fatalf("alerts %+v", got)
 	}
 	// Told once; the next round visits again, and a visit that works
 	// resolves it.
 	fx.vis.collect = func(store.Machine, int) (*model.Collection, error) { return base(), nil }
 	fx.visitOK(t, fx.id)
-	if got := fx.alerts.all(); len(got) != 2 || !slices.Equal(got[1].resolved, []string{"visit.failing"}) || failures(t, fx) != "0" {
+	if got := fx.alerts.all(); !slices.Equal(got[len(got)-1].resolved, []string{"visit.failing"}) || failures(t, fx) != "0" || decoding(t, fx, fx.id) != "" {
 		t.Fatalf("alerts %+v, failures %q", got, failures(t, fx))
 	}
 }

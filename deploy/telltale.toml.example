@@ -53,6 +53,6 @@ listen = "192.168.1.10:8443"
 # tens of MiB; a visit that passes the limit fails and is reported as a
 # failed visit. Decoded, a collection takes several times its size in
 # memory, and up to four visits run at once, so the server's memory
-# (MemoryMax=2G and GOMEMLIMIT=1536MiB in the shipped systemd unit) has to
+# (MemoryMax=4G and GOMEMLIMIT=3GiB in the shipped systemd unit) has to
 # hold four of them: raise those limits too if you raise this one.
 #max_collection_mib = "64"

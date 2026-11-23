@@ -136,11 +136,13 @@ const (
 // Memory: each visit can hold up to 64 MiB of collector output (visit's
 // limit, visit.SetMaxCollection) plus the decoded collection, whose entries
 // are counted and capped before any is decoded, and up to four visits run
-// at once. The shipped systemd unit caps the service at 2 GiB (MemoryMax),
-// sets GOMEMLIMIT below that, and stops the service as a whole if the
-// kernel has to kill part of it (OOMPolicy=stop). A visit is counted as
-// failed from its start until it succeeds, so one that kills the server
-// still counts.
+// at once. The caps bound one collection, not what judging it can take: a
+// hostile machine's collection can still make the server use several GiB.
+// The shipped systemd unit caps the service at 4 GiB (MemoryMax), sets
+// GOMEMLIMIT below that, stops the service as a whole if the kernel has to
+// kill part of it (OOMPolicy=stop) and starts it again. The machine whose
+// collection was in memory when that happened is marked (decodingSetting)
+// and that visit counts as failed; after three the machine is reported.
 type Core struct {
 	Store *store.Store
 	// Bins supplies the collector binaries copied to machines.
@@ -303,9 +305,16 @@ func leftoverSetting(id int64) string  { return "leftover:" + strconv.FormatInt(
 func errorSetting(id int64) string     { return "visit_error:" + strconv.FormatInt(id, 10) }
 func failuresSetting(id int64) string  { return "visit_failures:" + strconv.FormatInt(id, 10) }
 func outageSetting(id int64) string    { return "visit_outage:" + strconv.FormatInt(id, 10) }
-func attemptSetting(id int64) string   { return "last_attempt:" + strconv.FormatInt(id, 10) }
-func rebaseSetting(id int64) string    { return "rebase:" + strconv.FormatInt(id, 10) }
-func alertSetting(id int64) string     { return "alert_state:" + strconv.FormatInt(id, 10) }
+
+// decodingSetting is set while the server holds a machine's collection in
+// memory: from when a visit starts to read it until the visit ends. A server
+// killed in between (a collection built to exhaust its memory) leaves it
+// set, and that is the only trace of the visit. Visits to other machines
+// that were under way at that moment have no mark and are not counted.
+func decodingSetting(id int64) string { return "visit_decoding:" + strconv.FormatInt(id, 10) }
+func attemptSetting(id int64) string  { return "last_attempt:" + strconv.FormatInt(id, 10) }
+func rebaseSetting(id int64) string   { return "rebase:" + strconv.FormatInt(id, 10) }
+func alertSetting(id int64) string    { return "alert_state:" + strconv.FormatInt(id, 10) }
 
 // outcome is what a visit leaves for VisitNow: the stored report, the
 // error, and the alert still to send.
@@ -447,37 +456,41 @@ func (c *Core) digestKey(id int64) ([]byte, error) {
 // the visit claimed it.
 func (c *Core) visit(parent, ctx context.Context, id int64, gen uint64) outcome {
 	m, err := c.Store.Machine(id)
-	// The attempt is counted as a failure before anything is sent to the
-	// machine, and the count is cleared only by a visit that works
-	// (visitSucceeded). A visit that kills the server (a collection that
-	// exhausts its memory) is then still counted: nothing else would
-	// remember it.
-	prev := c.failureCount(id)
 	if err != nil {
-		c.Store.SetSetting(failuresSetting(id), strconv.Itoa(prev+1))
 		return c.visitFailed(id, nil, err)
 	}
-	if told, _ := c.Store.Setting(outageSetting(id)); prev >= failingAfter && told == "" {
-		// Attempts were counted and nothing was ever recorded about them:
-		// the server stopped during each one. Say so before trying again.
-		return c.reportOutage(id, m, prev, causeServerStopped, errors.New("the server stopped during each of the last visits to this machine"))
+	// A mark left by an earlier visit: the server stopped while it was
+	// decoding or judging this machine's collection (see decodingSetting).
+	// That visit never got to say it failed, so it is counted now.
+	if v, _ := c.Store.Setting(decodingSetting(id)); v != "" {
+		if err := c.Store.SetSetting(failuresSetting(id), strconv.Itoa(c.failureCount(id)+1)); err != nil {
+			return outcome{err: err}
+		}
+		if err := c.Store.SetSetting(decodingSetting(id), ""); err != nil {
+			return outcome{err: err}
+		}
+		c.audit(actorServer, "visit interrupted", "machine %d", id) // logged on failure
+		if told, _ := c.Store.Setting(outageSetting(id)); c.failureCount(id) >= failingAfter && told == "" {
+			// Say so before trying again: the next attempt may end the
+			// same way.
+			return c.reportOutage(id, m, c.failureCount(id), causeServerStopped, errors.New("the server stopped while reading or judging what this machine sent, on each of its last visits"))
+		}
 	}
-	if err := c.Store.SetSetting(failuresSetting(id), strconv.Itoa(prev+1)); err != nil {
-		return outcome{err: err}
-	}
-	// What is not the machine's failure is not counted.
-	uncount := func() { c.Store.SetSetting(failuresSetting(id), strconv.Itoa(prev)) }
 	c.Store.SetSetting(attemptSetting(id), strconv.FormatInt(c.now().UnixNano(), 10))
 	sc, signer, err := c.scanContext(id)
 	if err != nil {
 		return c.visitFailed(id, m, err)
 	}
 	c.removeLeftovers(ctx, *m, signer)
-	col, verr := c.visitor().Visit(ctx, *m, signer, sc, c.Bins)
+	// From the moment the machine's collection is read into memory until
+	// this visit ends, in success or in a recorded failure, the machine is
+	// marked. Only a server that stops in between leaves the mark behind.
+	mark := func() { c.Store.SetSetting(decodingSetting(id), "1") }
+	defer c.Store.SetSetting(decodingSetting(id), "")
+	col, verr := c.visitor().Visit(visit.WithDecodeHook(ctx, mark), *m, signer, sc, c.Bins)
 	var left *visit.LeftOnMachineError
 	if verr != nil && errors.As(verr, &left) {
 		if err := c.recordLeftovers(id, left.Dirs); err != nil {
-			uncount()
 			return outcome{err: err}
 		}
 	}
@@ -486,7 +499,6 @@ func (c *Core) visit(parent, ctx context.Context, id int64, gen uint64) outcome 
 		verr = errors.New("the visit returned no collection")
 	case verr == nil:
 	case errors.Is(verr, visit.ErrHostKeyChanged):
-		uncount()
 		return c.hostKeyChanged(m, verr)
 	case left != nil && left.Collection != nil:
 		col, verr = left.Collection, nil
@@ -494,21 +506,17 @@ func (c *Core) visit(parent, ctx context.Context, id int64, gen uint64) outcome 
 	if verr != nil {
 		if parent.Err() != nil {
 			// The server is stopping: not the machine's failure.
-			uncount()
 			return outcome{err: fmt.Errorf("server: visit to machine %d stopped: %w", id, parent.Err())}
 		}
 		return c.visitFailed(id, m, verr)
 	}
-	out := c.judgeAndStore(parent, ctx, m, col, sc, gen)
-	if out.err != nil && c.failureCount(id) == prev+1 {
-		// The collection arrived; storing or judging it failed here.
-		uncount()
-	}
-	return out
+	mark() // a visitor that did not say when it started to decode
+	return c.judgeAndStore(parent, ctx, m, col, sc, gen)
 }
 
-// failureCount is how many visits to the machine in a row did not end in
-// success, the one under way included once it has started.
+// failureCount is how many visits to the machine in a row failed: those
+// recorded as failed, and those during which the server stopped while it
+// held the machine's collection.
 func (c *Core) failureCount(id int64) int {
 	v, _ := c.Store.Setting(failuresSetting(id))
 	n, _ := strconv.Atoi(v)
@@ -620,8 +628,10 @@ func (c *Core) visitFailed(id int64, m *store.Machine, verr error) outcome {
 	if err := c.Store.SetSecretSetting(errorSetting(id), []byte(boundedText(verr.Error()))); err != nil {
 		return outcome{err: errors.Join(fail, err)}
 	}
-	// The attempt was counted when the visit started.
-	n := c.failureCount(id)
+	n := c.failureCount(id) + 1
+	if err := c.Store.SetSetting(failuresSetting(id), strconv.Itoa(n)); err != nil {
+		return outcome{err: errors.Join(fail, err)}
+	}
 	if err := c.audit(actorServer, "visit failed", "machine %d", id); err != nil {
 		fail = errors.Join(fail, err)
 	}

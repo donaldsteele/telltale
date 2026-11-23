@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -166,5 +167,31 @@ func TestLoginRefusedMeansAuthenticationFailedOnly(t *testing.T) {
 	// The real thing is still marked.
 	if _, err := Visit(testCtx(t), f.machine(), newSigner(t, "ed25519"), testContext(), f.binaries(t)); !errors.Is(err, ErrLoginRefused) {
 		t.Errorf("a rejected key: %v", err)
+	}
+}
+
+// The caller is told when a visit starts to read what the machine sent,
+// before any of it is decoded: from then on the machine's data is in the
+// server's memory.
+func TestDecodeHookRunsBeforeTheCollectionIsRead(t *testing.T) {
+	f := newFake(t)
+	var order []string
+	set(t, &decodeOutput, func(r io.Reader, c *model.Collection) error {
+		order = append(order, "decode")
+		return decodeCollection(r, c)
+	})
+	ctx := WithDecodeHook(testCtx(t), func() { order = append(order, "hook") })
+	if _, err := Visit(ctx, f.machine(), f.client, testContext(), f.binaries(t)); err != nil {
+		t.Fatal(err)
+	}
+	if len(order) != 2 || order[0] != "hook" || order[1] != "decode" {
+		t.Errorf("order %v", order)
+	}
+	// A visit that never gets that far does not call it.
+	called := false
+	ctx = WithDecodeHook(testCtx(t), func() { called = true })
+	Visit(ctx, f.machine(), newSigner(t, "ed25519"), testContext(), f.binaries(t))
+	if called {
+		t.Error("the hook ran for a visit that was refused at the login")
 	}
 }

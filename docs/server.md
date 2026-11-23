@@ -346,27 +346,46 @@ passphrase file, and start it.
 - no capabilities at all, `NoNewPrivileges`, no new namespaces, only IP and
   local sockets, a system call filter, and the kernel, clock, devices and
   other processes out of reach;
-- `MemoryMax=2G`: the most memory the service may use. A visit holds what
+- `MemoryMax=4G`: the most memory the service may use. A visit holds what
   the machine sent (at most `max_collection_mib`, 64 MiB by default) and
   its decoded copy, which takes several times that, and four visits run at
   once; the limit keeps a machine that sends far too much from taking the
   server's host down with it;
-- `Environment=GOMEMLIMIT=1536MiB`: tells the Go runtime to keep its heap
+- `Environment=GOMEMLIMIT=3GiB`: tells the Go runtime to keep its heap
   below `MemoryMax` (about three quarters of it), so it frees memory
   harder before the kernel has to kill anything. If you raise
   `max_collection_mib`, raise `MemoryMax` and this with it;
 - `OOMPolicy=stop`: when the kernel has to kill one of the service's
   processes for memory, systemd stops the whole service rather than
-  leaving part of it running, and `Restart=on-failure` starts it again.
+  leaving part of it running;
+- `Restart=on-failure` with `RestartSec=30s`: the service starts again by
+  itself, which works with nobody there because the passphrase comes from
+  the credential (or from a key file).
 
-A machine you no longer trust writes its own collection, so the server
-defends itself against one built to exhaust it. It counts the collection's
-entries (files, startup files, processes, packages, lines) on the raw text
-before it decodes any, and refuses one with more than any machine has
-(`visit.oversized`). And every visit is counted as failed from the moment it
-starts until it succeeds: if the server is killed during a visit, three
-times in a row for one machine, it reports that at its next start, before it
-visits that machine again.
+**A machine you no longer trust can get the server killed.** It writes its
+own collection. The server counts the collection's entries (files, startup
+files, processes, packages, lines) on the raw text before it decodes any,
+and refuses one with more than any machine has (`visit.oversized`). That
+stops the cheapest attack, not all of them: a collection inside those
+limits can still make the server use several GiB while it is judged, more
+than `MemoryMax` allows, and the kernel then kills the service. What
+happens next:
+
+- systemd starts the server again after 30 seconds. Every other machine
+  keeps being visited; their visits that were under way are simply made
+  again and are not counted as failures.
+- The server had written down which machine's collection it was reading or
+  judging. That visit counts as a failed visit of that machine.
+- After three such visits in a row, the server reports the machine before
+  it visits it again: "The telltale server stopped during each of its last
+  visits to this machine", a backdoor sign, with an alert.
+- You can then set that machine's schedule to **Only when I press Check
+  now**, so it cannot take the server down on a timer, and look at the
+  machine from its console.
+
+Until the third visit the server restarts once per scheduled visit of that
+machine, and visits of other machines that were running at that moment are
+lost and made again at their next turn.
 
 To change it, use `sudo systemctl edit telltale` rather than editing the
 file, so a package upgrade keeps your change.

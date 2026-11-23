@@ -264,7 +264,7 @@ func TestUnitBoundsMemory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"MemoryMax=2G", "OOMPolicy=stop"} {
+	for _, want := range []string{"MemoryMax=4G", "Environment=GOMEMLIMIT=3GiB", "OOMPolicy=stop", "Restart=on-failure", "RestartSec=30s", "LoadCredential=passphrase:/etc/telltale/passphrase"} {
 		if !regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(want) + `$`).Match(unit) {
 			t.Errorf("the unit has no %s line", want)
 		}
@@ -307,14 +307,14 @@ func TestUnitSetsGoMemoryLimitBelowMemoryMax(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := regexp.MustCompile(`(?m)^Environment=GOMEMLIMIT=(\d+)MiB$`).FindSubmatch(unit)
+	m := regexp.MustCompile(`(?m)^Environment=GOMEMLIMIT=(\d+)GiB$`).FindSubmatch(unit)
 	x := regexp.MustCompile(`(?m)^MemoryMax=(\d+)G$`).FindSubmatch(unit)
 	if m == nil || x == nil {
 		t.Fatalf("GOMEMLIMIT %q, MemoryMax %q", m, x)
 	}
 	limit, _ := strconv.Atoi(string(m[1]))
 	most, _ := strconv.Atoi(string(x[1]))
-	if limit <= 0 || limit >= most*1024 || limit < most*1024/2 {
-		t.Errorf("GOMEMLIMIT %d MiB against MemoryMax %d GiB", limit, most)
+	if limit <= 0 || limit >= most || limit*2 < most {
+		t.Errorf("GOMEMLIMIT %d GiB against MemoryMax %d GiB", limit, most)
 	}
 }
