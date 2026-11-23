@@ -189,6 +189,8 @@ func Packages(root string) (model.Packages, []model.Skip) {
 	pk.StatOverrides = statOverrides(root, skip)
 	var s2 []model.Skip
 	pk.Sources, s2 = aptSources(root)
+	skips = append(skips, s2...)
+	pk.RepoTrust, s2 = aptRepoTrust(root, pk.Sources)
 	return pk, append(skips, s2...)
 }
 

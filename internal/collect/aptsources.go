@@ -97,12 +97,16 @@ func parseDeb822(file string, lines []string) []model.AptSource {
 	var out []model.AptSource
 	var cur model.AptSource
 	var have, disabled, inSigned bool
+	var inline []string
 	flush := func() {
 		if have && !disabled {
 			cur.File = file
+			if len(inline) > 0 {
+				cur.InlineKey = strings.Join(inline, "\n") + "\n"
+			}
 			out = append(out, cur)
 		}
-		cur, have, disabled, inSigned = model.AptSource{}, false, false, false
+		cur, have, disabled, inSigned, inline = model.AptSource{}, false, false, false, nil
 	}
 	for _, l := range lines {
 		if strings.TrimSpace(l) == "" {
@@ -113,8 +117,17 @@ func parseDeb822(file string, lines []string) []model.AptSource {
 			continue
 		}
 		if l[0] == ' ' || l[0] == '\t' {
-			if inSigned && cur.SignedBy == "" {
-				cur.SignedBy = "inline"
+			if inSigned {
+				if cur.SignedBy == "" {
+					cur.SignedBy = "inline"
+				}
+				// The embedded key: each line indented by one space, an
+				// empty line written as a single dot.
+				if t := strings.TrimSpace(l); t == "." {
+					inline = append(inline, "")
+				} else {
+					inline = append(inline, t)
+				}
 			}
 			continue
 		}
@@ -136,7 +149,12 @@ func parseDeb822(file string, lines []string) []model.AptSource {
 			cur.Components = strings.Fields(v)
 		case "signed-by":
 			cur.SignedBy = v
-			inSigned = v == ""
+			inSigned, inline = v == "", nil
+			if strings.HasPrefix(v, "-----BEGIN") {
+				inSigned = true
+				// The armor may start on the field's own line.
+				cur.SignedBy, inline = "inline", []string{v}
+			}
 		case "enabled":
 			disabled = strings.EqualFold(v, "no") || strings.EqualFold(v, "false")
 		}

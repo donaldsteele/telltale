@@ -263,6 +263,10 @@ type Packages struct {
 	// files are gone, but dpkg keeps their postrm script and runs it on purge.
 	Residual []Package   `json:"residual,omitempty"`
 	Sources  []AptSource `json:"sources"`
+	// RepoTrust lists, for each third-party APT source, the signing keys
+	// this machine accepts for it. See RepoTrust: only a snapshot's copy is
+	// ever used to verify anything.
+	RepoTrust []RepoTrust `json:"repo_trust,omitempty"`
 	// Diversions come from /var/lib/dpkg/diversions.
 	Diversions []Diversion `json:"diversions,omitempty"`
 	// StatOverrides come from /var/lib/dpkg/statoverride.
@@ -316,6 +320,10 @@ type AptSource struct {
 	URIs       []string `json:"uris"`
 	Suites     []string `json:"suites"`
 	Components []string `json:"components"`
+	// InlineKey is the armored key embedded in a deb822 source's Signed-By
+	// field. The collector reads it into Packages.RepoTrust; it is not
+	// stored with the source.
+	InlineKey string `json:"-"`
 }
 
 // Owners returns path -> package name for every path in every installed
