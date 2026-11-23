@@ -1459,3 +1459,81 @@ func TestVisitNoticesASilentlyDeadConnection(t *testing.T) {
 	}
 	f.check(t)
 }
+
+// The error for a changed host key carries both fingerprints, for the
+// owner to compare.
+func TestHostKeyMismatchErrorFingerprints(t *testing.T) {
+	f := newFake(t)
+	other := newSigner(t, "ed25519")
+	m := f.machine()
+	m.HostKey = authorizedLine(other.PublicKey())
+	_, err := Visit(testCtx(t), m, f.client, testContext(), f.binaries(t))
+	var hk *HostKeyMismatchError
+	if !errors.As(err, &hk) || !errors.Is(err, ErrHostKeyChanged) {
+		t.Fatalf("err = %v, want a *HostKeyMismatchError", err)
+	}
+	if hk.Pinned != ssh.FingerprintSHA256(other.PublicKey()) || hk.Offered != ssh.FingerprintSHA256(f.hostKeys[0].PublicKey()) {
+		t.Errorf("fingerprints %+v", hk)
+	}
+}
+
+func TestIsTempDir(t *testing.T) {
+	for s, want := range map[string]bool{
+		"/run/telltale.ABCDEFGH":         true,
+		"/tmp/telltale.a1b2c3d4":         true,
+		"/run/telltale.ABCDEFGH; rm -rf": false,
+		"/etc":                           false,
+		"":                               false,
+	} {
+		if got := IsTempDir(s); got != want {
+			t.Errorf("IsTempDir(%q) = %v, want %v", s, got, want)
+		}
+	}
+}
+
+// RemoveLeftovers removes what an earlier visit left behind, with one
+// command and nothing else.
+func TestRemoveLeftovers(t *testing.T) {
+	f := newFake(t)
+	dirs := []string{"/run/telltale.AbCdEfGh", "/var/tmp/telltale.12345678"}
+	for _, d := range dirs {
+		if err := os.MkdirAll(f.local(d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f.local(d+"/telltale"), f.binary, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := RemoveLeftovers(testCtx(t), f.machine(), f.client, dirs); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.commands(); !reflect.DeepEqual(got, []string{"rm -rf '/run/telltale.*' '/var/tmp/telltale.*'"}) {
+		t.Errorf("commands %q", got)
+	}
+	f.check(t)
+}
+
+// Anything but a directory of the form a visit makes is refused before the
+// server connects; a changed host key is ErrHostKeyChanged as for a visit.
+func TestRemoveLeftoversRefuses(t *testing.T) {
+	f := newFake(t)
+	for _, dirs := range [][]string{{"/etc"}, {"/run/telltale.AbCdEfGh", "/run/telltale.AbCdEfGh/../../etc"}, {"/run/telltale.AbCdEfGh\n/etc"}} {
+		if err := RemoveLeftovers(testCtx(t), f.machine(), f.client, dirs); err == nil {
+			t.Errorf("%q: removed", dirs)
+		}
+	}
+	f.mu.Lock()
+	conns := f.conns
+	f.mu.Unlock()
+	if conns != 0 {
+		t.Errorf("connected %d times for refused directories", conns)
+	}
+	m := f.machine()
+	m.HostKey = authorizedLine(newSigner(t, "ed25519").PublicKey())
+	if err := RemoveLeftovers(testCtx(t), m, f.client, []string{"/run/telltale.AbCdEfGh"}); !errors.Is(err, ErrHostKeyChanged) {
+		t.Errorf("changed host key: %v", err)
+	}
+	if err := RemoveLeftovers(testCtx(t), f.machine(), f.client, nil); err != nil {
+		t.Errorf("nothing to remove: %v", err)
+	}
+}

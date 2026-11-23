@@ -143,28 +143,13 @@ func Visit(ctx context.Context, m store.Machine, signer ssh.Signer, sc model.Sca
 	if len(sc.DigestKey) < minDigestKey {
 		return fail(fmt.Errorf("the scan context's digest key is %d bytes, the collector needs at least %d", len(sc.DigestKey), minDigestKey))
 	}
-	pinned, err := pinnedKey(m.HostKey)
-	if err != nil {
-		return fail(err)
-	}
-	hostport, err := hostPort(m.Addr)
+	hostport, cfg, err := loginConfig(m, signer)
 	if err != nil {
 		return fail(err)
 	}
 	input, err := json.Marshal(sc)
 	if err != nil {
 		return fail(err)
-	}
-	cfg := &ssh.ClientConfig{
-		User:              "root",
-		Auth:              []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyAlgorithms: algorithmsFor(pinned),
-		HostKeyCallback: func(_ string, _ net.Addr, k ssh.PublicKey) error {
-			if bytes.Equal(k.Marshal(), pinned.Marshal()) {
-				return nil
-			}
-			return fmt.Errorf("%w: pinned %s, the machine offered %s", ErrHostKeyChanged, ssh.FingerprintSHA256(pinned), ssh.FingerprintSHA256(k))
-		},
 	}
 	client, err := handshake(ctx, hostport, cfg)
 	if err != nil {
@@ -192,6 +177,77 @@ func Visit(ctx context.Context, m store.Machine, signer ssh.Signer, sc model.Sca
 		return fail(err)
 	}
 	return c, nil
+}
+
+// HostKeyMismatchError is ErrHostKeyChanged with both fingerprints, for the
+// owner to compare: the one pinned at enrolment and the one the machine
+// offered.
+type HostKeyMismatchError struct {
+	Pinned, Offered string
+}
+
+func (e *HostKeyMismatchError) Error() string {
+	return fmt.Sprintf("%v: pinned %s, the machine offered %s", ErrHostKeyChanged, e.Pinned, e.Offered)
+}
+
+func (e *HostKeyMismatchError) Unwrap() error { return ErrHostKeyChanged }
+
+// loginConfig is how the server logs into m as root with signer: only the
+// pinned host key is accepted.
+func loginConfig(m store.Machine, signer ssh.Signer) (string, *ssh.ClientConfig, error) {
+	pinned, err := pinnedKey(m.HostKey)
+	if err != nil {
+		return "", nil, err
+	}
+	hostport, err := hostPort(m.Addr)
+	if err != nil {
+		return "", nil, err
+	}
+	return hostport, &ssh.ClientConfig{
+		User:              "root",
+		Auth:              []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyAlgorithms: algorithmsFor(pinned),
+		HostKeyCallback: func(_ string, _ net.Addr, k ssh.PublicKey) error {
+			if bytes.Equal(k.Marshal(), pinned.Marshal()) {
+				return nil
+			}
+			return &HostKeyMismatchError{Pinned: ssh.FingerprintSHA256(pinned), Offered: ssh.FingerprintSHA256(k)}
+		},
+	}, nil
+}
+
+// IsTempDir reports whether d has the form of a directory a visit makes
+// (/run, /var/tmp, /root or /tmp, then telltale. and eight letters or
+// digits): the only form RemoveLeftovers puts in a command.
+func IsTempDir(d string) bool { return tempDirRE.MatchString(d) }
+
+// RemoveLeftovers logs into m as Visit does and removes directories an
+// earlier visit could not (a *LeftOnMachineError's Dirs). Every one must
+// pass IsTempDir; otherwise nothing is sent and the server does not even
+// connect. The removal has its own time limit and ends with ctx.
+func RemoveLeftovers(ctx context.Context, m store.Machine, signer ssh.Signer, dirs []string) error {
+	for _, d := range dirs {
+		if !IsTempDir(d) {
+			return fmt.Errorf("visit %s: \"%s\" is not a directory a visit makes; nothing was removed", m.Name, escape.Terminal(d))
+		}
+	}
+	if len(dirs) == 0 {
+		return nil
+	}
+	hostport, cfg, err := loginConfig(m, signer)
+	if err != nil {
+		return fmt.Errorf("visit %s: %w", m.Name, err)
+	}
+	client, err := handshake(ctx, hostport, cfg)
+	if err != nil {
+		return fmt.Errorf("visit %s: log in to %s: %w", m.Name, hostport, err)
+	}
+	r := &remote{client: client}
+	defer func() { r.client.Close() }()
+	if err := r.remove(ctx, slices.Compact(slices.Sorted(slices.Values(dirs)))...); err != nil {
+		return fmt.Errorf("visit %s: %w", m.Name, err)
+	}
+	return nil
 }
 
 // pinnedKey parses the stored host key.
