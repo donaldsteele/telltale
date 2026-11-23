@@ -1085,7 +1085,7 @@ func capitalize(s string) string {
 func persistFix(p string, cur, old *model.PersistFile, lines []diff.LineChange, meta bool, lv linkView) string {
 	switch {
 	case cur == nil:
-		return "Restore the file from a backup if you did not remove it (the snapshot's lines are shown above)."
+		return "Restore the file from a backup if you did not remove it (telltale's report shows the snapshot's lines)."
 	case old == nil:
 		return command([]string{p}, func(q []string) string {
 			return keep(q[0]) + " && rm -- " + q[0] + "   # only if you did not create it; after removing a systemd unit run systemctl daemon-reload"
@@ -1102,9 +1102,9 @@ func persistFix(p string, cur, old *model.PersistFile, lines []diff.LineChange, 
 		added = append(added, lv.line(lc.Line))
 	}
 	if !meta && len(added) > 0 {
-		return lv.deleteLines(p, added, "removes the added lines shown above")
+		return lv.deleteLines(p, added, "removes the lines that were added")
 	}
-	return fixKeepOnly(p, "then edit it back to the snapshot's lines shown above")
+	return fixKeepOnly(p, "then edit it back to the snapshot's lines, which telltale's report shows")
 }
 
 // --- SSH keys for root ---

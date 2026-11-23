@@ -3600,3 +3600,34 @@ func TestSpecialFilesBehindAMovedDirectoryKeepTheirRanking(t *testing.T) {
 	must(t, r, "pkg.unverifiable:/srv/pam/pam_unix.so", model.SevBackdoor)
 	must(t, r, "pkg.unverifiable:/srv/mod/6.1/x.ko", model.SevBackdoor)
 }
+
+// A persistence fix never points at lines "shown above": an alert shows one
+// line of the change, and other outputs put the fix elsewhere.
+func TestJudgePersistFixesSayWhereTheLinesAre(t *testing.T) {
+	old := clean()
+	old.Persist = []model.PersistFile{cron("0 3 * * * root /usr/local/bin/backup")}
+	old.Files = append(old.Files, file("/etc/cron.d/backup", "0 3 * * * root /usr/local/bin/backup", 0o644))
+	for name, c := range map[string]struct {
+		lines []string // nil: the file is gone
+		want  string
+	}{
+		"replaced": {[]string{"* * * * * root /tmp/.x"}, "then edit it back to the snapshot's lines, which telltale's report shows"},
+		"added":    {[]string{"0 3 * * * root /usr/local/bin/backup", "* * * * * root /tmp/.x"}, "removes the lines that were added"},
+		"removed":  {nil, "telltale's report shows the snapshot's lines"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cur := clone(old)
+			if c.lines == nil {
+				cur.Persist = nil
+				cur.Files = slices.DeleteFunc(cur.Files, func(f model.FileEntry) bool { return f.Path == "/etc/cron.d/backup" })
+			} else {
+				cur.Persist = []model.PersistFile{cron(c.lines...)}
+				setFile(cur, file("/etc/cron.d/backup", strings.Join(c.lines, "\n"), 0o644))
+			}
+			f := must(t, run(cur, snapOf(old), nil), "snap.persist:/etc/cron.d/backup", model.SevBackdoor)
+			if !strings.Contains(f.Fix, c.want) || strings.Contains(f.Fix, "shown above") {
+				t.Errorf("fix %q, want %q", f.Fix, c.want)
+			}
+		})
+	}
+}

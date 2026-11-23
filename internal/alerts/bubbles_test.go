@@ -218,7 +218,33 @@ func TestAlertReplacedLineShowsTheNewLine(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := fx.fake.Posts()[0]
-	if !strings.Contains(n.Text, "Changed line in "+mdText("/etc/ssh/sshd_config.d/00-lab.conf:1")+":\n```\nPermitRootLogin yes\n```") || strings.Contains(n.Text, "PermitRootLogin no") {
+	if !strings.Contains(n.Text, "Changed line in "+mdText("/etc/ssh/sshd_config.d/00-lab.conf:1")+":\n```\nPermitRootLogin yes\n```") || strings.Contains(n.Text, "PermitRootLogin no") ||
+		strings.Contains(n.Text, "other changed line") {
+		t.Errorf("text:\n%s", n.Text)
+	}
+}
+
+// The alert shows the first change in order: removing pam_deny.so cannot be
+// hidden behind a comment added further down. The other changes are
+// counted, the judge's "and N more" included.
+func TestAlertShowsTheFirstChangeNotADecoy(t *testing.T) {
+	fx := newFixture(t)
+	fx.connect(t)
+	const p = "/etc/pam.d/common-auth"
+	f := model.Finding{Key: "snap.persist:" + p, Severity: model.SevBackdoor, Title: "PAM configuration changed",
+		Evidence: []model.Evidence{
+			{Path: p, Line: 3, Before: sum("a"), After: sum("b"), Detail: "2 lines added, 1 line removed"},
+			{Path: p, Line: 3, Before: "auth requisite pam_deny.so", Detail: "line removed"},
+			{Path: p, Line: 7, After: "# tidied up", Detail: "line added"},
+			{Path: p, Line: 8, After: "# more tidying", Detail: "line added"},
+			{Detail: "and 2 more"},
+		}}
+	if err := fx.b.Notify(t.Context(), machine, []model.Finding{f}, nil); err != nil {
+		t.Fatal(err)
+	}
+	n := fx.fake.Posts()[0]
+	if !strings.Contains(n.Text, "Removed line in "+mdText(p+":3")+":\n```\nauth requisite pam_deny.so\n```\n"+mdText("4 other changed lines are in telltale's web UI.")) ||
+		strings.Contains(n.Text, "tidied") || strings.Contains(n.Text, "tidying") {
 		t.Errorf("text:\n%s", n.Text)
 	}
 }

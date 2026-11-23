@@ -407,49 +407,63 @@ const (
 	evidenceOther         // anything else: hashes, versions, a summary
 )
 
-// alertEvidence picks the one piece of evidence an alert shows, and what
-// it is. A changed line comes first: the first evidence the judge marks
-// "line added", else the first marked "line removed" (a replaced line is
-// the old one removed and the new one added, and the new one is what
-// somebody put on the machine). A snapshot finding about a persistence file
-// starts with a summary of the file (its After is the file's hash, its
-// Line the first changed line), which is never shown as a line. Then a
-// line a check matched in a file (a line number and its text). Anything
-// else is shown as evidence, not as a line. Only the first line of any
-// text is used.
-func alertEvidence(f model.Finding) (e model.Evidence, kind int, ok bool) {
+// alertEvidence picks the one piece of evidence an alert shows, what it
+// is, and, for a changed line, how many other changed lines the finding
+// has. A changed line comes first: the first change, in the judge's order,
+// of the evidence it marks "line added" or "line removed". The one
+// exception is a replaced line, a removed line followed by a line added at
+// the same place: then the added one is shown, the line the machine has
+// now. Taking the first change in order means a harmless second change (a
+// comment added further down) cannot stand in for the one that matters. A
+// snapshot finding about a persistence file starts with a summary of the
+// file (its After is the file's hash, its Line the first changed line),
+// which is never shown as a line. Then a line a check matched in a file (a
+// line number and its text). Anything else is shown as evidence, not as a
+// line. Only the first line of any text is used.
+func alertEvidence(f model.Finding) (e model.Evidence, kind, others int, ok bool) {
 	evs := f.Evidence
 	var summary *model.Evidence
 	if strings.HasPrefix(f.Key, "snap.persist:") && len(evs) > 0 {
 		summary, evs = &evs[0], evs[1:]
 	}
+	var changes []model.Evidence
+	more := 0
 	for _, x := range evs {
-		if x.Detail == "line added" && x.After != "" {
-			return x, evidenceChange, true
+		if (x.Detail == "line added" && x.After != "") || (x.Detail == "line removed" && x.Before != "") {
+			changes = append(changes, x)
+		} else if m := moreRE.FindStringSubmatch(x.Detail); m != nil && x.Path == "" && x.Before == "" && x.After == "" {
+			more, _ = strconv.Atoi(m[1]) // the judge's "and N more" after the evidence it kept
 		}
 	}
-	for _, x := range evs {
-		if x.Detail == "line removed" && x.Before != "" {
-			return x, evidenceChange, true
+	if len(changes) > 0 {
+		first, shown := changes[0], 1
+		if next := changes[min(1, len(changes)-1)]; first.Detail == "line removed" && len(changes) > 1 &&
+			next.Detail == "line added" && next.Path == first.Path && next.Line == first.Line {
+			first, shown = next, 2
 		}
+		return first, evidenceChange, len(changes) - shown + more, true
 	}
 	if summary == nil {
 		for _, x := range evs {
 			if x.Line > 0 && x.After != "" {
-				return x, evidenceLine, true
+				return x, evidenceLine, 0, true
 			}
 		}
 	}
 	if summary != nil {
-		return *summary, evidenceOther, true
+		return *summary, evidenceOther, 0, true
 	}
 	for _, x := range evs {
 		if x.After != "" || x.Before != "" || x.Detail != "" {
-			return x, evidenceOther, true
+			return x, evidenceOther, 0, true
 		}
 	}
-	return model.Evidence{}, 0, false
+	return model.Evidence{}, 0, 0, false
 }
+
+// moreRE is the evidence the judge adds when it kept only some of a
+// finding's evidence.
+var moreRE = regexp.MustCompile(`^and ([0-9]{1,9}) more$`)
 
 func where(e model.Evidence) string {
 	w := e.Path
@@ -463,7 +477,7 @@ func where(e model.Evidence) string {
 // most one line: the changed or matched line, kept text the collector
 // redacted, redacted once more here.
 func (b *Bubbles) evidenceText(f model.Finding) string {
-	e, kind, ok := alertEvidence(f)
+	e, kind, others, ok := alertEvidence(f)
 	if !ok {
 		return ""
 	}
@@ -477,10 +491,17 @@ func (b *Bubbles) evidenceText(f model.Finding) string {
 	}
 	switch kind {
 	case evidenceChange:
+		t := "Changed line" + in + ":\n" + code(e.After)
 		if e.Detail == "line removed" {
-			return "Removed line" + in + ":\n" + code(e.Before)
+			t = "Removed line" + in + ":\n" + code(e.Before)
 		}
-		return "Changed line" + in + ":\n" + code(e.After)
+		switch {
+		case others == 1:
+			t += "\n" + mdText("1 other changed line is in telltale's web UI.")
+		case others > 1:
+			t += "\n" + mdText(strconv.Itoa(others)+" other changed lines are in telltale's web UI.")
+		}
+		return t
 	case evidenceLine:
 		return "Line" + in + ":\n" + code(e.After)
 	}
