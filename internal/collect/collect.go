@@ -89,12 +89,18 @@ func All(opt Options) (*model.Collection, error) {
 	links := followLinks(opt.Root, c.Persist, c.Files, SystemPaths, func(p string) bool { return RefusedForLinks(p, c.Runtime.Mounts) }, linkChainBudget)
 	c.LinkRefused, c.LinkMissing = links.refused, links.missing
 	add(links.skips)
-	c.Files, s = ensureEntriesIn(opt.Root, c.Files, links.chain, c.Runtime.Mounts, defaultMaxHash, underNeverRead, linkSkipFS)
+	c.Files, s = ensureChainEntries(opt.Root, c.Files, links.chain, c.Runtime.Mounts, defaultMaxHash)
 	add(s)
 	// Modules the PAM configuration loads from outside the system paths.
 	c.Files, s = ensurePAMEntries(opt.Root, c.Files, c.Runtime.Mounts, c.Persist, defaultMaxHash)
 	add(s)
 	c.Packages, s = Packages(opt.Root)
+	add(s)
+	// What is behind a package directory that is a symbolic link now, so
+	// that package verification can compare the files where they are.
+	var refused, missing []string
+	c.Files, refused, missing, s = ensurePackageDirEntries(opt.Root, c.Files, c.Packages, c.Runtime.Mounts, defaultMaxHash)
+	c.LinkRefused, c.LinkMissing = append(c.LinkRefused, refused...), append(c.LinkMissing, missing...)
 	add(s)
 	c.LinkerCache, s = LinkerCache(opt.Root)
 	add(s)

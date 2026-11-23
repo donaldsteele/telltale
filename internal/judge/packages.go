@@ -2,7 +2,6 @@ package judge
 
 import (
 	"fmt"
-	"path"
 	"slices"
 	"sort"
 	"strings"
@@ -457,62 +456,24 @@ func indexSignature(errs []string) *model.Finding {
 	return f
 }
 
-// mergedTop are the top-level directories that are links into /usr on a
-// merged-/usr machine. Packages still list paths below them.
-var mergedTop = []string{"/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32"}
-
 // packageDirLinks reports each directory dpkg lists that is a symbolic link
-// now. dpkg unpacks a package into real directories; a link in the place of
-// one means every file the package lists below it is really somewhere else.
-// An admin moving /opt to another disk does that, and so does someone who
-// wants a package's names to cover other files. The files reached are
-// compared with the package by package verification; this finding says that
-// the directory itself is not what the package installed. A link that leads
-// to an ordinary place on the machine is a note; one that leads into a
-// temporary or hidden place, or nowhere the inventory can follow, is a
-// backdoor sign. The links merged /usr consists of are left out.
+// now (model.Packages.DirLinks). dpkg unpacks a package into real
+// directories; a link in the place of one means every file the package lists
+// below it is really somewhere else. An admin moving /opt to another disk
+// does that, and so does someone who wants a package's names to cover other
+// files. The collector records what is behind such a link, and package
+// verification compares it with the package where it is; this finding says
+// that the directory itself is not what the package installed.
+//
+// It is a note when the link leads to an ordinary place on the machine and
+// every file listed below it has an entry where it really is. It is a
+// backdoor sign when the link leads into a temporary, user-writable or
+// hidden place or nowhere the inventory can follow, and when a listed file
+// below it has no entry: then nobody looked at what the package's name leads
+// to. The links merged /usr consists of are left out.
 func (j *judge) packageDirLinks() {
-	lister := map[string]string{} // listed directory -> the first package listing something below it
-	for i := range j.c.Packages.Installed {
-		p := &j.c.Packages.Installed[i]
-		for _, f := range p.Files {
-			if !path.IsAbs(f) {
-				continue
-			}
-			for d := path.Dir(path.Clean(f)); d != "/"; d = path.Dir(d) {
-				if _, seen := lister[d]; seen {
-					break // its parents were entered with it
-				}
-				lister[d] = p.Name
-			}
-		}
-	}
-	dirs := make([]string, 0, len(lister))
-	for d := range lister {
-		dirs = append(dirs, d)
-	}
-	sort.Strings(dirs)
-	parents := map[string]string{} // directory as dpkg spells it -> where it is ("" = cannot be told)
-	for _, d := range dirs {
-		up := path.Dir(d)
-		real, seen := parents[up]
-		if !seen {
-			real, _ = model.ResolveInInventory(j.files, up, model.LinkHops)
-			parents[up] = real
-		}
-		if real == "" {
-			continue // below a link that is itself reported, or not recorded
-		}
-		at := path.Join(real, path.Base(d))
-		e := j.files[at]
-		if e == nil || e.Type != "symlink" {
-			continue
-		}
-		to, ok := model.ResolveInInventory(j.files, model.LinkWalk(at, e.Target), model.LinkHops)
-		if ok && slices.Contains(mergedTop, d) && to == "/usr"+d {
-			continue
-		}
-		pkgName := lister[d]
+	for _, l := range j.c.Packages.DirLinks(j.files) {
+		d, pkgName, to := l.Dir, l.Package, l.To
 		f := &model.Finding{
 			Key: "pkg.dir_now_link:" + d, ID: "TT-PKG-010", Source: srcPackage, Severity: model.SevNote,
 			Title: fmt.Sprintf("%s, a directory of package %s, is now a link to %s", d, pkgName, to),
@@ -522,12 +483,21 @@ func (j *judge) packageDirLinks() {
 			Fix: command([]string{d}, func(q []string) string {
 				return "ls -ld -- " + q[0] + " && readlink -f -- " + q[0] + "   # nothing to do if you moved this directory yourself"
 			}),
-			Evidence: []model.Evidence{{Path: d, After: "symlink -> " + e.Target, Detail: "listed as a directory by package " + pkgName + "; leads to " + to, When: j.whenFor(at)}},
+			Evidence: []model.Evidence{{Path: d, After: "symlink -> " + l.Target, Detail: "listed as a directory by package " + pkgName + "; leads to " + to, When: j.whenFor(l.At)}},
 			Refs:     []string{"T1574"},
 		}
-		reason := ""
+		// Listed files below the link that have no entry where they are.
+		var unseen []string
+		if to != "" {
+			for _, p := range l.Below {
+				if phys, ok := model.PhysicalPath(j.files, p); !ok || j.files[phys] == nil {
+					unseen = append(unseen, p)
+				}
+			}
+		}
+		reason, tail := "", "Nobody keeps a package's files there: whatever the link leads to is what programs get when they ask for this package's files."
 		switch {
-		case !ok:
+		case to == "":
 			reason = "it leads nowhere telltale could follow"
 			f.Title = fmt.Sprintf("%s, a directory of package %s, is now a link that cannot be followed", d, pkgName)
 			f.Evidence[0].Detail = "listed as a directory by package " + pkgName + "; where the link leads cannot be told"
@@ -535,11 +505,19 @@ func (j *judge) packageDirLinks() {
 			reason = "it leads into " + underTemp(to)
 		case hiddenPath(to):
 			reason = "it leads into a hidden directory"
+		case len(unseen) > 0:
+			reason = fmt.Sprintf("%d of the %d files the package lists below it could not be checked where the link leads (they are missing there, or telltale could not look)", len(unseen), len(l.Below))
+			tail = "What programs get when they ask for those files is unknown: they were not compared with the package."
+			for i, p := range unseen {
+				if i == maxEvidence-1 {
+					break
+				}
+				f.Evidence = append(f.Evidence, model.Evidence{Path: p, Detail: "listed by a package below " + d + "; nothing was found for it where the link leads"})
+			}
 		}
 		if reason != "" {
 			f.Severity = model.SevBackdoor
-			f.Why = "dpkg unpacked this package into a real directory here; a symbolic link is in its place now, and " + reason + ". " +
-				"Nobody keeps a package's files there: whatever the link leads to is what programs get when they ask for this package's files."
+			f.Why = "dpkg unpacked this package into a real directory here; a symbolic link is in its place now, and " + reason + ". " + tail
 			f.Fix = command([]string{d, pkgName}, func(q []string) string {
 				return keep(q[0]) + " && ls -la -- " + q[0] + "/   # the link is saved; look at what it leads to. To put the package's directory back: rm -- " + q[0] + " && apt-get install --reinstall -- " + q[1]
 			})
@@ -548,9 +526,13 @@ func (j *judge) packageDirLinks() {
 	}
 }
 
-// underTemp names the world-writable temporary tree p is in, or "".
+// tempPlaces are trees any user can write to: the world-writable temporary
+// directories, each user's runtime directory and the lock directory.
+var tempPlaces = []string{"/tmp", "/dev/shm", "/var/tmp", "/run/user", "/run/lock"}
+
+// underTemp names the temporary or user-writable tree p is in, or "".
 func underTemp(p string) string {
-	for _, d := range []string{"/tmp", "/dev/shm", "/var/tmp"} {
+	for _, d := range tempPlaces {
 		if p == d || strings.HasPrefix(p, d+"/") {
 			return d
 		}

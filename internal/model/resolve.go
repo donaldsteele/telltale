@@ -247,3 +247,115 @@ func PhysicalOwnersOf(byList map[string]string, files map[string]*FileEntry) (ow
 	}
 	return owners, literal
 }
+
+// mergedTop are the top-level directories that are links into /usr on a
+// merged-/usr machine. Packages still list paths below them.
+var mergedTop = []string{"/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32"}
+
+// PackageDirLink is a directory dpkg lists that is a symbolic link now.
+type PackageDirLink struct {
+	Dir     string // as dpkg spells it
+	At      string // where the link itself is
+	Target  string // the link's text
+	Package string // the first package listing something below Dir
+	To      string // where the link leads; "" when the inventory cannot follow it
+	// Below lists, sorted, every path any package lists below Dir that is
+	// not itself a listed directory: the files (and links) dpkg unpacked
+	// through Dir.
+	Below []string
+}
+
+// DirLinks returns each directory the installed packages list that is a
+// symbolic link in the inventory, sorted by Dir. dpkg unpacks a package into
+// real directories; a link in the place of one means every file listed below
+// it is really somewhere else. The links merged /usr consists of (/bin ->
+// usr/bin and so on, when they lead exactly there) are left out. A directory
+// below a link that cannot be followed is not looked at: nothing is known
+// about it.
+func (p Packages) DirLinks(files map[string]*FileEntry) []PackageDirLink {
+	lister := map[string]string{} // listed directory -> the first package listing something below it
+	for i := range p.Installed {
+		pk := &p.Installed[i]
+		for _, f := range pk.Files {
+			if !path.IsAbs(f) {
+				continue
+			}
+			for d := path.Dir(path.Clean(f)); d != "/"; d = path.Dir(d) {
+				if _, seen := lister[d]; seen {
+					break // its parents were entered with it
+				}
+				lister[d] = pk.Name
+			}
+		}
+	}
+	dirs := make([]string, 0, len(lister))
+	for d := range lister {
+		dirs = append(dirs, d)
+	}
+	sort.Strings(dirs)
+	parents := map[string]string{} // directory as dpkg spells it -> where it is ("" = cannot be told)
+	var out []PackageDirLink
+	for _, d := range dirs {
+		up := path.Dir(d)
+		real, seen := parents[up]
+		if !seen {
+			real, _ = ResolveInInventory(files, up, LinkHops)
+			parents[up] = real
+		}
+		if real == "" {
+			continue
+		}
+		at := path.Join(real, path.Base(d))
+		e := files[at]
+		if e == nil || e.Type != "symlink" {
+			continue
+		}
+		to, ok := ResolveInInventory(files, LinkWalk(at, e.Target), LinkHops)
+		if ok && to == "/usr"+d {
+			merged := false
+			for _, m := range mergedTop {
+				merged = merged || m == d
+			}
+			if merged {
+				continue
+			}
+		}
+		out = append(out, PackageDirLink{Dir: d, At: at, Target: e.Target, Package: lister[d], To: to})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	for i := range p.Installed {
+		for _, f := range p.Installed[i].Files {
+			if !path.IsAbs(f) {
+				continue
+			}
+			f = path.Clean(f)
+			if _, isDir := lister[f]; isDir || seen[f] {
+				continue
+			}
+			seen[f] = true
+			for j := range out {
+				if strings.HasPrefix(f, out[j].Dir+"/") {
+					out[j].Below = append(out[j].Below, f)
+				}
+			}
+		}
+	}
+	for j := range out {
+		sort.Strings(out[j].Below)
+	}
+	return out
+}
+
+// PhysicalPath returns where the listed path p is when the directories on
+// the way to it are followed in the inventory; its own last component is not
+// followed. ok is false when the directory cannot be resolved.
+func PhysicalPath(files map[string]*FileEntry, p string) (string, bool) {
+	real, ok := ResolveInInventory(files, path.Dir(p), LinkHops)
+	if !ok {
+		return "", false
+	}
+	return path.Join(real, path.Base(p)), true
+}

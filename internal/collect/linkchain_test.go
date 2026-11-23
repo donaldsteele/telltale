@@ -339,12 +339,146 @@ func TestChainEntriesOnTmpfsAreMarkedVolatile(t *testing.T) {
 	os.WriteFile(root+"/run/systemd/resolve/stub-resolv.conf", []byte("nameserver 127.0.0.53\n"), 0o644)
 	os.WriteFile(root+"/opt/pkg/file", []byte("x"), 0o644)
 	mounts := []model.Mount{{Path: "/", FSType: "ext4"}, {Path: "/run", FSType: "tmpfs"}}
-	files, _ := ensureEntriesIn(root, nil, []string{"/run", "/run/systemd/resolve/stub-resolv.conf", "/opt/pkg/file"}, mounts, 1<<20, underNeverRead, linkSkipFS)
+	files, _ := ensureChainEntries(root, nil, []string{"/run", "/run/systemd/resolve/stub-resolv.conf", "/opt/pkg/file"}, mounts, 1<<20)
+	// The same paths recorded for another reason (the target of a startup
+	// link, a PAM module) are files something runs: compared in full.
+	plain, _ := ensureEntriesIn(root, nil, []string{"/run/systemd/resolve/stub-resolv.conf"}, mounts, 1<<20, underNeverRead, linkSkipFS)
+	if len(plain) != 1 || plain[0].Volatile || !plain[0].Supplementary {
+		t.Errorf("an entry outside the chain walk is marked volatile: %+v", plain)
+	}
 	got := map[string]bool{}
 	for _, f := range files {
 		got[f.Path] = f.Volatile
 	}
 	if len(got) != 3 || !got["/run"] || !got["/run/systemd/resolve/stub-resolv.conf"] || got["/opt/pkg/file"] {
 		t.Errorf("volatile marks: %v", got)
+	}
+}
+
+// A package directory moved to where the file scan does not go (/srv), with
+// a link left in its place: the collector records what is behind the link
+// for every path the package lists there, so that package verification has
+// the files to compare. A file that is not there, or lies where the
+// collector does not look, gets no entry.
+func TestPackageDirectoryContentsAreRecorded(t *testing.T) {
+	root := t.TempDir()
+	const sec = "/usr/lib/x86_64-linux-gnu/security"
+	os.MkdirAll(root+"/usr/lib/x86_64-linux-gnu", 0o755)
+	os.MkdirAll(root+"/usr/bin", 0o755)
+	os.MkdirAll(root+"/etc", 0o755)
+	os.MkdirAll(root+"/srv/pam/sub", 0o755)
+	os.MkdirAll(root+"/srv/deeper", 0o755)
+	os.MkdirAll(root+"/proc/1", 0o755)
+	os.WriteFile(root+"/srv/pam/pam_unix.so", []byte("evil"), 0o644)
+	os.WriteFile(root+"/srv/pam/sub/x.so", []byte("x"), 0o644)
+	os.WriteFile(root+"/srv/deeper/y.so", []byte("y"), 0o644)
+	os.WriteFile(root+"/usr/bin/ls", []byte("ls"), 0o755)
+	os.Symlink("/srv/pam", root+sec)
+	os.Symlink("/var/lib/x/evil", root+"/srv/pam/pam_link.so")
+	os.Symlink("/srv/deeper", root+"/srv/pam/nested")
+	os.Symlink("usr/bin", root+"/bin")
+	os.Symlink("/proc/1", root+"/usr/lib/kern")
+	pkgs := model.Packages{Installed: []model.Package{
+		{Name: "libpam-modules", Files: []string{sec, sec + "/pam_unix.so", sec + "/pam_gone.so", sec + "/pam_link.so", sec + "/sub", sec + "/sub/x.so", sec + "/nested", sec + "/nested/y.so"}},
+		{Name: "coreutils", Files: []string{"/bin", "/bin/ls"}},
+		{Name: "kern", Files: []string{"/usr/lib/kern", "/usr/lib/kern/secret"}},
+	}}
+	files, _ := Files(root, []string{"/usr", "/etc", "/bin"}, FileOptions{})
+	res := followLinks(root, nil, files, nil, underNeverRead, linkChainBudget)
+	files, _ = ensureChainEntries(root, files, res.chain, nil, 1<<20)
+	if model.Inventory(files)["/srv/pam/pam_unix.so"] != nil {
+		t.Fatal("the link pass alone recorded the file: this test no longer shows anything")
+	}
+	files, _, missing, skips := ensurePackageDirEntries(root, files, pkgs, nil, 1<<20)
+	inv := model.Inventory(files)
+	for _, p := range []string{"/srv/pam/pam_unix.so", "/srv/pam/sub/x.so", "/srv/deeper/y.so"} {
+		e := inv[p]
+		if e == nil || e.Type != "file" || e.SHA256 == "" || !e.Supplementary || e.Volatile {
+			t.Errorf("%s: want a hashed supplementary entry, got %+v", p, e)
+		}
+	}
+	if e := inv["/srv/pam/pam_link.so"]; e == nil || e.Type != "symlink" || e.Target != "/var/lib/x/evil" {
+		t.Errorf("a link where the package has a file is not recorded as one: %+v", e)
+	}
+	if inv["/srv/pam/pam_gone.so"] != nil || !slices.Contains(missing, "/srv/pam/pam_gone.so") {
+		t.Errorf("a file that is not there: entry %+v, missing %q", inv["/srv/pam/pam_gone.so"], missing)
+	}
+	// A package directory that leads into a kernel tree cannot be followed
+	// in the inventory: nothing is looked for there (the judge reports the
+	// link itself).
+	for p := range inv {
+		if strings.HasPrefix(p, "/proc") {
+			t.Errorf("recorded %s", p)
+		}
+	}
+	if len(skips) != 0 {
+		t.Errorf("skips: %+v", skips)
+	}
+	// Nothing left to look for but what could not be found.
+	if left := packageDirPaths(pkgs, files); !slices.Equal(left, []string{sec + "/pam_gone.so"}) {
+		t.Errorf("still without an entry: %q", left)
+	}
+}
+
+// Any user can plant padded startup links in a home directory; a hundred of
+// them spend the whole budget. System startup links are followed first, and
+// one the inventory already resolves is not walked at all, so neither ends
+// up among the links telltale could not resolve.
+func TestUserLinksCannotStarveSystemLinks(t *testing.T) {
+	root := t.TempDir()
+	const home = "/home/u"
+	wants := home + "/.config/systemd/user/default.target.wants"
+	os.MkdirAll(root+wants, 0o755)
+	os.MkdirAll(root+home+"/x", 0o755)
+	os.MkdirAll(root+"/usr/lib/systemd/system", 0o755)
+	os.MkdirAll(root+"/etc/systemd/system/multi-user.target.wants", 0o755)
+	os.MkdirAll(root+"/etc/cron.daily", 0o755)
+	os.MkdirAll(root+"/opt/vendor", 0o755)
+	os.WriteFile(root+"/usr/lib/systemd/system/ssh.service", []byte("[Service]\n"), 0o644)
+	os.WriteFile(root+"/opt/vendor/job", []byte("#!/bin/sh\n"), 0o755)
+	const sys, cron = "/etc/systemd/system/multi-user.target.wants/ssh.service", "/etc/cron.daily/vendor"
+	os.Symlink("/usr/lib/systemd/system/ssh.service", root+sys)
+	os.Symlink("/opt/vendor/job", root+cron)
+	pad := strings.Repeat("x/../", 800)
+	for i := 1; i <= 8; i++ {
+		next := fmt.Sprintf("L%d", i+1)
+		if i == 8 {
+			next = "end"
+		}
+		os.Symlink(pad+next, fmt.Sprintf("%s%s/L%d", root, home, i))
+	}
+	// The user's links come first in the list, as they may on a machine.
+	var persist []model.PersistFile
+	const n = 100
+	for i := 0; i < n; i++ {
+		a := fmt.Sprintf("%s/A%d", home, i)
+		os.Symlink(pad+"L1", root+a)
+		p := fmt.Sprintf("%s/u%d.service", wants, i)
+		os.Symlink(a, root+p)
+		persist = append(persist, model.PersistFile{Path: p, Mode: 0o120777, Lines: []string{a}})
+	}
+	persist = append(persist,
+		model.PersistFile{Path: sys, Mode: 0o120777, Lines: []string{"/usr/lib/systemd/system/ssh.service"}},
+		model.PersistFile{Path: cron, Mode: 0o120777, Lines: []string{"/opt/vendor/job"}})
+	files, _ := Files(root, []string{"/usr", "/etc"}, FileOptions{})
+	files, _ = ensureEntriesIn(root, files, linkTargets(persist), nil, 1<<20, underNeverRead, linkSkipFS)
+	res := followLinks(root, persist, files, nil, underNeverRead, linkChainBudget)
+	if res.unwalked == 0 || len(res.skips) == 0 {
+		t.Fatalf("the user's links did not spend the budget: this test shows nothing (%d lookups)", res.spent)
+	}
+	for _, l := range []string{sys, cron} {
+		if slices.Contains(res.refused, l) {
+			t.Errorf("%s is among the links not looked at", l)
+		}
+	}
+	if !slices.ContainsFunc(res.refused, func(p string) bool { return strings.HasPrefix(p, home+"/") }) {
+		t.Errorf("no user link is recorded as not followed: %q", res.refused)
+	}
+	files, _ = ensureChainEntries(root, files, res.chain, nil, 1<<20)
+	inv := model.Inventory(files)
+	for l, want := range map[string]string{sys: "/usr/lib/systemd/system/ssh.service", cron: "/opt/vendor/job"} {
+		if got, ok := model.ResolveInInventory(inv, l, model.LinkHops); !ok || got != want {
+			t.Errorf("%s resolves to %q (ok %v), want %s", l, got, ok, want)
+		}
 	}
 }

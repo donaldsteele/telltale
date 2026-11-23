@@ -3238,7 +3238,7 @@ func dirAt(p string) model.FileEntry {
 func TestPackageDirectoryLinkDoesNotOwnWhatItLeadsTo(t *testing.T) {
 	for _, target := range []string{"/usr/share/evil", "/srv/evil"} {
 		c := clean()
-		c.Files = append(c.Files, dirAt("/usr/lib"), symlinkAt("/usr/lib/foo", target, taken), file(target+"/helper", "bash 5.2", 0o4755))
+		c.Files = append(c.Files, dirAt("/usr/lib"), symlinkAt("/usr/lib/foo", target, taken), file(target+"/helper", "bash 5.2", 0o4755), file(target+"/README", "readme", 0o644))
 		c.Packages.Installed = append(c.Packages.Installed, pkg("foo", "1.0-1", "/usr/lib/foo", "/usr/lib/foo/helper", "/usr/lib/foo/README"))
 		c.Runtime.Processes = append(c.Runtime.Processes, model.Process{PID: 4242, PPID: 1, UID: 0, Exe: target + "/helper", Comm: "helper", Cmdline: target + "/helper"})
 		c.Runtime.Sockets = append(c.Runtime.Sockets, model.Socket{Proto: "tcp", Local: "0.0.0.0:31337", State: "LISTEN", PID: 4242, Listening: true})
@@ -3317,6 +3317,15 @@ func TestPackageDirectoryNowALink(t *testing.T) {
 		{"/lib pointed somewhere else", []model.FileEntry{symlinkAt("/lib", "/var/tmp/lib", taken), file("/var/tmp/lib/x.so", "x", 0o644)},
 			[]string{"/lib", "/lib/x.so"},
 			map[string]model.Severity{"/lib": model.SevBackdoor}, nil},
+		{"into a user's runtime directory", []model.FileEntry{dirAt("/usr/lib"), symlinkAt("/usr/lib/foo", "/run/user/1000/foo", taken), file("/run/user/1000/foo/helper", "x", 0o755)},
+			[]string{"/usr/lib/foo", "/usr/lib/foo/helper"},
+			map[string]model.Severity{"/usr/lib/foo": model.SevBackdoor}, nil},
+		{"into /run/lock", []model.FileEntry{dirAt("/usr/lib"), symlinkAt("/usr/lib/foo", "/run/lock/foo", taken), file("/run/lock/foo/helper", "x", 0o755)},
+			[]string{"/usr/lib/foo", "/usr/lib/foo/helper"},
+			map[string]model.Severity{"/usr/lib/foo": model.SevBackdoor}, nil},
+		{"elsewhere under /run is not a temporary place", []model.FileEntry{dirAt("/usr/lib"), symlinkAt("/usr/lib/foo", "/run/foo", taken), file("/run/foo/helper", "x", 0o755)},
+			[]string{"/usr/lib/foo", "/usr/lib/foo/helper"},
+			map[string]model.Severity{"/usr/lib/foo": model.SevNote}, nil},
 		{"a link the package ships as its last component", []model.FileEntry{dirAt("/usr/lib"), dirAt("/usr/lib/jvm"), dirAt("/usr/lib/jvm/java-17"), symlinkAt("/usr/lib/jvm/default-java", "java-17", taken)},
 			[]string{"/usr/lib/jvm", "/usr/lib/jvm/default-java", "/usr/lib/jvm/java-17"},
 			nil, []string{"/usr/lib/jvm/default-java"}},
@@ -3420,11 +3429,13 @@ func TestChangedLinkPastTheInventoryEdge(t *testing.T) {
 	}
 }
 
-// A setuid or capability file behind a package directory that was moved is
-// not "unowned" when package verification compared it, where it really is,
-// with the signed package and found it the package's own: the moved
-// directory is already reported. The machine's own checksums, which root can
-// edit, prove nothing of the kind, and neither does the absence of a verdict.
+// A setuid file behind a package directory that was moved is not "unowned"
+// when package verification compared it, where it really is, with the signed
+// package and found it the package's own: the moved directory is already
+// reported. The machine's own checksums, which root can edit, prove nothing
+// of the kind, and neither does the absence of a verdict. A file capability
+// is never cleared this way: package verification compares content and mode,
+// not capabilities, so a verified file can carry one the package never gave.
 func TestVerifiedFileBehindAMovedDirectoryIsNotUnowned(t *testing.T) {
 	const lit, phys = "/opt/google/chrome/chrome-sandbox", "/data/opt/google/chrome/chrome-sandbox"
 	const capLit, capPhys = "/opt/google/chrome/nethelper", "/data/opt/google/chrome/nethelper"
@@ -3448,7 +3459,7 @@ func TestVerifiedFileBehindAMovedDirectoryIsNotUnowned(t *testing.T) {
 	for _, src := range []string{pkgverify.SourceArchive, pkgverify.SourceRefs, pkgverify.SourceSnapshot} {
 		r := run(mk(), nil, signed(src))
 		absent(t, r, "heur.unowned_setuid:"+phys)
-		absent(t, r, "heur.unowned_caps:"+capPhys)
+		must(t, r, "heur.unowned_caps:"+capPhys, model.SevBackdoor)
 		must(t, r, "pkg.dir_now_link:/opt", model.SevNote)
 	}
 	// Only the machine's own checksums say so.
@@ -3470,4 +3481,53 @@ func TestVerifiedFileBehindAMovedDirectoryIsNotUnowned(t *testing.T) {
 	res := signed(pkgverify.SourceArchive)
 	res.Verified = append(res.Verified, verdict("/srv/x/sandbox", "google-chrome-stable", "131.0-1", "sandbox"))
 	must(t, run(c, nil, res), "heur.unowned_setuid:/srv/x/sandbox", model.SevBackdoor)
+}
+
+// A package directory moved to where the file scan does not go: the files
+// behind the link are compared with the package only if the collector got an
+// entry for each. One listed file without an entry (it is missing, on a
+// mount the collector stays out of, or past its budget) means nobody looked
+// at what the package's name now leads to, and the note would be a lie.
+func TestPackageDirectoryLinkWithFilesNotLookedAt(t *testing.T) {
+	const sec = "/usr/lib/x86_64-linux-gnu/security"
+	const key = "pkg.dir_now_link:" + sec
+	mk := func(extra ...model.FileEntry) *model.Collection {
+		c := clean()
+		c.Files = append(c.Files, dirAt("/usr/lib"), dirAt("/usr/lib/x86_64-linux-gnu"), symlinkAt(sec, "/srv/pam", taken), dirAt("/srv"), dirAt("/srv/pam"))
+		c.Files = append(c.Files, extra...)
+		c.Packages.Installed = append(c.Packages.Installed, pkg("libpam-modules", "1.5.2-6", sec, sec+"/pam_unix.so", sec+"/pam_deny.so", sec+"/sub", sec+"/sub/x.so"))
+		return c
+	}
+	unix, deny, sub := file("/srv/pam/pam_unix.so", "unix", 0o644), file("/srv/pam/pam_deny.so", "deny", 0o644), file("/srv/pam/sub/x.so", "x", 0o644)
+	// Every listed file has an entry where it really is.
+	must(t, run(mk(unix, deny, sub), nil, archive()), key, model.SevNote)
+	// None has.
+	f := must(t, run(mk(), nil, archive()), key, model.SevBackdoor)
+	if f != nil && (!strings.Contains(f.Why, "could not be checked") || !slices.ContainsFunc(f.Evidence, func(e model.Evidence) bool { return e.Path == sec+"/pam_unix.so" })) {
+		t.Errorf("the finding does not say which files were not checked: %s / %+v", f.Why, f.Evidence)
+	}
+	// One is missing.
+	f = must(t, run(mk(unix, sub), nil, archive()), key, model.SevBackdoor)
+	if f != nil && (!slices.ContainsFunc(f.Evidence, func(e model.Evidence) bool { return e.Path == sec+"/pam_deny.so" }) ||
+		slices.ContainsFunc(f.Evidence, func(e model.Evidence) bool { return e.Path == sec+"/pam_unix.so" })) {
+		t.Errorf("evidence should name pam_deny.so only: %+v", f.Evidence)
+	}
+	// A link where the package has a file is an entry: package verification
+	// reports the difference.
+	must(t, run(mk(unix, sub, symlinkAt("/srv/pam/pam_deny.so", "/var/lib/x/evil", taken)), nil, archive()), key, model.SevNote)
+}
+
+// /run/user/<uid> and /run/lock are writable by ordinary users.
+func TestChangedLinkIntoAUserWritableRuntimeDirectory(t *testing.T) {
+	const alt = "/etc/alternatives/awk"
+	old := clean()
+	old.Files = append(old.Files, dirAt("/etc/alternatives"), symlinkAt(alt, "/usr/bin/mawk", taken), file("/usr/bin/mawk", "mawk", 0o755))
+	for target, why := range map[string]string{"/run/user/1000/mawk": "points into /run/user", "/run/lock/mawk": "points into /run/lock"} {
+		c := clean()
+		c.Files = append(c.Files, dirAt("/etc/alternatives"), file("/usr/bin/mawk", "mawk", 0o755), symlinkAt(alt, target, changed), file(target, "evil", 0o755))
+		f := find(run(c, snapOf(clone(old)), archive()), "snap.file_modified:"+alt)
+		if f == nil || f.Severity != model.SevBackdoor || !strings.Contains(f.Why, why) {
+			t.Errorf("%s: want a backdoor sign (%s), got %+v", target, why, f)
+		}
+	}
 }

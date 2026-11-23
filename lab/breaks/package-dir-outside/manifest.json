@@ -1,0 +1,35 @@
+{
+  "requires": {},
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "pkg.mismatch:/srv/ssh-data/sftp-server",
+        "severity": "tampering"
+      },
+      {
+        "key_prefix": "pkg.mismatch:/srv/ssh-data/ssh-pkcs11-helper",
+        "severity": "tampering"
+      },
+      {
+        "key_prefix": "pkg.dir_now_link:/usr/lib/openssh",
+        "severity": "note"
+      }
+    ]
+  },
+  "without_snapshot": {
+    "must": [
+      {
+        "key_prefix": "pkg.mismatch:/srv/ssh-data/sftp-server",
+        "severity": "tampering"
+      },
+      {
+        "key_prefix": "pkg.mismatch:/srv/ssh-data/ssh-pkcs11-helper",
+        "severity": "tampering"
+      },
+      {
+        "key_prefix": "pkg.dir_now_link:/usr/lib/openssh",
+        "severity": "note"
+      }
+    ]
+  }
+}

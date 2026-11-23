@@ -539,17 +539,31 @@ func (s *session) physical(p string) string {
 	return path.Join(real, path.Base(p))
 }
 
-// physicalFile is physical for a package path that is not a regular file
-// under dpkg's spelling: the regular file really reached, or "".
+// physicalFile is physicalEntry when what is really reached is a regular
+// file, else "".
 func (s *session) physicalFile(p string) string {
+	q := s.physicalEntry(p)
+	if q == "" || !isRegular(s.files[q]) {
+		return ""
+	}
+	return q
+}
+
+// physicalEntry is physical for a package path that is not a regular file
+// under dpkg's spelling: the path of the entry really reached, of whatever
+// type (a link or a directory where the package has a file is a difference
+// to report), or "" when nothing was collected there.
+//
+// A path that some package lists under that very spelling is never reached
+// this way: it is that package's, and is compared with that package alone.
+// Otherwise a link from one package's directory into another's would have
+// the first package vouch for a file put in the second one's place.
+func (s *session) physicalEntry(p string) string {
 	if e := s.files[p]; e != nil && isRegular(e) {
 		return ""
 	}
 	q := s.physical(p)
-	if q == "" {
-		return ""
-	}
-	if e := s.files[q]; e == nil || !isRegular(e) {
+	if q == "" || s.files[q] == nil || s.owners[q] != "" {
 		return ""
 	}
 	if !slices.Contains(s.physLit[q], p) {
@@ -1365,8 +1379,9 @@ func (s *session) placeTables(results []*pkgResult) map[string][]expect {
 			idx[a] = append(idx[a], x)
 		}
 		// Not a regular file where dpkg installs it: when a directory on
-		// the way is a link, the file really reached is the one to compare.
-		if q := s.physicalFile(at); q != "" && !slices.ContainsFunc(idx[q], func(y expect) bool { return y.r == x.r && y.path == x.path }) {
+		// the way is a link, what is really reached is what to compare,
+		// whatever its type.
+		if q := s.physicalEntry(at); q != "" && !slices.ContainsFunc(idx[q], func(y expect) bool { return y.r == x.r && y.path == x.path }) {
 			idx[q] = append(idx[q], x)
 		}
 	}

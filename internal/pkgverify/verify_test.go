@@ -2049,3 +2049,72 @@ func TestVerifyOfflineFollowsAPackageDirectoryThatIsNowALink(t *testing.T) {
 		}
 	}
 }
+
+// The package's file behind a moved directory is itself a link now. Without
+// the move that is a type mismatch; the move must not turn it into nothing.
+func TestVerifyLeafLinkBehindAMovedDirectory(t *testing.T) {
+	f := toolFixture(t)
+	const to = "/data/lib"
+	const phys = to + "/libtool.so.1"
+	disk := toolDisk(nil)
+	delete(disk, libDir+"/libtool.so.1")
+	c := collectionOf(disk, toolPackage())
+	dir := func(p string) model.FileEntry { return model.FileEntry{Path: p, Type: "dir", Mode: 0o40755} }
+	c.Files = append(c.Files, dir("/usr"), dir("/usr/lib"), dir("/data"), dir(to),
+		symlinkEntry(libDir, to), symlinkEntry(phys, "/data/evil.so"), regular("/data/evil.so", "evil lib\n", 0o644))
+	res := Verify(context.Background(), c, f.opts())
+	if m, ok := find(res.Mismatch, phys); !ok || m.Kind != KindTypeDiffers || m.Package != "tool" || !strings.Contains(m.Actual, "/data/evil.so") {
+		t.Errorf("a link where the package has a file, behind a moved directory: Mismatch %+v", res.Mismatch)
+	}
+	// A directory there is a difference too.
+	c.Files[len(c.Files)-2] = dir(phys)
+	res = Verify(context.Background(), c, f.opts())
+	if m, ok := find(res.Mismatch, phys); !ok || m.Kind != KindTypeDiffers {
+		t.Errorf("a directory where the package has a file: Mismatch %+v", res.Mismatch)
+	}
+}
+
+// A path dpkg lists for one package is that package's, whatever link leads
+// another package's path to it. Package other lists /usr/lib/other/tool;
+// with /usr/lib/other a link to /usr/bin, other's tool put at /usr/bin/tool
+// is still compared with package tool, whose path that is.
+func TestVerifyLiteralOwnerWinsOverAMovedDirectory(t *testing.T) {
+	dirT := byte(tar.TypeDir)
+	const otherBody = "other tool binary\n"
+	otherDeb := buildDeb(t, "xz", nil, []debEntry{
+		{name: "./", typ: dirT, mode: 0o755},
+		{name: "./usr/", typ: dirT, mode: 0o755},
+		{name: "./usr/lib/", typ: dirT, mode: 0o755},
+		{name: "./usr/lib/other/", typ: dirT, mode: 0o755},
+		{name: "./usr/lib/other/tool", body: otherBody, mode: 0o755},
+	})
+	f := newFixture(t, map[string][]fakePkg{
+		"bookworm":         nil,
+		"bookworm-updates": {{"tool", "1.0-1", "amd64", toolDeb(t, "xz")}, {"other", "2.0-1", "amd64", otherDeb}},
+	})
+	other := model.Package{Name: "other", Version: "2.0-1", Arch: "amd64", Status: "install ok installed",
+		Files: []string{"/usr/lib/other", "/usr/lib/other/tool"}, LocalMD5: map[string]string{"/usr/lib/other/tool": md5hex(otherBody)}}
+	dir := func(p string) model.FileEntry { return model.FileEntry{Path: p, Type: "dir", Mode: 0o40755} }
+	c := collectionOf(toolDisk(map[string]string{"/usr/bin/tool": otherBody}), toolPackage(), other)
+	c.Files = append(c.Files, dir("/usr"), dir("/usr/lib"), dir("/usr/bin"), symlinkEntry("/usr/lib/other", "/usr/bin"))
+	res := Verify(context.Background(), c, f.opts())
+	if v, ok := find(res.Verified, "/usr/bin/tool"); ok {
+		t.Errorf("/usr/bin/tool is verified as package %s's file", v.Package)
+	}
+	if m, ok := find(res.Mismatch, "/usr/bin/tool"); !ok || m.Package != "tool" || m.Kind != KindContentDiffers {
+		t.Errorf("want a mismatch for package tool, got %+v", res.Mismatch)
+	}
+	// Offline: the machine's checksum for other's path does not vouch for it.
+	root := t.TempDir()
+	for p, body := range toolDisk(map[string]string{"/usr/bin/tool": otherBody}) {
+		os.MkdirAll(filepath.Join(root, filepath.Dir(p)), 0o755)
+		os.WriteFile(filepath.Join(root, p), []byte(body), 0o644)
+	}
+	res = Verify(context.Background(), c, Options{Offline: true, Root: root})
+	if v, ok := find(res.Verified, "/usr/bin/tool"); ok {
+		t.Errorf("offline: /usr/bin/tool is verified as package %s's file", v.Package)
+	}
+	if m, ok := find(res.Mismatch, "/usr/bin/tool"); !ok || m.Package != "tool" {
+		t.Errorf("offline: want a mismatch for package tool, got %+v", res.Mismatch)
+	}
+}
