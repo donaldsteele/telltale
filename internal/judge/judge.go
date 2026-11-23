@@ -19,6 +19,7 @@ import (
 	"github.com/donaldsteele/telltale/internal/heuristics"
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/internal/pkgverify"
+	"github.com/donaldsteele/telltale/internal/pkgverify/vendorkeys"
 )
 
 // Input is everything one judgement needs.
@@ -30,6 +31,10 @@ type Input struct {
 	// Pkg is the package verification result; nil means it did not run.
 	Pkg *pkgverify.Result
 	Now time.Time
+	// Vendors are the well-known vendors' pinned repository keys, for the
+	// note on a machine that trusts another key for a vendor's repository.
+	// Nil means the built-in table.
+	Vendors *vendorkeys.Table
 }
 
 // Fixed report wording.
@@ -221,6 +226,7 @@ func Judge(in Input) *model.Report {
 	}
 	j.packages()
 	j.packageDirLinks()
+	j.repoKeys()
 	if j.old != nil {
 		j.changes(chs)
 		j.finishPackages()

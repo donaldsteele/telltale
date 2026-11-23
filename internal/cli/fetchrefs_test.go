@@ -2,6 +2,7 @@ package cli
 
 import (
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/pkgverify"
+	"github.com/donaldsteele/telltale/internal/snapshot"
 )
 
 func writeCollection(t *testing.T, c *model.Collection, gz bool) string {
@@ -101,5 +104,41 @@ func TestFetchRefsRefusesNonEmptyDir(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(filepath.Join(out, "keep")); string(b) != "x" {
 		t.Error("existing file touched")
+	}
+}
+
+// fetch-refs fetches a third-party repository only for keys the snapshot
+// recorded (or --keys, or a built-in vendor key): the keys listed in the
+// collection it is given are the examined machine's word.
+func TestFetchRefsTakesRepoKeysFromTheSnapshotOnly(t *testing.T) {
+	machine := model.RepoTrust{URL: "https://repo.vendor.test/apt", Suite: "stable", Keys: []model.KeyBlob{{Fingerprint: "AA", Data: []byte("m")}}}
+	clean := model.RepoTrust{URL: "https://repo.vendor.test/apt", Suite: "stable", Keys: []model.KeyBlob{{Fingerprint: "BB", Data: []byte("s")}}}
+	c := oldDebianCollection()
+	c.Packages.RepoTrust = []model.RepoTrust{machine}
+	scan := writeCollection(t, c, false)
+	sc := oldDebianCollection()
+	sc.Packages.RepoTrust = []model.RepoTrust{clean}
+	snap := filepath.Join(t.TempDir(), "snap")
+	if err := snapshot.WriteFile(snap, snapshot.New(sc, nil, []byte("k")), ""); err != nil {
+		t.Fatal(err)
+	}
+	var got []pkgverify.Options
+	old := writeBundle
+	writeBundle = func(_ context.Context, _ *model.Collection, _ string, opt pkgverify.Options) error {
+		got = append(got, opt)
+		return nil
+	}
+	t.Cleanup(func() { writeBundle = old })
+	var out, errb strings.Builder
+	Run([]string{"fetch-refs", "--for", scan, "--out", filepath.Join(t.TempDir(), "o1")}, strings.NewReader(""), &out, &errb)
+	Run([]string{"fetch-refs", "--for", scan, "--out", filepath.Join(t.TempDir(), "o2"), "--snapshot", snap}, strings.NewReader(""), &out, &errb)
+	if len(got) != 2 {
+		t.Fatalf("bundle written %d times: %s", len(got), errb.String())
+	}
+	if len(got[0].RepoTrust) != 0 {
+		t.Errorf("without a snapshot: RepoTrust = %+v", got[0].RepoTrust)
+	}
+	if len(got[1].RepoTrust) != 1 || got[1].RepoTrust[0].Keys[0].Fingerprint != "BB" {
+		t.Errorf("with a snapshot: RepoTrust = %+v, want the snapshot's", got[1].RepoTrust)
 	}
 }

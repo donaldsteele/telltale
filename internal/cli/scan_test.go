@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
+	"github.com/donaldsteele/telltale/internal/repokeys"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -279,5 +282,85 @@ func TestChangedOwnedPathsBehindADirectoryLink(t *testing.T) {
 	got := changedOwnedPaths(&model.Snapshot{Collection: old}, cur)
 	if !got["/data/opt/google/chrome"] || got["/data/opt/google/stray"] {
 		t.Fatalf("got %v", got)
+	}
+}
+
+func writeTestKeyring(t *testing.T, file string) string {
+	t.Helper()
+	e, err := openpgp.NewEntity("vendor", "", "vendor@example.test", &packet.Config{Algorithm: packet.PubKeyAlgoEdDSA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b bytes.Buffer
+	if err := e.Serialize(&b); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, b.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return repokeys.Fingerprint(e)
+}
+
+// The keys a scan verifies a third-party repository with come from the
+// snapshot, never from the keyring the examined machine has now.
+func TestScanTrustsOnlyTheSnapshotsRepoKeys(t *testing.T) {
+	root := fixtureRoot(t)
+	keyring := filepath.Join(root, "usr/share/keyrings/vendor.gpg")
+	os.MkdirAll(filepath.Join(root, "etc/apt/sources.list.d"), 0o755)
+	if err := os.WriteFile(filepath.Join(root, "etc/apt/sources.list.d/vendor.list"),
+		[]byte("deb [signed-by=/usr/share/keyrings/vendor.gpg] https://repo.vendor.test/apt stable main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	atSnapshot := writeTestKeyring(t, keyring)
+	snap := filepath.Join(t.TempDir(), "snap")
+	var out, errb bytes.Buffer
+	if code := Run([]string{"snapshot", "--out", snap, "--no-encrypt", "--allow-non-root", "--root", root, "--proc-root", "../collect/testdata/proc1", "--sys-root", root},
+		strings.NewReader(""), &out, &errb); code != 0 {
+		t.Fatalf("snapshot: exit %d: %s", code, errb.String())
+	}
+	// The machine's keyring is replaced after the snapshot.
+	now := writeTestKeyring(t, keyring)
+
+	var got []pkgverify.Options
+	old := verifyPackages
+	verifyPackages = func(_ context.Context, _ *model.Collection, opt pkgverify.Options) *pkgverify.Result {
+		got = append(got, opt)
+		return &pkgverify.Result{Mode: pkgverify.ModeArchive}
+	}
+	t.Cleanup(func() { verifyPackages = old })
+	scan := func(extra ...string) {
+		t.Helper()
+		out.Reset()
+		errb.Reset()
+		if code := Run(append(scanArgs(root, "--no-color"), extra...), strings.NewReader(""), &out, &errb); code == 3 {
+			t.Fatalf("scan: exit %d: %s", code, errb.String())
+		}
+	}
+	scan("--snapshot", snap)
+	scan()
+	if len(got) != 2 {
+		t.Fatalf("package verification ran %d times", len(got))
+	}
+	with := got[0].RepoTrust
+	if len(with) != 1 || with[0].URL != "https://repo.vendor.test/apt" || with[0].Suite != "stable" || len(with[0].Keys) != 1 || with[0].Keys[0].Fingerprint != atSnapshot {
+		t.Errorf("with a snapshot: RepoTrust = %+v, want the snapshot's key %s", with, atSnapshot)
+	}
+	for _, tr := range with {
+		for _, k := range tr.Keys {
+			if k.Fingerprint == now {
+				t.Errorf("the machine's present key %s was passed as trusted", now)
+			}
+		}
+	}
+	if len(got[1].RepoTrust) != 0 {
+		t.Errorf("without a snapshot nothing vouches for the repository, got %+v", got[1].RepoTrust)
+	}
+	// The changed key is reported.
+	scan("--snapshot", snap, "--json", "-")
+	if !strings.Contains(out.String(), "pkg.repo_key_changed:https://repo.vendor.test/apt") {
+		t.Errorf("no pkg.repo_key_changed finding in the report")
 	}
 }

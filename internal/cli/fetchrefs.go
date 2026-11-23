@@ -15,12 +15,13 @@ import (
 	"github.com/donaldsteele/telltale/internal/escape"
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/internal/pkgverify"
+	"github.com/donaldsteele/telltale/internal/snapshot"
 )
 
 // maxScanJSON bounds a decompressed collection read by fetch-refs.
 const maxScanJSON = 1 << 30
 
-const fetchRefsUsage = `usage: telltale fetch-refs --for SCAN.json --out DIR [--full] [--keys DIR]
+const fetchRefsUsage = `usage: telltale fetch-refs --for SCAN.json --out DIR [--full] [--snapshot FILE] [--keys DIR]
 
 Builds a reference bundle on a machine with network access, so that an
 isolated machine's packages can be verified properly with
@@ -33,7 +34,14 @@ isolated machine's packages can be verified properly with
   --out DIR        a new or empty directory for the bundle
   --full           recorded in the bundle for "scan --refs --full"; every
                    installed package goes into the bundle either way
+  --snapshot FILE  the isolated machine's snapshot: third-party repositories
+                   are fetched and verified with the keys it recorded for
+                   them (the passphrase comes from TELLTALE_PASSPHRASE or a
+                   prompt). Pass the same snapshot to "scan --refs"
   --keys DIR       public keys of third-party repositories to trust
+
+Third-party repositories of well-known vendors are included with telltale's
+built-in keys. Keys listed in SCAN.json itself are never trusted.
 
 Everything in the bundle is checked again with telltale's built-in archive
 keys when it is used, so the bundle can travel by any means.`
@@ -53,6 +61,7 @@ func runFetchRefs(ctx *Context) int {
 	out := fs.String("out", "", "")
 	full := fs.Bool("full", false, "")
 	keys := fs.String("keys", "", "")
+	snapPath := fs.String("snapshot", "", "")
 	if err := fs.Parse(ctx.Args); err != nil || fs.NArg() > 0 || *scan == "" || *out == "" {
 		if err != nil && !errors.Is(err, flag.ErrHelp) {
 			fmt.Fprintf(ctx.Stderr, "telltale fetch-refs: %v\n", err)
@@ -65,6 +74,19 @@ func runFetchRefs(ctx *Context) int {
 		return fail(err)
 	}
 	opt := pkgverify.Options{Full: *full}
+	if *snapPath != "" {
+		pass, err := getPassphraseIfEncrypted(ctx, *snapPath)
+		if err != nil {
+			return fail(err)
+		}
+		snap, err := snapshot.ReadFile(*snapPath, pass)
+		if err != nil {
+			return fail(fmt.Errorf("read snapshot %s: %w", *snapPath, err))
+		}
+		if snap.Collection != nil {
+			opt.RepoTrust = snap.Collection.Packages.RepoTrust
+		}
+	}
 	if *keys != "" {
 		if opt.ExtraKeys, err = pkgverify.LoadKeys(*keys); err != nil {
 			return fail(err)
@@ -72,7 +94,7 @@ func runFetchRefs(ctx *Context) int {
 	}
 	sctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	werr := pkgverify.WriteBundle(sctx, c, *out, opt)
+	werr := writeBundle(sctx, c, *out, opt)
 	if m, err := pkgverify.ReadBundleManifest(*out); err == nil {
 		printBundleSummary(ctx.Stdout, *out, m)
 	}
@@ -144,3 +166,6 @@ func readCollectionFile(path string) (*model.Collection, error) {
 	}
 	return &c, nil
 }
+
+// writeBundle is pkgverify.WriteBundle; tests replace it.
+var writeBundle = pkgverify.WriteBundle

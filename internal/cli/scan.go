@@ -40,7 +40,10 @@ Flags:
                     saved next to it as FILE.last-report.json
   --refs DIR        reference bundle from "telltale fetch-refs"; nothing is
                     downloaded
-  --keys DIR        public keys of third-party repositories to trust
+  --keys DIR        public keys of third-party repositories to trust. Without
+                    it a third-party repository is verified with the key the
+                    snapshot recorded for it, or with telltale's built-in key
+                    for a well-known vendor; never with a key from this machine
   --offline         compare with the machine's own package checksums (root
                     can edit these) instead of downloading from the archive
   --full            verify every package file, not only the security-relevant ones
@@ -137,6 +140,13 @@ func runScan(ctx *Context) int {
 	opt.ExtraPaths = append(opt.ExtraPaths, heuristics.PackageLinkTargets(c, c.Packages.Owners())...)
 	if snap != nil {
 		opt.OnlyPaths = changedOwnedPaths(snap, c)
+		// The keys third-party repositories were signed with when the
+		// machine was clean. The collection just taken holds the same kind
+		// of record (c.Packages.RepoTrust); that one is the examined
+		// machine's word and is never passed here.
+		if snap.Collection != nil {
+			opt.RepoTrust = snap.Collection.Packages.RepoTrust
+		}
 	}
 	if *refs == "" && !*offline {
 		// Never leave a package cache on the machine being examined.

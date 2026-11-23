@@ -25,6 +25,8 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/pkgverify/vendorkeys"
+	"github.com/donaldsteele/telltale/internal/repokeys"
 )
 
 // Modes of a Result: how the expected file contents were obtained.
@@ -42,9 +44,15 @@ const (
 	// SourceOfflineLocal: the machine's own md5sums, which root can edit.
 	SourceOfflineLocal = "offline-local"
 	// SourceThirdParty: a third-party repository's signed index, verified
-	// with a key the owner supplied.
+	// with a key bound to that repository: one the snapshot recorded for
+	// it, a built-in vendor key, or one the owner supplied.
 	SourceThirdParty = "thirdparty"
 )
+
+// ThirdPartyVerified is in the SourcesUsed line of each third-party
+// repository whose signed index verified; the trust anchors its keys came
+// from follow it.
+const ThirdPartyVerified = " (third-party repository, verified with "
 
 const (
 	// OfflineWarning heads Result.Errors in offline-local mode.
@@ -73,8 +81,10 @@ const (
 	// string is not a valid Debian version, or looking it up failed while the
 	// host's own indexes were read.
 	KindNotFound = "not_found"
-	// KindUntrusted: the package comes from a third-party source whose key
-	// was not given.
+	// KindUntrusted: the machine has a third-party source that no trusted
+	// key verified (none is recorded in the snapshot, built in or given, or
+	// its index is signed by another key), and the package is in no source
+	// that was verified.
 	KindUntrusted = "untrusted_source"
 	// KindUnreachable: the host's own signed indexes (or the reference
 	// bundle, or telltale's keys) could not be read, so nothing could be
@@ -188,10 +198,24 @@ type Options struct {
 	// ExtraPaths are collected paths checked in addition to the default
 	// scope, and also when OnlyPaths is set.
 	ExtraPaths []string
-	// ExtraKeys are owner-supplied keys for third-party repositories. A
-	// third-party source is consulted only when its signed index verifies
-	// with one of them.
+	// ExtraKeys are owner-supplied keys for third-party repositories
+	// (--keys). They are tried for every third-party source.
+	//
+	// A third-party source is read only when a key for it is at hand: from
+	// ExtraKeys, RepoTrust or Vendors. Its signed index is verified with
+	// those keys alone. Nothing the examined machine holds (its keyrings,
+	// the collection's own Packages.RepoTrust) is ever a reason to trust a
+	// source.
 	ExtraKeys openpgp.EntityList
+	// RepoTrust is the SNAPSHOT's record of the keys each third-party
+	// repository was signed with when the machine was clean (never the
+	// examined collection's). An entry's keys vouch only for the repository
+	// address and suite the entry names.
+	RepoTrust []model.RepoTrust
+	// Vendors are the well-known vendors' pinned keys, each bound to the
+	// vendor's repository addresses. Nil means the built-in table; an
+	// empty table turns them off.
+	Vendors *vendorkeys.Table
 	// Root is where the examined filesystem is mounted, for offline-local
 	// mode, which reads the files to compute their MD5. "" means "/".
 	Root string
@@ -441,6 +465,7 @@ type session struct {
 	archives []*Archive
 	clock    *signedClock // shared by every archive of the run
 	third    []thirdSource
+	vendors  *vendorkeys.Table
 	old      *OldFinder
 	client   *http.Client
 	source   string        // replaces DebRef.Source in verdicts (refs)
@@ -469,6 +494,9 @@ type session struct {
 type thirdSource struct {
 	uri string
 	a   *Archive
+	// how names the trust anchors the source's keys come from, for
+	// SourcesUsed.
+	how string
 }
 
 func newSession(c *model.Collection, opt Options, res *Result) *session {
@@ -879,11 +907,49 @@ func (s *session) setup() error {
 
 var safeSuite = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+~-]*$`)
 
-// setupThirdParty lists the machine's non-official APT sources and, when
-// the owner supplied keys, prepares to read their signed indexes. Without
-// keys no third-party source is ever contacted, nor is an Ubuntu Pro source,
-// which needs a token.
+// thirdPartyKeys returns the keys that vouch for one suite of the
+// third-party repository at uri, and where they come from: the snapshot's
+// record for exactly that repository and suite, the built-in vendors whose
+// address patterns cover it, and the owner's keys. The examined machine's own
+// keyrings are not among them.
+func (s *session) thirdPartyKeys(uri, suite string) (openpgp.EntityList, string) {
+	var kr openpgp.EntityList
+	var how []string
+	if u, ok := model.RepoURL(uri); ok {
+		n := len(kr)
+		for _, t := range s.opt.RepoTrust {
+			if t.URL == u && t.Suite == suite {
+				kr = append(kr, repokeys.Entities(t.Keys)...)
+			}
+		}
+		if len(kr) > n {
+			how = append(how, "the key the snapshot recorded for it")
+		}
+		for _, v := range s.vendors.Match(u) {
+			kr = append(kr, v.Keys()...)
+			how = append(how, "the built-in "+v.Name+" key")
+		}
+	}
+	if len(s.opt.ExtraKeys) > 0 {
+		kr = append(kr, s.opt.ExtraKeys...)
+		how = append(how, "owner-supplied key")
+	}
+	return kr, strings.Join(how, ", ")
+}
+
+// setupThirdParty lists the machine's non-official APT sources and prepares
+// to read the signed index of each suite a key is at hand for (see
+// thirdPartyKeys). A source without one is never contacted, nor is an Ubuntu
+// Pro source, which needs a token.
 func (s *session) setupThirdParty(wrap func(*http.Client) *http.Client, cache string, refs bool) {
+	s.vendors = s.opt.Vendors
+	if s.vendors == nil {
+		t, err := vendorkeys.Builtin()
+		if err != nil {
+			s.problem(fmt.Errorf("built-in vendor keys: %w", err))
+		}
+		s.vendors = t
+	}
 	seen := map[string]bool{}
 	suites := 0
 	for _, src := range s.c.Packages.Sources {
@@ -898,7 +964,7 @@ func (s *session) setupThirdParty(wrap func(*http.Client) *http.Client, cache st
 				seen[uri] = true
 				s.thirdURIs = append(s.thirdURIs, uri)
 			}
-			if len(s.opt.ExtraKeys) == 0 || esmURI(uri) {
+			if esmURI(uri) {
 				continue
 			}
 			u, err := url.Parse(uri)
@@ -906,9 +972,15 @@ func (s *session) setupThirdParty(wrap func(*http.Client) *http.Client, cache st
 				continue
 			}
 			var sus, comps []string
+			keys := map[string]openpgp.EntityList{}
+			hows := map[string]string{}
 			for _, su := range src.Suites {
-				if safeSuite.MatchString(su) {
+				if !safeSuite.MatchString(su) {
+					continue
+				}
+				if kr, how := s.thirdPartyKeys(uri, su); len(kr) > 0 {
 					sus = append(sus, su)
+					keys[su], hows[su] = kr, how
 				}
 			}
 			for _, co := range src.Components {
@@ -917,7 +989,7 @@ func (s *session) setupThirdParty(wrap func(*http.Client) *http.Client, cache st
 				}
 			}
 			if len(sus) == 0 || len(comps) == 0 {
-				continue // flat repositories are not supported
+				continue // no key for it; flat repositories are not supported
 			}
 			if suites+len(sus) > maxThirdPartySuites {
 				s.problem(fmt.Errorf("more than %d third-party suites; %s and later sources were not read", maxThirdPartySuites, uri))
@@ -931,11 +1003,15 @@ func (s *session) setupThirdParty(wrap func(*http.Client) *http.Client, cache st
 			if wrap != nil {
 				client = wrap(client)
 			}
-			s.third = append(s.third, thirdSource{uri: uri, a: &Archive{
-				BaseURL: strings.TrimRight(uri, "/"), Suites: sus, Components: comps,
-				Keyring: s.opt.ExtraKeys, Client: client, Cache: cache, Now: s.opt.Now, Historical: refs,
-				memo: &releaseMemo{}, clock: s.clock,
-			}})
+			// One archive per suite: each suite's index is verified with
+			// the keys bound to that suite and no others.
+			for _, su := range sus {
+				s.third = append(s.third, thirdSource{uri: uri, how: hows[su], a: &Archive{
+					BaseURL: strings.TrimRight(uri, "/"), Suites: []string{su}, Components: comps,
+					Keyring: keys[su], Client: client, Cache: cache, Now: s.opt.Now, Historical: refs,
+					memo: &releaseMemo{}, clock: s.clock,
+				}})
+			}
 		}
 	}
 	sort.Strings(s.thirdURIs)
@@ -944,19 +1020,7 @@ func (s *session) setupThirdParty(wrap func(*http.Client) *http.Client, cache st
 // officialURI reports whether an APT source URI is an official Debian or
 // Ubuntu archive host. Mirrors elsewhere count as third-party; telltale never
 // reads them anyway.
-func officialURI(uri string) bool {
-	u, err := url.Parse(uri)
-	if err != nil {
-		return false
-	}
-	h := strings.ToLower(u.Hostname())
-	for _, d := range []string{"debian.org", "archive.ubuntu.com", "security.ubuntu.com", "ports.ubuntu.com"} {
-		if h == d || strings.HasSuffix(h, "."+d) {
-			return true
-		}
-	}
-	return false
-}
+func officialURI(uri string) bool { return model.OfficialAptURI(uri) }
 
 func esmURI(uri string) bool {
 	u, err := url.Parse(uri)
@@ -1025,13 +1089,13 @@ func (s *session) loadIndexes(ctx context.Context, wanted []*model.Package) {
 					switch {
 					case errors.Is(err, ErrNoSuchIndex):
 					case errors.Is(err, ErrNoValidSignature):
-						// Signed by a key the owner did not supply: the
+						// Signed by none of the keys bound to it: the
 						// source is simply not trusted.
 					case err != nil:
 						s.problem(fmt.Errorf("third-party source: %w", err))
 					default:
 						s.trusted[t.uri] = true
-						s.addSource(t.a.base() + " " + suite + " (owner-supplied key)")
+						s.addSource(t.a.base() + " " + suite + ThirdPartyVerified + t.how + ")")
 						keep(idx, s.thirdFound, SourceThirdParty)
 					}
 				}
@@ -1246,7 +1310,7 @@ func (s *session) notFound(p *model.Package, oldErr error) (string, string) {
 	}
 	r := ReasonNotOfficial
 	if len(s.trusted) > 0 {
-		r += " or the third-party sources whose keys were given"
+		r += " or the third-party sources a trusted key verified"
 	}
 	var untrusted []string
 	for _, u := range s.thirdURIs {

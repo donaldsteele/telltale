@@ -25,7 +25,7 @@ func sourceWords(src string) string {
 	case pkgverify.SourceOfflineLocal:
 		return OfflineReference
 	case pkgverify.SourceThirdParty:
-		return "a third-party repository's signed index (owner-supplied key)"
+		return "a third-party repository's signed index (verified with a key from the snapshot, the built-in vendor list or --keys)"
 	case "":
 		return "an unnamed source"
 	}
@@ -179,8 +179,8 @@ func (j *judge) packages() {
 		j.compared = append(j.compared, distroPackages(j.c.Host.OSID))
 	}
 	for _, s := range r.SourcesUsed {
-		if strings.HasSuffix(s, "(owner-supplied key)") {
-			j.compared = append(j.compared, "third-party packages (owner-supplied keys)")
+		if strings.Contains(s, pkgverify.ThirdPartyVerified) {
+			j.compared = append(j.compared, "third-party packages (repository keys from the snapshot, the built-in vendor list or --keys)")
 			break
 		}
 	}

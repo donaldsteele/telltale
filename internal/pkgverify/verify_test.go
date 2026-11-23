@@ -27,6 +27,8 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/pkgverify/vendorkeys"
+	"github.com/donaldsteele/telltale/internal/repokeys"
 )
 
 // .deb fixtures are built here rather than stored: an ar archive holding
@@ -2154,4 +2156,221 @@ func TestSignedFileBehindAMovedDirectoryWithNoEntryIsReported(t *testing.T) {
 	if res = Verify(context.Background(), c, f.opts()); len(res.MovedUnseen) != 0 {
 		t.Errorf("no directory is moved: MovedUnseen = %+v", res.MovedUnseen)
 	}
+}
+
+// thirdRepo is a third-party repository signed with its own key, holding
+// thirdtool 2.0, and a machine that has it installed from there.
+type thirdRepo struct {
+	key  *openpgp.Entity
+	srv  *archiveServer
+	url  string
+	c    *model.Collection
+	f    *fixture
+	body string
+}
+
+func newThirdRepo(t *testing.T, signer *openpgp.Entity) *thirdRepo {
+	t.Helper()
+	r := &thirdRepo{key: signer, body: "third\n"}
+	deb := buildDeb(t, "xz", nil, []debEntry{{name: "./usr/bin/thirdtool", body: r.body, mode: 0o755}})
+	r.f = newFixture(t, map[string][]fakePkg{"bookworm": nil})
+	idx := stanza("thirdtool", "2.0", "amd64", "pool/main/t/thirdtool/thirdtool_2.0_amd64.deb", deb)
+	r.srv = newArchiveServer(t, fakeSuite(t, signer, recordedNow, "/repo", "stable", "", map[string][]byte{"main/binary-amd64/Packages.xz": xzBytes(t, []byte(idx))}))
+	r.srv.set("/repo/pool/main/t/thirdtool/thirdtool_2.0_amd64.deb", deb)
+	r.url = r.srv.URL + "/repo"
+	r.c = r.machine(r.body, "2.0")
+	return r
+}
+
+// machine is a machine with thirdtool at the version installed and the
+// repository in its sources; body is the program's content on disk.
+func (r *thirdRepo) machine(body, version string) *model.Collection {
+	pkg := model.Package{Name: "thirdtool", Version: version, Arch: "amd64", Status: "install ok installed", Files: []string{"/usr/bin/thirdtool"}}
+	c := collectionOf(map[string]string{"/usr/bin/thirdtool": body}, pkg)
+	c.Packages.Sources = []model.AptSource{
+		{File: "/etc/apt/sources.list.d/debian.sources", Types: []string{"deb"}, URIs: []string{"http://deb.debian.org/debian"}, Suites: []string{"bookworm"}, Components: []string{"main"}},
+		{File: "/etc/apt/sources.list.d/vendor.list", SignedBy: "/usr/share/keyrings/vendor.gpg", Types: []string{"deb"}, URIs: []string{r.url + "/"}, Suites: []string{"stable"}, Components: []string{"main"}},
+	}
+	return c
+}
+
+// trustOf is what a snapshot records for a repository signed by the keys.
+func trustOf(t *testing.T, url, suite string, keys ...*openpgp.Entity) model.RepoTrust {
+	t.Helper()
+	u, ok := model.RepoURL(url)
+	if !ok {
+		t.Fatalf("bad URL %q", url)
+	}
+	tr := model.RepoTrust{URL: u, Suite: suite, Components: []string{"main"}, KeyOrigin: model.KeyOriginSignedBy}
+	for _, k := range keys {
+		b, err := repokeys.Blob(k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr.Keys = append(tr.Keys, b)
+	}
+	return tr
+}
+
+func TestThirdPartyVerifiedWithSnapshotKey(t *testing.T) {
+	repoKey := otherKey(t)
+	r := newThirdRepo(t, repoKey)
+	opt := r.f.opts()
+	opt.Vendors = &vendorkeys.Table{}
+	opt.RepoTrust = []model.RepoTrust{trustOf(t, r.url, "stable", repoKey)}
+
+	// The key the snapshot remembers verifies the repository's index, and
+	// the package is checked like a distribution package.
+	res := Verify(context.Background(), r.c, opt)
+	wantPaths(t, "Verified", res.Verified, "/usr/bin/thirdtool")
+	if len(res.Verified) == 1 && res.Verified[0].Source != SourceThirdParty {
+		t.Errorf("Source = %q, want %q", res.Verified[0].Source, SourceThirdParty)
+	}
+	if !slices.ContainsFunc(res.SourcesUsed, func(s string) bool { return strings.Contains(s, r.url) && strings.Contains(s, "snapshot") }) {
+		t.Errorf("SourcesUsed does not say the snapshot's key was used: %q", res.SourcesUsed)
+	}
+	// A changed file is a mismatch against the repository's package.
+	res = Verify(context.Background(), r.machine("evil\n", "2.0"), opt)
+	wantPaths(t, "Mismatch", res.Mismatch, "/usr/bin/thirdtool")
+
+	// A version the index does not hold is not found, not "untrusted".
+	res = Verify(context.Background(), r.machine(r.body, "3.0"), opt)
+	wantPaths(t, "Unverifiable", res.Unverifiable, "/usr/bin/thirdtool")
+	if len(res.Unverifiable) == 1 && res.Unverifiable[0].Kind != KindNotFound {
+		t.Errorf("a version absent from the trusted index: kind %q, want %q (%s)", res.Unverifiable[0].Kind, KindNotFound, res.Unverifiable[0].Reason)
+	}
+
+	// The repository is now signed with another key: refused.
+	swapped := newThirdRepo(t, readFakeKey(t))
+	opt = swapped.f.opts()
+	opt.Vendors = &vendorkeys.Table{}
+	opt.RepoTrust = []model.RepoTrust{trustOf(t, swapped.url, "stable", repoKey)}
+	res = Verify(context.Background(), swapped.c, opt)
+	wantPaths(t, "Verified", res.Verified)
+	wantPaths(t, "Unverifiable", res.Unverifiable, "/usr/bin/thirdtool")
+	if len(res.Unverifiable) == 1 && res.Unverifiable[0].Kind != KindUntrusted {
+		t.Errorf("index signed by another key: kind %q, want %q", res.Unverifiable[0].Kind, KindUntrusted)
+	}
+
+	// The snapshot's key is for that repository and that suite only.
+	for name, tr := range map[string]model.RepoTrust{
+		"another suite":      trustOf(t, r.url, "beta", repoKey),
+		"another repository": trustOf(t, r.srv.URL+"/other", "stable", repoKey),
+		"a longer path":      trustOf(t, r.url+"x", "stable", repoKey),
+	} {
+		opt := r.f.opts()
+		opt.Vendors = &vendorkeys.Table{}
+		opt.RepoTrust = []model.RepoTrust{tr}
+		before := r.srv.totalHits()
+		res := Verify(context.Background(), r.c, opt)
+		if len(res.Verified) != 0 || len(res.Unverifiable) != 1 || res.Unverifiable[0].Kind != KindUntrusted {
+			t.Errorf("%s: Verified %v, Unverifiable %+v", name, paths(res.Verified), res.Unverifiable)
+		}
+		if n := r.srv.totalHits() - before; n != 0 {
+			t.Errorf("%s: contacted a source no key is bound to (%d requests)", name, n)
+		}
+	}
+}
+
+func TestVendorKeyBoundToPatterns(t *testing.T) {
+	for _, tc := range []struct {
+		pattern, url string
+		want         bool
+	}{
+		{"https://dl.google.com/linux/chrome/deb", "https://dl.google.com/linux/chrome/deb", true},
+		{"https://dl.google.com/linux/chrome/deb", "https://dl.google.com/linux/chrome/deb/", true},
+		{"https://dl.google.com/linux/chrome/deb", "https://DL.Google.com/linux/chrome/deb/sub", true},
+		{"https://dl.google.com/linux/chrome/deb", "http://dl.google.com/linux/chrome/deb", true},
+		{"https://dl.google.com/linux/chrome/deb", "https://dl.google.com/linux/chrome/debX", false},
+		{"https://dl.google.com/linux/chrome/deb", "https://dl.google.com/linux/chrome", false},
+		{"https://dl.google.com/linux/chrome/deb", "https://dl.google.com.evil.test/linux/chrome/deb", false},
+		{"https://dl.google.com/linux/chrome/deb", "https://evil.test/dl.google.com/linux/chrome/deb", false},
+		{"https://dl.google.com/linux/chrome/deb", "https://user@dl.google.com/linux/chrome/deb", true},
+		{"https://packages.microsoft.com", "https://packages.microsoft.com/repos/code", true},
+		{"https://packages.microsoft.com", "https://packages.microsoft.com.evil.test/repos/code", false},
+		{"https://dl.google.com/linux/chrome/deb", "ftp://dl.google.com/linux/chrome/deb", false},
+	} {
+		if got := vendorkeys.Covers(tc.pattern, tc.url); got != tc.want {
+			t.Errorf("Covers(%q, %q) = %v, want %v", tc.pattern, tc.url, got, tc.want)
+		}
+	}
+
+	// End to end: a vendor's key verifies the repository its pattern
+	// covers, and nothing else.
+	repoKey := otherKey(t)
+	r := newThirdRepo(t, repoKey)
+	vendor := func(pattern string) *vendorkeys.Table {
+		return &vendorkeys.Table{Vendors: []*vendorkeys.Vendor{vendorkeys.NewVendor("Example Vendor", []string{pattern}, publicOnly(t, repoKey))}}
+	}
+	opt := r.f.opts()
+	opt.Vendors = vendor(r.url)
+	res := Verify(context.Background(), r.c, opt)
+	wantPaths(t, "Verified with the vendor's key", res.Verified, "/usr/bin/thirdtool")
+	if !slices.ContainsFunc(res.SourcesUsed, func(s string) bool { return strings.Contains(s, "Example Vendor") }) {
+		t.Errorf("SourcesUsed does not name the vendor: %q", res.SourcesUsed)
+	}
+	for _, pattern := range []string{r.srv.URL + "/other", r.srv.URL + "/rep", r.url + "/deeper", "https://dl.google.com/linux/chrome/deb"} {
+		opt.Vendors = vendor(pattern)
+		before := r.srv.totalHits()
+		res = Verify(context.Background(), r.c, opt)
+		if len(res.Verified) != 0 || len(res.Unverifiable) != 1 || res.Unverifiable[0].Kind != KindUntrusted {
+			t.Errorf("pattern %s vouched for %s: Verified %v, Unverifiable %+v", pattern, r.url, paths(res.Verified), res.Unverifiable)
+		}
+		if n := r.srv.totalHits() - before; n != 0 {
+			t.Errorf("pattern %s: contacted the repository %d times", pattern, n)
+		}
+	}
+}
+
+// The machine has the repository's key in its own keyring and names it in
+// its sources; the collection says so (RepoTrust). That is the examined
+// machine vouching for itself: without a snapshot, a vendor pin or --keys
+// the repository is not read and the package stays unconfirmed.
+func TestMachineKeyringNeverTrusted(t *testing.T) {
+	repoKey := otherKey(t)
+	r := newThirdRepo(t, repoKey)
+	r.c.Packages.RepoTrust = []model.RepoTrust{trustOf(t, r.url, "stable", repoKey)}
+	opt := r.f.opts()
+	opt.Vendors = &vendorkeys.Table{}
+	res := Verify(context.Background(), r.c, opt)
+	wantPaths(t, "Verified", res.Verified)
+	wantPaths(t, "Unverifiable", res.Unverifiable, "/usr/bin/thirdtool")
+	if len(res.Unverifiable) == 1 && res.Unverifiable[0].Kind != KindUntrusted {
+		t.Errorf("kind %q, want %q", res.Unverifiable[0].Kind, KindUntrusted)
+	}
+	if n := r.srv.totalHits(); n != 0 {
+		t.Errorf("read a repository only the machine's own keyring vouches for (%d requests)", n)
+	}
+	// The same holds when building a reference bundle from that collection.
+	dir := filepath.Join(t.TempDir(), "refs")
+	if err := WriteBundle(context.Background(), r.c, dir, opt); err != nil {
+		t.Fatal(err)
+	}
+	if n := r.srv.totalHits(); n != 0 {
+		t.Errorf("fetch-refs read a repository only the machine's own keyring vouches for (%d requests)", n)
+	}
+}
+
+// A bundle carries a trusted third-party repository's index and package, and
+// a scan with --refs verifies them again with the same key.
+func TestBundleCarriesTrustedThirdPartySources(t *testing.T) {
+	repoKey := otherKey(t)
+	r := newThirdRepo(t, repoKey)
+	opt := r.f.opts()
+	opt.Vendors = &vendorkeys.Table{}
+	opt.RepoTrust = []model.RepoTrust{trustOf(t, r.url, "stable", repoKey)}
+	dir := filepath.Join(t.TempDir(), "refs")
+	if err := WriteBundle(context.Background(), r.c, dir, opt); err != nil {
+		t.Fatal(err)
+	}
+	r.srv.Close() // nothing is fetched from here on
+	ropt := refsOpts(r.f, dir)
+	ropt.Vendors = &vendorkeys.Table{}
+	ropt.RepoTrust = opt.RepoTrust
+	res := Verify(context.Background(), r.c, ropt)
+	wantPaths(t, "Verified from the bundle", res.Verified, "/usr/bin/thirdtool")
+	// Without the key the bundle's copy proves nothing.
+	ropt.RepoTrust = nil
+	res = Verify(context.Background(), r.c, ropt)
+	wantPaths(t, "Verified without the key", res.Verified)
 }
