@@ -753,9 +753,11 @@ const (
 	// causeRefused: it shows its pinned host key and rejects the server's
 	// key.
 	causeRefused
-	// causeCollector: it let the server in and the collector then did not
-	// return a usable collection (killed, too much output, not a
-	// collection).
+	// causeCollector: it let the server in and then did not behave as a
+	// machine does: the collector returned no usable collection (killed,
+	// too much output, not a collection), or a plain command was answered
+	// with something else (an unknown architecture, a mktemp that prints no
+	// directory).
 	causeCollector
 	// causeOversized: the collection holds more entries than any machine
 	// has.
@@ -773,7 +775,7 @@ func causeOf(verr error) failureCause {
 		return causeUnreachable
 	case errors.Is(verr, visit.ErrOversized):
 		return causeOversized
-	case errors.Is(verr, visit.ErrCollectorFailed):
+	case errors.Is(verr, visit.ErrCollectorFailed), errors.Is(verr, visit.ErrOddOutput):
 		return causeCollector
 	}
 	return causeUnreachable
@@ -825,7 +827,7 @@ func visitFailing(n int, visited bool, why failureCause) model.Finding {
 		f.Refs = []string{"T1562", "T1098.004"}
 	case causeCollector:
 		f.Title = "The machine lets the telltale server in, but the collector no longer returns a collection"
-		f.Why = "The server logs in as before, and the collector it runs there is then killed, fails, sends more than a collection may hold or sends something that is not one, visit after visit. " +
+		f.Why = "The server logs in as before, and then the machine answers its plain commands with something else, or the collector it runs there is killed, fails, sends more than a collection may hold or sends something that is not one, visit after visit. " +
 			"Whoever controls the machine can do that to keep it from being checked without refusing the login outright." + unchecked
 		f.Fix = console
 		f.Evidence = []model.Evidence{{Before: "visits worked", After: "no usable collection", Detail: fmt.Sprintf("%d visits in a row failed after the login", n)}}

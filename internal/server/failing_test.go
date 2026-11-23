@@ -293,6 +293,7 @@ func TestFailuresAfterLoginAreBackdoorSigns(t *testing.T) {
 	}{
 		"collector failed": {fmt.Errorf("visit web01: %w: collect: killed by signal KILL", visit.ErrCollectorFailed), "visit.failing", model.SevBackdoor, "collector"},
 		"oversized":        {fmt.Errorf("visit web01: %w: %w: more than 1000000 files", visit.ErrCollectorFailed, visit.ErrOversized), "visit.oversized", model.SevBackdoor, "more entries"},
+		"odd output":       {fmt.Errorf("visit web01: %w: mktemp in /run printed junk", visit.ErrOddOutput), "visit.failing", model.SevBackdoor, "collector"},
 		"no exec dir":      {fmt.Errorf("visit web01: %w (noexec)", visit.ErrNoExecDir), "visit.failing", model.SevWeak, ""},
 		"connection lost":  {errors.New("visit web01: collect: the command or the connection ended without an exit status"), "visit.failing", model.SevWeak, ""},
 	} {

@@ -127,6 +127,11 @@ var (
 	errNoExit = errors.New("the command or the connection ended without an exit status")
 	// errOdd marks machine output a visit will not go on with.
 	errOdd = errors.New("unexpected output")
+	// ErrOddOutput is errOdd for callers: after the login the machine
+	// answered a plain command with something no working machine gives (an
+	// architecture telltale does not know, a mktemp that prints something
+	// other than a new directory).
+	ErrOddOutput = errOdd
 	// errTooMuch marks output over its limit.
 	errTooMuch = errors.New("too large")
 )

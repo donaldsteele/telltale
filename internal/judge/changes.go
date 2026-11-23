@@ -1560,19 +1560,25 @@ func (j *judge) listenerAdded(ch diff.Change) {
 // but the kernel image they name (BOOT_IMAGE=), which is what booting a
 // newly installed kernel changes.
 func bootImageOnly(before, after string) bool {
-	strip := func(s string) (rest []string, image string) {
-		for _, f := range strings.Fields(s) {
-			if v, ok := strings.CutPrefix(f, "BOOT_IMAGE="); ok {
-				image = v
-				continue
-			}
-			rest = append(rest, f)
+	b, bi, bn := bootImage(before)
+	a, ai, an := bootImage(after)
+	return bn == 1 && an == 1 && bi != "" && ai != "" && bi != ai && slices.Equal(b, a)
+}
+
+// bootImage splits a kernel command line into its BOOT_IMAGE= value, how
+// many BOOT_IMAGE= words it has, and every other word. A line with more
+// than one names no image for the purposes here: which one the boot loader
+// meant is not for telltale to guess.
+func bootImage(cmdline string) (rest []string, image string, n int) {
+	for _, f := range strings.Fields(cmdline) {
+		if v, ok := strings.CutPrefix(f, "BOOT_IMAGE="); ok {
+			image = v
+			n++
+			continue
 		}
-		return rest, image
+		rest = append(rest, f)
 	}
-	b, bi := strip(before)
-	a, ai := strip(after)
-	return bi != "" && ai != "" && bi != ai && slices.Equal(b, a)
+	return rest, image, n
 }
 
 // bootImagePackage names the kernel package whose own image the command
@@ -1587,11 +1593,9 @@ func bootImageOnly(before, after string) bool {
 //     rolls into the baseline at the visit before the reboot, so by the time
 //     the new image is booted no package change is left to see.
 func (j *judge) bootImagePackage(cmdline string) string {
-	image := ""
-	for _, f := range strings.Fields(cmdline) {
-		if v, ok := strings.CutPrefix(f, "BOOT_IMAGE="); ok {
-			image = v
-		}
+	_, image, n := bootImage(cmdline)
+	if n != 1 {
+		return ""
 	}
 	// GRUB may write the device first: (hd0,gpt2)/vmlinuz-...
 	if strings.HasPrefix(image, "(") {

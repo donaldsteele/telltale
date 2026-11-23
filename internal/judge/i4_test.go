@@ -393,3 +393,27 @@ func TestJudgeTrustLocations(t *testing.T) {
 		t.Errorf("title %q", f.Title)
 	}
 }
+
+// The BOOT_IMAGE-only note needs exactly one BOOT_IMAGE= on each line: with
+// two, which one the boot loader meant is not telltale's to guess.
+func TestJudgeBootImageNeedsExactlyOneToken(t *testing.T) {
+	_, base := kernelUpdate()
+	base.Runtime.Cmdline = bootLine
+	cur := clone(base)
+	good := strings.Replace(bootLine, "6.1.0-25", "6.1.0-27", 1)
+	cur.Runtime.Cmdline = good
+	must(t, run(cur, snapOf(base), archive()), "snap.cmdline", model.SevNote)
+	for _, line := range []string{
+		"BOOT_IMAGE=/boot/vmlinuz-evil " + good,
+		good + " BOOT_IMAGE=/boot/vmlinuz-6.1.0-27-amd64",
+		strings.Replace(good, "BOOT_IMAGE=/boot/vmlinuz-6.1.0-27-amd64", "BOOT_IMAGE=/boot/vmlinuz-6.1.0-27-amd64 BOOT_IMAGE=/x", 1),
+	} {
+		cur.Runtime.Cmdline = line
+		must(t, run(cur, snapOf(base), archive()), "snap.cmdline", model.SevBackdoor)
+	}
+	// Two in the snapshot's line, one now.
+	two := clone(base)
+	two.Runtime.Cmdline = "BOOT_IMAGE=/boot/vmlinuz-6.1.0-25-amd64 " + bootLine
+	cur.Runtime.Cmdline = "BOOT_IMAGE=/boot/vmlinuz-6.1.0-25-amd64 " + good
+	must(t, run(cur, snapOf(two), archive()), "snap.cmdline", model.SevBackdoor)
+}

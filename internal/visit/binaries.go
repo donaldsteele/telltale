@@ -51,7 +51,7 @@ var goarchOf = map[string]string{"x86_64": "amd64", "aarch64": "arm64"}
 func (b Binaries) For(arch string) (string, error) {
 	goarch, ok := goarchOf[arch]
 	if !ok {
-		return "", fmt.Errorf("no collector for the machine's architecture \"%s\" (telltale is built for x86_64 and aarch64)", escape.Terminal(arch))
+		return "", fmt.Errorf("%w: no collector for the machine's architecture \"%s\" (telltale is built for x86_64 and aarch64)", errOdd, escape.Terminal(arch))
 	}
 	name := "telltale-linux-" + goarch
 	if b.Dir != "" {

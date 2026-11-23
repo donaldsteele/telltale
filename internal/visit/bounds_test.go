@@ -195,3 +195,21 @@ func TestDecodeHookRunsBeforeTheCollectionIsRead(t *testing.T) {
 		t.Error("the hook ran for a visit that was refused at the login")
 	}
 }
+
+// Output no working machine gives (an architecture telltale does not know,
+// a mktemp that prints something else) is marked, so the server can rank it
+// like the collector misbehaving. No directory to run from is not that.
+func TestVisitMarksOddRemoteOutput(t *testing.T) {
+	f := newFake(t)
+	f.arch = "pdp11"
+	_, err := Visit(testCtx(t), f.machine(), f.client, testContext(), f.binaries(t))
+	if !errors.Is(err, ErrOddOutput) || !strings.Contains(err.Error(), "no collector for the machine's architecture") {
+		t.Errorf("unknown architecture: %v", err)
+	}
+	if errors.Is(fmt.Errorf("x: %w (all noexec)", ErrNoExecDir), ErrOddOutput) {
+		t.Error("ErrNoExecDir counts as odd output")
+	}
+	if !errors.Is(fmt.Errorf("x: %w: mktemp printed y", errOdd), ErrOddOutput) {
+		t.Error("errOdd is not ErrOddOutput")
+	}
+}
