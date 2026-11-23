@@ -68,6 +68,7 @@ func trustedOwner(uid uint32) bool { return uid == 0 || uid == selfUID }
 // link, which the caller decides about.
 type place struct {
 	dir  int    // O_PATH descriptor of the directory; -1 when unset
+	root string // the examined root the walk was made in
 	name string // "" when the path names the directory itself
 	real string // the machine path of the directory really reached
 	// shut is true when a directory on the way can be searched neither by
@@ -136,32 +137,22 @@ func (p place) readlink() (string, error) {
 	return readlinkat(p.dir, p.name)
 }
 
-// open opens the name without following a link there and verifies the
-// descriptor is a regular file off the kernel filesystems (a FIFO must not
-// block). The returned Stat_t describes the opened descriptor.
+// open opens the name for reading, without following a link there, once it
+// is known to be a regular file off the kernel and device filesystems
+// (openChecked): a device or a FIFO is never opened. The returned Stat_t
+// describes the opened descriptor.
 func (p place) open() (*os.File, unix.Stat_t, error) {
 	var st unix.Stat_t
 	if p.name == "" {
 		return nil, st, errors.New("not a regular file")
 	}
-	fd, err := unix.Openat(p.dir, p.name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	fd, st, err := openChecked(p.dir, p.name, openMode{root: p.root})
 	if err != nil {
-		if errors.Is(err, unix.ELOOP) {
-			return nil, st, errors.New("is a symlink")
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			pe.Path = p.path()
 		}
-		return nil, st, &fs.PathError{Op: "open", Path: p.path(), Err: err}
-	}
-	if err := unix.Fstat(fd, &st); err != nil {
-		unix.Close(fd)
 		return nil, st, err
-	}
-	if kernelFS(fd) {
-		unix.Close(fd)
-		return nil, st, errKernelFS
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		unix.Close(fd)
-		return nil, st, errors.New("not a regular file")
 	}
 	return os.NewFile(uintptr(fd), p.path()), st, nil
 }
@@ -250,7 +241,7 @@ func walkTo(root, mp string, forUID uint32, followOwn bool) (place, error) {
 		top := stack[len(stack)-1].fd
 		if len(comps) == 0 {
 			keep = top
-			return place{dir: top, real: real(), shut: shut, own: own, link: ownLink}, nil
+			return place{dir: top, root: root, real: real(), shut: shut, own: own, link: ownLink}, nil
 		}
 		name := comps[0]
 		if steps++; steps > maxWalkSteps {
@@ -273,7 +264,7 @@ func walkTo(root, mp string, forUID uint32, followOwn bool) (place, error) {
 		}
 		if last && len(comps) == 1 {
 			keep = top
-			return place{dir: top, name: name, real: real(), shut: shut, own: own, link: ownLink}, nil
+			return place{dir: top, root: root, name: name, real: real(), shut: shut, own: own, link: ownLink}, nil
 		}
 		fd, err := unix.Openat(top, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if err != nil {

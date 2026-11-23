@@ -157,20 +157,22 @@ type exeResult struct {
 // deleted file) and refuses anything that is not a regular file. Files over
 // the cap are not hashed at all rather than partially.
 func hashExe(path string) (exeResult, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	// The link is followed, but what it leads to is opened only once it is
+	// known to be a regular file (openChecked).
+	fd, st, err := openChecked(unix.AT_FDCWD, path, openMode{follow: true, kernel: true})
+	if errors.Is(err, errNotRegular) {
+		return exeResult{opened: true, nlink: nlinkFn(path, &st)}, errors.New("exe is not a regular file")
+	}
 	if err != nil {
-		return exeResult{}, &fs.PathError{Op: "open", Path: path, Err: err}
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			pe.Path = path
+		}
+		return exeResult{}, err
 	}
 	f := os.NewFile(uintptr(fd), path)
 	defer f.Close()
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		return exeResult{}, err
-	}
 	res := exeResult{opened: true, nlink: nlinkFn(path, &st)}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return res, errors.New("exe is not a regular file")
-	}
 	if st.Size > maxExeHash {
 		return res, errTooLarge
 	}

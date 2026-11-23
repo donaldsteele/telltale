@@ -178,17 +178,25 @@ func statEntry(p, mp string, opt FileOptions, skips *[]model.Skip) (model.FileEn
 		if testHookBeforeOpen != nil {
 			testHookBeforeOpen(p)
 		}
-		fd, err := unix.Open(p, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
-		if err != nil {
-			if errors.Is(err, unix.ENOENT) {
-				vanished(err)
-				return model.FileEntry{}, false
+		// Never opened before it is known to be a regular file still: the
+		// name may have become a device since Lstat (openChecked).
+		fd, fst, err := openChecked(unix.AT_FDCWD, p, openMode{kernel: true})
+		switch {
+		case errors.Is(err, unix.ENOENT):
+			vanished(err)
+			return model.FileEntry{}, false
+		case errors.Is(err, errIsSymlink), errors.Is(err, errNotRegular):
+			e.Err = "changed while reading"
+			return e, true
+		case err != nil:
+			var pe *fs.PathError
+			if errors.As(err, &pe) {
+				err = pe.Err
 			}
 			e.Err = err.Error()
 			return e, true
 		}
-		var fst unix.Stat_t
-		if err := unix.Fstat(fd, &fst); err != nil || fst.Mode&unix.S_IFMT != unix.S_IFREG || fst.Dev != st.Dev || fst.Ino != st.Ino {
+		if fst.Dev != st.Dev || fst.Ino != st.Ino {
 			unix.Close(fd)
 			e.Err = "changed while reading"
 			return e, true

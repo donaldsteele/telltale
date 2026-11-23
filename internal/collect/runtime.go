@@ -40,19 +40,19 @@ var SysctlKeys = []string{
 // readBounded reads a regular file without following a final symlink, reading
 // at most max bytes.
 func readBounded(path string, max int64) ([]byte, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, &fs.PathError{Op: "open", Path: path, Err: err}
+	// The fixed files of /proc and /sys, so kernel filesystems are meant;
+	// still nothing but a regular file is opened.
+	fd, _, err := openChecked(unix.AT_FDCWD, path, openMode{kernel: true})
+	switch {
+	case errors.Is(err, errNotRegular):
+		return nil, fmt.Errorf("%s: not a regular file", path)
+	case errors.Is(err, errIsSymlink):
+		return nil, &fs.PathError{Op: "open", Path: path, Err: unix.ELOOP}
+	case err != nil:
+		return nil, err
 	}
 	f := os.NewFile(uintptr(fd), path)
 	defer f.Close()
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		return nil, err
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return nil, fmt.Errorf("%s: not a regular file", path)
-	}
 	return io.ReadAll(io.LimitReader(f, max))
 }
 

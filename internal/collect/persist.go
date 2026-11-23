@@ -28,29 +28,18 @@ const maxPersistBytes = 256 << 10
 
 func isNotExist(err error) bool { return errors.Is(err, fs.ErrNotExist) }
 
-// openRegular opens root+mp without following a final symlink and verifies
-// the descriptor is a regular file (a FIFO must not block).
+// openRegular opens root+mp for reading without following a final symlink,
+// once it is known to be a regular file (openChecked): a FIFO must not
+// block, and a device must not be opened at all.
 func openRegular(root, mp string) (*os.File, unix.Stat_t, error) {
 	p := filepath.Join(root, mp)
-	var st unix.Stat_t
-	fd, err := unix.Open(p, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	fd, st, err := openChecked(unix.AT_FDCWD, p, openMode{root: root})
 	if err != nil {
-		if errors.Is(err, unix.ELOOP) {
-			return nil, st, errors.New("is a symlink")
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			pe.Path = mp
 		}
-		return nil, st, &fs.PathError{Op: "open", Path: mp, Err: err}
-	}
-	if err := unix.Fstat(fd, &st); err != nil {
-		unix.Close(fd)
 		return nil, st, err
-	}
-	if kernelFS(fd) {
-		unix.Close(fd)
-		return nil, st, errKernelFS
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		unix.Close(fd)
-		return nil, st, errors.New("not a regular file")
 	}
 	return os.NewFile(uintptr(fd), p), st, nil
 }

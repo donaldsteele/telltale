@@ -100,7 +100,14 @@ built around that.
   their backups and anything holding a private key are never kept. A link
   that is not followed is never silent: the link itself is recorded with
   its target and ranked like any link at a startup path, and a note
-  (`heur.persist_link_refused`) says what is behind it was not read.
+  (`heur.persist_link_refused`) says what is behind it was not read. That
+  holds for every reason a link is not followed, a link through `/proc` and
+  a chain of links too long to walk included.
+- **Only regular files are ever opened.** Opening a device can do
+  something by itself (opening a watchdog device arms a reboot timer), and
+  a user's link may lead to one. The scan first takes a handle that opens
+  nothing, checks that it refers to a regular file that is not on `/dev` or
+  a kernel filesystem, and only then opens that same file.
 - **A user cannot make a scan fail by filling a directory.** From one
   user's systemd unit directory telltale reads at most 2,000 entries and
   8 MiB of text, and from all users' unit directories together 64 MiB;
@@ -317,3 +324,52 @@ compare with the new one. A compromised state is never accepted by
 accident: you see every change before it is accepted, and changes that
 would also hide an unrelated finding cannot be accepted until that finding
 is dealt with.
+
+## Known limits
+
+The README lists what telltale cannot tell you at all. These are narrower:
+places where v0.1.0 is known to say too much, too little, or to lean on
+something it does not check.
+
+- **systemd-boot and `initrd=`.** A kernel command line that changed only
+  in `BOOT_IMAGE=`, to an installed kernel package's own image, is a note.
+  That is what GRUB writes. systemd-boot and unified kernel images also put
+  `initrd=` words on the command line, and those change with every kernel
+  update too; telltale reports such a change as a backdoor sign
+  (`snap.cmdline`) for you to accept after each kernel update on machines
+  that boot that way.
+- **APT configuration rewritten by package scripts.** Any new or changed
+  file in `/etc/apt/apt.conf.d` is a backdoor sign unless it is its
+  package's default from a confirmed package change. Some packages rewrite
+  theirs from a maintainer script (`unattended-upgrades` and
+  `50unattended-upgrades`), which then shows as a backdoor sign to accept.
+- **"No signed index has it" counts as "not in the distribution's
+  history".** When a scan uses signed sources only (a scan of the machine
+  it runs on, and every reference bundle), a version that no signed
+  snapshot index could be asked about at all is treated like one they do
+  not have: a third-party repository verified with a key bound to it may
+  then confirm it. A signed lookup that failed (the network, a bad answer)
+  blocks that, but "there was no signed index to ask" does not.
+- **The firewall comparison counts rules.** It compares the backend, the
+  input policy and how many rules there are, not what the rules say. A
+  rule replaced by a weaker one leaves the count unchanged and is not
+  reported; chains that fail2ban, Docker, Podman, libvirt, CNI and
+  Kubernetes manage are not counted at all, so a rule hidden in one of
+  those is not seen either.
+- **Redaction is by pattern** (see the trust model above): a secret in a
+  format telltale does not know is kept as text.
+- **A hostile machine can get the server restarted.** Its collection is
+  bounded in size and in number of entries, but judging one built for the
+  purpose can still take more memory than the service is allowed. The
+  server is then killed and started again; it reports that machine after
+  three such visits in a row (see [server.md](server.md#the-systemd-unit)),
+  and until then the visits of other machines that were under way are made
+  again at their next turn.
+- **Links the scan does not follow.** A link at a user's startup path that
+  belongs to another account, leads where its owner could not read, leads
+  through `/proc` or another kernel filesystem, or is one of a chain longer
+  than the scan walks, is not followed. The link is recorded, ranked and
+  noted (`heur.persist_link_refused`), but what is behind it is not read.
+- **Files on the device filesystem are never read.** The scan opens only
+  regular files, and none on `/dev` itself (`/dev/shm` is read). A startup
+  link to a file kept on `/dev` is reported as a link, without its content.
