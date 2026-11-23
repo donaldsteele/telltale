@@ -19,6 +19,10 @@ import (
 	"github.com/donaldsteele/telltale/internal/server"
 )
 
+// requestFailedText is the error when a request did not get an answer
+// from the server; the detail goes in server_message.
+const requestFailedText = "The request to the telltale server did not work; the detail is in server_message."
+
 // maxListed bounds each list of findings in one result.
 const maxListed = 200
 
@@ -106,18 +110,19 @@ type exceptionOut struct {
 }
 
 type reportOut struct {
-	ID               int64          `json:"id"`
-	Time             string         `json:"time"`
-	ExitCode         int            `json:"exit_code"`
-	Summary          string         `json:"summary"`
-	Host             hostOut        `json:"host"`
-	ComparedAgainst  []string       `json:"compared_against,omitempty"`
-	CouldNotRuleOut  []string       `json:"could_not_rule_out,omitempty"`
-	Findings         []findingBrief `json:"findings"`
-	FindingsNotShown int            `json:"findings_not_shown,omitempty"`
-	Explained        []findingBrief `json:"explained,omitempty"`
-	Skipped          []skipOut      `json:"skipped,omitempty"`
-	Exceptions       []exceptionOut `json:"exceptions,omitempty"`
+	ID                int64          `json:"id"`
+	Time              string         `json:"time"`
+	ExitCode          int            `json:"exit_code"`
+	Summary           string         `json:"summary"`
+	Host              hostOut        `json:"host"`
+	ComparedAgainst   []string       `json:"compared_against,omitempty"`
+	CouldNotRuleOut   []string       `json:"could_not_rule_out,omitempty"`
+	Findings          []findingBrief `json:"findings"`
+	FindingsNotShown  int            `json:"findings_not_shown,omitempty"`
+	Explained         []findingBrief `json:"explained,omitempty"`
+	ExplainedNotShown int            `json:"explained_not_shown,omitempty"`
+	Skipped           []skipOut      `json:"skipped,omitempty"`
+	Exceptions        []exceptionOut `json:"exceptions,omitempty"`
 }
 
 type latestReportOut struct {
@@ -256,7 +261,8 @@ func fail(err error) (*mcp.CallToolResult, any, error) {
 	case errors.As(err, &ue):
 		e.Error = string(ue)
 	default:
-		e.Error = escape.Terminal(err.Error())
+		e.Error = requestFailedText
+		e.ServerMessage = escape.Terminal(err.Error())
 	}
 	b, _ := json.MarshalIndent(e, "", "  ")
 	return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: UntrustedNote}, &mcp.TextContent{Text: string(b)}}}, nil, nil
@@ -322,6 +328,18 @@ func metaOut(m server.APIReportMeta) reportMetaOut {
 	return reportMetaOut{ID: m.ID, Time: fmtTime(m.Time), ExitCode: m.ExitCode, Summary: summary(m.ExitCode), Findings: m.Findings}
 }
 
+// serverEscaped passes on text the server already escaped with
+// escape.Terminal (a machine's visit error), so it is not escaped twice.
+// Text that holds anything escape.Terminal would change, apart from
+// backslashes, was not escaped after all, and is escaped here.
+func serverEscaped(s string) string {
+	plain := strings.ReplaceAll(s, `\`, "")
+	if escape.Terminal(plain) == plain {
+		return s
+	}
+	return escape.Terminal(s)
+}
+
 func escapeAll(ss []string) []string {
 	var out []string
 	for _, s := range ss {
@@ -367,7 +385,7 @@ func (t *tools) listMachines(ctx context.Context, _ *mcp.CallToolRequest, _ noAr
 	}
 	out := listMachinesOut{Note: UntrustedNote, Machines: []machineOut{}}
 	for _, m := range ms {
-		mo := machineOut{ID: m.ID, Name: escape.Terminal(m.Name), Address: escape.Terminal(m.Addr), Schedule: escape.Terminal(m.Schedule), HasSnapshot: m.Snapshot, VisitRunning: m.Visiting, VisitError: escape.Terminal(m.VisitError)}
+		mo := machineOut{ID: m.ID, Name: escape.Terminal(m.Name), Address: escape.Terminal(m.Addr), Schedule: escape.Terminal(m.Schedule), HasSnapshot: m.Snapshot, VisitRunning: m.Visiting, VisitError: serverEscaped(m.VisitError)}
 		if m.LastVisit != nil {
 			mo.LastVisit = fmtTime(*m.LastVisit)
 		}
@@ -397,7 +415,7 @@ func reportView(r *server.APIReport) reportOut {
 	}
 	out.Findings, out.FindingsNotShown = briefs(rep.Findings, maxListed)
 	if len(rep.Explained) > 0 {
-		out.Explained, _ = briefs(rep.Explained, maxListed)
+		out.Explained, out.ExplainedNotShown = briefs(rep.Explained, maxListed)
 	}
 	for _, s := range rep.Skipped {
 		out.Skipped = append(out.Skipped, skipOut{Check: escape.Terminal(s.Check), Reason: escape.Terminal(s.Reason)})

@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -195,10 +196,20 @@ func checkToken(tok string) error {
 
 // ReadTokenFile reads the API token from a file that only its owner can
 // read. A symbolic link (in the last part of the path), anything but a
-// regular file, and a file other users can read or change are refused.
+// regular file, and a file other users can read or change are refused. A
+// leading ~/ is the home directory: MCP clients start telltale mcp without
+// a shell, so nothing else expands it.
 func ReadTokenFile(path string) (string, error) {
+	name := path
+	if rest, ok := strings.CutPrefix(path, "~/"); ok {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("the token file %s starts with ~/, but the home directory is not known (%v); give the full path", path, err)
+		}
+		name = filepath.Join(home, rest)
+	}
 	// O_NONBLOCK: opening a FIFO must not wait for a writer.
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	f, err := os.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if errors.Is(err, syscall.ELOOP) {
 		return "", fmt.Errorf("the token file %s is a symbolic link; give the file itself", path)
 	}

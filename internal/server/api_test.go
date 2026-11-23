@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -181,7 +182,7 @@ func TestAPITokenHashedAtRest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("token %q is not 32 random bytes: %v", tok, err)
 	}
-	for _, want := range []string{"telltale mcp", "--server https://" + testListen, "--fingerprint SHA256:AA:BB:CC", "--token-file"} {
+	for _, want := range []string{"telltale mcp", "--server https://" + testListen, "--fingerprint SHA256:AA:BB:CC", "--token-file /home/you/.telltale-token"} {
 		if !strings.Contains(html.UnescapeString(rec.Body.String()), want) {
 			t.Errorf("the page does not show %q", want)
 		}
@@ -500,7 +501,8 @@ func TestVisitRateLimited(t *testing.T) {
 	w.clock.advance(time.Second)
 	wantStatus(t, visit(tokA, m1), http.StatusOK)
 
-	// A running visit is a plain 409.
+	// A running visit is a plain 409, and since no visit started it does
+	// not use up the minute: the clock does not move below.
 	w.clock.advance(time.Minute)
 	w.core.mu.Lock()
 	w.core.visiting[m1] = true
@@ -513,10 +515,16 @@ func TestVisitRateLimited(t *testing.T) {
 	w.core.visiting[m1] = false
 	w.core.visitErr = ErrVisitRunning
 	w.core.mu.Unlock()
-	w.clock.advance(time.Minute)
 	rec = visit(tokA, m1)
 	if rec.Code != http.StatusConflict || !strings.Contains(apiError(t, rec), "A visit to this machine is running") {
 		t.Errorf("visit that finds one running: %d %s", rec.Code, rec.Body)
+	}
+	w.core.mu.Lock()
+	w.core.visitErr = nil
+	w.core.mu.Unlock()
+	wantStatus(t, visit(tokA, m1), http.StatusOK)
+	if rec := visit(tokA, m1); rec.Code != http.StatusTooManyRequests {
+		t.Errorf("a visit that started uses up the minute: %d", rec.Code)
 	}
 	// A visit that fails says so, escaped.
 	w.core.mu.Lock()
@@ -533,4 +541,83 @@ func TestVisitRateLimited(t *testing.T) {
 	if rec := visit(tokA, 999); rec.Code != http.StatusNotFound {
 		t.Errorf("unknown machine: %d", rec.Code)
 	}
+}
+
+func TestAPIFailureLimitCountsOnlyWrongTokens(t *testing.T) {
+	w := newWeb(t)
+	w.setup()
+	w.addMachine("web01")
+	tok, _ := w.newToken("laptop")
+	refusals := func(ip string) []string {
+		var out []string
+		for _, e := range auditActions(t, w.st) {
+			if strings.HasPrefix(e, "api ") && strings.HasSuffix(e, "from "+ip) {
+				out = append(out, e)
+			}
+		}
+		return out
+	}
+
+	// Valid requests in parallel from one address (an MCP client's tool
+	// calls run at once) all get in, and none is recorded as a failure.
+	var wg sync.WaitGroup
+	codes := make([]int, 10)
+	for i := range codes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes[i] = w.api(http.MethodGet, "/api/v1/machines", tok).Code
+		}()
+	}
+	wg.Wait()
+	for i, c := range codes {
+		if c != http.StatusOK {
+			t.Errorf("parallel request %d: %d", i, c)
+		}
+	}
+	if r := refusals(testClientIP); len(r) != 0 {
+		t.Errorf("valid requests audited as failures: %q", r)
+	}
+
+	// Requests that carry no token (a web page's preflights, a browser
+	// opening the address) are refused but never counted, so they cannot
+	// lock out the owner's token.
+	page := w.browser("192.0.2.80")
+	for i := 0; i < 2*loginFailures; i++ {
+		method, mod := http.MethodGet, func(*http.Request) {}
+		if i%2 == 0 {
+			method, mod = http.MethodOptions, func(r *http.Request) {
+				r.Header.Set("Origin", "https://evil.example")
+				r.Header.Set("Access-Control-Request-Method", "GET")
+				r.Header.Set("Access-Control-Request-Headers", "authorization")
+			}
+		}
+		if rec := page.api(method, "/api/v1/machines", "", mod); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s without a token: %d", method, rec.Code)
+		}
+	}
+	wantStatus(t, page.api(http.MethodGet, "/api/v1/machines", tok), http.StatusOK)
+	if r := refusals("192.0.2.80"); len(r) != 0 {
+		t.Errorf("requests without a token audited as failures: %q", r)
+	}
+
+	// Wrong tokens are counted: after loginFailures of them the address
+	// waits, the right token from it too.
+	bad := w.browser("192.0.2.81")
+	for i := 0; i < loginFailures; i++ {
+		if rec := bad.api(http.MethodGet, "/api/v1/machines", newToken()); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("wrong token %d: %d", i, rec.Code)
+		}
+	}
+	if rec := bad.api(http.MethodGet, "/api/v1/machines", newToken()); rec.Code != http.StatusTooManyRequests {
+		t.Errorf("wrong token %d: %d", loginFailures+1, rec.Code)
+	}
+	if rec := bad.api(http.MethodGet, "/api/v1/machines", tok); rec.Code != http.StatusTooManyRequests {
+		t.Errorf("right token while over the limit: %d", rec.Code)
+	}
+	if !hasAudit(t, w.st, "api refused, too many failures: from 192.0.2.81") {
+		t.Errorf("lockout not audited: %q", refusals("192.0.2.81"))
+	}
+	// Another address is not affected.
+	wantStatus(t, page.api(http.MethodGet, "/api/v1/machines", tok), http.StatusOK)
 }

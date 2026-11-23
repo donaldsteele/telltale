@@ -69,7 +69,8 @@ func runMCP(ctx *Context) int {
 	defer stop()
 
 	// A wrong fingerprint or token is a hard error at start. A server that
-	// is down is not: the tools report it until it is back.
+	// is down, or is making this address wait, is not: the tools report it
+	// until it answers.
 	check, cancel := context.WithTimeout(runCtx, mcpCheckTimeout)
 	_, err = c.Machines(check)
 	cancel()
@@ -78,8 +79,10 @@ func runMCP(ctx *Context) int {
 	switch {
 	case errors.As(err, &fe):
 		return fail(err)
-	case errors.As(err, &se) && (se.Status == http.StatusUnauthorized || se.Status == http.StatusTooManyRequests):
+	case errors.As(err, &se) && se.Status == http.StatusUnauthorized:
 		return fail(fmt.Errorf("the server refused the token: %s", se.Message))
+	case errors.As(err, &se) && se.Status == http.StatusTooManyRequests:
+		fmt.Fprintln(ctx.Stderr, "telltale mcp: warning: the server is rate-limiting this address; try again in a minute. The tools will say so until it answers")
 	case err != nil:
 		fmt.Fprintf(ctx.Stderr, "telltale mcp: warning: %s; the tools will say so until it answers\n", escape.Terminal(err.Error()))
 	}

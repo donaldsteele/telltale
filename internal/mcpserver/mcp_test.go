@@ -285,6 +285,26 @@ func TestLatestReportTool(t *testing.T) {
 	if len(lm.Machines) != 3 || lm.Machines[0].Name != "web01" || lm.Machines[0].LatestReport == nil || lm.Machines[0].LatestReport.ID != 11 {
 		t.Errorf("list_machines: %+v", lm)
 	}
+
+	// Long lists are cut, and what was cut is counted, explained
+	// findings too.
+	a.addMachine(4, "big01")
+	var many []model.Finding
+	for i := range maxListed + 5 {
+		many = append(many, testFinding("k"+strconv.Itoa(i), model.SevNote, "T"))
+	}
+	a.addReport(4, 40, many...)
+	quiet := slices.Clone(many)
+	for i := range quiet {
+		quiet[i].Severity = model.SevExplained
+	}
+	a.reports[40].Report.Explained = quiet
+	var big latestReportOut
+	result(t, call(t, cs, "latest_report", map[string]any{"machine": "big01"}), &big)
+	r := big.Report
+	if len(r.Findings) != maxListed || r.FindingsNotShown != 5 || len(r.Explained) != maxListed || r.ExplainedNotShown != 5 {
+		t.Errorf("long report: %d findings (%d not shown), %d explained (%d not shown)", len(r.Findings), r.FindingsNotShown, len(r.Explained), r.ExplainedNotShown)
+	}
 }
 
 func TestExplainFindingIncludesFix(t *testing.T) {
@@ -375,6 +395,10 @@ func TestToolResultsMarkMachineTextUntrusted(t *testing.T) {
 	a.reports[11].Report.Host.Hostname = "web01\x1b[31m"
 	a.machines[0].VisitError = "ssh: \x1b[2Jbanner"
 	a.machines[0].Worst = &server.APIFindingBrief{Key: "persist.cron", Severity: model.SevBackdoor, Title: hostile}
+	// The server stores a visit error already escaped; it is passed on as
+	// it is, not escaped a second time.
+	a.addMachine(2, "db01")
+	a.machines[1].VisitError = `ssh: \x1b[2Jbanner, escaped by the server`
 	cs := connect(t, a)
 	want := escape.Terminal(hostile)
 
@@ -411,6 +435,9 @@ func TestToolResultsMarkMachineTextUntrusted(t *testing.T) {
 	result(t, check("list_machines", call(t, cs, "list_machines", nil)), &lm)
 	if lm.Machines[0].WorstFinding.Title != want || lm.Machines[0].VisitError != `ssh: \x1b[2Jbanner` {
 		t.Errorf("list_machines: %+v", lm.Machines[0])
+	}
+	if lm.Machines[1].VisitError != `ssh: \x1b[2Jbanner, escaped by the server` {
+		t.Errorf("an escaped visit error was escaped again: %q", lm.Machines[1].VisitError)
 	}
 
 	// Errors start with the note too, and keep the server's words apart.
@@ -534,6 +561,12 @@ func TestTokenFileModes(t *testing.T) {
 	if tok, err := ReadTokenFile(good); err != nil || tok != "abc_DEF-123" {
 		t.Errorf("0600 file: %q %v", tok, err)
 	}
+	// MCP clients start telltale mcp without a shell, so a leading ~/ is
+	// expanded here.
+	t.Setenv("HOME", dir)
+	if tok, err := ReadTokenFile("~/good"); err != nil || tok != "abc_DEF-123" {
+		t.Errorf("~/good: %q %v", tok, err)
+	}
 	if tok, err := ReadTokenFile(write("ro", "abc\n", 0o400)); err != nil || tok != "abc" {
 		t.Errorf("0400 file: %q %v", tok, err)
 	}
@@ -575,5 +608,56 @@ func TestTokenFileModes(t *testing.T) {
 	}
 	if _, err := ReadTokenFile(filepath.Join(dir, "missing")); err == nil {
 		t.Error("missing file: accepted")
+	}
+}
+
+func TestToolErrorsKeepDetailApart(t *testing.T) {
+	a := newFakeAPI(t)
+	cs := connect(t, a)
+	addr := strings.TrimPrefix(a.srv.URL, "https://")
+	a.srv.Close() // the server is gone: a transport error
+	e := wantToolError(t, call(t, cs, "list_machines", nil))
+	if e.Error != requestFailedText {
+		t.Errorf("error %q, want the tool's own fixed text", e.Error)
+	}
+	if !strings.Contains(e.ServerMessage, addr) {
+		t.Errorf("the transport detail is not in server_message: %+v", e)
+	}
+}
+
+func TestClientNeverFollowsRedirects(t *testing.T) {
+	var hits int
+	var mu sync.Mutex
+	other := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(server.APIMachines{Machines: []server.APIMachine{{ID: 9, Name: "trap"}}})
+	}))
+	defer other.Close()
+	redir := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+r.URL.RequestURI(), http.StatusTemporaryRedirect)
+	}))
+	defer redir.Close()
+	fp := "SHA256:" + server.Fingerprint(redir.Certificate().Raw)
+	// Both test servers use the same certificate, so the pin alone would not
+	// stop the client: only refusing redirects does.
+	if fp != "SHA256:"+server.Fingerprint(other.Certificate().Raw) {
+		t.Log("the two test servers have different certificates")
+	}
+	c, err := NewClient(ClientOptions{Server: redir.URL, Token: testToken, Fingerprint: fp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms, err := c.Machines(context.Background())
+	var se *ServerError
+	if !errors.As(err, &se) || se.Status != http.StatusTemporaryRedirect || len(ms) != 0 {
+		t.Errorf("redirect: %v %v", ms, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if hits != 0 {
+		t.Errorf("the client followed the redirect to another host (%d requests, the token with them)", hits)
 	}
 }

@@ -345,12 +345,17 @@ func (a *api) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.mux.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), apiTokenKey{}, tok)))
 }
 
-// authenticate checks the bearer token. Failed tries are counted per peer
-// address like logins: at most loginFailures a minute, and while an address
-// is over that even a good token from it waits.
+// authenticate checks the bearer token. Wrong tokens are counted per peer
+// address like failed logins: after loginFailures in a minute the address
+// waits, even with a good token. Only a token that was presented and did
+// not match counts. A request with no token (a web page's CORS preflight,
+// a browser opening the address) is refused but not counted, so a page
+// cannot lock out the owner's token, and valid requests running in
+// parallel never count at all.
 func (a *api) authenticate(w http.ResponseWriter, r *http.Request) (APIToken, bool) {
 	ip := peerIP(r)
-	if ok, first := a.limiter.attempt(ip, a.now()); !ok {
+	now := a.now()
+	if over, first := a.limiter.over(ip, now); over {
 		if first {
 			a.audit(actorAPI, "api refused, too many failures", "from %s", ip)
 		}
@@ -358,8 +363,7 @@ func (a *api) authenticate(w http.ResponseWriter, r *http.Request) (APIToken, bo
 		writeAPIError(w, http.StatusTooManyRequests, "Too many failed token attempts from your address. Wait a minute and try again.")
 		return APIToken{}, false
 	}
-	refuse := func(msg string) (APIToken, bool) {
-		a.audit(actorAPI, "api token refused", "from %s", ip)
+	unauthorized := func(msg string) (APIToken, bool) {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="telltale"`)
 		writeAPIError(w, http.StatusUnauthorized, msg)
 		return APIToken{}, false
@@ -367,19 +371,21 @@ func (a *api) authenticate(w http.ResponseWriter, r *http.Request) (APIToken, bo
 	presented, ok := bearerToken(r)
 	if !ok {
 		if _, err := r.Cookie(sessionCookie); err == nil {
-			return refuse("The API does not take a browser session. Send a token from the web UI's settings as Authorization: Bearer <token>.")
+			return unauthorized("The API does not take a browser session. Send a token from the web UI's settings as Authorization: Bearer <token>.")
 		}
-		return refuse("The API needs a token from the web UI's settings, sent as Authorization: Bearer <token>.")
+		return unauthorized("The API needs a token from the web UI's settings, sent as Authorization: Bearer <token>.")
 	}
 	t, found, err := findAPIToken(a.store, presented)
 	if err != nil {
+		// The server's trouble, not a failed try.
 		a.serverError(w, r, err)
 		return APIToken{}, false
 	}
 	if !found {
-		return refuse("That token is not valid: it was revoked, or it was never made on this server.")
+		a.limiter.fail(ip, now)
+		a.audit(actorAPI, "api token refused", "from %s", ip)
+		return unauthorized("That token is not valid: it was revoked, or it was never made on this server.")
 	}
-	a.limiter.succeed(ip)
 	return t, true
 }
 
@@ -565,9 +571,10 @@ func (a *api) compare(w http.ResponseWriter, r *http.Request) {
 
 const visitRunningText = "A visit to this machine is running; try again when it is done."
 
-// visitWait is how long the token must wait before it may ask for another
-// visit to the machine; 0 means now, and the request is counted.
-func (a *api) visitWait(tokenID, machineID int64, now time.Time) time.Duration {
+// reserveVisit takes the token's one visit a minute for the machine and
+// returns 0, or says how long until it is free. Taking it at once, under
+// the lock, keeps two requests sent together from both getting it.
+func (a *api) reserveVisit(tokenID, machineID int64, now time.Time) time.Duration {
 	a.visitMu.Lock()
 	defer a.visitMu.Unlock()
 	for k, t := range a.lastVisit {
@@ -583,21 +590,35 @@ func (a *api) visitWait(tokenID, machineID int64, now time.Time) time.Duration {
 	return 0
 }
 
+// releaseVisit gives back the reservation made at at, when no visit
+// started after all (one was already running).
+func (a *api) releaseVisit(tokenID, machineID int64, at time.Time) {
+	a.visitMu.Lock()
+	defer a.visitMu.Unlock()
+	k := [2]int64{tokenID, machineID}
+	if t, ok := a.lastVisit[k]; ok && t.Equal(at) {
+		delete(a.lastVisit, k)
+	}
+}
+
 // visit starts a visit, like the web UI's "Check now": it waits a moment for
-// a visit that ends at once and otherwise says it has started.
+// a visit that ends at once and otherwise says it has started. Only a visit
+// that starts uses up the token's minute for the machine; a 409 does not.
 func (a *api) visit(w http.ResponseWriter, r *http.Request) {
 	m, ok := a.machine(w, r)
 	if !ok {
 		return
 	}
 	tok := tokenOf(r)
-	if wait := a.visitWait(tok.ID, m.ID, a.now()); wait > 0 {
+	at := a.now()
+	if wait := a.reserveVisit(tok.ID, m.ID, at); wait > 0 {
 		secs := int((wait + time.Second - 1) / time.Second)
 		w.Header().Set("Retry-After", strconv.Itoa(secs))
 		writeAPIError(w, http.StatusTooManyRequests, fmt.Sprintf("This token asked for a visit to this machine less than a minute ago. Try again in %d seconds.", secs))
 		return
 	}
 	if a.core.Visiting(m.ID) {
+		a.releaseVisit(tok.ID, m.ID, at)
 		writeAPIError(w, http.StatusConflict, visitRunningText)
 		return
 	}
@@ -611,6 +632,9 @@ func (a *api) visit(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer a.visits.Done()
 		rid, err := a.core.VisitNow(a.ctx, m.ID)
+		if errors.Is(err, ErrVisitRunning) {
+			a.releaseVisit(tok.ID, m.ID, at)
+		}
 		done <- result{rid, err}
 	}()
 	select {

@@ -374,6 +374,37 @@ func (l *limiter) prune(now time.Time) {
 	}
 }
 
+// over reports whether the address has had loginFailures failures in the
+// window, counting nothing. firstRefusal is set the first time in a window,
+// so the refusal is audited once. Use it with fail where a try is cheap to
+// check and only a real failure may count (API tokens); attempt is for
+// passwords.
+func (l *limiter) over(ip netip.Addr, now time.Time) (over, firstRefusal bool) {
+	key := limitKey(ip)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.recent(key, now)) < loginFailures {
+		return false, false
+	}
+	if t, seen := l.audited[key]; seen && now.Sub(t) < loginWindow {
+		return true, false
+	}
+	l.audited[key] = now
+	return true, true
+}
+
+// fail counts one failed try for the address.
+func (l *limiter) fail(ip netip.Addr, now time.Time) {
+	key := limitKey(ip)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	ts := l.recent(key, now)
+	if ts == nil && len(l.fails) >= maxLimited {
+		l.prune(now)
+	}
+	l.fails[key] = append(ts, now)
+}
+
 // succeed forgets an address's tries after a good password.
 func (l *limiter) succeed(ip netip.Addr) {
 	l.mu.Lock()

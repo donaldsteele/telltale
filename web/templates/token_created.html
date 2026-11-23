@@ -11,8 +11,8 @@
 <p>then paste the token into it. <code>telltale mcp</code> refuses a token file that other users can read.</p>
 </li>
 <li>
-<p>Add this command to your MCP client's configuration as a stdio server:</p>
-<div class="fix"><div class="fix-head"><strong>Command</strong> <button type="button" class="btn small copy" data-copy="mcp-command">Copy</button></div><pre><code id="mcp-command">telltale mcp --server {{.Server}} --token-file ~/.telltale-token --fingerprint {{.Fingerprint}}</code></pre></div>
+<p>Add this command to your MCP client's configuration as a stdio server, with the token file's full path in place of <code>/home/you/.telltale-token</code>. MCP clients start it without a shell, so most do not expand <code>~</code> themselves; <code>telltale mcp</code> does expand a leading <code>~/</code>.</p>
+<div class="fix"><div class="fix-head"><strong>Command</strong> <button type="button" class="btn small copy" data-copy="mcp-command">Copy</button></div><pre><code id="mcp-command">telltale mcp --server {{.Server}} --token-file /home/you/.telltale-token --fingerprint {{.Fingerprint}}</code></pre></div>
 <p>The fingerprint is this server's HTTPS certificate. <code>telltale mcp</code> talks only to a server with exactly that certificate.</p>
 </li>
 </ol>
