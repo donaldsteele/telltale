@@ -8,8 +8,9 @@ Docker machines for developing and testing telltale. Everything here is named `t
 - `variants/`: `clean`, `hardened`, `noexec` (a run flag, see below), `thirdparty` (two third-party apt sources, each with its key in a `signed-by` keyring: Tailscale, and the lab's own repository, from which `lab-vendor` 1.0 is installed through apt), `localsoft` (a built program and a setuid helper in `/usr/local`).
 - `sink/`: TCP accept-and-log on 4444 and 8443, the attacker's remote end.
 - `repo/`: the image `telltale-lab/repo`, a signed third-party APT repository holding `lab-vendor` 1.0 and 2.0, and a static file server for it. The signing keys are generated when the image is built, so none is in git. The image holds two trees with the same packages: one signed with the vendor's key (served as `telltale-lab-repo`) and one signed with a second key (served as `telltale-lab-repo-swapped`), for the scenario in which a repository and its key are swapped.
-- `labkit/`: the Go harness (`Build`, `Start`, `Exec`, `CopyIn`, `CopyOut`, `IP`, `StartSink`, `StartRepo`).
+- `labkit/`: the Go harness (`Build`, `Start`, `Exec`, `CopyIn`, `CopyOut`, `IP`, `StartSink`, `StartRepo`, `Networks`, `Subnet`).
 - `compose.yml`: the internal network and the sink, for use by hand. Build the sink first: `CGO_ENABLED=0 go build -tags lab -o lab/sink/sink ./lab/sink`.
+- `compose.server.yml`: the server end-to-end test's telltale server, bubbles server and two machines (see below).
 
 ## Running
 
@@ -53,6 +54,14 @@ Hostnames default to `<distro>-<variant>`; set `Opts.Hostname` for the made-up n
 
 - `TestVisitCleanMachine`: the clean machine. The collector runs from `/run`.
 - `TestVisitNoexecMachine`: the noexec machine with `/run` and `/var/tmp` also mounted `noexec`, as `/run` is under systemd. Only `/root` is left for the collector.
+
+## The server end-to-end test
+
+`TestServerEndToEnd` (`server_test.go`) runs `compose.server.yml` as Compose project `telltale-lab-e2e`: a real `telltale server`, a bubbles server, the clean Debian 12 machine and the Ubuntu 24.04 noexec machine (with `/run` and `/var/tmp` noexec too). The server runs the binaries `scripts/build.sh` writes (built into a temporary directory with `TELLTALE_DIST_DIR`), which are also its collectors. It has a fixed address on `telltale-lab`, its `server_addr`, and also joins `telltale-lab-egress` to fetch packages for verification; the machines and bubbles are on `telltale-lab` only. Its package cache is kept in `$TELLTALE_LAB_CACHE/server-pkgcache` between runs.
+
+The owner's part goes through the web UI's real forms: the setup code the server prints, the admin password, the login, CSRF tokens and the confirmation pages. The test pairs with bubbles (the fingerprint telltale shows is compared with bubbles' Admin > Overview, and the request is approved through bubbles' admin API, signed in with the generated admin password bubbles prints), makes an MCP token, enrols both machines (the snippets the UI shows are added through `docker exec` as shown), presses Check now, takes both snapshots, plants `root-key` and `regress-root-login` on Debian 12, and checks the machine page, the critical alerts in bubbles (only the changed line of a file, and not the server's own key or Match block), `latest_report` through `telltale mcp` on the host, and that the root key's alert is resolved once the key is gone. After every visit nothing may be left on the machine, and on the noexec machine the collector must have run from `/root`.
+
+The bubbles image is `telltale-lab/bubbles:<version>`, the version `go.mod` requires. When it is missing it is built from bubbles' own `deploy/docker/Dockerfile` in a clean checkout of that tag: `TELLTALE_LAB_BUBBLES_SRC=DIR`, or `~/code/bubbles` (`git clone --branch v0.4.0 https://github.com/donaldsteele/bubbles DIR`). The test is skipped when `TELLTALE_LAB_DISTROS` leaves out debian12 or ubuntu2404.
 
 ## Notes
 

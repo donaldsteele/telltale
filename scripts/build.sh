@@ -7,6 +7,10 @@
 # Usage: bash scripts/build.sh                     (VERSION from git describe)
 #        VERSION=0.1.0 bash scripts/build.sh       (a leading "v" is dropped)
 #        RELEASE=1 VERSION=v0.1.0 bash scripts/build.sh
+#        TELLTALE_DIST_DIR=/tmp/out bash scripts/build.sh   (writes there, not dist/)
+#
+# The output directory is emptied first, dist/ or the one given (a relative
+# one is relative to the repository).
 #
 # LICENSE and NOTICE are always required. A missing README.md is a warning,
 # or an error with RELEASE=1.
@@ -25,7 +29,13 @@ esac
 MODULE=github.com/donaldsteele/telltale
 LDFLAGS="-s -w -X $MODULE/internal/version.Version=$VERSION"
 ARCHES="amd64 arm64"
-DIST=dist
+DIST="${TELLTALE_DIST_DIR:-dist}"
+case "$DIST" in
+  "" | / | . | .. | ./ | ../)
+    echo "build.sh: TELLTALE_DIST_DIR '$DIST' would empty more than an output directory" >&2
+    exit 2
+    ;;
+esac
 
 docs=()
 for f in README.md LICENSE NOTICE; do

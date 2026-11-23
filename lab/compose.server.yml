@@ -1,0 +1,85 @@
+# Server mode end to end (server_test.go, TestServerEndToEnd): a telltale
+# server, a bubbles server and two lab machines, as Compose project
+# telltale-lab-e2e. The test builds the images, writes the server's
+# configuration, sets the variables below and runs
+#   docker compose -p telltale-lab-e2e -f lab/compose.server.yml up -d
+#
+# Networks, both made by labkit and external here:
+#   telltale-lab         internal, no route out. Every service is on it. The
+#                        server has a fixed address there, the server_addr
+#                        machines see it connect from.
+#   telltale-lab-egress  the lab's one network with a route out. Only the
+#                        server joins it, to fetch packages from the
+#                        archives for package verification. The machines
+#                        and bubbles never get a route out.
+#
+# Every container carries the label telltale-lab=1, so labkit's reaper
+# removes whatever a killed run leaves. Nothing here makes a volume: the
+# server's and bubbles' data live in tmpfs mounts.
+name: telltale-lab-e2e
+
+services:
+  server:
+    image: ${TELLTALE_LAB_SERVER_IMAGE:?the server base image}
+    # The collector binaries from scripts/build.sh; the server runs the one
+    # for its own architecture. It runs as the user who started the test,
+    # so the package cache it shares with the host stays theirs.
+    entrypoint: ["/opt/telltale/bin/telltale-linux-${TELLTALE_LAB_ARCH:-amd64}", "server", "--config", "/etc/telltale/telltale.toml"]
+    user: "${TELLTALE_LAB_UID:?}:${TELLTALE_LAB_GID:?}"
+    environment:
+      TELLTALE_PASSPHRASE: ${TELLTALE_PASSPHRASE:?the store passphrase}
+    volumes:
+      - ${TELLTALE_LAB_BIN_DIR:?scripts/build.sh output}:/opt/telltale/bin:ro
+      - ${TELLTALE_LAB_CONFIG:?the server configuration}:/etc/telltale/telltale.toml:ro
+      - ${TELLTALE_LAB_PKGCACHE:?the package cache}:/var/lib/telltale/pkgcache
+    tmpfs:
+      - /var/lib/telltale:uid=${TELLTALE_LAB_UID},gid=${TELLTALE_LAB_GID},mode=0700
+    labels:
+      telltale-lab: "1"
+    networks:
+      lab:
+        ipv4_address: ${TELLTALE_LAB_SERVER_IP:?the server address on telltale-lab}
+      egress: {}
+
+  bubbles:
+    image: ${TELLTALE_LAB_BUBBLES_IMAGE:?the bubbles image}
+    environment:
+      BUBBLES_NO_MDNS: "true"
+    tmpfs:
+      - /data:uid=65532,gid=65532,mode=0700
+    labels:
+      telltale-lab: "1"
+    networks: [lab]
+
+  debian12:
+    image: ${TELLTALE_LAB_DEBIAN12_IMAGE:?the debian12 clean image}
+    hostname: debian12
+    # As labkit.Start: root sees other accounts' programs, as on a real machine.
+    cap_add: [SYS_PTRACE]
+    labels:
+      telltale-lab: "1"
+    networks: [lab]
+
+  ubuntu2404-noexec:
+    image: ${TELLTALE_LAB_UBUNTU2404_NOEXEC_IMAGE:?the ubuntu2404 noexec image}
+    hostname: ubuntu2404-noexec
+    cap_add: [SYS_PTRACE]
+    # /tmp and /dev/shm noexec, as the noexec variant is run, and /run and
+    # /var/tmp too (systemd mounts /run so, hardened machines /var/tmp): the
+    # visit has to fall back to /root for the collector.
+    tmpfs:
+      - /tmp:noexec
+      - /dev/shm:noexec
+      - /run:noexec,nosuid,nodev,mode=755
+      - /var/tmp:noexec,nosuid,nodev,mode=1777
+    labels:
+      telltale-lab: "1"
+    networks: [lab]
+
+networks:
+  lab:
+    name: telltale-lab
+    external: true
+  egress:
+    name: telltale-lab-egress
+    external: true

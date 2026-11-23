@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path"
@@ -173,6 +174,28 @@ func createNetwork(t testing.TB, name string, internal bool) {
 	if _, se, code := docker(append(args, name)...); code != 0 && !strings.Contains(se, "already exists") {
 		t.Fatalf("create network %s: %s", name, se)
 	}
+}
+
+// Networks makes sure both lab networks exist, the internal one and the one
+// with a route out, for containers started by other means than Start (a
+// Compose file that names them as external networks). Reap removes them.
+func Networks(t testing.TB) {
+	t.Helper()
+	ensureNetwork(t)
+	ensureEgressNetwork(t)
+}
+
+// Subnet is the internal lab network's IPv4 subnet.
+func Subnet(t testing.TB) netip.Prefix {
+	t.Helper()
+	out := mustDocker(t, "network", "inspect", "--format", "{{range .IPAM.Config}}{{.Subnet}} {{end}}", NetworkName)
+	for _, s := range strings.Fields(out) {
+		if p, err := netip.ParsePrefix(s); err == nil && p.Addr().Is4() {
+			return p.Masked()
+		}
+	}
+	t.Fatalf("network %s has no IPv4 subnet (%q)", NetworkName, strings.TrimSpace(out))
+	return netip.Prefix{}
 }
 
 // NetworkInternal reports whether the lab network has no route out.
