@@ -23,7 +23,7 @@ const mcpUsage = `usage: telltale mcp --server https://ADDRESS:PORT --token-file
 Runs an MCP server on stdin and stdout for an AI assistant. Its tools read a
 running telltale server's machines and reports and can ask it for a visit:
 list_machines, latest_report, explain_finding, compare_reports and check_now.
-They cannot take a snapshot, accept changes or add exceptions, and telltale
+They cannot take a snapshot, accept changes or add or remove exceptions, and telltale
 never runs a fix command.
 
 Flags:

@@ -3,7 +3,7 @@
 // api.go), over HTTPS pinned to the server's certificate.
 //
 // The tools read machines and reports and can ask for a visit. They cannot
-// take a snapshot, accept changes or add exceptions; the API does not offer
+// take a snapshot, accept changes or add or remove exceptions; the API does not offer
 // those. Every string that came from a monitored machine is escaped with
 // escape.Terminal and returned in its own JSON field, never inside the
 // tools' own sentences, and every result starts with UntrustedNote.

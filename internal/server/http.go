@@ -37,6 +37,7 @@ type Backend interface {
 	MarkClean(ctx context.Context, machineID, reportID int64) error
 	AcceptChanges(ctx context.Context, machineID, reportID int64, keys []string) error
 	AddException(ctx context.Context, machineID, reportID int64, key, note string) error
+	RemoveException(ctx context.Context, machineID, exceptionID int64) error
 	VisitError(machineID int64) (string, error)
 	Leftovers(machineID int64) ([]string, error)
 	Visiting(machineID int64) bool
@@ -430,6 +431,8 @@ func (u *UI) routes() {
 	m.HandleFunc("POST /machines/{id}/accept", u.authed(u.acceptPost))
 	m.HandleFunc("GET /machines/{id}/exception", u.authed(u.exceptionPage))
 	m.HandleFunc("POST /machines/{id}/exception", u.authed(u.exceptionPost))
+	m.HandleFunc("GET /machines/{id}/exception/remove", u.authed(u.exceptionRemovePage))
+	m.HandleFunc("POST /machines/{id}/exception/remove", u.authed(u.exceptionRemovePost))
 	m.HandleFunc("GET /machines/{id}/enrolled", u.authed(u.snippetsPage))
 
 	m.HandleFunc("GET /enrol", u.authed(u.enrolPage))

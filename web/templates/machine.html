@@ -43,7 +43,7 @@
 <h2>Exceptions</h2>
 {{if .Exceptions}}
 <p>Findings you accepted as intended. Each stays accepted only while its value stays exactly the same.</p>
-<ul class="plain">{{range .Exceptions}}<li class="mono small">{{.}}</li>{{end}}</ul>
+<ul class="plain">{{range .Exceptions}}<li><span class="mono small">{{.Text}}</span> &middot; <a href="{{.RemoveURL}}">Remove</a></li>{{end}}</ul>
 {{else}}
 <p class="dim">None. To accept a finding you meant to have (a locally built module, a setting you leave as it is), use "Accept as an exception" under it.</p>
 {{end}}

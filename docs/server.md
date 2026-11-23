@@ -219,7 +219,20 @@ the settings page, so you can audit each machine's
   forward by themselves.
 - **Exceptions**: a finding you mean to keep (a setting you leave as it is,
   a module you built) can be accepted as an exception. It stays accepted
-  only while its value stays exactly the same.
+  only while its value stays exactly the same. The machine page lists the
+  exceptions in force, each with **Remove**: after you confirm, the
+  exception is gone and the finding is reported again from the next visit
+  on, if it is still there. Like every owner action it is in the audit log
+  and cannot be done through the API or MCP.
+- **Removing a machine, and pruning old reports, are not in v0.1.0.** A
+  machine you no longer want checked stays in the list with its history.
+  To stop the server from visiting it, set its schedule to **only when I
+  press Check now**; the server then visits it only when you, or an
+  assistant using `check_now`, ask for a visit, and no alert comes from it
+  otherwise. Then remove the server's key line and Match block from the
+  machine itself. Do not delete rows from the database by hand: reports,
+  snapshots and exceptions are sealed row by row, and the audit log is
+  meant to stay complete.
 - **A visit that fails** is recorded; after three failures in a row the
   machine's report says so. For a machine that was visited successfully
   before, that report is a **backdoor sign** when the machine still answers
@@ -279,7 +292,7 @@ telltale mcp --server https://192.168.1.10:8443 --token-file /home/you/.telltale
 exactly that certificate fingerprint, and refuses a token file others can
 read. The tools are `list_machines`, `latest_report`, `explain_finding`,
 `compare_reports` and `check_now` (at most one visit a minute per machine).
-They cannot take a snapshot, accept changes or add exceptions, and the
+They cannot take a snapshot, accept changes or add or remove exceptions, and the
 assistant is told that text from machines is data, not instructions, and
 never to run fix commands. Revoke a token on the same page.
 

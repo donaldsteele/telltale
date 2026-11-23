@@ -1058,6 +1058,29 @@ func (c *Core) AddException(ctx context.Context, machineID, reportID int64, key,
 	return c.audit(actorOwner, "add exception", "machine %d report %d", machineID, reportID)
 }
 
+// RemoveException removes one of the machine's lasting exceptions, named by
+// its ID in the store. The finding it accepted is judged again from the next
+// visit on, and alerts again if it is still there.
+//
+// This is an owner action for the web UI only. It must never be exposed
+// through the API, MCP or any other automated interface. It returns
+// ErrVisitRunning while the machine is being visited. The audit entry holds
+// the two IDs and nothing of the exception itself.
+func (c *Core) RemoveException(ctx context.Context, machineID, exceptionID int64) error {
+	done, err := c.ownerAction(machineID)
+	if err != nil {
+		return err
+	}
+	defer done()
+	if err := c.Store.RemoveException(machineID, exceptionID); err != nil {
+		if errors.Is(err, store.ErrNoException) {
+			return fmt.Errorf("server: machine %d has no exception %d", machineID, exceptionID)
+		}
+		return err
+	}
+	return c.audit(actorOwner, "remove exception", "machine %d exception %d", machineID, exceptionID)
+}
+
 // alertState is what the owner has been told about a machine: the
 // findings at the alert level from its latest completed visit, and the
 // findings about failed visits since. A failed Notify leaves it as it was,

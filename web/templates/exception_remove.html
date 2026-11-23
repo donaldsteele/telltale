@@ -1,0 +1,16 @@
+{{define "content"}}
+{{- $csrf := .CSRF}}
+{{- with .Body}}
+<h1>Remove an exception on {{.Name}}</h1>
+<div class="callout warn">
+<p>Removing an exception means this finding is no longer accepted. From the next visit on it is reported again, and alerts again, for as long as it is still there.</p>
+</div>
+<p class="mono small">{{.Text}}</p>
+<form method="post" action="/machines/{{.MachineID}}/exception/remove" class="confirm stack">
+<input type="hidden" name="csrf" value="{{$csrf}}">
+<input type="hidden" name="exception" value="{{.ExceptionID}}">
+<input type="hidden" name="confirm" value="yes">
+<div><button type="submit" class="btn primary">Yes, remove this exception</button> <a href="/machines/{{.MachineID}}">Cancel</a></div>
+</form>
+{{- end}}
+{{end}}

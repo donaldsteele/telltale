@@ -27,7 +27,7 @@ import (
 // browser session, so a page cannot make a browser call it.
 //
 // It reads machines and reports, and it can ask for a visit. Nothing else:
-// taking a snapshot, accepting changes and adding exceptions are the owner's
+// taking a snapshot, accepting changes and adding or removing exceptions are the owner's
 // decisions in the web UI and are not reachable from here. apiBackend and
 // apiStore are all the API is given, so that holds by construction.
 

@@ -666,3 +666,35 @@ func TestDBNotRegularRefused(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestRemoveException(t *testing.T) {
+	s := openPass(t, filepath.Join(t.TempDir(), "t.db"), "pw")
+	a, b := addM(t, s, "a"), addM(t, s, "b")
+	for _, k := range []string{"heur.one", "heur.two"} {
+		if err := s.AddException(a, model.Exception{FindingKey: k, AcceptedValue: "v"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.AddException(b, model.Exception{FindingKey: "heur.other", AcceptedValue: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.ExceptionRows(a)
+	if err != nil || len(rows) != 2 || rows[0].ID == 0 || rows[0].ID == rows[1].ID || rows[0].FindingKey != "heur.one" {
+		t.Fatalf("rows %+v: %v", rows, err)
+	}
+	// Another machine's exception is not this machine's to remove.
+	if err := s.RemoveException(b, rows[0].ID); !errors.Is(err, ErrNoException) {
+		t.Errorf("removing machine a's exception as machine b: %v", err)
+	}
+	if err := s.RemoveException(a, rows[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RemoveException(a, rows[0].ID); !errors.Is(err, ErrNoException) {
+		t.Errorf("removing it twice: %v", err)
+	}
+	left, _ := s.Exceptions(a)
+	other, _ := s.Exceptions(b)
+	if len(left) != 1 || left[0].FindingKey != "heur.two" || len(other) != 1 {
+		t.Errorf("left %+v, other machine %+v", left, other)
+	}
+}

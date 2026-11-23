@@ -357,7 +357,7 @@ func TestAPINeverExposesOwnerActions(t *testing.T) {
 		}
 	}
 	st := reflect.TypeFor[apiStore]()
-	for _, name := range []string{"AddException", "PutSnapshot", "UpdateMachine", "AddMachine", "SetSecretSetting", "SetSetting", "PutReport"} {
+	for _, name := range []string{"AddException", "RemoveException", "PutSnapshot", "UpdateMachine", "AddMachine", "SetSecretSetting", "SetSetting", "PutReport"} {
 		if _, ok := st.MethodByName(name); ok {
 			t.Errorf("the API can reach the store's %s", name)
 		}
@@ -370,6 +370,10 @@ func TestAPINeverExposesOwnerActions(t *testing.T) {
 		"/api/v1/machines/" + m + "/accept?report=" + r + "&all=1",
 		"/api/v1/machines/" + m + "/exception",
 		"/api/v1/machines/" + m + "/exception?report=" + r + "&key=a",
+		"/api/v1/machines/" + m + "/exception/remove",
+		"/api/v1/machines/" + m + "/exception/remove?exception=1",
+		"/api/v1/machines/" + m + "/exceptions/1",
+		"/api/v1/exceptions/1",
 		"/api/v1/machines/" + m + "/changes",
 		"/api/v1/machines/" + m + "/snapshot",
 		"/api/v1/machines/" + m + "/schedule",
@@ -417,7 +421,7 @@ func TestAPINeverExposesOwnerActions(t *testing.T) {
 	}
 	w.core.mu.Lock()
 	defer w.core.mu.Unlock()
-	if len(w.core.cleans)+len(w.core.accepts)+len(w.core.exceptions) != 0 || len(w.core.visits) != 0 {
+	if len(w.core.cleans)+len(w.core.accepts)+len(w.core.exceptions)+len(w.core.removed) != 0 || len(w.core.visits) != 0 {
 		t.Errorf("an owner action ran through the API: %v %v %v %v", w.core.cleans, w.core.accepts, w.core.exceptions, w.core.visits)
 	}
 	if ex, err := w.st.Exceptions(mid); err != nil || len(ex) != 0 {

@@ -303,7 +303,13 @@ type machineView struct {
 	CleanURL              string
 	Changes               int
 	History               []historyRow
-	Exceptions            []string
+	Exceptions            []exceptionRow
+}
+
+// exceptionRow is one exception in force, with the page that removes it.
+type exceptionRow struct {
+	Text      string
+	RemoveURL string
 }
 
 // machinePage shows one machine and one of its reports: the latest, or the
@@ -360,13 +366,13 @@ func (u *UI) machinePage(c *reqCtx) {
 	if a, err := u.o.Core.Acceptable(m.ID); err == nil && !a.Stale && len(metas) > 0 && a.ReportID == metas[0].ID {
 		v.Changes = len(a.With)
 	}
-	exc, err := u.o.Store.Exceptions(m.ID)
+	exc, err := u.o.Store.ExceptionRows(m.ID)
 	if err != nil {
 		u.serverError(c.w, c.r, err)
 		return
 	}
 	for _, e := range exc {
-		v.Exceptions = append(v.Exceptions, exceptionText(e))
+		v.Exceptions = append(v.Exceptions, exceptionRow{Text: exceptionText(e.Exception), RemoveURL: fmt.Sprintf("/machines/%d/exception/remove?exception=%d", m.ID, e.ID)})
 	}
 	u.page(c, http.StatusOK, "machine", v.Name, "machines", v, "")
 }
@@ -870,6 +876,68 @@ func (u *UI) exceptionPost(c *reqCtx) {
 		return
 	}
 	u.redirect(c, to, "Accepted as an exception. It stays accepted while its value stays the same.")
+}
+
+type exceptionRemoveView struct {
+	MachineID   int64
+	Name        string
+	ExceptionID int64
+	Text        string
+}
+
+// storedException finds the machine's exception a removal names; it
+// answers 404 itself when there is none.
+func (u *UI) storedException(c *reqCtx, m *store.Machine, raw string) (store.ExceptionRow, bool) {
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 {
+		u.fail(c.w, c.r, http.StatusNotFound, "This machine has no such exception.")
+		return store.ExceptionRow{}, false
+	}
+	rows, err := u.o.Store.ExceptionRows(m.ID)
+	if err != nil {
+		u.serverError(c.w, c.r, err)
+		return store.ExceptionRow{}, false
+	}
+	for _, r := range rows {
+		if r.ID == id {
+			return r, true
+		}
+	}
+	u.fail(c.w, c.r, http.StatusNotFound, "This machine has no such exception.")
+	return store.ExceptionRow{}, false
+}
+
+func (u *UI) exceptionRemovePage(c *reqCtx) {
+	m := u.machine(c)
+	if m == nil {
+		return
+	}
+	e, ok := u.storedException(c, m, c.r.URL.Query().Get("exception"))
+	if !ok {
+		return
+	}
+	v := exceptionRemoveView{MachineID: m.ID, Name: escape.Terminal(m.Name), ExceptionID: e.ID, Text: exceptionText(e.Exception)}
+	u.page(c, http.StatusOK, "exception_remove", "Remove an exception", "machines", v, "")
+}
+
+func (u *UI) exceptionRemovePost(c *reqCtx) {
+	m := u.machine(c)
+	if m == nil {
+		return
+	}
+	e, ok := u.storedException(c, m, c.r.PostForm.Get("exception"))
+	if !ok {
+		return
+	}
+	if !u.confirmed(c, fmt.Sprintf("/machines/%d/exception/remove?exception=%d", m.ID, e.ID)) {
+		return
+	}
+	to := fmt.Sprintf("/machines/%d", m.ID)
+	if err := u.o.Core.RemoveException(c.r.Context(), m.ID, e.ID); err != nil {
+		u.redirect(c, to, actionError(err))
+		return
+	}
+	u.redirect(c, to, "The exception is removed. From the next visit on the finding is reported again, if it is still there.")
 }
 
 type snippetsView struct {

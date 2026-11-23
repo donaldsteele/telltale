@@ -550,6 +550,55 @@ func (s *Store) Exceptions(machineID int64) ([]model.Exception, error) {
 	return out, rows.Err()
 }
 
+// ErrNoException means the machine has no exception with that ID.
+var ErrNoException = errors.New("store: the machine has no such exception")
+
+// ExceptionRow is an exception with the ID that names it for removal.
+type ExceptionRow struct {
+	ID int64
+	model.Exception
+}
+
+// ExceptionRows lists the machine's exceptions with their IDs, in the order
+// they were added.
+func (s *Store) ExceptionRows(machineID int64) ([]ExceptionRow, error) {
+	rows, err := s.db.Query(`SELECT id, blob FROM exceptions WHERE machine_id=? ORDER BY id`, machineID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ExceptionRow
+	for rows.Next() {
+		var id int64
+		var blob []byte
+		if err := rows.Scan(&id, &blob); err != nil {
+			return nil, err
+		}
+		r := ExceptionRow{ID: id}
+		if err := s.openJSON(blob, rowAAD("exception", machineID, id), &r.Exception); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// RemoveException removes one of the machine's exceptions. It is
+// ErrNoException when the machine has none with that ID: an exception of
+// another machine is never removed.
+func (s *Store) RemoveException(machineID, id int64) error {
+	res, err := s.db.Exec(`DELETE FROM exceptions WHERE id=? AND machine_id=?`, id, machineID)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return ErrNoException
+	}
+	return nil
+}
+
 // Audit appends an entry to the audit log. There is no way to change or remove
 // one through this API, and the schema's triggers refuse it in SQL too.
 //

@@ -58,6 +58,7 @@ type fakeCore struct {
 	cleans     [][2]int64
 	accepts    []acceptCall
 	exceptions []exceptionCall
+	removed    [][2]int64
 	actionErr  error
 	visitError map[int64]string
 	visiting   map[int64]bool
@@ -112,6 +113,16 @@ func (f *fakeCore) AddException(_ context.Context, id, rid int64, key, note stri
 		return f.actionErr
 	}
 	f.exceptions = append(f.exceptions, exceptionCall{id, rid, key, note})
+	return nil
+}
+
+func (f *fakeCore) RemoveException(_ context.Context, id, eid int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.actionErr != nil {
+		return f.actionErr
+	}
+	f.removed = append(f.removed, [2]int64{id, eid})
 	return nil
 }
 
