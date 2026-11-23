@@ -8,7 +8,10 @@
 <meta property="og:type" content="website">
 <meta property="og:title" content="telltale - has someone backdoored this Linux machine?">
 <meta property="og:description" content="A tamper and backdoor check for Debian and Ubuntu machines. One static binary; carry it, or run a server that visits. Reports only, never fixes.">
-<meta property="og:image" content="https://donaldsteele.github.io/telltale/assets/report-light.png">
+<meta property="og:image" content="https://donaldsteele.github.io/telltale/assets/social-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="627">
+<meta property="og:image:alt" content="telltale, marked beta: Has someone backdoored this machine? A terminal shows telltale's findings for a lab machine after a break-in, the first one in red: ps hides 1 item that telltale can see directly.">
 <meta property="og:url" content="https://donaldsteele.github.io/telltale/">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="color-scheme" content="light dark">
@@ -18,6 +21,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500..700;1,9..144,500&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap" rel="stylesheet">
 <link rel="stylesheet" href="styles.css">
+<script src="assets/demo.js" defer></script>
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
@@ -93,8 +97,23 @@
 </div>
 </div></section>
 
+<section id="server"><div class="wrap">
+<div class="sec-head"><p class="folio"><svg class="mark" viewBox="0 0 20 20" aria-hidden="true"><path fill="currentColor" d="M1.5 6.5H9L7.8 8.3L9.6 10L7.8 11.7L9 13.5H1.5Z"/><path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M10.2 7.3H18.5V14.3H10.2L9 12.5L10.8 10.8L9 9.1Z"/></svg><span>06 / The server</span></p><h2>Every machine, one page.</h2></div>
+<div class="lead">
+<div><p>The server's web UI lists your machines with the worst finding on each. A machine's page has its latest report, every finding with its evidence, why it matters and the command that would fix it, and its earlier visits.</p></div>
+<div><p>Changes since the snapshot get a page of their own: if you made one on purpose, accept it there and the snapshot rolls forward. Alerts go to a bubbles channel and close themselves when a later visit no longer finds the problem. Taking the snapshot and accepting changes or exceptions are yours alone, in the web UI: never through the API or the MCP server.</p></div>
+</div>
+<figure class="frame demo"><video controls muted loop playsinline preload="metadata" poster="assets/web-ui-demo-poster.jpg" width="1280" height="800" aria-label="A recorded walk through the telltale web UI: the machines page, debian12's page and its first finding with the fix command, the changes since the snapshot, then the alert in bubbles."><source src="assets/web-ui-demo.webm" type="video/webm"><source src="assets/web-ui-demo.mp4" type="video/mp4"><a href="assets/web-ui-demo.mp4">Download the recording (MP4, 1.3 MB)</a></video><figcaption>Recorded in the test lab with telltale 0.1.1: the real server and a Debian 12 machine on which a root SSH key was planted and root login turned back on, then the alert bubbles got. No sound.</figcaption></figure>
+<div class="shots">
+<figure class="frame"><a href="assets/web-machines.png"><img src="assets/web-machines.png" width="1920" height="848" loading="lazy" alt="The machines page: debian12's worst finding is tampering, SSH root login turned back on since the snapshot; ubuntu2404-noexec's is a weak setting. Each has a Check now button."></a><figcaption>Machines: debian12 after the break-in, ubuntu2404 with only the weak settings it already had.</figcaption></figure>
+<figure class="frame"><a href="assets/web-machine.png"><img src="assets/web-machine.png" width="1920" height="1743" loading="lazy" alt="debian12's page: last visit, the snapshot, the visit schedule, a box saying 3 findings are changes since the snapshot, and the latest report's first finding with why it matters and the fix command."></a><figcaption>A machine: its latest report, first finding first, with the fix.</figcaption></figure>
+<figure class="frame"><a href="assets/web-changes.png"><img src="assets/web-changes.png" width="1920" height="1161" loading="lazy" alt="The changes page for debian12: Accept all 3 changes, then the first change, root login turned back on, with an Accept this change button."></a><figcaption>Changes since the snapshot, to accept if you made them.</figcaption></figure>
+<figure class="frame"><a href="assets/web-bubbles-alert.png"><img src="assets/web-bubbles-alert.png" width="1920" height="1200" loading="lazy" alt="bubbles' Alerts view: a critical alert from telltale, debian12: New SSH key for root, not in the snapshot, with the key line, the fix, and Acknowledge and Resolve buttons."></a><figcaption>The alert in bubbles for the planted root key.</figcaption></figure>
+</div>
+</div></section>
+
 <section id="good-to-know"><div class="wrap">
-<div class="sec-head"><p class="folio"><svg class="mark" viewBox="0 0 20 20" aria-hidden="true"><path fill="currentColor" d="M1.5 6.5H9L7.8 8.3L9.6 10L7.8 11.7L9 13.5H1.5Z"/><path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M10.2 7.3H18.5V14.3H10.2L9 12.5L10.8 10.8L9 9.1Z"/></svg><span>06 / Good to know</span></p><h2>What it cannot tell you.</h2></div>
+<div class="sec-head"><p class="folio"><svg class="mark" viewBox="0 0 20 20" aria-hidden="true"><path fill="currentColor" d="M1.5 6.5H9L7.8 8.3L9.6 10L7.8 11.7L9 13.5H1.5Z"/><path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M10.2 7.3H18.5V14.3H10.2L9 12.5L10.8 10.8L9 9.1Z"/></svg><span>07 / Good to know</span></p><h2>What it cannot tell you.</h2></div>
 <ol class="good">
 <li><span><strong>A kernel-level rootkit can fool any check that runs on the machine</strong>, telltale included. Every report says so. The answer is to check the disk from another machine, which is planned for a later version.</span></li>
 <li><span>It checks one moment. It does not watch the machine between checks.</span></li>
