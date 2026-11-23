@@ -1,0 +1,40 @@
+#cloud-config
+# Cloud-init for the telltale kernel lab VM. run.sh fills in the two @...@
+# placeholders: the per-run SSH public key and the base64 of labmod.c.
+users:
+  - name: debian
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - "@SSH_PUBKEY@"
+ssh_pwauth: false
+write_files:
+  - path: /root/labmod.c
+    permissions: "0644"
+    encoding: b64
+    content: "@LABMOD_C_B64@"
+  - path: /root/Makefile
+    permissions: "0644"
+    content: |
+      obj-m += labmod.o
+      all:
+      	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+  - path: /etc/nftables.conf
+    permissions: "0644"
+    content: |
+      #!/usr/sbin/nft -f
+      flush ruleset
+      table inet filter {
+        chain input {
+          type filter hook input priority 0; policy drop;
+          iif lo accept
+          ct state established,related accept
+          tcp dport 22 accept
+        }
+      }
+runcmd:
+  - [sh, -c, "export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y build-essential nftables linux-headers-$(uname -r)"]
+  - [sh, -c, "cd /root && make && insmod /root/labmod.ko"]
+  - [systemctl, enable, --now, nftables]
+  - [sh, -c, "touch /var/lib/telltale-lab-ready"]
