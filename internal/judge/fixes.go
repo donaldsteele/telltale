@@ -95,7 +95,7 @@ func fixDeleteLines(p string, lines []int, note string) string {
 // target is edited, after both are saved.
 func fixDeleteLinesIn(link, target string, lines []int, note string) string {
 	if target == "" {
-		return fixKeepOnly(link, "then remove the lines shown above from the file it links to")
+		return fixKeepOnly(link, "then remove the added lines, which telltale's report lists, from the file it links to")
 	}
 	return command([]string{link, target}, func(q []string) string {
 		return keep(q[0], q[1]) + " && sed -i '" + sedDeletes(lines) + "' " + q[1] + comment(note)

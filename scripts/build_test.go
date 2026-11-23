@@ -123,3 +123,82 @@ func TestPrepareDist(t *testing.T) {
 		})
 	}
 }
+
+// prepareDistIn runs prepare_dist on the name d from the directory dir.
+func prepareDistIn(t *testing.T, dir, d string) (int, string) {
+	t.Helper()
+	script, err := filepath.Abs("dist-dir.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", "-c", `. "$1" && prepare_dist "$2"`, "test", script, d)
+	cmd.Dir = dir
+	return exitCode(t, cmd)
+}
+
+// A relative name that starts with "-" is listed like any other: find
+// must not read it as an option, fail, and leave nothing listed and
+// everything to delete.
+func TestPrepareDistDashName(t *testing.T) {
+	needBash(t)
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "-build", "notes.txt"), "mine")
+	code, stderr := prepareDistIn(t, dir, "-build")
+	if code != 1 || !strings.Contains(stderr, "will not empty it") {
+		t.Errorf("exit %d, stderr %q; want it refused", code, stderr)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "-build", "notes.txt")); err != nil || string(b) != "mine" {
+		t.Errorf("notes.txt after prepare_dist: %q, %v", b, err)
+	}
+
+	previousDist(t, filepath.Join(dir, "-old"))
+	if code, stderr := prepareDistIn(t, dir, "-old"); code != 0 {
+		t.Errorf("a previous build's output named -old: exit %d (%s), want it emptied", code, stderr)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "-old")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("-old after prepare_dist: %v", err)
+	}
+}
+
+// A directory that cannot be listed is refused, never taken for empty.
+func TestPrepareDistUnlistable(t *testing.T) {
+	needBash(t)
+	if os.Geteuid() == 0 {
+		t.Skip("root can list any directory")
+	}
+	d := filepath.Join(t.TempDir(), "dist")
+	write(t, filepath.Join(d, "notes.txt"), "mine")
+	if err := os.Chmod(d, 0o300); err != nil { // writable and searchable, not readable
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(d, 0o755) })
+	code, stderr := prepareDistIn(t, t.TempDir(), d)
+	os.Chmod(d, 0o755)
+	if code != 1 || !strings.Contains(stderr, "will not empty it") {
+		t.Errorf("exit %d, stderr %q; want it refused", code, stderr)
+	}
+	if b, err := os.ReadFile(filepath.Join(d, "notes.txt")); err != nil || string(b) != "mine" {
+		t.Errorf("notes.txt after prepare_dist: %q, %v", b, err)
+	}
+}
+
+// A link written with a trailing slash (lnk/) is still a link: it is
+// refused, and the directory it points at is left alone.
+func TestPrepareDistLinkWithSlash(t *testing.T) {
+	needBash(t)
+	dir := t.TempDir()
+	other := filepath.Join(dir, "other")
+	previousDist(t, other)
+	if err := os.Symlink(other, filepath.Join(dir, "lnk")); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"lnk/", "lnk//", filepath.Join(dir, "lnk") + "/"} {
+		code, stderr := prepareDistIn(t, dir, name)
+		if code != 1 || !strings.Contains(stderr, "symbolic link") {
+			t.Errorf("%s: exit %d, stderr %q; want it refused as a link", name, code, stderr)
+		}
+		if _, err := os.Stat(filepath.Join(other, "SHA256SUMS")); err != nil {
+			t.Errorf("%s: the link's target lost its files: %v", name, err)
+		}
+	}
+}

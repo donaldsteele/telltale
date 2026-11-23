@@ -411,9 +411,9 @@ const (
 // is, and, for a changed line, how many other changed lines the finding
 // has. A changed line comes first: the first change, in the judge's order,
 // of the evidence it marks "line added" or "line removed". The one
-// exception is a replaced line, a removed line followed by a line added at
-// the same place: then the added one is shown, the line the machine has
-// now. Taking the first change in order means a harmless second change (a
+// exception is a replaced line, a removed line with lines added in its
+// place (after the rest of its block of removed lines, see replacement):
+// then the added one is shown, the line the machine has now. Taking the first change in order means a harmless second change (a
 // comment added further down) cannot stand in for the one that matters. A
 // snapshot finding about a persistence file starts with a summary of the
 // file (its After is the file's hash, its Line the first changed line),
@@ -426,10 +426,17 @@ func alertEvidence(f model.Finding) (e model.Evidence, kind, others int, ok bool
 	if strings.HasPrefix(f.Key, "snap.persist:") && len(evs) > 0 {
 		summary, evs = &evs[0], evs[1:]
 	}
-	var changes []model.Evidence
+	var lines, changes []model.Evidence
+	firstAt := -1 // the first change's place in lines
 	more := 0
 	for _, x := range evs {
+		if x.Detail == "line added" || x.Detail == "line removed" {
+			lines = append(lines, x)
+		}
 		if (x.Detail == "line added" && x.After != "") || (x.Detail == "line removed" && x.Before != "") {
+			if firstAt < 0 {
+				firstAt = len(lines) - 1
+			}
 			changes = append(changes, x)
 		} else if m := moreRE.FindStringSubmatch(x.Detail); m != nil && x.Path == "" && x.Before == "" && x.After == "" {
 			more, _ = strconv.Atoi(m[1]) // the judge's "and N more" after the evidence it kept
@@ -437,9 +444,8 @@ func alertEvidence(f model.Finding) (e model.Evidence, kind, others int, ok bool
 	}
 	if len(changes) > 0 {
 		first, shown := changes[0], 1
-		if next := changes[min(1, len(changes)-1)]; first.Detail == "line removed" && len(changes) > 1 &&
-			next.Detail == "line added" && next.Path == first.Path && next.Line == first.Line {
-			first, shown = next, 2
+		if added, ok := replacement(lines, firstAt); ok {
+			first, shown = added, 2
 		}
 		return first, evidenceChange, len(changes) - shown + more, true
 	}
@@ -459,6 +465,44 @@ func alertEvidence(f model.Finding) (e model.Evidence, kind, others int, ok bool
 		}
 	}
 	return model.Evidence{}, 0, 0, false
+}
+
+// replacement reports the line added in place of a removed line, the first
+// change: lines[at]. The judge lists a replaced block as every removed line
+// and then every added one (removed lines 2 and 3, then added lines 2 and
+// 3), numbering removed lines in the old file and added lines in the new
+// one. So the removed line was replaced when its block of removed lines,
+// one after another in the same file, is followed by a block of lines added
+// in that file from the same line number on. The line shown is the first
+// added line that is not blank.
+func replacement(lines []model.Evidence, at int) (model.Evidence, bool) {
+	if at < 0 || lines[at].Detail != "line removed" {
+		return model.Evidence{}, false
+	}
+	next := func(i int) bool { // lines[i] directly follows lines[i-1] in one block
+		a, b := lines[i-1], lines[i]
+		return b.Path == a.Path && b.Detail == a.Detail && b.Line == a.Line+1
+	}
+	start := at // blank removed lines may come first
+	for start > 0 && next(start) {
+		start--
+	}
+	i := at + 1
+	for i < len(lines) && next(i) {
+		i++
+	}
+	if i == len(lines) || lines[i].Detail != "line added" || lines[i].Path != lines[start].Path || lines[i].Line != lines[start].Line {
+		return model.Evidence{}, false
+	}
+	for ; i < len(lines); i++ {
+		if lines[i].After != "" {
+			return lines[i], true
+		}
+		if i+1 < len(lines) && !next(i+1) {
+			break
+		}
+	}
+	return model.Evidence{}, false
 }
 
 // moreRE is the evidence the judge adds when it kept only some of a

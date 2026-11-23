@@ -224,6 +224,47 @@ func TestAlertReplacedLineShowsTheNewLine(t *testing.T) {
 	}
 }
 
+// A block of lines replaced by another comes out of the judge as every
+// removed line first, then every added one. The alert pairs the first
+// removed line with the first line added in its place, so a two-line cron
+// replacement shows the job somebody planted, never the snapshot's harmless
+// one.
+func TestAlertMultiLineReplacementShowsTheNewLine(t *testing.T) {
+	const p = "/etc/cron.d/backup"
+	for name, evs := range map[string][]model.Evidence{
+		"two lines": {
+			{Path: p, Line: 2, Before: "0 3 * * * root /usr/local/bin/backup", Detail: "line removed"},
+			{Path: p, Line: 3, Before: "30 3 * * * root /usr/local/bin/rotate", Detail: "line removed"},
+			{Path: p, Line: 2, After: "* * * * * root /var/tmp/.x/cb", Detail: "line added"},
+			{Path: p, Line: 3, After: "30 3 * * * root /usr/local/bin/rotate --all", Detail: "line added"},
+		},
+		// Blank lines are never shown, and they do not break the pairing.
+		"blank lines in the blocks": {
+			{Path: p, Line: 1, Detail: "line removed"},
+			{Path: p, Line: 2, Before: "0 3 * * * root /usr/local/bin/backup", Detail: "line removed"},
+			{Path: p, Line: 3, Before: "30 3 * * * root /usr/local/bin/rotate", Detail: "line removed"},
+			{Path: p, Line: 1, Detail: "line added"},
+			{Path: p, Line: 2, After: "* * * * * root /var/tmp/.x/cb", Detail: "line added"},
+			{Path: p, Line: 3, After: "30 3 * * * root /usr/local/bin/rotate --all", Detail: "line added"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fx := newFixture(t)
+			fx.connect(t)
+			f := model.Finding{Key: "snap.persist:" + p, Severity: model.SevBackdoor, Title: "Cron job changed",
+				Evidence: append([]model.Evidence{{Path: p, Line: 2, Before: sum("a"), After: sum("b"), Detail: "2 lines added, 2 lines removed"}}, evs...)}
+			if err := fx.b.Notify(t.Context(), machine, []model.Finding{f}, nil); err != nil {
+				t.Fatal(err)
+			}
+			n := fx.fake.Posts()[0]
+			if !strings.Contains(n.Text, "Changed line in "+mdText(p+":2")+":\n```\n* * * * * root /var/tmp/.x/cb\n```\n"+mdText("2 other changed lines are in telltale's web UI.")) ||
+				strings.Contains(n.Text, "/usr/local/bin/backup") || strings.Contains(n.Text, "Removed line") {
+				t.Errorf("text:\n%s", n.Text)
+			}
+		})
+	}
+}
+
 // The alert shows the first change in order: removing pam_deny.so cannot be
 // hidden behind a comment added further down. The other changes are
 // counted, the judge's "and N more" included.

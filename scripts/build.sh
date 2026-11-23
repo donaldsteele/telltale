@@ -38,6 +38,10 @@ case "$DIST" in
     exit 2
     ;;
 esac
+# A relative name starting with "-" would read as an option to mkdir and cd.
+case "$DIST" in
+  -*) DIST=./$DIST ;;
+esac
 
 docs=()
 for f in README.md LICENSE NOTICE; do

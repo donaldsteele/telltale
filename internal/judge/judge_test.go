@@ -3601,6 +3601,24 @@ func TestSpecialFilesBehindAMovedDirectoryKeepTheirRanking(t *testing.T) {
 	must(t, r, "pkg.unverifiable:/srv/mod/6.1/x.ko", model.SevBackdoor)
 }
 
+// A cron file that is a link to a file telltale did not collect: the fix
+// cannot name the file to edit, and it says where the added lines are
+// listed, never "shown above".
+func TestJudgePersistLinkFixSaysWhereTheLinesAre(t *testing.T) {
+	link := func(lines ...string) model.PersistFile {
+		all := append([]string{"/srv/jobs/backup"}, lines...)
+		return model.PersistFile{Path: "/etc/cron.d/backup", Kind: model.PersistKindCron, Mode: 0o120777, SHA256: h(strings.Join(all, "\n")), Lines: all, MTime: changed}
+	}
+	old := clean()
+	old.Persist = []model.PersistFile{link("0 3 * * * root /usr/local/bin/backup")}
+	cur := clone(old)
+	cur.Persist = []model.PersistFile{link("0 3 * * * root /usr/local/bin/backup", "* * * * * root /tmp/.x")}
+	f := must(t, run(cur, snapOf(old), nil), "snap.persist:/etc/cron.d/backup", model.SevBackdoor)
+	if !strings.Contains(f.Fix, "which telltale's report lists") || strings.Contains(f.Fix, "shown above") {
+		t.Errorf("fix %q", f.Fix)
+	}
+}
+
 // A persistence fix never points at lines "shown above": an alert shows one
 // line of the change, and other outputs put the fix elsewhere.
 func TestJudgePersistFixesSayWhereTheLinesAre(t *testing.T) {
