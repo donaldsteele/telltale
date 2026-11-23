@@ -113,7 +113,7 @@ binary to the machine you want to check:
 
 ```
 sha256sum --check --ignore-missing SHA256SUMS
-tar xzf telltale-carry_0.1.0_linux_amd64.tar.gz
+tar xzf telltale-carry_0.1.1_linux_amd64.tar.gz
 scp telltale web01:
 ```
 
@@ -123,7 +123,7 @@ was built by this repository's release workflow from the tagged commit. With
 the [GitHub CLI](https://cli.github.com/) you can check that:
 
 ```
-gh attestation verify telltale-carry_0.1.0_linux_amd64.tar.gz --repo donaldsteele/telltale
+gh attestation verify telltale-carry_0.1.1_linux_amd64.tar.gz --repo donaldsteele/telltale
 ```
 
 On the machine, as root (without root it still runs, and lists what it had
@@ -171,7 +171,7 @@ Run the server on a small machine of its own ([docs/server.md](docs/server.md)
 says why). With the package:
 
 ```
-sudo apt install ./telltale_0.1.0-1_amd64.deb
+sudo apt install ./telltale_0.1.1-1_amd64.deb
 sudo install -m 0640 -o root -g telltale /etc/telltale/telltale.toml.example /etc/telltale/telltale.toml
 sudoedit /etc/telltale/telltale.toml           # set listen to this machine's LAN address and a port
 sudo install -m 0600 /dev/null /etc/telltale/passphrase
@@ -196,6 +196,12 @@ setup code. Then, for each machine:
    and when you believe the machine is clean, press **This machine is
    believed clean: take the snapshot**. Every later visit is compared with
    that snapshot.
+
+<img src="site/assets/web-machine.png" width="720" alt="The telltale web UI: debian12's page in the test lab after a root SSH key was planted and root login turned back on. It says 3 findings are changes since the snapshot and shows the first finding, root login no longer off, with why it matters and the fix command.">
+
+A machine's page in the test lab after a break-in. The
+[site](https://donaldsteele.github.io/telltale/#server) has more screenshots
+and a short recording.
 
 Visits happen daily by default. A change you made on purpose is accepted
 from the machine page and rolls the snapshot forward; changes that a

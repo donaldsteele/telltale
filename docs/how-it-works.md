@@ -328,7 +328,7 @@ is dealt with.
 ## Known limits
 
 The README lists what telltale cannot tell you at all. These are narrower:
-places where v0.1.0 is known to say too much, too little, or to lean on
+places where v0.1 is known to say too much, too little, or to lean on
 something it does not check.
 
 - **systemd-boot and `initrd=`.** A kernel command line that changed only

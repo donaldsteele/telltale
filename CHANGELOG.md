@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.1.1 (2026-11-23)
+
+Two fixes in the server's web UI, and the site now shows it.
+
+- **Fixed: weak settings counted as changes.** A checklist item that already
+  failed when the snapshot was taken was offered as a change since the
+  snapshot, so the page of a machine that had not changed at all said, for
+  example, "9 findings are changes since the snapshot", and the changes page
+  listed its standing weak settings for acceptance. Only an item that held
+  in the snapshot and fails now is a change. Carry mode was not affected:
+  `telltale accept` records an exception.
+- **Fixed:** on the machines page, the Check now cell's bottom border did
+  not line up with the rest of its row.
+- **Site:** screenshots and a recorded walk-through of the web UI and the
+  alerts it sends to bubbles, made with the server in the test lab.
+
+The downloads are as in v0.1.0, named for 0.1.1.
+
 ## v0.1.0 (2026-11-23)
 
 The first release.

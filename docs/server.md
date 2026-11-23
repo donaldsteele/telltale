@@ -38,7 +38,7 @@ locks down nearly everything it does not need (see below).
 With the package (amd64 or arm64):
 
 ```
-sudo apt install ./telltale_0.1.0-1_amd64.deb
+sudo apt install ./telltale_0.1.1-1_amd64.deb
 ```
 
 It installs:
@@ -225,7 +225,7 @@ the settings page, so you can audit each machine's
   exception is gone and the finding is reported again from the next visit
   on, if it is still there. Like every owner action it is in the audit log
   and cannot be done through the API or MCP.
-- **Removing a machine, and pruning old reports, are not in v0.1.0.** A
+- **Removing a machine, and pruning old reports, are not in v0.1.** A
   machine you no longer want checked stays in the list with its history.
   To stop the server from visiting it, set its schedule to **only when I
   press Check now**; the server then visits it only when you, or an

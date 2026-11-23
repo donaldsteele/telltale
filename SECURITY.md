@@ -45,7 +45,7 @@ built from. To check a download before you trust it:
 
 ```
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify telltale_0.1.0_linux_amd64.tar.gz --repo donaldsteele/telltale
+gh attestation verify telltale_0.1.1_linux_amd64.tar.gz --repo donaldsteele/telltale
 ```
 
 `gh attestation verify` needs the [GitHub CLI](https://cli.github.com/). A
