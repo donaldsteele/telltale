@@ -286,7 +286,8 @@ func (b *Bubbles) StartPairing(ctx context.Context, id string) (PairStatus, erro
 	}
 	rctx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
-	p, err := bubblesclient.RequestPairing(rctx, c.t.baseURL(), c.fp, protocol.PairingRequest{AppName: AppName, Description: desc, RequestedScopes: Scopes})
+	req := protocol.PairingRequest{AppName: AppName, Description: desc, RequestedScopes: Scopes, ReplacesAppID: b.replacesApp(rctx, c.t.baseURL())}
+	p, err := bubblesclient.RequestPairing(rctx, c.t.baseURL(), c.fp, req)
 	if err != nil {
 		return PairStatus{}, errors.New(b.explain(err))
 	}
@@ -295,8 +296,12 @@ func (b *Bubbles) StartPairing(ctx context.Context, id string) (PairStatus, erro
 	b.mu.Lock()
 	b.stopPairLocked()
 	b.pair = s
+	b.pairing.Add(1)
 	b.mu.Unlock()
-	go b.wait(wctx, s, p)
+	go func() {
+		defer b.pairing.Done()
+		b.wait(wctx, s, p)
+	}()
 	return b.PairStatus(), nil
 }
 
@@ -336,46 +341,97 @@ func (b *Bubbles) wait(ctx context.Context, s *pairSession, p *bubblesclient.Pai
 		}
 		return
 	}
-	conn, err := cfg.ConnectionString()
-	if err == nil {
-		err = b.Store.SetSecretSetting(SettingConn, []byte(conn))
+	if b.afterWait != nil {
+		b.afterWait()
 	}
+	// The app's id, learnt with the new token, lets a later pairing with
+	// this server reconnect the same app (ReplacesAppID).
+	appID := ""
+	if cl, err := bubblesclient.New(cfg); err == nil {
+		sctx, cancel := context.WithTimeout(ctx, callTimeout)
+		if self, err := cl.Self(sctx); err == nil {
+			appID = self.App.ID
+		}
+		cancel()
+	}
+	conn, err := cfg.ConnectionString()
 	if err != nil {
-		b.logf("telltale server: bubbles: the new connection could not be saved: %s", escape.Terminal(err.Error()))
+		b.logf("telltale server: bubbles: the new connection cannot be written down: %s", escape.Terminal(err.Error()))
 		b.mu.Lock()
 		if b.pair == s {
-			s.state, s.msg = PairFailed, "telltale couldn't save the connection in its database. Try again; if it keeps happening, check the server's log."
+			s.state, s.msg = PairFailed, noTalkMsg
 		}
+		b.mu.Unlock()
+		return
+	}
+	var chans []Channel
+	for _, ch := range p.Channels() {
+		chans = append(chans, Channel{ID: ch.ID, Name: ch.Name})
+	}
+	// The check that this request is still the one wanted and the save
+	// are one step under b.mu: a cancel or a disconnect that came while
+	// the token was on its way wins, and the token is not kept.
+	b.mu.Lock()
+	if b.pair != s {
 		b.mu.Unlock()
 		return
 	}
 	var prev channelRecord
 	_ = b.loadSealed(SettingChannel, &prev)
-	var chans []Channel
-	for _, ch := range p.Channels() {
-		chans = append(chans, Channel{ID: ch.ID, Name: ch.Name})
-	}
-	rec := channelRecord{Server: s.c.name}
+	rec := channelRecord{Server: s.c.name, AppID: appID}
 	switch i := slices.IndexFunc(chans, func(c Channel) bool { return c.ID == prev.ID }); {
 	case prev.ID != "" && i >= 0:
 		rec.Channel = chans[i]
 	case len(chans) == 1:
 		rec.Channel = chans[0]
 	}
-	if err := b.saveSealed(SettingChannel, rec); err != nil {
-		b.logf("telltale server: bubbles: the alert channel could not be saved: %s", escape.Terminal(err.Error()))
+	err = b.Store.SetSecretSetting(SettingConn, []byte(conn))
+	if err == nil {
+		err = b.saveSealed(SettingChannel, rec)
 	}
-	b.audit("bubbles connected")
-	b.mu.Lock()
-	// A new connection is trusted afresh: the old one's trouble goes.
-	b.trouble, b.since = TroubleNone, time.Time{}
+	if err != nil {
+		s.state, s.msg = PairFailed, "telltale couldn't save the connection in its database. Try again; if it keeps happening, check the server's log."
+		b.mu.Unlock()
+		b.logf("telltale server: bubbles: the new connection could not be saved: %s", escape.Terminal(err.Error()))
+		return
+	}
 	b.cl, b.clConn = nil, ""
 	b.choices, b.choosing = chans, rec.ID == ""
-	if b.pair == s {
-		s.state = PairApproved
-	}
+	s.state = PairApproved
 	b.mu.Unlock()
+	// A new connection is trusted afresh: the old one's trouble goes.
+	b.clearTrouble()
+	b.audit("bubbles connected")
 	b.Kick()
+}
+
+// Wait waits for a pairing request still waiting for the chat admin to
+// end, as it does when Context ends (the server stopping).
+func (b *Bubbles) Wait() { b.pairing.Wait() }
+
+// replacesApp is the app telltale was paired as with the server at
+// baseURL, if it is the server telltale is connected to now: the id kept
+// at pairing, else the one the current token reports. With it, the chat
+// admin reconnects that app instead of adding a second one.
+func (b *Bubbles) replacesApp(ctx context.Context, baseURL string) string {
+	cfg, _, ok, err := b.connection()
+	if err != nil || !ok || !strings.EqualFold(cfg.BaseURL, baseURL) {
+		return ""
+	}
+	var rec channelRecord
+	if b.loadSealed(SettingChannel, &rec) == nil && rec.AppID != "" {
+		return rec.AppID
+	}
+	cl, _, err := b.client()
+	if err != nil || cl == nil {
+		return ""
+	}
+	sctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+	if self, err := cl.Self(sctx); err == nil {
+		return self.App.ID
+	}
+	return ""
 }
 
 // PairStatus is the pairing request telltale has open, if any.
@@ -479,10 +535,11 @@ func (b *Bubbles) SetChannel(id string) (Channel, error) {
 	}
 	b.mu.Lock()
 	b.choosing = false
-	if b.trouble == TroubleNotAllowed || b.trouble == TroubleArchived || b.trouble == TroubleNoChannel {
-		b.trouble, b.since = TroubleNone, time.Time{}
-	}
+	reset := b.trouble == TroubleNotAllowed || b.trouble == TroubleArchived || b.trouble == TroubleNoChannel
 	b.mu.Unlock()
+	if reset {
+		b.clearTrouble()
+	}
 	b.Kick()
 	return Channel{ID: ch.ID, Name: escape.Terminal(ch.Name)}, nil
 }

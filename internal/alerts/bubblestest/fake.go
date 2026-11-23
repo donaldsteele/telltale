@@ -34,6 +34,9 @@ const Token = "bub_testtoken"
 // Code is the pairing code the fake shows.
 const Code = "123456"
 
+// AppID is the app id GET /apps/self reports.
+const AppID = "app-telltale-1"
+
 // Server is a running fake.
 type Server struct {
 	// CAFingerprint is the CA's "sha256:<hex>"; URL the HTTPS base URL.
@@ -51,7 +54,7 @@ type Server struct {
 	started      int
 	posts        []protocol.AlertInput
 	resolves     []protocol.ResolveAlertByKeyRequest
-	open         map[string]bool
+	open         map[string]string // dedupe key -> the channel its open alert is in
 	channels     []protocol.PairingChannel
 	request      *protocol.PairingRequest
 	approved     bool
@@ -106,7 +109,7 @@ func New(t testing.TB) *Server {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(caDER)
-	s := &Server{CAFingerprint: "sha256:" + hex.EncodeToString(sum[:]), caDER: caDER, open: map[string]bool{}, instanceName: "office chat",
+	s := &Server{CAFingerprint: "sha256:" + hex.EncodeToString(sum[:]), caDER: caDER, open: map[string]string{}, instanceName: "office chat",
 		channels: []protocol.PairingChannel{{ID: "ch-alerts", Name: "telltale-alerts"}}}
 	apiLn, onboardLn := adjacentListeners(t)
 	s.api = httptest.NewUnstartedServer(http.HandlerFunc(s.serveAPI))
@@ -202,6 +205,8 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	case !authed:
 		apiError(w, http.StatusUnauthorized, protocol.CodeUnauthorized, "bad token")
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/apps/self":
+		writeJSON(w, http.StatusOK, protocol.AppSelf{App: protocol.App{ID: AppID, Name: "telltale"}})
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/channels":
 		var items []protocol.Channel
 		for _, c := range s.channels {
@@ -219,8 +224,12 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 			apiError(w, http.StatusNotFound, protocol.CodeNotFound, "no such channel")
 			return
 		}
+		if ch, ok := s.open[in.DedupeKey]; ok && ch != in.Channel {
+			apiError(w, http.StatusConflict, protocol.CodeConflict, "the alert with this dedupe_key is open in another channel")
+			return
+		}
 		s.posts = append(s.posts, in)
-		s.open[in.DedupeKey] = true
+		s.open[in.DedupeKey] = in.Channel
 		writeJSON(w, http.StatusCreated, protocol.PostedAlert{Transition: "created"})
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/alerts/resolve":
 		var in protocol.ResolveAlertByKeyRequest
@@ -229,11 +238,11 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.resolves = append(s.resolves, in)
-		if !s.open[in.DedupeKey] {
+		if _, ok := s.open[in.DedupeKey]; !ok {
 			apiError(w, http.StatusNotFound, protocol.CodeNotFound, "no open alert with that key")
 			return
 		}
-		s.open[in.DedupeKey] = false
+		delete(s.open, in.DedupeKey)
 		writeJSON(w, http.StatusOK, protocol.Message{})
 	default:
 		apiError(w, http.StatusNotFound, protocol.CodeNotFound, "no such endpoint")
@@ -309,6 +318,14 @@ func (s *Server) Resolves() []protocol.ResolveAlertByKeyRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return slices.Clone(s.resolves)
+}
+
+// Open reports the channel the open alert with key is in, if any.
+func (s *Server) Open(key string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch, ok := s.open[key]
+	return ch, ok
 }
 
 // Calls is how many API calls began.

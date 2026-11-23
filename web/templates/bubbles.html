@@ -40,8 +40,8 @@
 {{- else if $.Body.Trouble}}
 <div class="callout warn"><p>{{$.Body.Trouble}}{{with $.Body.Since}} <span class="small">(since {{.}})</span>{{end}}</p></div>
 {{- end}}
-{{- if .Pending}}<p>{{count .Pending "alert is" "alerts are"}} waiting to be sent.</p>{{end}}
-{{- if .Dropped}}<p>{{count .Dropped "older alert was" "older alerts were"}} dropped while bubbles could not be reached: telltale keeps at most 1000. bubbles gets one alert that says so with the next one that goes out.</p>{{end}}
+{{- if .Pending}}<p>{{count .Pending "alert is" "alerts are"}} waiting to be sent{{if .Critical}}, {{.Critical}} of them critical{{end}}.</p>{{end}}
+{{- if .Dropped}}<p>{{count .Dropped "alert was" "alerts were"}} not sent because the queue was full: telltale keeps at most 1000 waiting, and leaves out the least severe first, the oldest first among those. bubbles gets one alert that says so with the next one that goes out.</p>{{end}}
 {{- if .Choosing}}
 {{- if .Choices}}
 <form method="post" action="/settings/bubbles/channel" class="stack">

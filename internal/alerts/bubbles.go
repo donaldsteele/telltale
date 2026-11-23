@@ -9,22 +9,26 @@
 // alert card, and writes them into a Markdown body for clients without
 // cards: there the title is escaped by bubbles but entities and links are
 // not, and fields are escaped for a table cell only. So title and field
-// values get no character reference that Markdown would decode and no
-// link scheme a linkifier would follow (plain). The alert text is
-// Markdown on the card too, with links, entities and @mentions: every
-// machine string in it is either backslash-escaped character by
-// character (mdText) or a line in a fenced code block (mdCode), where
-// Markdown interprets nothing. An alert carries at most one line of a
-// file: the first changed line of the finding's evidence, which is kept
-// text and so already redacted, and is redacted once more here.
+// values get no character reference that Markdown would decode, and no
+// link: no http, https or mailto scheme, inline link, autolink or e-mail
+// address (plain). The alert text is Markdown on the card too, with
+// links, entities and @mentions: every machine string in it is either
+// backslash-escaped character by character (mdText) or a line in a fenced
+// code block (mdCode), where Markdown interprets nothing. An alert carries
+// at most one line of a file: the changed line of the finding's evidence
+// (or the line a check matched), which is kept text and so already
+// redacted, and is redacted once more here. Other evidence (hashes,
+// versions) is shown as evidence, never as a line.
 //
 // Alerts bubbles cannot take now wait, sealed, in the store (at most
-// MaxPending; past that the oldest are dropped and counted, and the count
-// goes out as one summary alert with the next send). They are sent again
-// after the next visit (Kick) and every RetryEvery (Run).
+// MaxPending; past that the least severe are left out, the oldest first
+// among equals, and counted, and the count goes out as one summary alert
+// with the next send). They are sent again after the next visit (Kick) and
+// every RetryEvery (Run).
 package alerts
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -57,6 +61,8 @@ const (
 	SettingConn    = "bubbles_conn"
 	SettingChannel = "bubbles_channel"
 	SettingPending = "bubbles_pending"
+	// SettingStatus is a small summary of the queue and the last trouble.
+	SettingStatus = "bubbles_status"
 	// SettingAlertTimeout is the server's alert_timeout setting
 	// (server.SettingAlertTimeout; the server package imports this one).
 	// It bounds every retry the way it bounds Notify.
@@ -109,9 +115,11 @@ type Bubbles struct {
 	Hostname string
 
 	initOnce   sync.Once
-	retryEvery time.Duration // RetryEvery; tests shorten it
-	qmu        sync.Mutex    // the pending queue in the store
-	sending    chan struct{} // held by the one flush that sends
+	retryEvery time.Duration  // RetryEvery; tests shorten it
+	qmu        sync.Mutex     // the pending queue in the store
+	sending    chan struct{}  // held by the one flush that sends
+	pairing    sync.WaitGroup // the goroutine waiting for the chat admin
+	afterWait  func()         // tests: runs when a pairing request got its token
 	kick       chan struct{}
 	redactKey  []byte
 
@@ -199,6 +207,8 @@ type Channel struct {
 type channelRecord struct {
 	Channel
 	Server string `json:"server,omitempty"`
+	// AppID is the app telltale was paired as, for ReplacesAppID.
+	AppID string `json:"app_id,omitempty"`
 }
 
 func (b *Bubbles) loadSealed(key string, v any) error {
@@ -299,21 +309,44 @@ var (
 	// entityRE is a Markdown character reference ("&#x202e;", "&amp;"),
 	// which would decode to a character the text never showed.
 	entityRE = regexp.MustCompile(`&(#[0-9]{1,8}|#[xX][0-9a-fA-F]{1,8}|[A-Za-z][A-Za-z0-9]{0,31});`)
-	// schemeRE and mailtoRE are what a linkifier turns into a link.
+	// schemeRE is "scheme://" and linkRE the schemes a Markdown link
+	// destination or a linkifier accepts, with or without "//"
+	// ("http:evil.example" is a link too).
 	schemeRE = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.\-]*):(//)`)
-	mailtoRE = regexp.MustCompile(`(?i)\bmailto:`)
+	linkRE   = regexp.MustCompile(`(?i)(https?|mailto):`)
+	// inlineLinkRE is the "](" of an inline link or image, autolinkRE an
+	// autolink ("<scheme:...>", "<user@host>"), emailRE an address a
+	// linkifier turns into a mailto link.
+	inlineLinkRE = regexp.MustCompile(`\]\(`)
+	autolinkRE   = regexp.MustCompile(`<([A-Za-z][A-Za-z0-9+.\-]{1,31}:[^<>\s]*|[^<>\s@]+@[^<>\s]+)>`)
+	emailRE      = regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(\.[A-Za-z0-9\-]+)+`)
+	// unitSuffix are systemd unit types: "getty@tty1.service" is a unit.
+	unitSuffix = map[string]bool{"service": true, "socket": true, "timer": true, "target": true, "mount": true, "automount": true,
+		"path": true, "slice": true, "scope": true, "device": true, "swap": true}
 )
 
 // plain makes a machine string safe for the alert's title and field
-// values: escape.Terminal, then no character reference (its & is written
-// \x26, as escape.Terminal writes bytes it hides) and no link scheme
-// ("https://" is written "https[:]//", the usual way to defang an
-// address).
+// values, which bubbles shows as plain text on its card and writes into a
+// Markdown body for other clients: escape.Terminal, then no character
+// reference (its & is written \x26, as escape.Terminal writes bytes it
+// hides), no link scheme ("https://" and "http:" are written "https[:]//"
+// and "http[:]", the usual way to defang an address), no inline link or
+// autolink ("](" and "<" are written "]\x28" and "\x3c"), and no e-mail
+// address ("a[@]b.example").
 func plain(s string) string {
 	s = escape.Terminal(s)
 	s = entityRE.ReplaceAllStringFunc(s, func(m string) string { return `\x26` + m[1:] })
+	s = autolinkRE.ReplaceAllStringFunc(s, func(m string) string { return `\x3c` + m[1:] })
 	s = schemeRE.ReplaceAllString(s, "${1}[:]${2}")
-	return mailtoRE.ReplaceAllStringFunc(s, func(m string) string { return m[:len(m)-1] + "[:]" })
+	s = linkRE.ReplaceAllString(s, "${1}[:]")
+	s = inlineLinkRE.ReplaceAllString(s, `]\x28`)
+	return emailRE.ReplaceAllStringFunc(s, func(m string) string {
+		at := strings.LastIndexByte(m, 0x40)
+		if unitSuffix[strings.ToLower(m[strings.LastIndexByte(m, 0x2e)+1:])] {
+			return m // a systemd template unit, not an address
+		}
+		return m[:at] + "[@]" + m[at+1:]
+	})
 }
 
 const asciiPunct = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
@@ -362,27 +395,102 @@ func truncate(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-// changedLine is the one line of file content an alert may carry: the
-// first line of the first evidence item with text, the new text when there
-// is one, else the old text (a removed line).
-func changedLine(f model.Finding) (where, line string, removed, ok bool) {
-	for _, e := range f.Evidence {
-		text := e.After
-		if text == "" {
-			text, removed = e.Before, true
-		}
-		if text == "" {
-			removed = false
-			continue
-		}
-		line, _, _ = strings.Cut(text, "\n")
-		where = e.Path
-		if e.Line > 0 && where != "" {
-			where += ":" + strconv.Itoa(e.Line)
-		}
-		return where, line, removed, true
+func firstLine(s string) string {
+	l, _, _ := strings.Cut(s, "\n")
+	return l
+}
+
+// The kinds of evidence an alert can show.
+const (
+	evidenceChange = iota // a line added to or removed from a file
+	evidenceLine          // a line of a file a heuristic matched
+	evidenceOther         // anything else: hashes, versions, a summary
+)
+
+// alertEvidence picks the one piece of evidence an alert shows, and what
+// it is. A changed line comes first: the evidence the judge marks "line
+// added" or "line removed". A snapshot finding about a persistence file
+// starts with a summary of the file (its After is the file's hash, its
+// Line the first changed line), which is never shown as a line. Then a
+// line a check matched in a file (a line number and its text). Anything
+// else is shown as evidence, not as a line. Only the first line of any
+// text is used.
+func alertEvidence(f model.Finding) (e model.Evidence, kind int, ok bool) {
+	evs := f.Evidence
+	var summary *model.Evidence
+	if strings.HasPrefix(f.Key, "snap.persist:") && len(evs) > 0 {
+		summary, evs = &evs[0], evs[1:]
 	}
-	return "", "", false, false
+	for _, x := range evs {
+		if (x.Detail == "line added" && x.After != "") || (x.Detail == "line removed" && x.Before != "") {
+			return x, evidenceChange, true
+		}
+	}
+	if summary == nil {
+		for _, x := range evs {
+			if x.Line > 0 && x.After != "" {
+				return x, evidenceLine, true
+			}
+		}
+	}
+	if summary != nil {
+		return *summary, evidenceOther, true
+	}
+	for _, x := range evs {
+		if x.After != "" || x.Before != "" || x.Detail != "" {
+			return x, evidenceOther, true
+		}
+	}
+	return model.Evidence{}, 0, false
+}
+
+func where(e model.Evidence) string {
+	w := e.Path
+	if e.Line > 0 && w != "" {
+		w += ":" + strconv.Itoa(e.Line)
+	}
+	return w
+}
+
+// evidenceText is the alert text's evidence part. A file's content is at
+// most one line: the changed or matched line, kept text the collector
+// redacted, redacted once more here.
+func (b *Bubbles) evidenceText(f model.Finding) string {
+	e, kind, ok := alertEvidence(f)
+	if !ok {
+		return ""
+	}
+	in := ""
+	if w := where(e); w != "" {
+		in = " in " + mdText(truncate(escape.Terminal(w), maxWhere))
+	}
+	code := func(s string) string {
+		s, _ = redact.Line(b.redactKey, firstLine(s))
+		return mdCode(truncate(escape.Terminal(s), maxLine))
+	}
+	switch kind {
+	case evidenceChange:
+		if e.Detail == "line removed" {
+			return "Removed line" + in + ":\n" + code(e.Before)
+		}
+		return "Changed line" + in + ":\n" + code(e.After)
+	case evidenceLine:
+		return "Line" + in + ":\n" + code(e.After)
+	}
+	label := "Evidence" + in + ":"
+	if e.Detail != "" {
+		label += "\n" + mdText(truncate(escape.Terminal(firstLine(e.Detail)), maxWhere))
+	}
+	before, after := firstLine(e.Before), firstLine(e.After)
+	switch {
+	case before != "" && after != "":
+		return label + "\n" + code(before+" -> "+after)
+	case after != "":
+		return label + "\n" + code(after)
+	case before != "":
+		return label + "\n" + code(before+" -> (gone)")
+	}
+	return label
 }
 
 func evidencePath(f model.Finding) string {
@@ -403,17 +511,7 @@ func (b *Bubbles) alertFor(m store.Machine, f model.Finding, now time.Time) prot
 	if w := truncate(escape.Terminal(f.Why), maxWhy); w != "" {
 		why = mdText(w)
 	}
-	if where, line, removed, ok := changedLine(f); ok {
-		line, _ = redact.Line(b.redactKey, line)
-		label := "Changed line"
-		if removed {
-			label = "Removed line"
-		}
-		if where != "" {
-			label += " in " + mdText(truncate(escape.Terminal(where), maxWhere))
-		}
-		changed = label + ":\n" + mdCode(truncate(escape.Terminal(line), maxLine))
-	}
+	changed = b.evidenceText(f)
 	if f.Fix != "" {
 		cmd := truncate(escape.Terminal(f.Fix), maxFix)
 		if escape.HasUnsafe(f.Fix) {
@@ -466,14 +564,16 @@ func alertText(why, changed, fix string) string {
 }
 
 // pendingItem is one alert or resolve waiting to be sent. Alert's channel
-// is set when it is sent.
+// is set when it is sent. Severity orders what is dropped when the queue
+// is full: for a resolve it is the resolved finding's.
 type pendingItem struct {
-	ID      uint64              `json:"id"`
-	Key     string              `json:"key"`
-	Resolve bool                `json:"resolve,omitempty"`
-	Note    string              `json:"note,omitempty"`
-	Alert   protocol.AlertInput `json:"alert"`
-	Queued  time.Time           `json:"queued"`
+	ID       uint64               `json:"id"`
+	Key      string               `json:"key"`
+	Severity string               `json:"severity"`
+	Resolve  bool                 `json:"resolve,omitempty"`
+	Note     string               `json:"note,omitempty"`
+	Alert    *protocol.AlertInput `json:"alert,omitempty"`
+	Queued   time.Time            `json:"queued"`
 }
 
 // pendingQueue is SettingPending: at most MaxPending items, one per
@@ -486,13 +586,45 @@ type pendingQueue struct {
 	DroppedSeverity string        `json:"dropped_severity,omitempty"`
 }
 
+// queueStatus is SettingStatus: a small summary of the queue and of the
+// last trouble, kept beside it, so the settings pages never read the whole
+// queue.
+type queueStatus struct {
+	Pending         int       `json:"pending"`
+	Critical        int       `json:"critical,omitempty"`
+	Warning         int       `json:"warning,omitempty"`
+	Info            int       `json:"info,omitempty"`
+	Dropped         int       `json:"dropped,omitempty"`
+	DroppedSeverity string    `json:"dropped_severity,omitempty"`
+	Trouble         Trouble   `json:"trouble,omitempty"`
+	Since           time.Time `json:"since,omitzero"`
+}
+
+// sealCompact stores v sealed, as JSON without the HTML escaping that
+// would write each "<", ">" and "&" of an alert's text as six bytes.
+func (b *Bubbles) sealCompact(key string, v any) error {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return err
+	}
+	return b.Store.SetSecretSetting(key, bytes.TrimSuffix(buf.Bytes(), []byte("\n")))
+}
+
 func (b *Bubbles) loadQueue() (pendingQueue, error) {
 	var q pendingQueue
 	err := b.loadSealed(SettingPending, &q)
 	return q, err
 }
 
-// updateQueue changes the stored queue under qmu.
+func (b *Bubbles) loadStatus() (queueStatus, error) {
+	var st queueStatus
+	err := b.loadSealed(SettingStatus, &st)
+	return st, err
+}
+
+// updateQueue changes the stored queue, and its summary, under qmu.
 func (b *Bubbles) updateQueue(f func(q *pendingQueue)) error {
 	b.qmu.Lock()
 	defer b.qmu.Unlock()
@@ -501,34 +633,106 @@ func (b *Bubbles) updateQueue(f func(q *pendingQueue)) error {
 		return err
 	}
 	f(&q)
-	return b.saveSealed(SettingPending, q)
+	if err := b.sealCompact(SettingPending, q); err != nil {
+		return err
+	}
+	st, err := b.loadStatus()
+	if err != nil {
+		return err
+	}
+	st.Pending, st.Critical, st.Warning, st.Info = len(q.Items), 0, 0, 0
+	for _, it := range q.Items {
+		switch itemSeverity(it) {
+		case protocol.SeverityCritical:
+			st.Critical++
+		case protocol.SeverityWarning:
+			st.Warning++
+		default:
+			st.Info++
+		}
+	}
+	st.Dropped, st.DroppedSeverity = q.Dropped, q.DroppedSeverity
+	return b.sealCompact(SettingStatus, st)
 }
 
-// enqueue adds items to the queue. A newer item for a dedupe key replaces
-// the one waiting (only the latest state of an alert matters: a resolve
-// after a post that never went is a resolve bubbles ignores). Past
-// MaxPending the oldest are dropped and counted.
-func (b *Bubbles) enqueue(items []pendingItem) error {
+func itemSeverity(it pendingItem) string {
+	if it.Severity == "" && it.Alert != nil {
+		return it.Alert.Severity
+	}
+	return it.Severity
+}
+
+// queued is an alert or resolve offered to the queue. Its item, with the
+// alert's text, is built only when the queue keeps it.
+type queued struct {
+	key      string
+	severity string
+	build    func() pendingItem
+}
+
+// enqueue adds alerts and resolves to the queue, in time linear in the
+// queue and the offer. A newer offer for a dedupe key replaces the item
+// waiting for it: only the latest state of an alert matters (a resolve of
+// an alert that never went out is one bubbles ignores). When more than
+// MaxPending would wait, the least severe go first, the oldest first among
+// equals, so a critical alert is never dropped for a less severe one; only
+// when critical alerts alone fill the queue does the oldest of them go.
+// What is dropped is counted, for the summary alert.
+func (b *Bubbles) enqueue(offers []queued) error {
 	return b.updateQueue(func(q *pendingQueue) {
-		for _, it := range items {
-			kept := q.Items[:0]
-			for _, x := range q.Items {
-				if x.Key != it.Key {
-					kept = append(kept, x)
-				}
+		last := make(map[string]int, len(offers))
+		for i, o := range offers {
+			last[o.key] = i
+		}
+		var count [3]int
+		kept := q.Items[:0]
+		for _, x := range q.Items {
+			if _, replaced := last[x.Key]; !replaced {
+				kept = append(kept, x)
+				count[severityRank(itemSeverity(x))]++
 			}
-			q.Items = kept
+		}
+		q.Items = kept
+		fresh := make([]queued, 0, len(last))
+		for i, o := range offers {
+			if last[o.key] == i {
+				fresh = append(fresh, o)
+				count[severityRank(o.severity)]++
+			}
+		}
+		var drop [3]int
+		over := len(q.Items) + len(fresh) - MaxPending
+		for r := 0; r < len(drop) && over > 0; r++ {
+			drop[r] = min(count[r], over)
+			over -= drop[r]
+		}
+		dropped := func(sev string) {
+			q.Dropped++
+			if severityRank(sev) >= severityRank(q.DroppedSeverity) {
+				q.DroppedSeverity = sev
+			}
+		}
+		// The items waiting are older than the offers: they go first.
+		kept = q.Items[:0]
+		for _, x := range q.Items {
+			if r := severityRank(itemSeverity(x)); drop[r] > 0 {
+				drop[r]--
+				dropped(itemSeverity(x))
+				continue
+			}
+			kept = append(kept, x)
+		}
+		q.Items = kept
+		for _, o := range fresh {
+			if r := severityRank(o.severity); drop[r] > 0 {
+				drop[r]--
+				dropped(o.severity)
+				continue
+			}
+			it := o.build()
 			q.Next++
 			it.ID = q.Next
 			q.Items = append(q.Items, it)
-		}
-		for len(q.Items) > MaxPending {
-			old := q.Items[0]
-			q.Items = q.Items[1:]
-			q.Dropped++
-			if !old.Resolve && severityRank(old.Alert.Severity) >= severityRank(q.DroppedSeverity) {
-				q.DroppedSeverity = old.Alert.Severity
-			}
 		}
 	})
 }
@@ -547,18 +751,25 @@ func (b *Bubbles) Notify(ctx context.Context, m store.Machine, newFindings, reso
 		return err
 	}
 	now := b.now()
-	var items []pendingItem
+	offers := make([]queued, 0, len(newFindings)+len(resolved))
 	for _, f := range newFindings {
-		in := b.alertFor(m, f, now)
-		items = append(items, pendingItem{Key: in.DedupeKey, Alert: in, Queued: now})
+		key, sev := DedupeKey(m.Name, f.Key), Severity(f.Severity)
+		offers = append(offers, queued{key: key, severity: sev, build: func() pendingItem {
+			in := b.alertFor(m, f, now)
+			return pendingItem{Key: key, Severity: sev, Alert: &in, Queued: now}
+		}})
 	}
+	note := "No longer found on " + now.UTC().Format("2006-01-02 15:04 UTC") + "."
 	for _, f := range resolved {
-		items = append(items, pendingItem{Key: DedupeKey(m.Name, f.Key), Resolve: true, Note: "No longer found on " + now.UTC().Format("2006-01-02 15:04 UTC") + ".", Queued: now})
+		key, sev := DedupeKey(m.Name, f.Key), Severity(f.Severity)
+		offers = append(offers, queued{key: key, severity: sev, build: func() pendingItem {
+			return pendingItem{Key: key, Severity: sev, Resolve: true, Note: note, Queued: now}
+		}})
 	}
-	if len(items) == 0 {
+	if len(offers) == 0 {
 		return nil
 	}
-	if err := b.enqueue(items); err != nil {
+	if err := b.enqueue(offers); err != nil {
 		return err
 	}
 	if err := b.Flush(ctx); err != nil && !errors.Is(err, ErrNoChannel) {
@@ -647,10 +858,10 @@ func refusal(ae *bubblesclient.APIError) string {
 // another channel (the channel was changed) closes it there and posts
 // again, as netdiag does.
 func send(ctx context.Context, cl *bubblesclient.Client, ch channelRecord, it pendingItem) error {
-	if it.Resolve {
+	if it.Resolve || it.Alert == nil {
 		return cl.ResolveAlert(ctx, it.Key, it.Note)
 	}
-	in := it.Alert
+	in := *it.Alert
 	in.Channel = ch.ID
 	_, err := cl.PostAlert(ctx, in)
 	if openElsewhere(err) && cl.ResolveAlert(ctx, it.Key, "Moved to #"+escape.Terminal(ch.Name)+".") == nil {
@@ -659,24 +870,31 @@ func send(ctx context.Context, cl *bubblesclient.Client, ch channelRecord, it pe
 	return err
 }
 
-// droppedAlert is the summary of n alerts dropped while bubbles could not
-// be reached.
-func droppedAlert(ch channelRecord, n int, sev string, now time.Time) protocol.AlertInput {
+// droppedAlert is the summary of n alerts the queue had no room for. The
+// queue drops the least severe first, so they are lower-priority than
+// every alert kept, unless critical alerts alone filled it.
+func droppedAlert(n int, sev string, now time.Time) protocol.AlertInput {
 	if sev == "" {
-		sev = protocol.SeverityWarning
+		sev = protocol.SeverityInfo
 	}
 	zero := 0
 	at := now.UTC().Format(time.RFC3339)
-	what := "1 alert"
+	what := "1 lower-priority alert was"
 	if n != 1 {
-		what = strconv.Itoa(n) + " alerts"
+		what = strconv.Itoa(n) + " lower-priority alerts were"
+	}
+	if sev == protocol.SeverityCritical {
+		what = "1 alert was"
+		if n != 1 {
+			what = strconv.Itoa(n) + " alerts were"
+		}
 	}
 	return protocol.AlertInput{
-		Channel:        ch.ID,
-		Severity:       sev,
-		Title:          "telltale dropped " + what + " while bubbles could not be reached",
-		Text:           fmt.Sprintf("telltale keeps at most %d alerts while it cannot reach bubbles, and dropped the oldest. Open telltale's web UI to see every machine's findings.", MaxPending),
-		Fields:         []protocol.AlertField{{Name: "Dropped", Value: strconv.Itoa(n), Short: true}},
+		Severity: sev,
+		Title:    "telltale: " + what + " not sent because the queue was full",
+		Text: fmt.Sprintf("telltale keeps at most %d alerts waiting to be sent. When more wait, the least severe are not sent, the oldest first. "+
+			"Open telltale's web UI to see every machine's findings.", MaxPending),
+		Fields:         []protocol.AlertField{{Name: "Not sent", Value: strconv.Itoa(n), Short: true}},
 		DedupeKey:      DroppedKey,
 		RenotifyAfterS: &zero,
 		OccurredAt:     &at,
@@ -684,10 +902,11 @@ func droppedAlert(ch channelRecord, n int, sev string, now time.Time) protocol.A
 }
 
 // Flush sends the queued alerts in order, until none are left, bubbles
-// cannot take more, or ctx ends. The count of dropped alerts goes first,
-// as one summary alert. Only one flush sends at a time; another waits for
-// it within its ctx. Not being paired is not an error; having no channel
-// yet is ErrNoChannel.
+// cannot take more, or ctx ends. The count of alerts the queue had no room
+// for goes first, as one summary alert; the summary sent before is closed
+// first, so each count is an alert of its own. Only one flush sends at a
+// time; another waits for it within its ctx. Not being paired is not an
+// error; having no channel yet is ErrNoChannel.
 func (b *Bubbles) Flush(ctx context.Context) error {
 	b.init()
 	select {
@@ -707,13 +926,18 @@ func (b *Bubbles) Flush(ctx context.Context) error {
 		b.setTrouble(TroubleNoChannel)
 		return ErrNoChannel
 	}
-	q, err := b.loadQueue()
+	st, err := b.loadStatus()
 	if err != nil {
 		return err
 	}
-	if q.Dropped > 0 {
-		n := q.Dropped
-		_, err := cl.PostAlert(ctx, droppedAlert(ch, n, q.DroppedSeverity, b.now()))
+	if st.Dropped > 0 {
+		n := st.Dropped
+		err := cl.ResolveAlert(ctx, DroppedKey, "A newer count follows.")
+		if b.classify(err, true) == keep {
+			return err
+		}
+		sum := droppedAlert(n, st.DroppedSeverity, b.now())
+		err = send(ctx, cl, ch, pendingItem{Key: DroppedKey, Alert: &sum})
 		if b.classify(err, false) == keep {
 			return err
 		}
@@ -821,8 +1045,7 @@ func (b *Bubbles) Run(ctx context.Context) {
 // retry is one try of Run: nothing when nothing waits, and nothing for a
 // Kick right after a try that failed.
 func (b *Bubbles) retry(ctx context.Context, kicked bool) {
-	q, err := b.loadQueue()
-	if err != nil || (len(q.Items) == 0 && q.Dropped == 0) {
+	if st, err := b.loadStatus(); err != nil || (st.Pending == 0 && st.Dropped == 0) {
 		return
 	}
 	b.mu.Lock()
@@ -886,13 +1109,43 @@ func (t Trouble) Message() string {
 // new pairing: nothing is trusted again by itself.
 func (b *Bubbles) setTrouble(t Trouble) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.trouble == TroubleIdentityChanged || b.trouble == t {
+		b.mu.Unlock()
 		return
 	}
 	b.trouble, b.since = t, b.now()
+	since := b.since
+	b.mu.Unlock()
 	if t != TroubleNone {
 		b.logf("telltale server: bubbles: %s", t.Message())
+	}
+	b.saveTrouble(t, since)
+}
+
+// clearTrouble forgets the trouble, a changed identity too: a new
+// connection or channel is trusted afresh.
+func (b *Bubbles) clearTrouble() {
+	b.mu.Lock()
+	b.trouble, b.since = TroubleNone, time.Time{}
+	b.mu.Unlock()
+	b.saveTrouble(TroubleNone, time.Time{})
+}
+
+// saveTrouble records the trouble in the queue's summary, for the
+// settings pages.
+func (b *Bubbles) saveTrouble(t Trouble, since time.Time) {
+	b.qmu.Lock()
+	defer b.qmu.Unlock()
+	st, err := b.loadStatus()
+	if err == nil {
+		if t == TroubleNone {
+			since = time.Time{}
+		}
+		st.Trouble, st.Since = t, since
+		err = b.sealCompact(SettingStatus, st)
+	}
+	if err != nil {
+		b.logf("telltale server: bubbles: could not record the connection's state: %s", escape.Terminal(err.Error()))
 	}
 }
 
@@ -925,6 +1178,7 @@ type Status struct {
 	ServerName string
 	Channel    Channel
 	Pending    int
+	Critical   int // of Pending
 	Dropped    int
 	Trouble    Trouble
 	Since      time.Time
@@ -934,7 +1188,8 @@ type Status struct {
 	Choices  []Channel
 }
 
-// Status reads the connection, the queue and the last trouble.
+// Status reads the connection and the queue's summary (never the whole
+// queue).
 func (b *Bubbles) Status() (Status, error) {
 	b.init()
 	cfg, _, ok, err := b.connection()
@@ -945,14 +1200,14 @@ func (b *Bubbles) Status() (Status, error) {
 	if err := b.loadSealed(SettingChannel, &ch); err != nil {
 		return Status{}, err
 	}
-	q, err := b.loadQueue()
+	qs, err := b.loadStatus()
 	if err != nil {
 		return Status{}, err
 	}
 	st := Status{Connected: true, Address: escape.Terminal(strings.TrimPrefix(cfg.BaseURL, "https://")), ServerName: escape.Terminal(ch.Server),
-		Channel: Channel{ID: ch.ID, Name: escape.Terminal(ch.Name)}, Pending: len(q.Items), Dropped: q.Dropped}
+		Channel: Channel{ID: ch.ID, Name: escape.Terminal(ch.Name)}, Pending: qs.Pending, Critical: qs.Critical, Dropped: qs.Dropped,
+		Trouble: qs.Trouble, Since: qs.Since}
 	b.mu.Lock()
-	st.Trouble, st.Since = b.trouble, b.since
 	st.Choosing = b.choosing || ch.ID == ""
 	for _, c := range b.choices {
 		st.Choices = append(st.Choices, Channel{ID: c.ID, Name: escape.Terminal(c.Name)})
@@ -1038,5 +1293,8 @@ func (b *Bubbles) Disconnect() error {
 	}
 	b.qmu.Lock()
 	defer b.qmu.Unlock()
-	return b.Store.SetSecretSetting(SettingPending, nil)
+	if err := b.Store.SetSecretSetting(SettingPending, nil); err != nil {
+		return err
+	}
+	return b.Store.SetSecretSetting(SettingStatus, nil)
 }

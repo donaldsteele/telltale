@@ -208,6 +208,8 @@ func serve(ctx *Context, cfg *config.Config, st *store.Store) int {
 	srv.Shutdown(shut)
 	wg.Wait()
 	ui.Wait()
+	// A pairing request still waiting for the chat admin ends with runCtx.
+	bub.Wait()
 	return code
 }
 
