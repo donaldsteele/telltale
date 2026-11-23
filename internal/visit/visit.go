@@ -32,6 +32,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -74,6 +75,10 @@ var (
 	// stopGrace is how long a step that is over may take to stop its
 	// command before the whole connection is closed under it.
 	stopGrace = 2 * time.Second
+	// keepaliveInterval is how often a running step checks that the
+	// machine still answers; keepaliveMisses unanswered checks in a row
+	// close the connection.
+	keepaliveInterval = 30 * time.Second
 )
 
 // maxOutput bounds the collector's stdout and the JSON it decompresses to.
@@ -292,6 +297,10 @@ func (r *remote) mktemp(ctx context.Context, base string) (string, error) {
 	if errors.Is(err, errTooMuch) {
 		return "", fmt.Errorf("%w: %w; a directory mktemp may have made in %s is left on the machine", errOdd, err, base)
 	}
+	if errors.Is(err, errStopped) {
+		// It may have run, and its directory is unknown.
+		return "", fmt.Errorf("%w; a directory mktemp may have made in %s is left on the machine", err, base)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -372,19 +381,27 @@ func (r *remote) run(ctx context.Context, what, line string, limit time.Duration
 	ctx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 	start := time.Now()
+	grace, every := stopGrace, keepaliveInterval // read once: goroutines below outlive the call
 	errs := &tail{max: maxStderr}
 	stopped := func() error {
 		return fmt.Errorf("%s: %w after %v: %w%s", what, errStopped, time.Since(start).Round(time.Millisecond), ctx.Err(), errs.suffix())
 	}
+	var dead atomic.Bool // set when keepalives closed the connection
+	lost := func(err error) error {
+		if dead.Load() {
+			return fmt.Errorf("%s: %w: the machine did not answer %d keepalives in a row", what, errSession, keepaliveMisses)
+		}
+		return err
+	}
 	// Opening a session, starting a command and even stopping one wait on
 	// the machine, and one that stops answering would hold the step
-	// forever. So once the step is over it has stopGrace to finish, then
+	// forever. So once the step is over it has the grace to finish, then
 	// the whole connection is closed under it.
 	finished := make(chan struct{})
 	defer close(finished)
 	client := r.client
 	defer context.AfterFunc(ctx, func() {
-		t := time.NewTimer(stopGrace)
+		t := time.NewTimer(grace)
 		defer t.Stop()
 		select {
 		case <-finished:
@@ -392,12 +409,13 @@ func (r *remote) run(ctx context.Context, what, line string, limit time.Duration
 			client.Close()
 		}
 	})()
+	go keepalive(client, finished, every, &dead)
 	s, err := client.NewSession()
 	if err != nil {
 		if ctx.Err() != nil {
 			return stopped()
 		}
-		return fmt.Errorf("%s: %w: %w", what, errSession, escaped{err})
+		return lost(fmt.Errorf("%s: %w: %w", what, errSession, escaped{err}))
 	}
 	defer s.Close()
 	if stdin != nil {
@@ -412,13 +430,31 @@ func (r *remote) run(ctx context.Context, what, line string, limit time.Duration
 		if ctx.Err() != nil {
 			return stopped()
 		}
-		return fmt.Errorf("%s: %w: %w", what, errSession, escaped{err})
+		return lost(fmt.Errorf("%s: %w: %w", what, errSession, escaped{err}))
 	}
 	type result struct{ read, wait error }
 	done := make(chan result, 1)
+	waited := false // s.Wait was called; only the goroutine below uses it
 	kill := func(rerr error) {
 		s.Signal(ssh.SIGKILL)
 		s.Close()
+		if !waited {
+			// Reap the session, so that none of its goroutines (stdin,
+			// stderr, exit status) outlives the step: it has the grace,
+			// then the connection is closed under it.
+			w := make(chan struct{})
+			go func() {
+				s.Wait()
+				close(w)
+			}()
+			t := time.NewTimer(grace)
+			select {
+			case <-w:
+			case <-t.C:
+				client.Close()
+			}
+			t.Stop()
+		}
 		select {
 		case done <- result{read: rerr}:
 		default:
@@ -436,26 +472,82 @@ func (r *remote) run(ctx context.Context, what, line string, limit time.Duration
 		if read != nil {
 			rerr = read(out)
 		}
-		if !errors.Is(rerr, errTooMuch) {
+		tooMuch := errors.Is(rerr, errTooMuch)
+		if !tooMuch {
 			// Read the rest, still bounded, so the command can end and
 			// its exit status can say why it failed.
-			if _, err := io.Copy(io.Discard, out); err != nil && rerr == nil {
-				rerr = err
+			_, derr := io.Copy(io.Discard, out)
+			tooMuch = errors.Is(derr, errTooMuch)
+			if derr != nil && rerr == nil {
+				rerr = derr
 			}
 		}
-		if errors.Is(rerr, errTooMuch) {
+		if tooMuch {
 			kill(rerr)
 			return
 		}
+		waited = true
 		done <- result{read: rerr, wait: s.Wait()}
 	}()
 	select {
 	case res := <-done:
-		return outcome(what, res.read, res.wait, errs)
+		if err := outcome(what, res.read, res.wait, errs); err != nil {
+			return lost(err)
+		}
+		return nil
 	case <-ctx.Done():
 		s.Signal(ssh.SIGKILL)
 		s.Close()
+		// Wait for the goroutine above, which reaps the session; if the
+		// machine does not end it, the guard closes the connection.
+		<-done
 		return stopped()
+	}
+}
+
+// keepaliveMisses unanswered keepalives in a row close the connection.
+const keepaliveMisses = 3
+
+// keepalive sends a keepalive request every interval until stop is closed.
+// A request that fails or gets no answer within the interval is a miss;
+// after keepaliveMisses in a row it sets dead and closes the client, so a
+// connection that died without a word is noticed within minutes, not at the
+// end of a step's limit.
+func keepalive(c *ssh.Client, stop <-chan struct{}, every time.Duration, dead *atomic.Bool) {
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	misses := 0
+	for {
+		select {
+		case <-stop:
+			return
+		case <-tick.C:
+		}
+		reply := make(chan error, 1)
+		go func() {
+			_, _, err := c.SendRequest("keepalive@openssh.com", true, nil)
+			reply <- err
+		}()
+		wait := time.NewTimer(every)
+		select {
+		case <-stop:
+			wait.Stop()
+			return
+		case err := <-reply:
+			if err != nil {
+				misses++
+			} else {
+				misses = 0
+			}
+		case <-wait.C:
+			misses++
+		}
+		wait.Stop()
+		if misses >= keepaliveMisses {
+			dead.Store(true)
+			c.Close()
+			return
+		}
 	}
 }
 

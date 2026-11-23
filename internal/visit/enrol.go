@@ -63,13 +63,18 @@ func CheckServerAddr(s string) (netip.Addr, error) {
 var keyCommentRE = regexp.MustCompile(`^[A-Za-z0-9._@+-]+$`)
 
 // checkKeyLine accepts one line "ssh-ed25519 <base64> <comment>" holding an
-// ed25519 public key, fields separated by single spaces.
+// ed25519 public key, fields separated by single spaces and the key in
+// canonical base64. (Go's decoder skips \r and \n, so a decodable key
+// could still span lines.)
 func checkKeyLine(line string) error {
 	f := strings.Split(line, " ")
-	if len(f) != 3 || f[0] != ssh.KeyAlgoED25519 || !keyCommentRE.MatchString(f[2]) {
+	if strings.ContainsAny(line, "\r\n") || len(f) != 3 || f[0] != ssh.KeyAlgoED25519 || !keyCommentRE.MatchString(f[2]) {
 		return errors.New(`the server key line is not "ssh-ed25519 <base64> <comment>" on one line`)
 	}
 	raw, err := base64.StdEncoding.DecodeString(f[1])
+	if err == nil && base64.StdEncoding.EncodeToString(raw) != f[1] {
+		err = errors.New("the base64 is not in canonical form")
+	}
 	if err == nil {
 		var k ssh.PublicKey
 		if k, err = ssh.ParsePublicKey(raw); err == nil && k.Type() != ssh.KeyAlgoED25519 {

@@ -22,6 +22,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1237,10 +1238,224 @@ func TestEnrolSnippetsRefusesUnsafeInput(t *testing.T) {
 		"ssh-ed25519  " + key + " telltale-server",     // two spaces
 		"ssh-ed25519 " + key[:20] + " telltale-server", // not a key
 		"ssh-ed25519 !!!! telltale-server",
+		// Go's base64 decoder skips \r and \n: the line must still be one line.
+		"ssh-ed25519 " + key[:20] + "\n" + key[20:] + " telltale-server",
+		"ssh-ed25519 " + key[:20] + "\r\n" + key[20:] + " telltale-server",
+		"ssh-ed25519 " + key + "\n telltale-server",
 		rsa,
 	} {
 		if ak, _, err := EnrolSnippets("192.0.2.7", kl); err == nil {
 			t.Errorf("EnrolSnippets with key line %q = %q, want an error", kl, ak)
 		}
 	}
+}
+
+// freezeProxy forwards TCP connections to target. freeze stops forwarding
+// on the first connection, from the client to the machine (up) and from the
+// machine to the client (down): a connection that died without a word.
+// Later connections are never frozen.
+func freezeProxy(t *testing.T, target string) (string, func(up, down bool)) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var up, down atomic.Bool
+	stop := make(chan struct{})
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		close(stop)
+		l.Close()
+		mu.Lock()
+		for _, c := range conns {
+			c.Close()
+		}
+		mu.Unlock()
+	})
+	pipe := func(dst, src net.Conn, frozen *atomic.Bool) {
+		buf := make([]byte, 32<<10)
+		for {
+			n, err := src.Read(buf)
+			if frozen != nil && frozen.Load() {
+				<-stop
+				return
+			}
+			if n > 0 {
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		dst.Close()
+		src.Close()
+	}
+	go func() {
+		for first := true; ; first = false {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			s, err := net.Dial("tcp", target)
+			if err != nil {
+				c.Close()
+				continue
+			}
+			mu.Lock()
+			conns = append(conns, c, s)
+			mu.Unlock()
+			var u, d *atomic.Bool
+			if first {
+				u, d = &up, &down
+			}
+			go pipe(s, c, u)
+			go pipe(c, s, d)
+		}
+	}()
+	return l.Addr().String(), func(u, d bool) {
+		if u {
+			up.Store(true)
+		}
+		if d {
+			down.Store(true)
+		}
+	}
+}
+
+// within runs fn and fails the test if it takes longer than limit (giving
+// up on it after a while).
+func within(t *testing.T, limit time.Duration, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+		if took := time.Since(start); took > limit {
+			t.Errorf("took %v, want at most %v", took, limit)
+		}
+	case <-time.After(limit + 10*time.Second):
+		t.Fatalf("still running after %v", limit+10*time.Second)
+	}
+}
+
+// When mktemp itself runs out of time it may have made its directory.
+func TestVisitSaysAStoppedMktempMayLeaveADirectory(t *testing.T) {
+	set(t, &commandTimeout, 500*time.Millisecond)
+	set(t, &stopGrace, 100*time.Millisecond)
+	f := newFake(t)
+	m := f.machine()
+	m.Addr = hangServer(t, f, 1, 0, "silent") // uname works; mktemp never ends
+	_, err := Visit(testCtx(t), m, f.client, testContext(), f.binaries(t))
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "a directory mktemp may have made in /run is left on the machine") {
+		t.Errorf("err = %v, want a stopped mktemp that may have left a directory", err)
+	}
+}
+
+// sessionGoroutines counts goroutines running x/crypto/ssh session code.
+func sessionGoroutines() int {
+	buf := make([]byte, 4<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+	n := 0
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if strings.Contains(g, "golang.org/x/crypto/ssh.(*Session)") {
+			n++
+		}
+	}
+	return n
+}
+
+// A command killed for its output, on a machine that no longer hears the
+// kill or the close: the step ends within the grace, and none of the
+// session's goroutines outlives it.
+func TestRunReapsTheSessionAfterAKill(t *testing.T) {
+	set(t, &maxOutput, 16<<10)
+	set(t, &stopGrace, 200*time.Millisecond)
+	f := newFake(t)
+	addr, freeze := freezeProxy(t, f.addr)
+	f.collect = func(c call) int {
+		freeze(true, false) // the kill and the close never reach the machine
+		chunk := bytes.Repeat([]byte("x"), 32<<10)
+		for c.ctx.Err() == nil {
+			if _, err := c.stdout.Write(chunk); err != nil {
+				return 1
+			}
+		}
+		return 137
+	}
+	ctx := testCtx(t)
+	pinned, err := pinnedKey(f.machine().HostKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := handshake(ctx, addr, &ssh.ClientConfig{
+		User: "root", Auth: []ssh.AuthMethod{ssh.PublicKeys(f.client)},
+		HostKeyAlgorithms: algorithmsFor(pinned), HostKeyCallback: ssh.FixedHostKey(pinned),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &remote{client: client}
+	defer func() { r.client.Close() }()
+	bin, err := f.binaries(t).For("x86_64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fh, err := os.Open(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fh.Close()
+	fi, _ := fh.Stat()
+	d, err := r.execDir(ctx, io.NewSectionReader(fh, 0, fi.Size()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, _ := json.Marshal(testContext())
+	within(t, 2*time.Second, func() {
+		err = r.run(ctx, "collect", quote(d+"/telltale")+" collect --context-stdin --gzip", time.Minute,
+			bytes.NewReader(input), maxOutput, func(rd io.Reader) error { var c model.Collection; return decodeCollection(rd, &c) })
+	})
+	if err == nil {
+		t.Fatal("run succeeded")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for sessionGoroutines() > 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := sessionGoroutines(); n > 0 {
+		t.Errorf("%d session goroutines outlived the step", n)
+	}
+}
+
+// A connection that dies without a word during a long step is noticed by
+// keepalives, long before the step's own limit, and the clean-up logs in
+// again to remove the directory.
+func TestVisitNoticesASilentlyDeadConnection(t *testing.T) {
+	set(t, &keepaliveInterval, 100*time.Millisecond)
+	set(t, &stopGrace, 100*time.Millisecond)
+	set(t, &cleanupTimeout, 2*time.Second)
+	f := newFake(t)
+	addr, freeze := freezeProxy(t, f.addr)
+	f.collect = func(c call) int {
+		freeze(true, true)
+		<-c.ctx.Done()
+		return 137
+	}
+	m := f.machine()
+	m.Addr = addr
+	var err error
+	within(t, 3*time.Second, func() {
+		_, err = Visit(testCtx(t), m, f.client, testContext(), f.binaries(t))
+	})
+	if err == nil || !strings.Contains(err.Error(), "keepalives") {
+		t.Errorf("err = %v, want the connection lost to unanswered keepalives", err)
+	}
+	f.check(t)
 }
