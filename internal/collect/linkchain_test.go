@@ -150,7 +150,7 @@ func TestLinkChainsWorkIsBounded(t *testing.T) {
 	}
 	start := time.Now()
 	chain, _, skips := linkChains(root, persist, nil, underNeverRead)
-	if el := time.Since(start); el > 2*time.Second {
+	if el := time.Since(start); el > timeBound(2*time.Second) {
 		t.Errorf("%d links into a tree %d deep took %v", len(persist), depth, el)
 	}
 	if !slices.ContainsFunc(skips, func(s model.Skip) bool { return s.Check == linkChainCheck && strings.Contains(s.Reason, "deep") }) {
@@ -237,7 +237,7 @@ func TestLinkChainsCountEveryLookup(t *testing.T) {
 	}
 	start := time.Now()
 	res := followLinks(root, persist, nil, nil, underNeverRead, linkChainBudget)
-	if el := time.Since(start); el > time.Second {
+	if el := time.Since(start); el > timeBound(time.Second) {
 		t.Errorf("%d padded links took %v", n, el)
 	}
 	if res.spent > linkChainBudget+model.MaxWalkSteps {
@@ -573,7 +573,7 @@ func TestHostileFileListBelowAPaddedDirectoryLinkIsCheap(t *testing.T) {
 		t.Fatalf("%d paths left to look for, want %d", len(left), n)
 	}
 	// Unmemoized this takes seconds (one 1600-component walk per path).
-	if d := time.Since(start); d > time.Second {
+	if d := time.Since(start); d > timeBound(time.Second) {
 		t.Errorf("packageDirPaths over %d listed paths took %v: the directory is resolved again for every path", n, d)
 	}
 }

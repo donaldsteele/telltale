@@ -259,7 +259,7 @@ func TestDiffLinesLargeBounded(t *testing.T) {
 	}
 	start := time.Now()
 	ls := diffLines(a, b)
-	if len(ls) != 100000 || time.Since(start) > 5*time.Second {
+	if len(ls) != 100000 || time.Since(start) > timeBound(5*time.Second) {
 		t.Errorf("len %d in %v", len(ls), time.Since(start))
 	}
 }

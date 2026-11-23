@@ -631,7 +631,7 @@ func TestEnqueueLinear(t *testing.T) {
 	if err := fx.b.Notify(t.Context(), machine, fs, nil); err != nil {
 		t.Fatal(err)
 	}
-	if d := time.Since(start); d > 3*time.Second {
+	if d := time.Since(start); d > timeBound(3*time.Second) {
 		t.Errorf("Notify of 50,000 findings took %v", d)
 	}
 	if q := fx.queue(t); len(q.Items) != MaxPending || q.Dropped != 50000-MaxPending {

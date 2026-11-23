@@ -1141,6 +1141,7 @@ func TestPaddedStartupLinksAreNotWalkedAgain(t *testing.T) {
 		return c
 	}
 	check := func(name string, c *model.Collection, limit time.Duration) {
+		limit = timeBound(limit)
 		start := time.Now()
 		fs := Run(c, ctx, cleanOwned())
 		if el := time.Since(start); el > limit {
