@@ -1555,21 +1555,56 @@ func bootImageOnly(before, after string) bool {
 	return bi != "" && ai != "" && bi != ai && slices.Equal(b, a)
 }
 
-// confirmedKernel names a kernel image package that was installed or
-// upgraded since the snapshot and whose new version something confirmed.
-func (j *judge) confirmedKernel() string {
-	return j.changedPackage(func(n string) bool {
-		k := j.pkgChange[n].Kind
-		return (k == diff.PkgInstalled || k == diff.PkgUpgraded) && j.confirmed[n]
-	}, func(n string) bool { return strings.HasPrefix(n, "linux-image") })
+// bootImagePackage names the kernel package whose own image the command
+// line now boots, or "": BOOT_IMAGE= names a vmlinuz-* file in /boot (named
+// with or without the directory, as a separate /boot partition has it) that
+// is there, belongs to an installed linux-image package, and is that
+// package's file as far as anyone can tell:
+//
+//   - this scan verified it against the signed package, or
+//   - the package did not change since the snapshot and the file is exactly
+//     the one the snapshot has. On the server a confirmed kernel install
+//     rolls into the baseline at the visit before the reboot, so by the time
+//     the new image is booted no package change is left to see.
+func (j *judge) bootImagePackage(cmdline string) string {
+	image := ""
+	for _, f := range strings.Fields(cmdline) {
+		if v, ok := strings.CutPrefix(f, "BOOT_IMAGE="); ok {
+			image = v
+		}
+	}
+	// GRUB may write the device first: (hd0,gpt2)/vmlinuz-...
+	if strings.HasPrefix(image, "(") {
+		if k := strings.IndexByte(image, ')'); k > 0 {
+			image = image[k+1:]
+		}
+	}
+	base := path.Base(image)
+	if dir := path.Dir(image); !strings.HasPrefix(base, "vmlinuz-") || (dir != "/boot" && dir != "/") {
+		return ""
+	}
+	p := "/boot/" + base
+	e := j.files[p]
+	name := j.owned[p]
+	if e == nil || e.Type != "file" || e.SHA256 == "" || !strings.HasPrefix(name, "linux-image") {
+		return ""
+	}
+	if v, ok := j.verified[p]; ok && v.Package == name && v.Source != pkgverify.SourceOfflineLocal && j.verifiedNow(v, e) {
+		return name
+	}
+	if o := j.oldFiles[p]; !j.pkgChanged(name) && j.oldOwned[p] == name && o != nil && o.SHA256 == e.SHA256 && sameMeta(o, e) {
+		return name
+	}
+	return ""
 }
 
 // cmdlineChanged ranks a kernel command line that differs from the
 // snapshot's. The command line decides what runs first (init=, rdinit=),
 // which security features are on (module.sig_enforce, lockdown, apparmor,
 // selinux) and what the initramfs does, so a change nobody made on purpose
-// is a backdoor sign. The one routine change is the kernel image's name
-// after a kernel upgrade the signed archive confirms: a note.
+// is a backdoor sign. The one routine change is the kernel image's name,
+// when the image named now is a kernel package's own file (bootImagePackage):
+// a note.
 func (j *judge) cmdlineChanged(ch diff.Change) {
 	before, _ := redact.Line(j.in.Context.DigestKey, ch.Before)
 	after, _ := redact.Line(j.in.Context.DigestKey, ch.After)
@@ -1584,10 +1619,10 @@ func (j *judge) cmdlineChanged(ch diff.Change) {
 		Evidence: []model.Evidence{{Before: before, After: after, Detail: "kernel command line (/proc/cmdline)"}},
 		Refs:     []string{"T1542", "T1562.001"},
 	}
-	if name := j.confirmedKernel(); name != "" && bootImageOnly(ch.Before, ch.After) {
+	if name := j.bootImagePackage(ch.After); name != "" && bootImageOnly(ch.Before, ch.After) {
 		f.Severity = model.SevNote
 		f.Title = "The machine booted another kernel image since the snapshot"
-		f.Why = "Only the kernel image named on the kernel command line changed, and the kernel package " + name + " was installed or upgraded since the snapshot to a version the signed archive confirms. " +
+		f.Why = "Only the kernel image named on the kernel command line changed, and the image it names now is the kernel package " + name + "'s own file: verified against the signed package in this scan, or unchanged since the snapshot along with its package. " +
 			"That is what a kernel update followed by a reboot looks like. Nothing else on the command line changed."
 		f.Fix = ""
 		f.Evidence[0].Detail = "kernel command line (/proc/cmdline); only BOOT_IMAGE= changed"

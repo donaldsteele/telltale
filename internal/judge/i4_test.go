@@ -258,3 +258,54 @@ func TestJudgeKernelAutoremoveBootFilesAreNotes(t *testing.T) {
 	setFile(cur, file("/boot/initrd.img-6.1.0-27-amd64", "initrd 27 + implant", 0o644))
 	must(t, run(cur, snapOf(old), archive()), "snap.file_modified:/boot/initrd.img-6.1.0-27-amd64", model.SevBackdoor)
 }
+
+// The reviewer's probe, server mode: visit 1 confirms the new kernel package
+// and rolls it into the baseline; the machine reboots; visit 2 sees only
+// BOOT_IMAGE= changed, with no package change left in the comparison. The
+// image it names is a kernel package's own file, as the baseline has it: a
+// note, not a critical alert.
+func TestJudgeBootImageAfterRolledKernelUpdate(t *testing.T) {
+	_, base := kernelUpdate() // the baseline after visit 1: both kernels installed
+	base.Runtime.Cmdline = bootLine
+	cur := clone(base)
+	cur.Runtime.Cmdline = strings.Replace(bootLine, "6.1.0-25", "6.1.0-27", 1)
+
+	f := must(t, run(cur, snapOf(base), archive()), "snap.cmdline", model.SevNote)
+	if !strings.Contains(f.Why, "linux-image-6.1.0-27-amd64") {
+		t.Errorf("why %q", f.Why)
+	}
+	must(t, run(cur, snapOf(base), nil), "snap.cmdline", model.SevNote)
+	// A separate /boot: the image is named without the directory.
+	sep := clone(cur)
+	sep.Runtime.Cmdline = strings.Replace(sep.Runtime.Cmdline, "/boot/vmlinuz", "/vmlinuz", 1)
+	old := clone(base)
+	old.Runtime.Cmdline = strings.Replace(bootLine, "/boot/vmlinuz", "/vmlinuz", 1)
+	must(t, run(sep, snapOf(old), archive()), "snap.cmdline", model.SevNote)
+
+	for name, change := range map[string]func(c *model.Collection){
+		"anything else on the line": func(c *model.Collection) { c.Runtime.Cmdline += " init=/bin/sh" },
+		"an image no package owns": func(c *model.Collection) {
+			c.Runtime.Cmdline = strings.Replace(bootLine, "vmlinuz-6.1.0-25-amd64", "vmlinuz-6.1.0-99-evil", 1)
+			c.Files = append(c.Files, file("/boot/vmlinuz-6.1.0-99-evil", "evil", 0o644))
+		},
+		"an image that is not there": func(c *model.Collection) {
+			c.Runtime.Cmdline = strings.Replace(bootLine, "vmlinuz-6.1.0-25-amd64", "vmlinuz-6.1.0-31-amd64", 1)
+		},
+		"an image outside /boot": func(c *model.Collection) {
+			c.Runtime.Cmdline = strings.Replace(bootLine, "/boot/vmlinuz-6.1.0-25-amd64", "/srv/vmlinuz-6.1.0-27-amd64", 1)
+		},
+		"the package's image replaced since the baseline": func(c *model.Collection) {
+			setFile(c, file("/boot/vmlinuz-6.1.0-27-amd64", "k27 with an implant", 0o644))
+		},
+		"an image owned by another kind of package": func(c *model.Collection) {
+			c.Runtime.Cmdline = strings.Replace(bootLine, "vmlinuz-6.1.0-25-amd64", "vmlinuz-custom", 1)
+			c.Files = append(c.Files, file("/boot/vmlinuz-custom", "x", 0o644))
+			c.Packages.Installed = append(c.Packages.Installed, pkg("my-tools", "1", "/boot/vmlinuz-custom"))
+		},
+	} {
+		c := clone(cur)
+		change(c)
+		must(t, run(c, snapOf(base), archive()), "snap.cmdline", model.SevBackdoor)
+		_ = name
+	}
+}

@@ -256,8 +256,11 @@ rules telltale follows, in plain words:
   the snapshot's. A change is a backdoor sign (`init=` runs any program
   first, `module.sig_enforce=0` lets unsigned modules in), shown with the
   line before and after. The one exception is a note: only the kernel
-  image named in `BOOT_IMAGE=` changed, and a kernel package the signed
-  archive confirms was installed or upgraded.
+  image named in `BOOT_IMAGE=` changed, and the image named now is a
+  `/boot/vmlinuz-*` file of an installed kernel package, either verified
+  against the signed package in this scan or unchanged since the snapshot
+  together with its package (on the server, a confirmed kernel update is
+  already in the baseline by the time the machine reboots into it).
 - **The live firewall** is compared as a summary: the backend, the input
   policy and the number of rules. An input policy opened to accept, or
   fewer rules than at the snapshot, is a weak setting while the firewall
