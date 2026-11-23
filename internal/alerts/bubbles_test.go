@@ -81,6 +81,22 @@ func (fx *fixture) connect(t *testing.T) {
 	}
 }
 
+// run runs the retry loop until the test ends. Its context is cancelled and
+// Run has returned before the fixture closes the store, as the server's
+// shutdown does.
+func (fx *fixture) run(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fx.b.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+}
+
 func (fx *fixture) queue(t *testing.T) pendingQueue {
 	t.Helper()
 	q, err := fx.b.loadQueue()
@@ -440,9 +456,7 @@ func TestPendingRetriedWhenUnreachable(t *testing.T) {
 	if bytes.Contains(raw, []byte("UNIQUE-TITLE")) || bytes.Contains(wal, []byte("UNIQUE-TITLE")) {
 		t.Error("a queued alert is stored in the clear")
 	}
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	go fx.b.Run(ctx)
+	fx.run(t)
 	time.Sleep(100 * time.Millisecond)
 	if n := len(fx.fake.Posts()); n != 0 {
 		t.Fatalf("%d alerts posted while bubbles was down", n)
@@ -465,9 +479,7 @@ func TestKickRetries(t *testing.T) {
 	fx.b.Now = func() time.Time { mu.Lock(); defer mu.Unlock(); return clock }
 	fx.fake.SetDown(true)
 	fx.b.Notify(t.Context(), machine, []model.Finding{{Key: "k", Severity: model.SevTampering, Title: "t"}}, nil)
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	go fx.b.Run(ctx)
+	fx.run(t)
 	fx.fake.SetDown(false)
 	mu.Lock()
 	clock = clock.Add(kickGap + time.Second)
