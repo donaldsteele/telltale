@@ -45,6 +45,11 @@ type Scope struct {
 	// programs to (Collection.LinkerCache). It goes with the cache file:
 	// the next rebuild is judged against it.
 	LinkerCache bool `json:"linker_cache,omitempty"`
+	// Cmdline is the kernel command line the machine booted with
+	// (Runtime.Cmdline); Firewall the summary of the live firewall rules
+	// (Collection.Firewall).
+	Cmdline  bool `json:"cmdline,omitempty"`
+	Firewall bool `json:"firewall,omitempty"`
 	// With lists the other findings in the report about the same things
 	// that depend on the snapshot: rolling this scope forward would make
 	// them go away too (a file no longer changed is no longer verified
@@ -54,7 +59,7 @@ type Scope struct {
 
 // Empty reports whether s names nothing to roll forward.
 func (s Scope) Empty() bool {
-	return len(s.Paths)+len(s.Packages)+len(s.Users)+len(s.Groups)+len(s.Modules)+len(s.Listeners)+len(s.Checks) == 0 && !s.LinkerCache
+	return len(s.Paths)+len(s.Packages)+len(s.Users)+len(s.Groups)+len(s.Modules)+len(s.Listeners)+len(s.Checks) == 0 && !s.LinkerCache && !s.Cmdline && !s.Firewall
 }
 
 // Merge adds o's parts to s (not With).
@@ -67,6 +72,8 @@ func (s *Scope) Merge(o Scope) {
 	s.Listeners = append(s.Listeners, o.Listeners...)
 	s.Checks = append(s.Checks, o.Checks...)
 	s.LinkerCache = s.LinkerCache || o.LinkerCache
+	s.Cmdline = s.Cmdline || o.Cmdline
+	s.Firewall = s.Firewall || o.Firewall
 }
 
 // addPath adds a path, and the linker cache's list with the cache file.
@@ -87,6 +94,12 @@ func (s Scope) subjects() []string {
 		for _, v := range l.vals {
 			out = append(out, l.kind+v)
 		}
+	}
+	if s.Cmdline {
+		out = append(out, "cmdline:")
+	}
+	if s.Firewall {
+		out = append(out, "firewall:")
 	}
 	return out
 }
@@ -119,6 +132,12 @@ func RollForward(snap *model.Snapshot, cur *model.Collection, curChecks []model.
 	oc.Runtime.Sockets = replaceIn(oc.Runtime.Sockets, cur.Runtime.Sockets, func(k model.Socket) bool { return k.Listening && listeners[listenKey(k)] })
 	if s.LinkerCache {
 		oc.LinkerCache = slices.Clone(cur.LinkerCache)
+	}
+	if s.Cmdline {
+		oc.Runtime.Cmdline = cur.Runtime.Cmdline
+	}
+	if s.Firewall {
+		oc.Firewall = cur.Firewall
 	}
 	out.Collection = &oc
 	out.Checks = replaceIn(snap.Checks, curChecks, func(r model.CheckResult) bool { return checks[r.ID] })
@@ -291,6 +310,10 @@ func (j *judge) changeScope(f *model.Finding) (Scope, bool) {
 		return Scope{Groups: []string{subj}}, true
 	case "snap.module":
 		return Scope{Modules: []string{subj}}, true
+	case "snap.cmdline":
+		return Scope{Cmdline: true}, true
+	case "snap.firewall":
+		return Scope{Firewall: true}, true
 	case "snap.listener":
 		// The key spells diff's subject "tcp 0.0.0.0:22" as "tcp:0.0.0.0:22".
 		return Scope{Listeners: []string{strings.Replace(subj, ":", " ", 1)}}, true

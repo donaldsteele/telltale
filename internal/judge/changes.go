@@ -11,6 +11,7 @@ import (
 	"github.com/donaldsteele/telltale/internal/heuristics"
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/internal/pkgverify"
+	"github.com/donaldsteele/telltale/internal/redact"
 )
 
 // index records what the other rules depend on: which packages changed,
@@ -160,6 +161,10 @@ func (j *judge) changes(chs []diff.Change) {
 			j.moduleAdded(ch)
 		case diff.ListenerAdded:
 			j.listenerAdded(ch)
+		case diff.CmdlineChanged:
+			j.cmdlineChanged(ch)
+		case diff.FirewallChanged:
+			j.firewallChanged(ch)
 		case diff.CheckRegressed:
 			j.regressed(ch.CheckID, ch.Before, nil)
 		}
@@ -564,6 +569,11 @@ func (j *judge) placed(ch diff.Change, e, old, cur *model.FileEntry, owner strin
 	if v, ok := j.verified[p]; ok && j.verifiedNow(v, cur) && (v.Source != pkgverify.SourceOfflineLocal || j.pkgChanged(v.Package)) {
 		ev.Detail = "matches " + strings.TrimSpace(v.Package+" "+v.Version) + " from " + sourceWords(v.Source)
 		j.foldIntoPackage(v.Package, ev, model.SevExplained)
+		return true
+	}
+	if name := j.caStoreExplained(p, old, cur); name != "" {
+		ev.Detail += "; the certificate store, rebuilt when " + name + " changed"
+		j.foldIntoPackage(name, ev, model.SevNote)
 		return true
 	}
 	if generatedFile(p) {
@@ -1458,4 +1468,152 @@ func (j *judge) listenerAdded(ch diff.Change) {
 	}
 	f.Evidence = []model.Evidence{{Path: exe, After: ch.Subject + " served by " + by, Detail: detail}}
 	j.add(f)
+}
+
+// bootImageOnly reports whether two kernel command lines differ in nothing
+// but the kernel image they name (BOOT_IMAGE=), which is what booting a
+// newly installed kernel changes.
+func bootImageOnly(before, after string) bool {
+	strip := func(s string) (rest []string, image string) {
+		for _, f := range strings.Fields(s) {
+			if v, ok := strings.CutPrefix(f, "BOOT_IMAGE="); ok {
+				image = v
+				continue
+			}
+			rest = append(rest, f)
+		}
+		return rest, image
+	}
+	b, bi := strip(before)
+	a, ai := strip(after)
+	return bi != "" && ai != "" && bi != ai && slices.Equal(b, a)
+}
+
+// confirmedKernel names a kernel image package that was installed or
+// upgraded since the snapshot and whose new version something confirmed.
+func (j *judge) confirmedKernel() string {
+	return j.changedPackage(func(n string) bool {
+		k := j.pkgChange[n].Kind
+		return (k == diff.PkgInstalled || k == diff.PkgUpgraded) && j.confirmed[n]
+	}, func(n string) bool { return strings.HasPrefix(n, "linux-image") })
+}
+
+// cmdlineChanged ranks a kernel command line that differs from the
+// snapshot's. The command line decides what runs first (init=, rdinit=),
+// which security features are on (module.sig_enforce, lockdown, apparmor,
+// selinux) and what the initramfs does, so a change nobody made on purpose
+// is a backdoor sign. The one routine change is the kernel image's name
+// after a kernel upgrade the signed archive confirms: a note.
+func (j *judge) cmdlineChanged(ch diff.Change) {
+	before, _ := redact.Line(j.in.Context.DigestKey, ch.Before)
+	after, _ := redact.Line(j.in.Context.DigestKey, ch.After)
+	f := &model.Finding{
+		Key: "snap.cmdline", ID: "TT-SNAP-014", Source: srcSnapshot, Severity: model.SevBackdoor,
+		Title: "The kernel command line changed since the snapshot",
+		Why: "The kernel command line decides what the machine runs first and which protections are on: init= or rdinit= starts any program as the first process, " +
+			"module.sig_enforce=0 and lockdown=none let unsigned kernel modules in, apparmor=0 and selinux=0 switch confinement off. " +
+			"It is set in the boot loader's configuration, which only root can change, and nothing that changed since the snapshot explains this.",
+		Fix: "cat /proc/cmdline; grep -n 'GRUB_CMDLINE' /etc/default/grub /etc/default/grub.d/* 2>/dev/null   # find where the added words come from, remove them, run update-grub and reboot; " +
+			"if you did not add them, treat the boot loader and the machine as compromised",
+		Evidence: []model.Evidence{{Before: before, After: after, Detail: "kernel command line (/proc/cmdline)"}},
+		Refs:     []string{"T1542", "T1562.001"},
+	}
+	if name := j.confirmedKernel(); name != "" && bootImageOnly(ch.Before, ch.After) {
+		f.Severity = model.SevNote
+		f.Title = "The machine booted another kernel image since the snapshot"
+		f.Why = "Only the kernel image named on the kernel command line changed, and the kernel package " + name + " was installed or upgraded since the snapshot to a version the signed archive confirms. " +
+			"That is what a kernel update followed by a reboot looks like. Nothing else on the command line changed."
+		f.Fix = ""
+		f.Evidence[0].Detail = "kernel command line (/proc/cmdline); only BOOT_IMAGE= changed"
+	}
+	j.add(f)
+}
+
+// firewallChanged ranks a change of the live firewall's summary while the
+// firewall is still there (a firewall switched off is the checklist's
+// finding). An input policy opened to accept, or fewer rules than at the
+// snapshot, is a weak setting; more rules, or a tighter policy, a note.
+func (j *judge) firewallChanged(ch diff.Change) {
+	old, cur := j.old.Firewall, j.c.Firewall
+	var weaker []string
+	if strings.EqualFold(cur.InputPolicy, "accept") && !strings.EqualFold(old.InputPolicy, "accept") {
+		weaker = append(weaker, "the input policy is now accept")
+	}
+	if cur.InputRules < old.InputRules {
+		weaker = append(weaker, fmt.Sprintf("%d input %s fewer", old.InputRules-cur.InputRules, plural(old.InputRules-cur.InputRules, "rule", "rules")))
+	}
+	if cur.Rules < old.Rules {
+		weaker = append(weaker, fmt.Sprintf("%d %s fewer in all", old.Rules-cur.Rules, plural(old.Rules-cur.Rules, "rule", "rules")))
+	}
+	f := &model.Finding{
+		Key: "snap.firewall", ID: "TT-SNAP-015", Source: srcSnapshot, Severity: model.SevNote,
+		Title: "The firewall rules changed since the snapshot",
+		Why: "The live firewall differs from the snapshot's: its backend, its input policy or the number of rules. Nothing was removed and the policy did not open, " +
+			"so this is most likely a service that manages its own rules, or rules you added. Listed so that every change is accounted for.",
+		Fix:      "nft list ruleset 2>/dev/null || iptables-save   # look at the rules as they are now",
+		Evidence: []model.Evidence{{Before: ch.Before, After: ch.After, Detail: "live firewall summary"}},
+	}
+	if len(weaker) > 0 {
+		f.Severity = model.SevWeak
+		f.Title = "The firewall lets more in than at the snapshot"
+		f.Why = "The firewall is still active, but " + strings.Join(weaker, ", ") + " compared with the snapshot. Opening the firewall is how a listener planted on the machine becomes reachable. " +
+			"Services that add and remove their own rules (fail2ban, Docker, libvirt) change the counts too; accept the change if that is what happened."
+		f.Evidence[0].Detail = "live firewall summary: " + strings.Join(weaker, ", ")
+		f.Refs = []string{"T1562.004"}
+	}
+	j.add(f)
+}
+
+// caStore is where the system's trusted CA certificates are linked and
+// bundled. update-ca-certificates rebuilds it from the certificates the
+// ca-certificates package ships and from local ones.
+const caStore = "/etc/ssl/certs/"
+
+// caStoreExplained names the package whose confirmed change explains a
+// change in the CA store, or "":
+//   - a link (added, changed or removed) that leads, or led, to a
+//     certificate file of a package whose change the signed archive
+//     confirms, the file itself matching that package as it is now;
+//   - the bundle, rebuilt when ca-certificates (or ca-certificates-java, for
+//     the Java keystore) changed to a confirmed version.
+//
+// A certificate linked in from anywhere else is not explained, whatever
+// else changed with it.
+func (j *judge) caStoreExplained(p string, old, cur *model.FileEntry) string {
+	if !strings.HasPrefix(p, caStore) {
+		return ""
+	}
+	confirmed := func(name string) bool {
+		k := j.pkgChange[name].Kind
+		return name != "" && (k == diff.PkgUpgraded || k == diff.PkgInstalled) && j.confirmed[name]
+	}
+	switch {
+	case cur != nil && cur.Type == "symlink":
+		t, ok := model.ResolveInInventory(j.files, model.LinkWalk(p, cur.Target), model.LinkHops)
+		if !ok {
+			return ""
+		}
+		name := j.physOwned[t]
+		if v, ok := j.verified[t]; ok && confirmed(name) && v.Package == name && v.Source != pkgverify.SourceOfflineLocal && j.verifiedNow(v, j.files[t]) {
+			return name
+		}
+	case cur == nil && old != nil && old.Type == "symlink":
+		// A certificate the package dropped: its link went with it.
+		t, ok := model.ResolveInInventory(j.oldFiles, model.LinkWalk(p, old.Target), model.LinkHops)
+		if !ok {
+			return ""
+		}
+		if name := j.oldOwned[t]; confirmed(name) && j.files[t] == nil {
+			return name
+		}
+	case cur != nil && cur.Type == "file" && (p == caStore+"ca-certificates.crt" || p == caStore+"java/cacerts"):
+		name := "ca-certificates"
+		if strings.HasSuffix(p, "/cacerts") && !confirmed(name) {
+			name = "ca-certificates-java"
+		}
+		if confirmed(name) {
+			return name
+		}
+	}
+	return ""
 }

@@ -27,6 +27,8 @@ const (
 	PkgRemoved      = "pkg_removed"
 	ModuleAdded     = "module_added"
 	ListenerAdded   = "listener_added"
+	CmdlineChanged  = "cmdline_changed"
+	FirewallChanged = "firewall_changed"
 	CheckRegressed  = "check_regressed"
 	CheckFixed      = "check_fixed"
 	absent          = "absent"
@@ -39,7 +41,7 @@ func init() {
 	for i, k := range []string{FileAdded, FileRemoved, FileModified, PersistChanged,
 		UserAdded, UserRemoved, UserChanged, GroupChanged,
 		PkgUpgraded, PkgDowngraded, PkgInstalled, PkgRemoved,
-		ModuleAdded, ListenerAdded, CheckRegressed, CheckFixed} {
+		ModuleAdded, ListenerAdded, CmdlineChanged, FirewallChanged, CheckRegressed, CheckFixed} {
 		kindOrder[k] = i
 	}
 }
@@ -80,6 +82,7 @@ func Compare(old *model.Snapshot, cur *model.Collection, curChecks []model.Check
 	out = append(out, compareAccounts(oc.Accounts, cur.Accounts)...)
 	out = append(out, comparePackages(oc.Packages.Installed, cur.Packages.Installed)...)
 	out = append(out, compareRuntime(oc.Runtime, cur.Runtime)...)
+	out = append(out, compareFirewall(oc.Firewall, cur.Firewall)...)
 	if old != nil {
 		out = append(out, compareChecks(old.Checks, curChecks)...)
 	}
@@ -485,7 +488,43 @@ func compareRuntime(old, cur model.Runtime) []Change {
 			out = append(out, Change{Kind: ModuleAdded, Subject: m.Name, After: m.File})
 		}
 	}
+	// The kernel command line the machine booted with. An empty one was
+	// not collected (an older snapshot, a collection without /proc), which
+	// is not a change.
+	if old.Cmdline != "" && cur.Cmdline != "" && old.Cmdline != cur.Cmdline {
+		out = append(out, Change{Kind: CmdlineChanged, Subject: "cmdline", Before: old.Cmdline, After: cur.Cmdline})
+	}
 	return out
+}
+
+// FirewallSummary is the live firewall as a report shows it: the backend,
+// the input policy and the rule counts.
+func FirewallSummary(f model.Firewall) string {
+	backend, policy := f.Backend, f.InputPolicy
+	if backend == "" {
+		backend = "none"
+	}
+	if policy == "" {
+		policy = "none"
+	}
+	return fmt.Sprintf("backend %s, input policy %s, %d rules (%d for input) in %d tables", backend, policy, f.Rules, f.InputRules, f.Tables)
+}
+
+// compareFirewall reports a change of the firewall summary. A side with no
+// backend and no rules at all was not read (it needs root and the tools),
+// which is not a change.
+func compareFirewall(old, cur model.Firewall) []Change {
+	unread := func(f model.Firewall) bool {
+		return f.Backend == "" && f.InputPolicy == "" && f.Rules == 0 && f.InputRules == 0 && f.Tables == 0
+	}
+	if unread(old) || unread(cur) {
+		return nil
+	}
+	b, a := FirewallSummary(old), FirewallSummary(cur)
+	if b == a {
+		return nil
+	}
+	return []Change{{Kind: FirewallChanged, Subject: "firewall", Before: b, After: a}}
 }
 
 func compareChecks(old, cur []model.CheckResult) []Change {

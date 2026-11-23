@@ -222,10 +222,36 @@ rules telltale follows, in plain words:
 - **apt's history log** is used only as supporting evidence: root can edit
   it.
 
+- **The kernel command line** the machine booted with is compared with
+  the snapshot's. A change is a backdoor sign (`init=` runs any program
+  first, `module.sig_enforce=0` lets unsigned modules in), shown with the
+  line before and after. The one exception is a note: only the kernel
+  image named in `BOOT_IMAGE=` changed, and a kernel package the signed
+  archive confirms was installed or upgraded.
+- **The live firewall** is compared as a summary: the backend, the input
+  policy and the number of rules. An input policy opened to accept, or
+  fewer rules than at the snapshot, is a weak setting while the firewall
+  is still on (a firewall switched off is the checklist's finding, raised
+  to tampering); more rules or a tighter policy is a note. Services that
+  manage their own rules (fail2ban, Docker, libvirt) change the counts
+  too: accept the change when that is what happened.
+- **The CA certificate store** (`/etc/ssl/certs`) is a persistence
+  location: a planted CA lets someone read or forge the machine's TLS
+  connections. A certificate that a confirmed `ca-certificates` upgrade
+  brought, and the bundle that upgrade rebuilt, are explained; a
+  certificate linked in from anywhere else is a backdoor sign.
+
 Everything else that changed is unexplained, and is ranked by where it is: a
-change in a persistence location (cron, systemd, SSH, sudo, PAM, shell
-start-up files, `ld.so.preload`, kernel modules) or to a security-relevant
-program ranks higher than a change to a data file.
+change in a persistence location or to a security-relevant program ranks
+higher than a change to a data file. Persistence locations are cron,
+systemd, SSH, sudo (`sudoers`, `sudo.conf`), PAM, shell start-up files,
+`ld.so.preload` and the library search path, kernel module lists and
+options, the boot loader's and the initramfs's configuration, udev rules,
+APT's configuration, sources and trusted keys, logrotate and tmpfiles
+snippets, NetworkManager dispatcher scripts, desktop autostart entries,
+polkit rules, `nftables.conf`, the name resolution files and the CA
+certificate store. A file added or changed there that no confirmed package
+change explains is a backdoor sign.
 
 On the server, changes explained by a confirmed package update roll forward
 into the snapshot by themselves. Anything else rolls forward only when you

@@ -399,3 +399,32 @@ func TestCompareVolatileEntriesOnlyByTypeAndPlace(t *testing.T) {
 	plain := col(model.FileEntry{Path: stub, Type: "file", SHA256: "bb", Size: 10, Mode: 0o100644, UID: 101}, model.FileEntry{Path: "/run/l", Type: "symlink", Target: "/run/a"})
 	find(t, Compare(snap(old), plain, nil), FileModified, stub)
 }
+
+func TestCompareCmdlineAndFirewall(t *testing.T) {
+	old := &model.Collection{
+		Runtime:  model.Runtime{Cmdline: "BOOT_IMAGE=/vmlinuz root=/dev/sda1 ro"},
+		Firewall: model.Firewall{Backend: "nftables", InputPolicy: "drop", Tables: 1, Rules: 8, InputRules: 4},
+	}
+	cur := &model.Collection{Runtime: old.Runtime, Firewall: old.Firewall}
+	if cs := Compare(snap(old), cur, nil); len(cs) != 0 {
+		t.Fatalf("no change expected: %+v", cs)
+	}
+	cur.Runtime.Cmdline += " init=/bin/sh"
+	cur.Firewall.InputPolicy, cur.Firewall.InputRules = "accept", 1
+	cs := Compare(snap(old), cur, nil)
+	c := find(t, cs, CmdlineChanged, "cmdline")
+	if c.Before != old.Runtime.Cmdline || c.After != cur.Runtime.Cmdline {
+		t.Errorf("cmdline change %+v", c)
+	}
+	f := find(t, cs, FirewallChanged, "firewall")
+	if f.Before != "backend nftables, input policy drop, 8 rules (4 for input) in 1 tables" || f.After != "backend nftables, input policy accept, 8 rules (1 for input) in 1 tables" {
+		t.Errorf("firewall change %+v", f)
+	}
+	// Not collected on one side: not a change.
+	if cs := Compare(snap(&model.Collection{}), cur, nil); len(cs) != 0 {
+		t.Errorf("a snapshot without the data: %+v", cs)
+	}
+	if cs := Compare(snap(old), &model.Collection{}, nil); len(cs) != 0 {
+		t.Errorf("a collection without the data: %+v", cs)
+	}
+}

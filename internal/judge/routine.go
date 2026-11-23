@@ -774,12 +774,19 @@ func dpkgInfoPackage(p string) string {
 // gets in.
 var (
 	persistExact = map[string]bool{"/etc/passwd": true, "/etc/shadow": true, "/etc/group": true, "/etc/gshadow": true, "/etc/subuid": true, "/etc/subgid": true,
-		"/etc/ld.so.preload": true, "/etc/rc.local": true, "/etc/environment": true, "/etc/bash.bashrc": true, "/etc/crontab": true}
+		"/etc/ld.so.preload": true, "/etc/rc.local": true, "/etc/environment": true, "/etc/bash.bashrc": true, "/etc/crontab": true,
+		"/etc/sudo.conf": true, "/etc/nftables.conf": true}
 	persistPrefixes = []string{
 		"/etc/sudoers", "/etc/ssh/", "/etc/cron.", "/var/spool/cron/", "/etc/systemd/", "/lib/systemd/", "/usr/lib/systemd/", "/etc/init.d/",
 		"/etc/profile", "/etc/ld.so.conf", "/etc/pam.d/", "/etc/security/", "/etc/modules", "/etc/modprobe.d/", "/lib/modprobe.d/",
 		"/usr/lib/modprobe.d/", "/etc/update-motd.d/", "/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf",
 		"/etc/default/grub", "/etc/grub.d/", "/etc/initramfs-tools/",
+		// Run as root on an event: a device appearing, a package operation,
+		// a log rotation, a network change, a boot, a login session.
+		"/etc/udev/rules.d/", "/etc/apt/apt.conf.d/", "/etc/logrotate.d/", "/etc/NetworkManager/dispatcher.d/", "/etc/tmpfiles.d/", "/etc/xdg/autostart/",
+		// Decide what is trusted: who may act as root, which package
+		// sources and keys, which certificate authorities.
+		"/etc/polkit-1/rules.d/", "/etc/apt/sources.list.d/", "/etc/apt/trusted.gpg.d/", caStore,
 		"/root/.ssh/authorized_keys", "/root/.ssh/rc", "/root/.ssh/environment", "/root/.ssh/config",
 		"/root/.bashrc", "/root/.profile", "/root/.bash_profile",
 	}
