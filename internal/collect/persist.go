@@ -116,7 +116,13 @@ func (c *collector) file(mp, kind string) {
 	if c.seen[kind+"\x00"+mp] {
 		return
 	}
-	pl, err := walkTo(c.root, mp, 0)
+	// A user's own link on the way to the user's own file is followed
+	// (pl.own): what it leads to is then read only if the user could.
+	var uid uint32
+	if c.user != nil {
+		uid = uint32(c.user.UID)
+	}
+	pl, err := walkTo(c.root, mp, uid, c.user != nil)
 	if err != nil {
 		switch {
 		case errors.Is(err, errUserLink):
@@ -151,6 +157,13 @@ func (c *collector) file(mp, kind string) {
 	}
 	defer f.Close()
 	c.seen[kind+"\x00"+mp] = true
+	if pl.own && !readableBy(uid, &st, pl.shut) {
+		// Nothing of the file is recorded, not even its size or dates:
+		// the user could not have seen those either.
+		c.skip(mp, skipOwnLinkPath)
+		c.refusedLink(pl.link, kind)
+		return
+	}
 
 	pf := model.PersistFile{Path: mp, Kind: kind}
 	c.meta(st, &pf)
@@ -272,11 +285,16 @@ func (c *collector) link(pl place, mp, kind string, lst unix.Stat_t, readContent
 	// as written, so that ".." and every link on the way mean what they
 	// mean to the kernel.
 	owner := ownerOf(&lst)
+	if pl.own && c.user != nil {
+		// Reached through the user's own link: whoever owns this one, the
+		// user chose it.
+		owner = uint32(c.user.UID)
+	}
 	from := target
 	if !path.IsAbs(target) {
 		from = pl.real + "/" + target
 	}
-	tpl, err := walkTo(c.root, from, owner)
+	tpl, err := walkTo(c.root, from, owner, false)
 	if err != nil {
 		switch {
 		case errors.Is(err, errUserLink):
@@ -349,7 +367,7 @@ func (c *collector) refusedLink(mp, kind string) {
 	if mp == "" || c.seen[kind+"\x00"+mp] {
 		return
 	}
-	pl, err := walkTo(c.root, mp, 0)
+	pl, err := walkTo(c.root, mp, 0, false)
 	if err != nil {
 		return
 	}

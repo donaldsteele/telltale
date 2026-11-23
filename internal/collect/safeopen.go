@@ -19,7 +19,10 @@ import (
 //     the directory before it, so nothing can be swapped between the check
 //     and the open;
 //   - a symbolic link on the way that a non-root account owns is not
-//     followed;
+//     followed. The one exception is a user's own link on the way to that
+//     user's own start-up file (~/.ssh kept in a dotfiles directory): it is
+//     followed, and what is reached is then read only when that user could
+//     read it;
 //   - nothing below a kernel filesystem (/proc, /sys) is passed through;
 //   - what a non-root account's link leads to is read only when that
 //     account could read it (readableBy).
@@ -38,6 +41,7 @@ const (
 	skipUnreadable     = "target is not readable by the link's owner, content not kept"
 	skipHardLink       = "has more than one hard link and belongs to another account, content not kept"
 	skipUserLinkPath   = "a directory on the way is a symbolic link owned by a non-root user: not followed"
+	skipOwnLinkPath    = "reached through the account's own symbolic link and not readable by that account, content not kept"
 )
 
 const (
@@ -68,8 +72,14 @@ type place struct {
 	// shut is true when a directory on the way can be searched neither by
 	// everyone nor by its owner being the account the walk was made for.
 	shut bool
-	// link is the machine path of the link the walk refused (errUserLink).
+	// link is the machine path of the link the walk refused (errUserLink),
+	// or of the first link followed only because it belongs to the account
+	// the walk was made for (own).
 	link string
+	// own is true when the walk followed a link only because it belongs to
+	// the account the walk was made for. What was reached is then that
+	// account's choice, and is read only when the account could read it.
+	own bool
 }
 
 func (p place) close() {
@@ -163,11 +173,12 @@ func readableBy(uid uint32, st *unix.Stat_t, shut bool) bool {
 // walkTo resolves every component of the machine path mp but the last,
 // below root, the way the kernel does, and returns the directory reached
 // with the last name. forUID is the account the walk is made for (place.shut
-// is relative to it). The caller closes the place.
+// is relative to it). With followOwn, links that account owns are followed
+// too (place.own). The caller closes the place.
 //
 // A walk never leaves root: an absolute link starts again at root and ".."
 // at root stays there.
-func walkTo(root, mp string, forUID uint32) (place, error) {
+func walkTo(root, mp string, forUID uint32, followOwn bool) (place, error) {
 	none := place{dir: -1}
 	if root == "" {
 		root = "/"
@@ -201,7 +212,7 @@ func walkTo(root, mp string, forUID uint32) (place, error) {
 		return b.String()
 	}
 	comps := strings.Split(mp, "/")
-	shut := false
+	shut, own, ownLink := false, false, ""
 	hops, steps := 0, 0
 	for {
 		// Drop what names no step: empty components and ".".
@@ -211,7 +222,7 @@ func walkTo(root, mp string, forUID uint32) (place, error) {
 		top := stack[len(stack)-1].fd
 		if len(comps) == 0 {
 			keep = top
-			return place{dir: top, real: real(), shut: shut}, nil
+			return place{dir: top, real: real(), shut: shut, own: own, link: ownLink}, nil
 		}
 		name := comps[0]
 		if steps++; steps > maxWalkSteps {
@@ -234,7 +245,7 @@ func walkTo(root, mp string, forUID uint32) (place, error) {
 		}
 		if last && len(comps) == 1 {
 			keep = top
-			return place{dir: top, name: name, real: real(), shut: shut}, nil
+			return place{dir: top, name: name, real: real(), shut: shut, own: own, link: ownLink}, nil
 		}
 		fd, err := unix.Openat(top, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if err != nil {
@@ -247,11 +258,17 @@ func walkTo(root, mp string, forUID uint32) (place, error) {
 		}
 		switch st.Mode & unix.S_IFMT {
 		case unix.S_IFLNK:
-			if !trustedOwner(ownerOf(&st)) {
-				unix.Close(fd)
-				pl := none
-				pl.link = strings.TrimSuffix(real(), "/") + "/" + name
-				return pl, errUserLink
+			if o := ownerOf(&st); !trustedOwner(o) {
+				at := strings.TrimSuffix(real(), "/") + "/" + name
+				if !followOwn || o != forUID {
+					unix.Close(fd)
+					pl := none
+					pl.link = at
+					return pl, errUserLink
+				}
+				if !own {
+					own, ownLink = true, at
+				}
 			}
 			target, err := readlinkat(fd, "")
 			unix.Close(fd)

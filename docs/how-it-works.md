@@ -74,7 +74,10 @@ built around that.
   text behind it is kept only when the link's owner could have read it
   anyway: root owns the link, or the link's owner owns the target, or
   everyone may read it. A link on the way that a non-root account owns is
-  not followed, nothing is read through `/proc`, and the password files,
+  not followed (except a user's own link on the way to that user's own
+  start-up file or key file, such as `~/.ssh` kept in a dotfiles directory,
+  and then only to files that user could read), nothing is read through
+  `/proc`, and the password files,
   their backups and anything holding a private key are never kept. The
   link itself is still recorded and reported, with a note that its content
   was not read.

@@ -177,8 +177,36 @@ func TestPersistenceUserLinkToReadableFileIsRead(t *testing.T) {
 	}
 }
 
-// A per-user path that leads through a directory link the user owns is not
-// followed; the link is recorded, so it is still seen and compared.
+// A user's own directory link on the way to the user's own file is followed
+// when it leads to files the user could read (~/.ssh kept in a dotfiles
+// directory), so the keys there stay visible.
+func TestPersistenceUserDirectoryLinkToOwnFiles(t *testing.T) {
+	root := t.TempDir()
+	rootOnly(t, root, "home/mallory/dot/ssh/authorized_keys", "ssh-ed25519 AAAA mallory@laptop\n")
+	symlinkAt(t, root, "home/mallory/.ssh", "dot/ssh")
+	ownedBy(t, malloryUID, filepath.Join(root, "home/mallory"), filepath.Join(root, "home/mallory/.ssh"),
+		filepath.Join(root, "home/mallory/dot"), filepath.Join(root, "home/mallory/dot/ssh"), filepath.Join(root, "home/mallory/dot/ssh/authorized_keys"))
+	pf, skips := Persistence(root, mallory(), testKey)
+	if f, ok := findPersist(pf, "/home/mallory/.ssh/authorized_keys"); !ok || len(f.Lines) != 1 || f.Lines[0] != "ssh-ed25519 AAAA mallory@laptop" {
+		t.Errorf("keys behind the user's own directory link: %+v ok=%v", f, ok)
+	}
+	if len(skips) != 0 {
+		t.Errorf("skips %+v", skips)
+	}
+
+	// Another account's directory link on the way is never followed.
+	ownedBy(t, malloryUID+1, filepath.Join(root, "home/mallory/.ssh"))
+	pf, skips = Persistence(root, mallory(), testKey)
+	if _, ok := findPersist(pf, "/home/mallory/.ssh/authorized_keys"); ok {
+		t.Errorf("file behind another account's directory link was recorded")
+	}
+	if !persistSkip(skips, "/home/mallory/.ssh/authorized_keys", skipUserLinkPath) {
+		t.Errorf("skips %+v", skips)
+	}
+}
+
+// A user's directory link that leads to files the user cannot read is not
+// read through; the link is recorded, so it is still seen and compared.
 func TestPersistenceUserDirectoryLinkNotFollowed(t *testing.T) {
 	root := t.TempDir()
 	rootOnly(t, root, "root/.ssh/authorized_keys", "ssh-ed25519 AAAA rootsecretkey\n")
@@ -193,7 +221,7 @@ func TestPersistenceUserDirectoryLinkNotFollowed(t *testing.T) {
 	if !ok || f.Kind != model.PersistKindAuthorizedKeys || len(f.Lines) != 1 || f.Lines[0] != "/root/.ssh" || f.Mode&unix.S_IFMT != unix.S_IFLNK {
 		t.Errorf("the directory link is not recorded: %+v ok=%v", f, ok)
 	}
-	if !persistSkip(skips, "/home/mallory/.ssh/authorized_keys", skipUserLinkPath) {
+	if !persistSkip(skips, "/home/mallory/.ssh/authorized_keys", skipOwnLinkPath) {
 		t.Errorf("skips %+v", skips)
 	}
 }
