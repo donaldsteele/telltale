@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"errors"
+	"log"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"slices"
 	"strconv"
@@ -152,5 +154,25 @@ func TestRemoveExceptionInTheUI(t *testing.T) {
 	}
 	if len(w.core.removed) != 0 {
 		t.Errorf("removed without the owner's confirmed request: %+v", w.core.removed)
+	}
+}
+
+// The log line for a failed request never carries raw control characters,
+// whatever the path or the error holds: a log is read in a terminal.
+func TestServerErrorLogEscapesThePath(t *testing.T) {
+	var buf strings.Builder
+	u := &UI{o: UIOptions{Log: log.New(&buf, "", 0)}}
+	if err := u.loadTemplates(); err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(http.MethodGet, "https://192.0.2.10:8443/x", nil)
+	r.URL.Path = "/machines/1\x1b]0;owned\x07\n2026/11/23 forged line\x1b[2J"
+	u.serverError(httptest.NewRecorder(), r, errors.New("store: \x1b[31mred\x07"))
+	got := buf.String()
+	if strings.ContainsAny(strings.TrimSuffix(got, "\n"), "\x1b\x07\n\r") {
+		t.Errorf("raw control characters in the log line: %q", got)
+	}
+	if !strings.Contains(got, "/machines/1") || !strings.Contains(got, "forged line") || !strings.Contains(got, "red") {
+		t.Errorf("the log line lost the path or the error: %q", got)
 	}
 }

@@ -528,7 +528,9 @@ func (u *UI) fail(w http.ResponseWriter, r *http.Request, status int, msg string
 }
 
 func (u *UI) serverError(w http.ResponseWriter, r *http.Request, err error) {
-	u.logf("telltale server: %s %s: %v", r.Method, r.URL.Path, err)
+	// The path is the client's to choose and the error may quote stored
+	// text: neither reaches the log with raw control characters.
+	u.logf("telltale server: %s %s: %s", escape.Terminal(r.Method), escape.Terminal(r.URL.Path), escape.Terminal(err.Error()))
 	u.fail(w, r, http.StatusInternalServerError, "Something went wrong on the server: "+escape.Terminal(err.Error()))
 }
 
