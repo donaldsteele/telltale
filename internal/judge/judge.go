@@ -596,6 +596,7 @@ func (j *judge) report(checks []model.CheckResult, applied []model.Exception) *m
 	}
 	finish := func(f *model.Finding) model.Finding {
 		out := *f
+		out.Fix = j.guardFix(f)
 		if n := j.omitted[f]; n > 0 {
 			out.Evidence = append(append([]model.Evidence(nil), f.Evidence...), model.Evidence{Detail: fmt.Sprintf("and %d more", n)})
 		}

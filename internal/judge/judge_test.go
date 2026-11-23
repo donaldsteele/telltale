@@ -820,6 +820,12 @@ func TestJudgeLowerTrustSourcesNote(t *testing.T) {
 
 // --- snapshot change rulings ---
 
+// stillAsSeen is the test a line-editing fix makes first: the file must
+// still have the content the scan hashed.
+func stillAsSeen(p, sha string) string {
+	return `[ "$(sha256sum < '` + p + `' | cut -d' ' -f1)" = '` + sha + `' ]`
+}
+
 func rootKeys(lines ...string) model.PersistFile {
 	return model.PersistFile{Path: "/root/.ssh/authorized_keys", Kind: model.PersistKindAuthorizedKeys, Mode: 0o100600,
 		SHA256: h(strings.Join(lines, "\n")), Lines: lines, MTime: changed}
@@ -850,7 +856,7 @@ func TestJudgeNewRootKeyIsBackdoor(t *testing.T) {
 	if e := f.Evidence[0]; e.Path != "/root/.ssh/authorized_keys" || e.Line != 3 || e.After != evilKey || e.When == nil {
 		t.Errorf("evidence %+v", e)
 	}
-	want := evidenceCopy + "'/root/.ssh/authorized_keys' /root/telltale-evidence/ && sed -i '3d' '/root/.ssh/authorized_keys'"
+	want := evidenceCopy + "'/root/.ssh/authorized_keys' /root/telltale-evidence/ && " + stillAsSeen("/root/.ssh/authorized_keys", cur.Persist[0].SHA256) + " && sed -i '3d' '/root/.ssh/authorized_keys'"
 	if !strings.HasPrefix(f.Fix, want) {
 		t.Errorf("fix %q", f.Fix)
 	}
@@ -1153,7 +1159,7 @@ func TestJudgePersistChanged(t *testing.T) {
 	if !slices.ContainsFunc(f.Evidence, func(e model.Evidence) bool { return e.Line == 2 && e.After == "* * * * * root /tmp/.x" }) {
 		t.Errorf("added line missing: %+v", f.Evidence)
 	}
-	if !strings.HasPrefix(f.Fix, evidenceCopy+"'/etc/cron.d/backup' /root/telltale-evidence/ && sed -i '2d' '/etc/cron.d/backup'") {
+	if !strings.HasPrefix(f.Fix, evidenceCopy+"'/etc/cron.d/backup' /root/telltale-evidence/ && "+stillAsSeen("/etc/cron.d/backup", cur.Persist[0].SHA256)+" && sed -i '2d' '/etc/cron.d/backup'") {
 		t.Errorf("fix %q", f.Fix)
 	}
 	absent(t, r, "snap.file_modified:/etc/cron.d/backup")
@@ -1666,7 +1672,7 @@ func TestJudgeSymlinkedAuthorizedKeys(t *testing.T) {
 
 	r := run(cur, snapOf(old), nil)
 	f := must(t, r, "snap.root_key:/root/.ssh/authorized_keys:1", model.SevBackdoor)
-	want := evidenceCopy + "'/root/.ssh/authorized_keys' '/etc/ssh/keys/root' /root/telltale-evidence/ && sed -i '1d' '/etc/ssh/keys/root'"
+	want := evidenceCopy + "'/root/.ssh/authorized_keys' '/etc/ssh/keys/root' /root/telltale-evidence/ && " + stillAsSeen("/etc/ssh/keys/root", cur.Persist[1].SHA256) + " && sed -i '1d' '/etc/ssh/keys/root'"
 	if !strings.HasPrefix(f.Fix, want) || f.Evidence[0].Line != 1 {
 		t.Errorf("fix %q evidence %+v", f.Fix, f.Evidence[0])
 	}

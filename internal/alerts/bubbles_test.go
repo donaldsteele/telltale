@@ -145,8 +145,11 @@ func TestAlertMappingFields(t *testing.T) {
 			t.Errorf("persist alert text has no %q:\n%s", want, a.Text)
 		}
 	}
+	// (The fix command names the file's hash, to refuse a file edited since
+	// the scan; what is shown as the change must not.)
+	shown, _, _ := strings.Cut(a.Text, "Fix:\n")
 	for _, e := range persist.Evidence[:1] {
-		if strings.Contains(a.Text, e.After) || strings.Contains(a.Text, e.Before) {
+		if strings.Contains(shown, e.After) || strings.Contains(shown, e.Before) {
 			t.Errorf("persist alert shows the summary's hash as a line:\n%s", a.Text)
 		}
 	}

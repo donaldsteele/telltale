@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/netip"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -94,7 +95,7 @@ var items = []Item{
 		ID:     "TT-ACCT-004",
 		Title:  "Passwords are hashed with yescrypt or SHA-512",
 		Why:    "Older hashes (MD5, DES, SHA-256) can be cracked quickly by anyone who gets a copy of /etc/shadow.",
-		Fix:    `sed -i 's/^ENCRYPT_METHOD.*/ENCRYPT_METHOD YESCRYPT/' /etc/login.defs && awk -F: '$2 != "" && $2 !~ /^[!*]/ && $2 !~ /^\$(y|6)\$/ {print $1}' /etc/shadow | xargs -r -n1 passwd -e`,
+		Fix:    `sed -i 's/^ENCRYPT_METHOD.*/ENCRYPT_METHOD YESCRYPT/' /etc/login.defs && awk -F: '$2 != "" && $2 !~ /^[!*]/ && $2 !~ /^\$(y|6)\$/ {print $1}' /etc/shadow | xargs -r -n1 passwd -e` + "   " + expireNote,
 		Check:  checkHashAlgo,
 		fixFor: fixHashAlgo,
 	},
@@ -111,10 +112,10 @@ var items = []Item{
 	{
 		ID:     "TT-SUDO-002",
 		Title:  "sudo always asks for authentication (no !authenticate)",
-		Why:    "A Defaults !authenticate line makes sudo hand out root without asking for any password.",
+		Why:    "A Defaults !authenticate line makes sudo hand out root without asking for any password. Before removing it, give each account that uses sudo a password, or nobody may be able to become root.",
 		Fix:    `grep -rl '!authenticate' /etc/sudoers /etc/sudoers.d | xargs -r sed -i 's/![[:space:]]*authenticate/authenticate/g' && visudo -c`,
 		Check:  sudoRuleCheck(notAuthRe, "!authenticate"),
-		fixFor: sudoRuleFix(notAuthRe, `s/![[:space:]]*authenticate/authenticate/g`),
+		fixFor: fixNotAuth,
 	},
 	{
 		ID:     "TT-SUDO-003",
@@ -880,12 +881,23 @@ func checkHashAlgo(c *model.Collection, _ model.ScanContext) (bool, string, stri
 	return true, "every password hash is yescrypt or SHA-512", ""
 }
 
+// expireNote warns about what passwd -e does to an account nobody knows
+// the password of.
+const expireNote = "# passwd -e makes the account choose a new password at its next login, which asks for the current one. " +
+	"For root, or any account that logs in with an SSH key only and whose password nobody knows, that is a lockout: set a new password with passwd <name> instead."
+
 func fixHashAlgo(c *model.Collection, _ model.ScanContext) string {
 	_, names, _ := weakHashes(c)
 	if len(names) == 0 {
 		return ""
 	}
-	return andThen(`sed -i 's/^ENCRYPT_METHOD.*/ENCRYPT_METHOD YESCRYPT/' /etc/login.defs`, perUser(names, "passwd -e"))
+	fix := andThen(`sed -i 's/^ENCRYPT_METHOD.*/ENCRYPT_METHOD YESCRYPT/' /etc/login.defs`, perUser(names, "passwd -e"))
+	for _, u := range accounts(c) {
+		if u.UID == 0 && slices.Contains(names, u.Name) {
+			return expireNote + "\n" + fix
+		}
+	}
+	return fix
 }
 
 // --- sudo ---
@@ -995,6 +1007,13 @@ func sudoUserList(t string) []string {
 // and members of %groups) and whether a rule covers ALL users. Negations,
 // #uids and aliases are not expanded; root is left out (it needs no sudo).
 func noPasswdUsers(c *model.Collection) (users []model.User, all bool) {
+	return sudoRuleUsers(c, func(t string) bool { return noPasswdRe.MatchString(t) })
+}
+
+// sudoRuleUsers returns the local accounts named on the sudo rules keep
+// accepts (users, and members of %groups) and whether one of those rules
+// covers ALL users. Defaults lines are not rules.
+func sudoRuleUsers(c *model.Collection, keep func(rule string) bool) (users []model.User, all bool) {
 	names := map[string]bool{}
 	for _, pf := range sudoFiles(c) {
 		lines, ok := persistText(pf)
@@ -1003,30 +1022,128 @@ func noPasswdUsers(c *model.Collection) (users []model.User, all bool) {
 		}
 		for _, l := range lines {
 			t := sudoContent(l)
-			if !noPasswdRe.MatchString(t) || strings.HasPrefix(t, "Defaults") {
+			if t == "" || strings.HasPrefix(t, "Defaults") || strings.HasPrefix(t, "#include") || strings.HasPrefix(t, "@include") ||
+				strings.Contains(strings.Fields(t)[0], "_Alias") || !strings.Contains(t, "=") || !keep(t) {
 				continue
 			}
-			for _, who := range sudoUserList(t) {
-				switch {
-				case who == "ALL":
-					all = true
-				case strings.HasPrefix(who, "%"):
-					for _, u := range groupMembers(c, strings.TrimPrefix(strings.TrimPrefix(who, "%:"), "%")) {
-						names[u] = true
-					}
-				case who[0] == '!' || who[0] == '#' || isSudoAlias(who):
-				default:
-					names[who] = true
-				}
-			}
+			all = sudoNames(c, sudoUserList(t), names) || all
 		}
 	}
+	return namedAccounts(c, names), all
+}
+
+// sudoNames adds the accounts a sudoers user list names to names (users,
+// and members of %groups) and reports whether the list covers ALL users.
+// Negations, #uids and aliases are not expanded.
+func sudoNames(c *model.Collection, list []string, names map[string]bool) (all bool) {
+	for _, who := range list {
+		switch {
+		case who == "ALL":
+			all = true
+		case strings.HasPrefix(who, "%"):
+			for _, u := range groupMembers(c, strings.TrimPrefix(strings.TrimPrefix(who, "%:"), "%")) {
+				names[u] = true
+			}
+		case who[0] == '!' || who[0] == '#' || isSudoAlias(who):
+		default:
+			names[who] = true
+		}
+	}
+	return all
+}
+
+// namedAccounts returns the local accounts in names, without root (it
+// needs no sudo).
+func namedAccounts(c *model.Collection, names map[string]bool) []model.User {
+	var users []model.User
 	for _, u := range accounts(c) {
 		if names[u.Name] && u.Name != "root" {
 			users = append(users, u)
 		}
 	}
-	return users, all
+	return users
+}
+
+// notAuthUsers returns the accounts a !authenticate setting lets use sudo
+// without a password, and whether a rule covers ALL users. A setting bound
+// to users ("Defaults:alice,%ops !authenticate") covers those; any other
+// form (plain Defaults, or bound to a host, a command or a target user)
+// covers everyone a sudo rule names.
+func notAuthUsers(c *model.Collection) (users []model.User, all bool) {
+	names := map[string]bool{}
+	everyone := false
+	for _, pf := range sudoFiles(c) {
+		lines, ok := persistText(pf)
+		if !ok {
+			continue
+		}
+		for _, l := range lines {
+			t := sudoContent(l)
+			if !strings.HasPrefix(t, "Defaults") || !notAuthRe.MatchString(t) {
+				continue
+			}
+			rest := strings.TrimPrefix(t, "Defaults")
+			if !strings.HasPrefix(rest, ":") {
+				everyone = true
+				continue
+			}
+			all = sudoNames(c, sudoUserList(strings.TrimSpace(rest[1:])), names) || all
+		}
+	}
+	if everyone || all {
+		ruled, any := sudoRuleUsers(c, func(string) bool { return true })
+		for _, u := range ruled {
+			names[u.Name] = true
+		}
+		all = all || any
+	}
+	return namedAccounts(c, names), all
+}
+
+// fixNotAuth turns authentication back on, first setting a password for
+// each covered account that has none: the same lockout as with NOPASSWD.
+func fixNotAuth(c *model.Collection, ctx model.ScanContext) string {
+	base := sudoRuleFix(notAuthRe, `s/![[:space:]]*authenticate/authenticate/g`)(c, ctx)
+	if base == "" {
+		return ""
+	}
+	users, all := notAuthUsers(c)
+	return passwordFirst(c, users, all, "a sudo rule covers ALL users", "!authenticate", base)
+}
+
+// passwordFirst puts in front of a sudoers fix the passwd commands for the
+// accounts that would be locked out of sudo by it, or a comment when that
+// cannot be told (ALL users, or shadow not read).
+func passwordFirst(c *model.Collection, users []model.User, all bool, allWhat, without, base string) string {
+	var b strings.Builder
+	if all {
+		b.WriteString("# " + allWhat + ": every user with a locked password must get one before this change\n")
+	}
+	if shadowMissing(c) != "" {
+		var names []string
+		for _, u := range users {
+			names = append(names, u.Name)
+		}
+		if len(names) > 0 {
+			b.WriteString("# check that " + escapeAll(names) + " can give sudo a password before running this, or nobody may be able to become root\n")
+		}
+		return b.String() + base
+	}
+	var need []string
+	for _, u := range users {
+		if !u.Password.Set || u.Password.Locked {
+			need = append(need, u.Name)
+		}
+	}
+	if len(need) == 0 {
+		return b.String() + base
+	}
+	verb := "has"
+	if len(need) > 1 {
+		verb = "have"
+	}
+	fmt.Fprintf(&b, "# %s %s no usable password: without %s sudo asks for one, so set it first or nobody may be able to become root\n", escapeAll(need), verb, without)
+	return b.String() + andThen(perUser(need, "passwd"), base)
 }
 
 // isSudoAlias reports whether a sudoers name is an alias (upper case,
@@ -1067,35 +1184,7 @@ func fixNoPasswd(c *model.Collection, ctx model.ScanContext) string {
 		return ""
 	}
 	users, all := noPasswdUsers(c)
-	var b strings.Builder
-	if all {
-		b.WriteString("# a NOPASSWD rule covers ALL users: every user with a locked password must get one before this change\n")
-	}
-	if shadowMissing(c) != "" {
-		var names []string
-		for _, u := range users {
-			names = append(names, u.Name)
-		}
-		if len(names) > 0 {
-			b.WriteString("# check that " + escapeAll(names) + " can give sudo a password before running this, or nobody may be able to become root\n")
-		}
-		return b.String() + base
-	}
-	var need []string
-	for _, u := range users {
-		if !u.Password.Set || u.Password.Locked {
-			need = append(need, u.Name)
-		}
-	}
-	if len(need) == 0 {
-		return b.String() + base
-	}
-	verb := "has"
-	if len(need) > 1 {
-		verb = "have"
-	}
-	fmt.Fprintf(&b, "# %s %s no usable password: without NOPASSWD sudo asks for one, so set it first or nobody may be able to become root\n", escapeAll(need), verb)
-	return b.String() + andThen(perUser(need, "passwd"), base)
+	return passwordFirst(c, users, all, "a NOPASSWD rule covers ALL users", "NOPASSWD", base)
 }
 
 func sudoPaths(c *model.Collection) []string {

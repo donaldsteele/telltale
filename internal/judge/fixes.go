@@ -82,24 +82,123 @@ func fixScript(p, pkg string, installed bool) string {
 	})
 }
 
+// isSHA256 reports whether s is a SHA-256 in lower-case hex.
+func isSHA256(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// unchanged is the shell test that the quoted file q still has the content
+// the scan hashed. A line number means something only in the file as it
+// was: edited since, line 2 may be another line.
+func unchanged(q, sha string) string {
+	return `[ "$(sha256sum < ` + q + ` | cut -d' ' -f1)" = ` + sq(sha) + ` ]`
+}
+
+const unchangedNote = "; the edit runs only if the file is still as telltale saw it"
+
 // fixDeleteLines removes the given lines (numbers in the current file) in one
-// sed pass, after saving the file.
-func fixDeleteLines(p string, lines []int, note string) string {
+// sed pass, after saving the file and only if the file's content is still
+// the one whose SHA-256 the scan recorded (sha). Without that hash nothing
+// can be verified, and no line edit is offered.
+func fixDeleteLines(p string, lines []int, sha, note string) string {
+	if !isSHA256(sha) {
+		return fixKeepOnly(p, "then remove the added lines, which telltale's report lists, by hand")
+	}
 	return command([]string{p}, func(q []string) string {
-		return keep(q[0]) + " && sed -i '" + sedDeletes(lines) + "' " + q[0] + comment(note)
+		return keep(q[0]) + " && " + unchanged(q[0], sha) + " && sed -i '" + sedDeletes(lines) + "' " + q[0] + comment(note+unchangedNote)
 	})
 }
 
 // fixDeleteLinesIn removes lines from the file a symlink points to. sed -i
 // on the link itself would replace the link with a plain file, so the
-// target is edited, after both are saved.
-func fixDeleteLinesIn(link, target string, lines []int, note string) string {
-	if target == "" {
+// target is edited, after both are saved and only if its content is still
+// the one the scan hashed (sha).
+func fixDeleteLinesIn(link, target string, lines []int, sha, note string) string {
+	if target == "" || !isSHA256(sha) {
 		return fixKeepOnly(link, "then remove the added lines, which telltale's report lists, from the file it links to")
 	}
 	return command([]string{link, target}, func(q []string) string {
-		return keep(q[0], q[1]) + " && sed -i '" + sedDeletes(lines) + "' " + q[1] + comment(note)
+		return keep(q[0], q[1]) + " && " + unchanged(q[1], sha) + " && sed -i '" + sedDeletes(lines) + "' " + q[1] + comment(note+unchangedNote)
 	})
+}
+
+// tempDirs are the world-writable places: anyone can make names there.
+var tempDirs = []string{"/tmp", "/var/tmp", "/dev/shm"}
+
+// foreignDir is the highest directory on the way to p that an account other
+// than root controls, or "": a directory the inventory records as owned by
+// a non-root account, else the home of a non-root account, else a
+// world-writable temporary directory. Whoever controls it can change what
+// every path below it leads to.
+func (j *judge) foreignDir(p string) string {
+	if !strings.HasPrefix(p, "/") {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	dir := ""
+	for _, name := range parts[:max(len(parts)-1, 0)] {
+		dir += "/" + name
+		if e := j.files[dir]; e != nil && e.Type == "dir" && e.UID != 0 {
+			return dir
+		}
+	}
+	best := ""
+	for _, u := range j.c.Accounts.Users {
+		h := strings.TrimSuffix(u.Home, "/")
+		if u.UID != 0 && h != "" && strings.HasPrefix(p, h+"/") && (best == "" || len(h) < len(best)) {
+			best = h
+		}
+	}
+	if best != "" {
+		return best
+	}
+	for _, d := range tempDirs {
+		if strings.HasPrefix(p, d+"/") {
+			return d
+		}
+	}
+	return ""
+}
+
+// guardFix puts "# check first: ls -ld <dir>" in front of a finding's fix
+// when a path the finding is about lies below a directory another account
+// controls. The fix is run as root, some time after the scan, and the
+// owner of that directory can meanwhile replace the path with a link to
+// any file: the person about to run it should look first.
+func (j *judge) guardFix(f *model.Finding) string {
+	if f.Fix == "" || f.Fix == ctrlNote || strings.HasPrefix(f.Fix, "# check first: ") {
+		return f.Fix
+	}
+	var paths []string
+	if _, subj, ok := strings.Cut(f.Key, ":"); ok && strings.HasPrefix(subj, "/") {
+		paths = append(paths, subj)
+	}
+	for _, e := range f.Evidence {
+		if e.Path != "" {
+			paths = append(paths, e.Path)
+		}
+	}
+	seen := map[string]bool{}
+	var dirs []string
+	for _, p := range paths {
+		if d := j.foreignDir(p); d != "" && !seen[d] && !unsafeText(d) {
+			seen[d] = true
+			dirs = append(dirs, sq(d))
+		}
+	}
+	if len(dirs) == 0 {
+		return f.Fix
+	}
+	sort.Strings(dirs)
+	return "# check first: ls -ld " + strings.Join(dirs, " ") + "   (not root's: its owner can change what the paths below lead to until you look)\n" + f.Fix
 }
 
 func sedDeletes(lines []int) string {

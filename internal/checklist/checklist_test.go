@@ -866,3 +866,89 @@ func TestAndThenAndWithReloadNeverExtendAComment(t *testing.T) {
 		t.Errorf("%q", got)
 	}
 }
+
+// Turning authentication back on locks out every sudo user without a usable
+// password, exactly as removing NOPASSWD does: the fix sets one first.
+func TestNotAuthenticateFixSetsPasswordFirst(t *testing.T) {
+	base := func() *model.Collection {
+		c := hardened()
+		c.Accounts.Users = append(c.Accounts.Users,
+			model.User{Name: "ubuntu", UID: 1001, GID: 1001, Shell: "/bin/bash", Password: model.PasswordState{Locked: true, LastChange: 19000}},
+			model.User{Name: "carol", UID: 1002, GID: 1002, Shell: "/bin/bash", Password: model.PasswordState{Set: true, Algo: "yescrypt", LastChange: 19000}},
+			model.User{Name: "dave", UID: 1003, GID: 1003, Shell: "/bin/bash", Password: model.PasswordState{Locked: true, LastChange: 19000}},
+		)
+		c.Accounts.Groups = append(c.Accounts.Groups, model.Group{Name: "admins", GID: 2000, Members: []string{"carol", "dave"}})
+		c.Files = append(c.Files, fileEntry("/etc/sudoers.d/50-lab", 0o440, 0, 0))
+		return c
+	}
+	it, _ := ByID("TT-SUDO-002")
+	const sed = `sed -i 's/![[:space:]]*authenticate/authenticate/g' /etc/sudoers.d/50-lab && visudo -c`
+
+	// For everyone: every account a sudo rule names must be able to give a
+	// password.
+	c := base()
+	c.Persist = append(c.Persist, model.PersistFile{Path: "/etc/sudoers.d/50-lab", Kind: model.PersistKindSudoers, Mode: 0o100440,
+		Lines: []string{"Defaults !authenticate", "ubuntu ALL=(ALL) ALL", "%admins ALL=(ALL) ALL"}})
+	want := "# ubuntu, dave have no usable password: without !authenticate sudo asks for one, so set it first or nobody may be able to become root\n" +
+		"passwd ubuntu && passwd dave && " + sed
+	if fix := it.FixFor(c, model.ScanContext{}); fix != want {
+		t.Errorf("fix = %q\nwant  %q", fix, want)
+	}
+
+	// For named accounts only.
+	c = base()
+	c.Persist = append(c.Persist, model.PersistFile{Path: "/etc/sudoers.d/50-lab", Kind: model.PersistKindSudoers, Mode: 0o100440,
+		Lines: []string{"Defaults:ubuntu !authenticate", "ubuntu ALL=(ALL) ALL", "%admins ALL=(ALL) ALL"}})
+	want = "# ubuntu has no usable password: without !authenticate sudo asks for one, so set it first or nobody may be able to become root\n" +
+		"passwd ubuntu && " + sed
+	if fix := it.FixFor(c, model.ScanContext{}); fix != want {
+		t.Errorf("fix = %q\nwant  %q", fix, want)
+	}
+
+	// Everyone covered already has a password: the plain fix.
+	c = base()
+	c.Persist = append(c.Persist, model.PersistFile{Path: "/etc/sudoers.d/50-lab", Kind: model.PersistKindSudoers, Mode: 0o100440,
+		Lines: []string{"Defaults:carol !authenticate", "carol ALL=(ALL) ALL"}})
+	if fix := it.FixFor(c, model.ScanContext{}); fix != sed {
+		t.Errorf("fix = %q", fix)
+	}
+
+	// A rule for ALL users: said, since they cannot be listed.
+	c = base()
+	c.Persist = append(c.Persist, model.PersistFile{Path: "/etc/sudoers.d/50-lab", Kind: model.PersistKindSudoers, Mode: 0o100440,
+		Lines: []string{"Defaults !authenticate", "ALL ALL=(ALL) ALL"}})
+	if fix := it.FixFor(c, model.ScanContext{}); !strings.HasPrefix(fix, "# a sudo rule covers ALL users: every user with a locked password must get one before this change\n") || !strings.HasSuffix(fix, sed) {
+		t.Errorf("fix = %q", fix)
+	}
+	if !strings.Contains(it.Why, "password") || !strings.Contains(it.Why, "Before") {
+		t.Errorf("Why does not warn about passwords first: %q", it.Why)
+	}
+}
+
+// passwd -e makes the account choose a new password at its next login, and
+// that asks for the current one. For root reached with a key only, whose
+// password nobody may know, that is a lockout: the fix says so first.
+func TestHashAlgoFixWarnsAboutRoot(t *testing.T) {
+	it, _ := ByID("TT-ACCT-004")
+	c := hardened()
+	for i := range c.Accounts.Users {
+		if c.Accounts.Users[i].Name == "root" {
+			c.Accounts.Users[i].Password = model.PasswordState{Known: true, Set: true, Algo: "md5", LastChange: 19000}
+		}
+	}
+	fix := it.FixFor(c, model.ScanContext{})
+	first, rest, _ := strings.Cut(fix, "\n")
+	if !strings.HasPrefix(first, "# passwd -e ") || !strings.Contains(first, "root") || !strings.Contains(first, "key") || !strings.Contains(rest, "passwd -e root") {
+		t.Errorf("fix = %q", fix)
+	}
+	// No uid 0 account among them: no warning needed.
+	c = hardened()
+	c.Accounts.Users = append(c.Accounts.Users, model.User{Name: "carol", UID: 1002, GID: 1002, Shell: "/bin/bash", Password: model.PasswordState{Known: true, Set: true, Algo: "md5", LastChange: 19000}})
+	if fix := it.FixFor(c, model.ScanContext{}); strings.HasPrefix(fix, "#") || !strings.Contains(fix, "passwd -e carol") {
+		t.Errorf("fix = %q", fix)
+	}
+	// The general fix, as the documentation shows it, says it too.
+	if !strings.Contains(it.Fix, "# passwd -e ") {
+		t.Errorf("Fix = %q", it.Fix)
+	}
+}

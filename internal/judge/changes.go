@@ -1030,12 +1030,14 @@ func (v linkView) line(n int) int {
 	return n
 }
 
-// deleteLines removes content lines, from the target of a link.
-func (v linkView) deleteLines(p string, lines []int, note string) string {
+// deleteLines removes content lines, from the target of a link. sha is the
+// hash the scan recorded for the content (PersistFile.SHA256), which the
+// fix checks before it edits.
+func (v linkView) deleteLines(p string, lines []int, sha, note string) string {
 	if v.link {
-		return fixDeleteLinesIn(p, v.target, lines, note)
+		return fixDeleteLinesIn(p, v.target, lines, sha, note)
 	}
-	return fixDeleteLines(p, lines, note)
+	return fixDeleteLines(p, lines, sha, note)
 }
 
 func (j *judge) persistChange(ch diff.Change) {
@@ -1174,9 +1176,17 @@ func persistFix(p string, cur, old *model.PersistFile, lines []diff.LineChange, 
 		added = append(added, lv.line(lc.Line))
 	}
 	if !meta && len(added) > 0 {
-		return lv.deleteLines(p, added, "removes the lines that were added")
+		return lv.deleteLines(p, added, cur.SHA256, "removes the lines that were added")
 	}
 	return fixKeepOnly(p, "then edit it back to the snapshot's lines, which telltale's report shows")
+}
+
+// persistSHA is the hash the scan recorded for the persistence file at p.
+func (j *judge) persistSHA(p string) string {
+	if pf := j.persist[p]; pf != nil {
+		return pf.SHA256
+	}
+	return ""
 }
 
 // --- SSH keys for root ---
@@ -1231,7 +1241,7 @@ func (j *judge) newRootKeys(p string, ch diff.Change, old *model.PersistFile, lv
 				Title: fmt.Sprintf("New SSH key for root, not in the snapshot: %s line %d", p, n),
 				Why: "Whoever holds the matching private key can now log in as root without a password. Planting a key is the most common way attackers keep root access. " +
 					"It is not the telltale server's key.",
-				Fix:      lv.deleteLines(p, []int{n}, "only if you do not recognise the key; if you remove several lines from this file, start with the highest line number"),
+				Fix:      lv.deleteLines(p, []int{n}, j.persistSHA(p), "only if you do not recognise the key; a second removal from this file needs a new scan"),
 				Evidence: []model.Evidence{{Path: p, Line: n, After: s, Detail: "key added since the snapshot", When: j.whenFor(p)}},
 				Refs:     []string{"T1098.004"},
 			})
