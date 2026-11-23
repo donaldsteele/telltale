@@ -152,6 +152,16 @@ func hostPort(addr string) (string, error) {
 	return hp, nil
 }
 
+// authRejected reports whether a handshake error is the SSH server
+// rejecting every authentication method the client offered: the answer to a
+// key that is no longer authorised. The SSH library has no type for it, so
+// its two fixed phrases are matched. A connection that ended, or a deadline
+// that passed, during the login is not a rejection.
+func authRejected(err error) bool {
+	s := err.Error()
+	return strings.Contains(s, "ssh: unable to authenticate") || strings.Contains(s, "no supported methods remain")
+}
+
 // handshake connects to hostport and runs the SSH handshake (key exchange,
 // host key check and, when cfg has auth methods, the login), giving up
 // after dialTimeout or when ctx ends.
@@ -189,7 +199,7 @@ func handshake(ctx context.Context, hostport string, cfg *ssh.ClientConfig) (*ss
 		return nil, ctx.Err()
 	}
 	if err != nil {
-		if accepted {
+		if accepted && authRejected(err) {
 			return nil, fmt.Errorf("%w: %w", ErrLoginRefused, escaped{err})
 		}
 		return nil, escaped{err}
