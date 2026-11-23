@@ -103,6 +103,7 @@ type judge struct {
 	uncheckedFiles   []model.Evidence
 	uncheckedPkgs    []string                         // changed packages whose programs could not be checked
 	confDefault      map[string]pkgverify.FileVerdict // conffiles that equal the signed package's default
+	reported         map[string]bool                  // every path package verification gave any verdict about
 
 	// From the snapshot comparison.
 	pkgChange   map[string]diff.Change      // package name -> its change
@@ -138,7 +139,7 @@ func newJudge(in Input, c *model.Collection) *judge {
 		in: in, c: c, ctx: in.Context,
 		byKey: map[string]*model.Finding{}, groups: map[string]*model.Finding{}, omitted: map[*model.Finding]int{},
 		verified: map[string]pkgverify.FileVerdict{}, pkgPath: map[string]*model.Finding{},
-		unverified: map[string]bool{}, unverReason: map[string]string{}, unverKind: map[string]string{}, uncheckedSpecial: map[string]bool{}, confDefault: map[string]pkgverify.FileVerdict{},
+		unverified: map[string]bool{}, unverReason: map[string]string{}, unverKind: map[string]string{}, uncheckedSpecial: map[string]bool{}, confDefault: map[string]pkgverify.FileVerdict{}, reported: map[string]bool{},
 		pkgChange: map[string]diff.Change{}, pkgFinding: map[string]*model.Finding{}, persistDone: map[string]*model.Finding{},
 		pkgReasons: map[string][]string{}, unverIn: map[string][]model.Evidence{}, unchecked: map[string][]model.Evidence{}, unconfirmed: map[string]bool{},
 		acctChanged: map[string]bool{}, foldedMax: map[*model.Finding]model.Severity{},

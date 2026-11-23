@@ -986,7 +986,9 @@ func TestJudgeFileChangeRankedByLocation(t *testing.T) {
 		t.Errorf("evidence does not carry the full new hash: %q", after)
 	}
 	must(t, r, "snap.file_modified:/etc/security/limits.conf", model.SevBackdoor)
-	must(t, r, "snap.file_modified:/usr/share/doc/openssl/README", model.SevNote)
+	// A package's data file about which package verification, which ran,
+	// said nothing: silence is not a pass (see noVerdict).
+	must(t, r, "snap.file_modified:/usr/share/doc/openssl/README", model.SevBackdoor)
 	must(t, r, "snap.file_modified:/etc/hostname", model.SevNote)
 	a := must(t, r, "snap.file_added:/usr/local/bin/tool", model.SevBackdoor)
 	if a.Fix != evidenceCopy+"'/usr/local/bin/tool' /root/telltale-evidence/ && rm -- '/usr/local/bin/tool'   # only if you did not put it there" {

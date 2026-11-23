@@ -424,18 +424,19 @@ func (s *session) changedFiles() bool {
 	return false
 }
 
-// unplacedChange reports whether a changed in-scope regular file is placed
-// by none of the loaded tables.
+// unplacedChange reports whether a changed path is placed by none of the
+// loaded tables. Whatever is there now counts, except a directory: a
+// program replaced by a symbolic link, or a file whose execute bits were
+// dropped so that it no longer looks like a program, is exactly what a file
+// list edited to hide a change would leave behind.
 func (s *session) unplacedChange(results []*pkgResult) bool {
 	idx := s.placeTables(results)
 	for p := range s.opt.OnlyPaths {
 		e := s.files[p]
-		if e == nil || !isRegular(e) || len(idx[p]) > 0 || strings.HasPrefix(p, dpkgInfoDir) {
+		if e == nil || e.Type == "dir" || len(idx[p]) > 0 || strings.HasPrefix(p, dpkgInfoDir) {
 			continue // dpkg's own records are no package's files
 		}
-		if s.opt.Full || InScope(p, e.Mode) {
-			return true
-		}
+		return true
 	}
 	return false
 }
@@ -1870,6 +1871,14 @@ func (s *session) modeDiff(p string, diskMode uint32, f DebFile) (string, verdic
 	})
 	if !grants || backed {
 		if disk != ov {
+			if !grants && disk == base[0].mode {
+				// The override only takes privilege away and has not been
+				// applied (dpkg applies it at the next unpack): the file
+				// has the mode the signed package installs. A mode only the
+				// package's maintainer script would set is not this: the
+				// script leaves an overridden file alone.
+				return fmt.Sprintf("mode differs: a statoverride sets %04o and is not applied, disk %04o as the package installs it", ov, disk), verdictVerified
+			}
 			return judgeMode([]expectedMode{{ov, "statoverride"}}, disk, nil)
 		}
 		if !slices.ContainsFunc(base, func(e expectedMode) bool { return e.mode == disk }) && disk&^base[0].mode == 0 {

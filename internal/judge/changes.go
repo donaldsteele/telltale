@@ -214,7 +214,28 @@ const (
 	catHandedOff
 	catMaintScript
 	catKernelRemoval
+	catNoVerdict
 )
+
+// noVerdict reports whether p is a package's regular file about which
+// package verification, having run against signed packages, said nothing
+// at all. A scan with a snapshot asks it about every changed package file,
+// and it answers for each one a signed package accounts for (verified, a
+// mismatch, could not be verified, a configuration file); silence means the
+// file slipped past it. Silence is never taken as the file being fine.
+func (j *judge) noVerdict(p string, cur *model.FileEntry) bool {
+	if cur == nil || cur.Type != "file" || j.owned[p] == "" || j.in.Pkg == nil || j.in.Pkg.Mode == pkgverify.ModeOfflineLocal {
+		return false
+	}
+	if j.reported[p] || (usrAlias(p) != "" && j.reported[usrAlias(p)]) {
+		return false
+	}
+	// Where the file really is, when a directory on the way is a link.
+	if lit := j.literal[p]; lit != "" && j.reported[lit] {
+		return false
+	}
+	return true
+}
 
 // kernelRemovalRewrites names the kernel image package removed since the
 // snapshot when p is a boot file that removing a kernel rewrites: the boot
@@ -438,6 +459,8 @@ func (j *judge) fileChange(ch diff.Change) {
 		cat = catPersist
 	case e.Type == "file" && pkgverify.InScope(p, e.Mode):
 		cat = catSecurity
+	case j.noVerdict(p, cur):
+		cat = catNoVerdict
 	}
 	if e.Type == "file" && j.pkgChanged(owner) {
 		j.unconfirmed[owner] = true
@@ -488,6 +511,10 @@ func (j *judge) fileChange(ch diff.Change) {
 		why = fmt.Sprintf("This link now points to %s: %s. A program or file replaced by a link runs or reads whatever sits at the other end, so it no longer matters what the package installed here.",
 			to, linkWhy)
 		refs = []string{"T1574"}
+	case catNoVerdict:
+		why = "This file belongs to the package " + j.owned[p] + " and changed since the snapshot, and package verification, which ran, said nothing about it: not that it matches the signed package, not that it differs, not that it could not be checked. " +
+			"Every changed file a signed package accounts for gets one of those answers. A file the machine's own records call a package's while the signed package does not account for it is what hiding a replaced file looks like."
+		refs = []string{"T1554", "T1036"}
 	case catKernelRemoval:
 		// A note of its own, never part of the removal's explained group:
 		// that group rolls forward by itself, and a removal is only dpkg's

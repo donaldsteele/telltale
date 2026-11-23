@@ -95,6 +95,14 @@ func (j *judge) packages() {
 		j.couldNot = append(j.couldNot, noPkgLimit)
 		return
 	}
+	for _, list := range [][]pkgverify.FileVerdict{r.Verified, r.Mismatch, r.Unverifiable, r.Suspicious, r.ConffileDefaults} {
+		for _, v := range list {
+			j.reported[v.Path] = true
+		}
+	}
+	for _, d := range r.Conffiles {
+		j.reported[d.Path] = true
+	}
 	for _, v := range r.ConffileDefaults {
 		// Kept apart from the verified files: a conffile default confirms
 		// no package version and stands in for no program or library.

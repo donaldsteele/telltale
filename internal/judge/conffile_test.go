@@ -138,3 +138,32 @@ func TestJudgeConffileDefaultVerdictExplains(t *testing.T) {
 	res.ConffileDefaults = []pkgverify.FileVerdict{older}
 	must(t, run(cur, snapOf(old), res), "snap.file_modified:"+p, model.SevBackdoor)
 }
+
+// A package's file changed, package verification ran, and it said nothing
+// about the file: that never happens to a file the signed package accounts
+// for, so it is a backdoor sign, not a note (the probe: a trojan with its
+// execute bits dropped so that it no longer looks like a program).
+func TestJudgeOwnedChangedFileWithoutVerdict(t *testing.T) {
+	const p = "/usr/share/doc/openssl/README"
+	old := clean()
+	cur := clone(old)
+	setFile(cur, file(p, "trojan, mode 0644", 0o644))
+
+	f := must(t, run(cur, snapOf(old), archive()), "snap.file_modified:"+p, model.SevBackdoor)
+	if !strings.Contains(f.Why, "openssl") || !strings.Contains(f.Why, "said nothing") {
+		t.Errorf("why %q", f.Why)
+	}
+	// Any verdict about it decides instead.
+	v := pkgverify.FileVerdict{Path: p, Package: "openssl", Version: "3.0.14-1~deb12u2", Expected: h("trojan, mode 0644"), Actual: h("trojan, mode 0644"), Source: "archive"}
+	if r := run(cur, snapOf(old), archive(v)); find(r, "snap.file_modified:"+p) != nil {
+		t.Errorf("a verified file is still ranked: %v", keys(r))
+	}
+	// Package verification did not run, or used the machine's own
+	// checksums: there was nobody to say anything, and the report says so.
+	must(t, run(cur, snapOf(old), nil), "snap.file_modified:"+p, model.SevNote)
+	must(t, run(cur, snapOf(old), &pkgverify.Result{Mode: pkgverify.ModeOfflineLocal}), "snap.file_modified:"+p, model.SevNote)
+	// A file no package owns stays a note.
+	other := clone(old)
+	other.Files = append(other.Files, file("/usr/share/doc/mine/README", "mine", 0o644))
+	must(t, run(other, snapOf(old), archive()), "snap.file_added:/usr/share/doc/mine/README", model.SevNote)
+}

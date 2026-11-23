@@ -1698,7 +1698,10 @@ func TestModeDiff(t *testing.T) {
 		// A statoverride that removes privilege is fine; the mode is
 		// then what it says.
 		{"/usr/bin/chfn", 0o100755, DebFile{Mode: 0o4755}, "mode differs (less permissive): deb 4755, disk 0755", V},
-		{"/usr/bin/chfn", 0o104755, DebFile{Mode: 0o4755}, "mode differs: statoverride 0755, disk 4755", M},
+		// ... and until dpkg applies it, the file keeps the mode the signed
+		// package installs: the package's own file, not tampering.
+		{"/usr/bin/chfn", 0o104755, DebFile{Mode: 0o4755}, "mode differs: a statoverride sets 0755 and is not applied, disk 4755 as the package installs it", V},
+		{"/usr/bin/chfn", 0o106755, DebFile{Mode: 0o4755}, "mode differs: statoverride 0755, disk 6755", M},
 		{"/usr/bin/y", 0o100750, DebFile{Mode: 0o755}, "mode differs (less permissive): deb 0755, disk 0750", V},
 	} {
 		reason, kind := s.modeDiff(c.path, c.disk, c.deb)

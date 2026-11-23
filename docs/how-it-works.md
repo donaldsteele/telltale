@@ -154,9 +154,15 @@ security-relevant places (programs, shared libraries, PAM modules, kernel
 modules, `/boot`) and the packages' maintainer scripts; with a snapshot,
 the package files that changed since; with `--full`, everything. telltale
 plans every package `dpkg/status` lists, whatever the package's file list
-says, so editing a `.list` file cannot hide a replaced program. dpkg
+says, so editing a `.list` file cannot hide a replaced program. With a
+snapshot, a changed package path that none of the signed packages it
+loaded accounts for makes it check every installed package, whatever the
+path is now (a program replaced by a symbolic link, a file with its
+execute bits dropped). A changed package file about which verification
+then still says nothing is a backdoor sign: silence is never a pass. dpkg
 diversions and `statoverride` entries are followed, and the ones nothing
-legitimate explains are reported.
+legitimate explains are reported; a `statoverride` that only takes
+privilege away and is not applied yet leaves the file verified.
 
 The result for each file is one of: verified against the signed package;
 **a mismatch**, which is tampering; or unverifiable (the version is in no
