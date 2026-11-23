@@ -97,28 +97,33 @@ func Open(path string, u Unlock) (*Store, error) {
 	}
 	// Serialize setup (WAL switch, DDL, key creation) between processes:
 	// SQLite can answer BUSY to the first rollback-to-WAL switch without
-	// calling the busy handler. The lock file is never removed.
-	lock, err := os.OpenFile(path+".lock", os.O_RDWR|os.O_CREATE, 0o600)
+	// calling the busy handler. The lock file is never removed, and a symlink
+	// in its place is refused, not followed out of the data directory.
+	lock, err := openNoFollow(path+".lock", os.O_RDWR|os.O_CREATE, "lock file")
 	if err != nil {
 		return nil, err
 	}
 	defer lock.Close() // closing releases the flock
+	if err := regular0600(lock, "lock file"); err != nil {
+		return nil, err
+	}
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
 		return nil, fmt.Errorf("store: lock %s.lock: %w", path, err)
 	}
 	// Create the file 0600 ourselves so SQLite (which gives -wal and -shm the
 	// main file's mode) never makes a wider one. Only the opener whose
 	// O_EXCL create succeeds owns the file and may remove it on failure.
+	// O_CREATE|O_EXCL never follows a symlink (it fails with EEXIST), so only
+	// the reopen of an existing file needs O_NOFOLLOW.
 	created := true
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if errors.Is(err, os.ErrExist) {
 		created = false
-		f, err = os.OpenFile(path, os.O_RDWR, 0o600)
+		f, err = openNoFollow(path, os.O_RDWR, "database")
 	}
 	if err != nil {
 		return nil, err
 	}
-	f.Close()
 	fail := func(err error) (*Store, error) {
 		// Only before any SQL ran, and only by the opener that created the file.
 		if created {
@@ -128,7 +133,9 @@ func Open(path string, u Unlock) (*Store, error) {
 		}
 		return nil, err
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	err = regular0600(f, "database")
+	f.Close()
+	if err != nil {
 		return fail(err)
 	}
 	q := url.Values{}
@@ -154,6 +161,34 @@ func Open(path string, u Unlock) (*Store, error) {
 		}
 	}
 	return s, nil
+}
+
+// openNoFollow opens name without following a symlink in its last element.
+func openNoFollow(name string, flag int, what string) (*os.File, error) {
+	f, err := os.OpenFile(name, flag|syscall.O_NOFOLLOW, 0o600)
+	if errors.Is(err, syscall.ELOOP) {
+		return nil, fmt.Errorf("store: %s %s is a symbolic link; refusing to follow it", what, name)
+	}
+	return f, err
+}
+
+// regular0600 refuses anything but a regular file behind f and sets its mode
+// to 0600 through the descriptor, so a path swapped since the open is never
+// touched.
+func regular0600(f *os.File, what string) error {
+	fi, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("store: %s: %w", what, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("store: %s %s is not a regular file", what, f.Name())
+	}
+	if fi.Mode().Perm() != 0o600 {
+		if err := f.Chmod(0o600); err != nil {
+			return fmt.Errorf("store: %s: %w", what, err)
+		}
+	}
+	return nil
 }
 
 // dataTables are the tables whose rows are sealed with the data key.

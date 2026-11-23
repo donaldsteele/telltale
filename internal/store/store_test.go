@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -528,5 +529,124 @@ func TestConcurrentFirstOpen(t *testing.T) {
 	var n2 int
 	if err := db.db.QueryRow(`SELECT count(*) FROM settings WHERE key='wrapped_key'`).Scan(&n2); err != nil || n2 != 1 {
 		t.Fatalf("keys = %d %v", n2, err)
+	}
+}
+
+// writeMode writes an empty file and forces its mode past the umask.
+func writeMode(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, nil, mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLockFileSymlinkRefused(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		p := tmpDB(t)
+		target := filepath.Join(t.TempDir(), "elsewhere")
+		if existing {
+			writeMode(t, target, 0o644)
+		}
+		if err := os.Symlink(target, p+".lock"); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(p, Unlock{Passphrase: "pw"})
+		if err == nil {
+			s.Close()
+			t.Fatalf("existing=%v: opened through a symlinked lock file", existing)
+		}
+		if !strings.Contains(err.Error(), p+".lock") || !strings.Contains(err.Error(), "symbolic link") {
+			t.Fatalf("existing=%v: err = %v", existing, err)
+		}
+		fi, err := os.Lstat(target)
+		switch {
+		case !existing && !errors.Is(err, os.ErrNotExist):
+			t.Fatalf("lock target created: %v", err)
+		case existing && (err != nil || fi.Mode().Perm() != 0o644):
+			t.Fatalf("lock target touched: %v %v", fi, err)
+		}
+		if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("existing=%v: database created: %v", existing, err)
+		}
+	}
+}
+
+func TestLockFileTightened(t *testing.T) {
+	p := tmpDB(t)
+	writeMode(t, p+".lock", 0o644)
+	openPass(t, p, "pw")
+	fi, err := os.Stat(p + ".lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("lock mode %v", fi.Mode().Perm())
+	}
+}
+
+func TestLockFileNotRegularRefused(t *testing.T) {
+	p := tmpDB(t)
+	if err := syscall.Mkfifo(p+".lock", 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(p, Unlock{Passphrase: "pw"})
+	if err == nil {
+		s.Close()
+		t.Fatal("opened with a FIFO as the lock file")
+	}
+	if !strings.Contains(err.Error(), p+".lock") || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("database created: %v", err)
+	}
+}
+
+func TestDBSymlinkRefused(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		p := tmpDB(t)
+		target := filepath.Join(t.TempDir(), "elsewhere.db")
+		if existing {
+			writeMode(t, target, 0o644)
+		}
+		if err := os.Symlink(target, p); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(p, Unlock{Passphrase: "pw"})
+		if err == nil {
+			s.Close()
+			t.Fatalf("existing=%v: opened through a symlinked database", existing)
+		}
+		if !strings.Contains(err.Error(), p) || !strings.Contains(err.Error(), "symbolic link") {
+			t.Fatalf("existing=%v: err = %v", existing, err)
+		}
+		fi, err := os.Lstat(target)
+		switch {
+		case !existing && !errors.Is(err, os.ErrNotExist):
+			t.Fatalf("database target created: %v", err)
+		case existing && (err != nil || fi.Mode().Perm() != 0o644 || fi.Size() != 0):
+			t.Fatalf("database target touched: %v %v", fi, err)
+		}
+		if fi, err := os.Lstat(p); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("existing=%v: symlink replaced: %v %v", existing, fi, err)
+		}
+	}
+}
+
+func TestDBNotRegularRefused(t *testing.T) {
+	p := tmpDB(t)
+	if err := syscall.Mkfifo(p, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(p, Unlock{Passphrase: "pw"})
+	if err == nil {
+		s.Close()
+		t.Fatal("opened a FIFO as the database")
+	}
+	if !strings.Contains(err.Error(), p) || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("err = %v", err)
 	}
 }
