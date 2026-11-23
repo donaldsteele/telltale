@@ -7,6 +7,7 @@ import (
 
 	"github.com/donaldsteele/telltale/internal/diff"
 	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/pkgverify"
 )
 
 // Rebase says how a machine's snapshot can roll forward after a judgement:
@@ -14,9 +15,14 @@ import (
 // explained and which findings stand for which changes, so it says so here.
 type Rebase struct {
 	// Routine is what the report shows only as explained by package
-	// changes: those packages' records and the files shown with them,
-	// except files any finding (an excepted one included) is about. It
-	// rolls forward on every visit.
+	// changes this scan confirmed: a removal, or a new version a file of
+	// the changed architecture's package matched from a trusted source.
+	// It holds those packages' records (that architecture only) and the
+	// files shown with them, except files any finding (an excepted one
+	// included) is about and files only another architecture of the same
+	// name lists. A change nothing confirmed (an outage left it unchecked,
+	// or it has no files) is left out whole, to be judged again at the
+	// next visit. Routine rolls forward on every visit.
 	Routine Scope
 	// Accept maps the key of each finding in the report that is about a
 	// change since the snapshot to what accepting it rolls forward. A
@@ -29,7 +35,7 @@ type Rebase struct {
 // Scope names parts of a collection the way diff compares them.
 type Scope struct {
 	Paths     []string `json:"paths,omitempty"`     // file and persistence entries
-	Packages  []string `json:"packages,omitempty"`  // installed packages, every architecture
+	Packages  []string `json:"packages,omitempty"`  // installed packages, as "name:arch"
 	Users     []string `json:"users,omitempty"`     // accounts
 	Groups    []string `json:"groups,omitempty"`    // groups
 	Modules   []string `json:"modules,omitempty"`   // loaded kernel modules
@@ -108,7 +114,7 @@ func RollForward(snap *model.Snapshot, cur *model.Collection, curChecks []model.
 	oc.Persist = replaceIn(oc.Persist, cur.Persist, func(p model.PersistFile) bool { return paths[p.Path] })
 	oc.Accounts.Users = replaceIn(oc.Accounts.Users, cur.Accounts.Users, func(u model.User) bool { return users[u.Name] })
 	oc.Accounts.Groups = replaceIn(oc.Accounts.Groups, cur.Accounts.Groups, func(g model.Group) bool { return groups[g.Name] })
-	oc.Packages.Installed = replaceIn(oc.Packages.Installed, cur.Packages.Installed, func(p model.Package) bool { return pkgs[p.Name] })
+	oc.Packages.Installed = replaceIn(oc.Packages.Installed, cur.Packages.Installed, func(p model.Package) bool { return pkgs[pkgKey(p.Name, p.Arch)] })
 	oc.Runtime.Modules = replaceIn(oc.Runtime.Modules, cur.Runtime.Modules, func(m model.KernelModule) bool { return mods[m.Name] })
 	oc.Runtime.Sockets = replaceIn(oc.Runtime.Sockets, cur.Runtime.Sockets, func(k model.Socket) bool { return k.Listening && listeners[listenKey(k)] })
 	if s.LinkerCache {
@@ -203,11 +209,15 @@ func (j *judge) rebase(held map[string]bool) *Rebase {
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if j.pkgChanged(name) {
-			rb.Routine.Packages = append(rb.Routine.Packages, name)
+		if ch, ok := j.pkgChange[name]; ok {
+			if ch.Pkg == nil || !j.routineOK(name) {
+				continue // the whole group, files and all, is judged again
+			}
+			rb.Routine.Packages = append(rb.Routine.Packages, pkgKey(name, ch.Pkg.Arch))
 		}
+		other := j.otherArchPaths(name)
 		for _, p := range sortedSet(j.touched[name]) {
-			if !held[p] {
+			if !held[p] && !other[p] {
 				rb.Routine.addPath(p)
 			}
 		}
@@ -284,7 +294,27 @@ func (j *judge) changeScope(f *model.Finding) (Scope, bool) {
 	case "snap.listener":
 		// The key spells diff's subject "tcp 0.0.0.0:22" as "tcp:0.0.0.0:22".
 		return Scope{Listeners: []string{strings.Replace(subj, ":", " ", 1)}}, true
-	case "snap.pkg_upgraded", "snap.pkg_downgraded", "snap.pkg_installed", "snap.pkg_removed", "snap.pkg_version_only":
+	case "snap.pkg_installed":
+		// "snap.pkg_installed:<name>:<arch>" is another architecture of a
+		// package that also changed (package names have no colon): its
+		// record and every file it lists.
+		if name, arch, ok := strings.Cut(subj, ":"); ok {
+			s := Scope{Packages: []string{pkgKey(name, arch)}}
+			for i := range j.c.Packages.Installed {
+				if p := &j.c.Packages.Installed[i]; p.Name == name && p.Arch == arch {
+					for _, f := range p.Files {
+						s.addPath(f)
+						if a := usrAlias(f); a != "" {
+							s.addPath(a)
+						}
+					}
+				}
+			}
+			s.Paths = sortedSet(toSet(s.Paths))
+			return s, true
+		}
+		return j.packageScope(subj), true
+	case "snap.pkg_upgraded", "snap.pkg_downgraded", "snap.pkg_removed", "snap.pkg_version_only":
 		return j.packageScope(subj), true
 	case strings.TrimSuffix(checkKeyPrefix, ":"):
 		return Scope{Checks: []string{subj}}, true
@@ -300,9 +330,102 @@ func (j *judge) changeScope(f *model.Finding) (Scope, bool) {
 	return Scope{}, false
 }
 
-// packageScope is a package's record and every path shown with its change.
+// packageScope is the record of the package change the judge looked at (its
+// architecture only) and every path shown with it, except those only
+// another architecture of the name lists.
 func (j *judge) packageScope(name string) Scope {
-	return Scope{Packages: []string{name}, Paths: sortedSet(j.touched[name])}
+	var s Scope
+	if ch, ok := j.pkgChange[name]; ok && ch.Pkg != nil {
+		s.Packages = []string{pkgKey(name, ch.Pkg.Arch)}
+	}
+	other := j.otherArchPaths(name)
+	for _, p := range sortedSet(j.touched[name]) {
+		if !other[p] {
+			s.addPath(p)
+		}
+	}
+	return s
+}
+
+// pkgKey names an installed package by name and architecture, as dpkg
+// tells them apart.
+func pkgKey(name, arch string) string { return name + ":" + arch }
+
+// routineOK reports whether a package change may roll forward without the
+// owner: a removal, or a new version this scan verified, meaning a file the
+// changed architecture's package lists matched that version from a trusted
+// source as the file is now. A change an outage left unchecked does not
+// count (it contradicts nothing, but confirms nothing either), nor does a
+// version with no file to show for it.
+func (j *judge) routineOK(name string) bool {
+	ch := j.pkgChange[name]
+	if ch.Pkg == nil {
+		return false
+	}
+	if ch.Kind == diff.PkgRemoved {
+		return true
+	}
+	if j.in.Pkg == nil || !j.rebuilderOK(name) {
+		return false
+	}
+	p := j.entry(name, ch.Pkg.Arch)
+	if p == nil || p.Arch != ch.Pkg.Arch || p.Version != ch.Pkg.New {
+		return false
+	}
+	listed := map[string]bool{}
+	for _, f := range p.Files {
+		listed[f] = true
+		if a := usrAlias(f); a != "" {
+			listed[a] = true
+		}
+	}
+	for _, v := range j.in.Pkg.Verified {
+		if v.Package != name || v.Version != ch.Pkg.New || v.Source == "" || v.Source == pkgverify.SourceOfflineLocal {
+			continue
+		}
+		if e := j.files[v.Path]; e == nil || e.Type != "file" || e.SHA256 != v.Actual {
+			continue
+		}
+		if listed[v.Path] || (j.literal[v.Path] != "" && listed[j.literal[v.Path]]) {
+			return true
+		}
+	}
+	return false
+}
+
+// otherArchPaths lists the paths that another architecture of name lists,
+// now or in the snapshot, and the architecture whose change the judge
+// looked at does not. They belong to a change of their own.
+func (j *judge) otherArchPaths(name string) map[string]bool {
+	ch, ok := j.pkgChange[name]
+	if !ok || ch.Pkg == nil {
+		return nil
+	}
+	mine, theirs := map[string]bool{}, map[string]bool{}
+	for _, c := range []*model.Collection{j.c, j.old} {
+		if c == nil {
+			continue
+		}
+		for _, p := range c.Packages.Installed {
+			if p.Name != name {
+				continue
+			}
+			dst := theirs
+			if p.Arch == ch.Pkg.Arch {
+				dst = mine
+			}
+			for _, f := range p.Files {
+				dst[f] = true
+				if a := usrAlias(f); a != "" {
+					dst[a] = true
+				}
+			}
+		}
+	}
+	for p := range mine {
+		delete(theirs, p)
+	}
+	return theirs
 }
 
 // uncheckedPaths are the files the note on unchecked changes stands for.

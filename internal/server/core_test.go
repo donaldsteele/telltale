@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -148,6 +149,9 @@ type fakeAlerts struct {
 	mu   sync.Mutex
 	got  []alert
 	fail error
+	// block, when set, holds every Notify until it is closed, whatever
+	// its context says: a sink that hangs.
+	block chan struct{}
 }
 
 func keysOf(fs []model.Finding) []string {
@@ -159,6 +163,12 @@ func keysOf(fs []model.Finding) []string {
 }
 
 func (a *fakeAlerts) Notify(_ context.Context, m store.Machine, fresh, resolved []model.Finding) error {
+	a.mu.Lock()
+	block := a.block
+	a.mu.Unlock()
+	if block != nil {
+		<-block
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.fail != nil {
@@ -303,6 +313,14 @@ func TestVisitNowRefusesABadServerAddress(t *testing.T) {
 	}
 	if n := fx.vis.visits(fx.id); n != 0 {
 		t.Errorf("%d visits without a usable server address", n)
+	}
+	// It is not silent: each try is a failed visit, recorded on the
+	// machine, and the third in a row is reported.
+	if msg, _ := fx.core.VisitError(fx.id); !strings.Contains(msg, "server address") {
+		t.Errorf("recorded error %q", msg)
+	}
+	if metas, _ := fx.st.Reports(fx.id, 0); len(metas) != 1 {
+		t.Errorf("reports %+v", metas)
 	}
 }
 
@@ -573,15 +591,15 @@ func TestExplainedChangesRollForward(t *testing.T) {
 func TestExceptionSuppressesAlert(t *testing.T) {
 	fx := newFixture(t)
 	fx.vis.collect = func(store.Machine, int) (*model.Collection, error) { return uid0(base()), nil }
-	fx.visitOK(t, fx.id)
+	rid, _ := fx.visitOK(t, fx.id)
 	if got := fx.alerts.all(); len(got) != 1 || !slices.Contains(got[0].fresh, "heur.uid0:toor") {
 		t.Fatalf("alerts %+v", got)
 	}
 	ctx := context.Background()
-	if err := fx.core.AddException(ctx, fx.id, "heur.nothing", ""); err == nil {
+	if err := fx.core.AddException(ctx, fx.id, rid, "heur.nothing", ""); err == nil {
 		t.Error("exception for a finding the latest report does not have")
 	}
-	if err := fx.core.AddException(ctx, fx.id, "heur.uid0:toor", "our rescue account"); err != nil {
+	if err := fx.core.AddException(ctx, fx.id, rid, "heur.uid0:toor", "our rescue account"); err != nil {
 		t.Fatal(err)
 	}
 	exc, _ := fx.st.Exceptions(fx.id)
@@ -798,11 +816,11 @@ func TestAuditNeverCarriesMachineText(t *testing.T) {
 	if err := fx.core.AcceptChanges(ctx, fx.id, rid, []string{cronKey}); err != nil {
 		t.Fatal(err)
 	}
-	if err := fx.core.AddException(ctx, fx.id, crossKey, mark+" note"); err != nil {
+	if err := fx.core.AddException(ctx, fx.id, rid, crossKey, mark+" note"); err != nil {
 		t.Fatal(err)
 	}
 	fx.core.AcceptChanges(ctx, fx.id, rid, []string{mark})
-	fx.core.AddException(ctx, fx.id, mark, mark)
+	fx.core.AddException(ctx, fx.id, rid, mark, mark)
 
 	log, err := fx.st.AuditLog(0)
 	if err != nil || len(log) < 8 {
@@ -955,4 +973,288 @@ func TestSchedulerLimitsConcurrency(t *testing.T) {
 			t.Errorf("machine %d: error recorded for a visit the server stopped: %q", m.ID, msg)
 		}
 	}
+}
+
+// A sink that hangs costs the visit at most alert_timeout, and it holds no
+// visit slot meanwhile; the machine stays busy for owner actions until then.
+func TestNotifyDoesNotHoldASlotOrHang(t *testing.T) {
+	fx := newFixture(t)
+	if err := fx.st.SetSetting("alert_timeout", "300ms"); err != nil {
+		t.Fatal(err)
+	}
+	others := make([]int64, maxVisits)
+	for i := range others {
+		others[i] = fx.addMachine(t, fmt.Sprintf("other%d", i), "")
+	}
+	hang := make(chan struct{})
+	t.Cleanup(func() { close(hang) })
+	fx.alerts.block = hang
+	gate := make(chan struct{})
+	fx.vis.collect = func(m store.Machine, _ int) (*model.Collection, error) {
+		if m.ID != fx.id {
+			<-gate
+		}
+		return hidden(base()), nil
+	}
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		_, err := fx.core.VisitNow(context.Background(), fx.id)
+		done <- err
+	}()
+	// The visit is done collecting and stuck in Notify: every slot is free.
+	waitFor(t, func() bool { return fx.vis.visits(fx.id) == 1 })
+	time.Sleep(50 * time.Millisecond)
+	var wg sync.WaitGroup
+	for _, id := range others {
+		wg.Add(1)
+		go func(id int64) {
+			defer wg.Done()
+			fx.core.VisitNow(context.Background(), id)
+		}(id)
+	}
+	waitFor(t, func() bool {
+		fx.vis.mu.Lock()
+		defer fx.vis.mu.Unlock()
+		return fx.vis.running == maxVisits
+	})
+	if err := fx.core.MarkClean(context.Background(), fx.id, 1); !errors.Is(err, ErrVisitRunning) {
+		t.Errorf("owner action while the alert is pending: %v", err)
+	}
+	close(gate)
+	all := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(all)
+	}()
+	select {
+	case <-all:
+	case <-time.After(5 * time.Second):
+		t.Fatal("visits stuck behind a hung alert sink")
+	}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "alert") {
+			t.Errorf("err %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("VisitNow did not return")
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Errorf("took %v", d)
+	}
+}
+
+// Owner actions wait for no visit: they are refused while one runs.
+func TestOwnerActionsRefusedDuringVisit(t *testing.T) {
+	fx := newFixture(t)
+	rid, _ := fx.visitOK(t, fx.id)
+	fx.vis.gate = make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		fx.core.VisitNow(context.Background(), fx.id)
+		close(done)
+	}()
+	waitFor(t, func() bool { return fx.vis.visits(fx.id) == 2 })
+	ctx := context.Background()
+	for name, err := range map[string]error{
+		"mark clean":     fx.core.MarkClean(ctx, fx.id, rid),
+		"accept changes": fx.core.AcceptChanges(ctx, fx.id, rid, []string{cronKey}),
+		"add exception":  fx.core.AddException(ctx, fx.id, rid, crossKey, ""),
+	} {
+		if !errors.Is(err, ErrVisitRunning) {
+			t.Errorf("%s during a visit: %v", name, err)
+		}
+	}
+	close(fx.vis.gate)
+	<-done
+	if err := fx.core.MarkClean(ctx, fx.id, rid); err != nil {
+		t.Errorf("after the visit: %v", err)
+	}
+}
+
+// A visit that judged against a baseline an owner action changed meanwhile
+// saves no accept scopes and rolls nothing forward.
+func TestVisitOverlappingOwnerActionSavesNoScopes(t *testing.T) {
+	fx := newFixture(t)
+	rid, _ := fx.visitOK(t, fx.id)
+	if err := fx.core.MarkClean(context.Background(), fx.id, rid); err != nil {
+		t.Fatal(err)
+	}
+	fx.vis.collect = func(store.Machine, int) (*model.Collection, error) { return cronAdded(base()), nil }
+	fx.result = func(*model.Collection) *pkgverify.Result {
+		// An owner action that slipped in after the visit read the
+		// baseline.
+		fx.core.bumpGeneration(fx.id)
+		return &pkgverify.Result{Mode: pkgverify.ModeArchive}
+	}
+	rid, r := fx.visitOK(t, fx.id)
+	if find(r, cronKey) == nil {
+		t.Fatalf("fixture: %v", keysOf(r.Findings))
+	}
+	err := fx.core.AcceptChanges(context.Background(), fx.id, rid, []string{cronKey})
+	if err == nil || !strings.Contains(err.Error(), "baseline changed") {
+		t.Errorf("accepted from a report judged against an old baseline: %v", err)
+	}
+}
+
+// The exception records the value of the report the owner looked at, not
+// of a visit that landed since.
+func TestAddExceptionUsesThatReport(t *testing.T) {
+	fx := newFixture(t)
+	items := []string{"pid 666 /tmp/.x"}
+	fx.vis.collect = func(store.Machine, int) (*model.Collection, error) {
+		c := hidden(base())
+		c.CrossView[0].HiddenFromTool = slices.Clone(items)
+		return c, nil
+	}
+	seen, _ := fx.visitOK(t, fx.id)
+	items = append(items, "pid 667 /tmp/.y")
+	fx.visitOK(t, fx.id)
+	ctx := context.Background()
+	if err := fx.core.AddException(ctx, fx.id, seen, crossKey, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, r := fx.visitOK(t, fx.id); find(r, crossKey) == nil {
+		t.Error("an exception for one hidden item covers two")
+	}
+	other := fx.addMachine(t, "files02", "")
+	if err := fx.core.AddException(ctx, other, seen, crossKey, ""); err == nil {
+		t.Error("exception from another machine's report")
+	}
+}
+
+func TestAcceptOtherArchInstall(t *testing.T) {
+	fx := newFixture(t)
+	rid, _ := fx.visitOK(t, fx.id)
+	if err := fx.core.MarkClean(context.Background(), fx.id, rid); err != nil {
+		t.Fatal(err)
+	}
+	helper := fileEntry("/usr/lib/i386-linux-gnu/coreutils/helper", "helper")
+	helper.Mode = 0o104755
+	fx.vis.collect = func(store.Machine, int) (*model.Collection, error) {
+		c := base()
+		c.Packages.Installed[0].Version = "9.2-1"
+		c.Files[0] = fileEntry("/usr/bin/ls", "ls 9.2")
+		c.Files = append(c.Files, helper)
+		c.Packages.Installed = append(c.Packages.Installed, model.Package{Name: "coreutils", Version: "9.2-1", Arch: "i386",
+			Status: "install ok installed", Files: []string{helper.Path}})
+		return c, nil
+	}
+	fx.result = func(*model.Collection) *pkgverify.Result {
+		return &pkgverify.Result{Mode: pkgverify.ModeArchive, SourcesUsed: []string{"https://deb.debian.org/debian bookworm"},
+			Verified: []pkgverify.FileVerdict{
+				{Path: "/usr/bin/ls", Package: "coreutils", Version: "9.2-1", Expected: sum("ls 9.2"), Actual: sum("ls 9.2"), Source: pkgverify.SourceArchive},
+				{Path: helper.Path, Package: "coreutils", Version: "9.2-1", Expected: helper.SHA256, Actual: helper.SHA256, Source: pkgverify.SourceArchive}}}
+	}
+	const key = "snap.pkg_installed:coreutils:i386"
+	rid, r := fx.visitOK(t, fx.id)
+	if f := find(r, key); f == nil || f.Severity != model.SevBackdoor {
+		t.Fatalf("findings %v", keysOf(r.Findings))
+	}
+	if err := fx.core.AcceptChanges(context.Background(), fx.id, rid, []string{key}); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := fx.st.Snapshot(fx.id)
+	if !slices.ContainsFunc(s.Collection.Packages.Installed, func(p model.Package) bool { return p.Name == "coreutils" && p.Arch == "i386" }) {
+		t.Fatalf("the accepted install did not roll: %+v", s.Collection.Packages.Installed)
+	}
+	_, r = fx.visitOK(t, fx.id)
+	for _, f := range r.Findings {
+		if strings.HasPrefix(f.Key, "snap.pkg_installed:coreutils") {
+			t.Errorf("after accepting: %s", f.Key)
+		}
+	}
+}
+
+func TestAlertEscalationIsNew(t *testing.T) {
+	f := func(key string, sev model.Severity) model.Finding { return model.Finding{Key: key, Severity: sev} }
+	rep := func(fs ...model.Finding) *model.Report { return &model.Report{Findings: fs} }
+	st := alertState{Real: []model.Finding{f("a", model.SevNote), f("b", model.SevBackdoor)}}
+	fresh, _, next := diffAlerts(st, rep(f("a", model.SevBackdoor), f("b", model.SevTampering)), false, false)
+	if !slices.Equal(keysOf(fresh), []string{"a", "b"}) {
+		t.Errorf("level all: fresh %v", keysOf(fresh))
+	}
+	if fresh, _, _ = diffAlerts(next, rep(f("a", model.SevBackdoor), f("b", model.SevTampering)), false, false); len(fresh) != 0 {
+		t.Errorf("same severities again: %v", keysOf(fresh))
+	}
+	fresh, _, _ = diffAlerts(alertState{Real: []model.Finding{f("b", model.SevBackdoor)}}, rep(f("a", model.SevNote), f("b", model.SevTampering)), true, false)
+	if !slices.Equal(keysOf(fresh), []string{"b"}) {
+		t.Errorf("level urgent: fresh %v", keysOf(fresh))
+	}
+	fresh, _, next = diffAlerts(alertState{}, rep(f(KeyHostKeyChanged, model.SevTampering)), true, true)
+	if len(fresh) != 1 {
+		t.Fatalf("synthetic %v", keysOf(fresh))
+	}
+	if fresh, _, _ = diffAlerts(next, rep(f(KeyHostKeyChanged, model.SevTampering)), true, true); len(fresh) != 0 {
+		t.Errorf("synthetic again: %v", keysOf(fresh))
+	}
+}
+
+// When package verification did not run or finish, a package finding that
+// is missing is not resolved: it may only have gone unchecked.
+func TestPackageFindingNotResolvedWhenVerificationIncomplete(t *testing.T) {
+	mismatch := model.Finding{Key: "pkg.mismatch:/usr/bin/ls", Severity: model.SevTampering}
+	uid := model.Finding{Key: "heur.uid0:toor", Severity: model.SevBackdoor}
+	st := alertState{Real: []model.Finding{mismatch, uid}}
+	incomplete := &model.Report{CouldNotRuleOut: []string{"changed system files (package verification did not run)"}}
+	_, resolved, next := diffAlerts(st, incomplete, true, false)
+	if !slices.Equal(keysOf(resolved), []string{uid.Key}) || !slices.Equal(keysOf(next.Real), []string{mismatch.Key}) {
+		t.Errorf("resolved %v, still known %v", keysOf(resolved), keysOf(next.Real))
+	}
+	_, resolved, _ = diffAlerts(st, &model.Report{}, true, false)
+	if len(resolved) != 2 {
+		t.Errorf("full verification: resolved %v", keysOf(resolved))
+	}
+}
+
+// "Check now" moves the machine's next scheduled visit.
+func TestCheckNowMovesTheSchedule(t *testing.T) {
+	fx := newFixture(t)
+	fx.visitOK(t, fx.id)
+	fx.core.mu.Lock()
+	due := fx.core.due[fx.id]
+	fx.core.mu.Unlock()
+	if d := time.Until(due); d < 23*time.Hour || d > 26*time.Hour {
+		t.Errorf("next visit in %v, want about a day", d)
+	}
+}
+
+// The scheduler logs what goes wrong, so a bad server address shows.
+func TestSchedulerLogsErrors(t *testing.T) {
+	setVar(t, &scheduleTick, 10*time.Millisecond)
+	setVar(t, &startJitter, time.Millisecond)
+	fx := newFixture(t)
+	var buf syncBuffer
+	fx.core.Log = log.New(&buf, "", 0)
+	fx.core.ServerAddr = "telltale.lan"
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		fx.core.Run(ctx)
+		close(stopped)
+	}()
+	waitFor(t, func() bool { return strings.Contains(buf.String(), fmt.Sprintf("visit to machine %d", fx.id)) })
+	cancel()
+	<-stopped
+	if !strings.Contains(buf.String(), "server address") {
+		t.Errorf("log %q", buf.String())
+	}
+}
+
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }

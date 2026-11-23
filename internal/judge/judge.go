@@ -54,6 +54,12 @@ const (
 	nonRootLimit      = "checks that need root were skipped (see Skipped); a scan as root is needed for a full answer"
 	nothingCollected  = "anything at all: nothing was collected from the machine"
 	checkKeyPrefix    = "check:"
+	// What says package verification did not run or did not finish
+	// (PackagesIncomplete reads these).
+	noRefLimit       = "changed system files (no package reference could be used; see the skipped checks)"
+	notRunPrefix     = "package verification did not run: "
+	stoppedPrefix    = "verification stopped before "
+	sourceDownPrefix = "package files whose package source could not be used"
 )
 
 type judge struct {

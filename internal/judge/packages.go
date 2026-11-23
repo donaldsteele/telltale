@@ -135,7 +135,7 @@ func (j *judge) packages() {
 		j.couldNot = append(j.couldNot, j.notRun)
 	}
 	if n := len(j.stopped); n > 0 {
-		j.couldNot = append(j.couldNot, fmt.Sprintf("verification stopped before %d %s checked", n, plural(n, "package was", "packages were")))
+		j.couldNot = append(j.couldNot, fmt.Sprintf(stoppedPrefix+"%d %s checked", n, plural(n, "package was", "packages were")))
 	}
 	if len(j.budget) > 0 {
 		j.add(&model.Finding{
@@ -172,7 +172,7 @@ func (j *judge) packages() {
 		j.compared = append(j.compared, OfflineReference)
 		j.couldNot = append(j.couldNot, offlineLimit)
 	case !j.pkgUsed():
-		j.couldNot = append(j.couldNot, "changed system files (no package reference could be used; see the skipped checks)")
+		j.couldNot = append(j.couldNot, noRefLimit)
 	case r.Mode == pkgverify.ModeRefs:
 		j.compared = append(j.compared, "reference bundle")
 	default:
@@ -187,6 +187,32 @@ func (j *judge) packages() {
 	if n := len(r.Unverifiable); n > 0 {
 		j.couldNot = append(j.couldNot, fmt.Sprintf("changes to %d package %s that could not be verified", n, plural(n, "file", "files")))
 	}
+	// An outage (an unreachable archive, a bad signature) says nothing
+	// either way about the files it hit: a package finding missing from
+	// this report may only have gone unchecked.
+	down := 0
+	for _, v := range r.Unverifiable {
+		if j.classify(v.Kind) == classUnchecked {
+			down++
+		}
+	}
+	if down > 0 {
+		j.couldNot = append(j.couldNot, fmt.Sprintf("%s (%d %s; checked again when it can be used)", sourceDownPrefix, down, plural(down, "file", "files")))
+	}
+}
+
+// PackagesIncomplete reports whether r says package verification did not
+// run or did not finish: it did not run, no package source could be used
+// or one could not be reached, a deadline or stop cut it short, or it hit
+// one of its limits. A package finding missing from such a report may only
+// have gone unchecked, not away.
+func PackagesIncomplete(r *model.Report) bool {
+	for _, s := range r.CouldNotRuleOut {
+		if s == noPkgLimit || s == noRefLimit || strings.HasPrefix(s, notRunPrefix) || strings.HasPrefix(s, stoppedPrefix) || strings.HasPrefix(s, sourceDownPrefix) {
+			return true
+		}
+	}
+	return slices.ContainsFunc(r.Findings, func(f model.Finding) bool { return f.Key == "pkg.budget_exceeded" })
 }
 
 // pkgUsed reports whether the verification had a package reference at all:
@@ -280,6 +306,7 @@ func (j *judge) unverifiable(vs []pkgverify.FileVerdict) {
 		paths  []string
 	}
 	byReason := map[string]*bucket{}
+	var grouped []string
 	n := 0
 	for _, v := range vs {
 		j.unverReason[v.Path], j.unverKind[v.Path] = v.Reason, v.Kind
@@ -293,9 +320,9 @@ func (j *judge) unverifiable(vs []pkgverify.FileVerdict) {
 		case v.Kind == pkgverify.KindBudget && !slices.Contains(j.budget, v.Reason):
 			j.budget = append(j.budget, v.Reason)
 		case v.Kind == pkgverify.KindRelease:
-			j.notRun = "package verification did not run: /etc/os-release says " + strings.TrimSpace(j.c.Host.OSID+" "+j.c.Host.OSVersionID)
+			j.notRun = notRunPrefix + "/etc/os-release says " + strings.TrimSpace(j.c.Host.OSID+" "+j.c.Host.OSVersionID)
 		case v.Kind == pkgverify.KindHostArch:
-			j.notRun = "package verification did not run: " + v.Reason
+			j.notRun = notRunPrefix + v.Reason
 		case class == classStopped:
 			j.stopped[owner] = true
 		case class == classUnchecked && owner != "":
@@ -330,6 +357,7 @@ func (j *judge) unverifiable(vs []pkgverify.FileVerdict) {
 			continue
 		}
 		j.unverified[v.Path] = true
+		grouped = append(grouped, v.Path)
 		n++
 		b := byReason[v.Reason]
 		if b == nil {
@@ -356,8 +384,10 @@ func (j *judge) unverifiable(vs []pkgverify.FileVerdict) {
 		Title: fmt.Sprintf("%d package %s could not be verified", n, plural(n, "file", "files")),
 		Why: "These files belong to packages telltale could not check against a trusted copy, so a change to them would go unnoticed. " +
 			"Setuid programs, kernel modules, PAM modules and boot files are reported on their own, or with the files that could not be checked at all.",
-		Fix:      "Run telltale fetch-refs on a machine with network access and scan again with --refs DIR; pass third-party repository keys with --keys DIR.",
-		Evidence: []model.Evidence{{After: fmt.Sprintf("%d %s", n, plural(n, "file", "files")), Detail: "grouped by reason below"}},
+		Fix: "Run telltale fetch-refs on a machine with network access and scan again with --refs DIR; pass third-party repository keys with --keys DIR.",
+		// The value an exception accepts names every grouped file with its
+		// content, so it covers exactly these files.
+		Evidence: []model.Evidence{{After: fmt.Sprintf("%d %s; files %s", n, plural(n, "file", "files"), j.contentDigest(grouped)), Detail: "grouped by reason below"}},
 	}
 	for _, b := range bs {
 		ex := b.paths

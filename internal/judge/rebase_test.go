@@ -2,6 +2,7 @@ package judge
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/donaldsteele/telltale/internal/checklist"
@@ -32,7 +33,7 @@ func TestJudgeRebaseRoutineUpgrade(t *testing.T) {
 	if len(r.Findings) != 0 || explained(r, "explained:openssl") == nil {
 		t.Fatalf("findings %v explained %v", keys(r), r.Explained)
 	}
-	if rb == nil || !slices.Equal(rb.Routine.Packages, []string{"openssl"}) || !slices.Equal(rb.Routine.Paths, []string{"/usr/bin/openssl"}) {
+	if rb == nil || !slices.Equal(rb.Routine.Packages, []string{"openssl:amd64"}) || !slices.Equal(rb.Routine.Paths, []string{"/usr/bin/openssl"}) {
 		t.Fatalf("routine %+v", rb)
 	}
 	if len(rb.Accept) != 0 {
@@ -72,7 +73,7 @@ func TestJudgeRebaseAcceptScopes(t *testing.T) {
 	}
 	// Nothing confirmed the new version, so the changed program is a finding
 	// of its own, accepted on its own.
-	if up := rb.Accept["snap.pkg_upgraded:openssl"]; !slices.Equal(up.Packages, []string{"openssl"}) || len(up.Paths) != 0 {
+	if up := rb.Accept["snap.pkg_upgraded:openssl"]; !slices.Equal(up.Packages, []string{"openssl:amd64"}) || len(up.Paths) != 0 {
 		t.Errorf("accepting the upgrade: %+v", up)
 	}
 	if s := rb.Accept["snap.file_modified:/usr/bin/openssl"]; !slices.Equal(s.Paths, []string{"/usr/bin/openssl"}) {
@@ -211,5 +212,192 @@ func TestJudgeRebaseLinkerCache(t *testing.T) {
 	rolled := RollForward(snap, cur, checklist.Evaluate(cur, ctx), rb.Routine)
 	if !slices.Equal(rolled.Collection.LinkerCache, cur.LinkerCache) {
 		t.Errorf("cache list %v", rolled.Collection.LinkerCache)
+	}
+}
+
+const sslNew = "3.0.15-1~deb12u1"
+
+// upgradedSSL is clean() with openssl:amd64 upgraded and its program
+// verified, the routine case.
+func upgradedSSL() (*model.Collection, pkgverify.FileVerdict) {
+	cur := clean()
+	setVersion(cur, "openssl", sslNew)
+	nf := file("/usr/bin/openssl", "openssl 3.0.15", 0o755)
+	setFile(cur, nf)
+	return cur, pkgverify.FileVerdict{Path: "/usr/bin/openssl", Package: "openssl", Version: sslNew, Expected: nf.SHA256, Actual: nf.SHA256, Source: "archive"}
+}
+
+// Probe A: next to a confirmed upgrade of openssl:amd64, openssl:i386 is
+// installed with a setuid program. Only amd64 rolls forward; the i386
+// install stays a backdoor sign on the next visit too.
+func TestJudgeRebaseOtherArchInstallStays(t *testing.T) {
+	old := clean()
+	cur, v := upgradedSSL()
+	helper := file("/usr/lib/i386-linux-gnu/openssl/helper", "helper", 0o4755)
+	cur.Files = append(cur.Files, helper)
+	i386 := pkg("openssl", sslNew, helper.Path)
+	i386.Arch = "i386"
+	cur.Packages.Installed = append(cur.Packages.Installed, i386)
+	vi := pkgverify.FileVerdict{Path: helper.Path, Package: "openssl", Version: sslNew, Expected: helper.SHA256, Actual: helper.SHA256, Source: "archive"}
+
+	snap := snapOf(old)
+	r, rb := rebaseRun(cur, snap, archive(v, vi))
+	must(t, r, "snap.pkg_installed:openssl:i386", model.SevBackdoor)
+	if !slices.Equal(rb.Routine.Packages, []string{"openssl:amd64"}) || slices.Contains(rb.Routine.Paths, helper.Path) {
+		t.Fatalf("routine %+v", rb.Routine)
+	}
+	rolled := RollForward(snap, cur, checklist.Evaluate(cur, ctx), rb.Routine)
+	if n := len(slices.DeleteFunc(slices.Clone(rolled.Collection.Packages.Installed), func(p model.Package) bool { return p.Name != "openssl" })); n != 1 {
+		t.Fatalf("%d openssl entries in the snapshot", n)
+	}
+	r, _ = rebaseRun(cur, rolled, archive(vi))
+	var raised bool
+	for _, f := range r.Findings {
+		if strings.HasPrefix(f.Key, "snap.pkg_installed:openssl") && f.Severity == model.SevBackdoor {
+			raised = true
+		}
+	}
+	if !raised {
+		t.Errorf("visit 2 lost the i386 install with a setuid program: %v", keys(r))
+	}
+}
+
+// Probe B: openssl:i386 claims a version nothing confirmed while
+// openssl:amd64 has a confirmed upgrade. The i386 record does not roll; the
+// next visit judges it.
+func TestJudgeRebaseOtherArchVersionStays(t *testing.T) {
+	old := clean()
+	lib := file("/usr/lib/i386-linux-gnu/libssl.so.3", "libssl i386", 0o644)
+	old.Files = append(old.Files, lib)
+	i386 := pkg("openssl", "3.0.14-1~deb12u2", lib.Path)
+	i386.Arch = "i386"
+	old.Packages.Installed = append(old.Packages.Installed, i386)
+	cur, v := upgradedSSL()
+	cur.Files = append(cur.Files, lib)
+	fake := i386
+	fake.Version = "3.0.99-fake"
+	cur.Packages.Installed = append(cur.Packages.Installed, fake)
+
+	snap := snapOf(old)
+	_, rb := rebaseRun(cur, snap, archive(v))
+	if !slices.Equal(rb.Routine.Packages, []string{"openssl:amd64"}) {
+		t.Fatalf("routine %+v", rb.Routine)
+	}
+	rolled := RollForward(snap, cur, checklist.Evaluate(cur, ctx), rb.Routine)
+	for _, p := range rolled.Collection.Packages.Installed {
+		if p.Name == "openssl" && p.Arch == "i386" && p.Version != "3.0.14-1~deb12u2" {
+			t.Fatalf("the unconfirmed i386 version rolled in: %s", p.Version)
+		}
+	}
+	r, _ := rebaseRun(cur, rolled, archive())
+	if find(r, "snap.pkg_version_only:openssl") == nil && find(r, "snap.pkg_upgraded:openssl") == nil {
+		t.Errorf("visit 2 does not report the i386 version: %v", keys(r))
+	}
+}
+
+// Probe C: the archive is unreachable, openssl moves to a version nobody
+// could check, a data file changes and a package directory appears. The
+// explained group survives (an outage contradicts nothing), but nothing
+// rolls forward: once the archive is back, the version is a backdoor sign.
+func TestJudgeRebaseUncheckedVersionDoesNotRoll(t *testing.T) {
+	old := clean()
+	old.Files = append(old.Files, model.FileEntry{Path: "/usr/lib/ssl", Type: "dir", Mode: 0o40755, MTime: taken, CTime: taken})
+	old.Packages.Installed[0].Files = append(old.Packages.Installed[0].Files, "/usr/lib/ssl", "/usr/lib/ssl/certs")
+	cur := clone(old)
+	setVersion(cur, "openssl", "3.0.99-fake")
+	setFile(cur, file("/usr/share/doc/openssl/README", "readme 2", 0o644))
+	cur.Files = append(cur.Files, model.FileEntry{Path: "/usr/lib/ssl/certs", Type: "dir", Mode: 0o40755, MTime: changed, CTime: changed})
+	down := archive()
+	down.Unverifiable = []pkgverify.FileVerdict{{Path: "/usr/share/doc/openssl/README", Package: "openssl", Version: "3.0.99-fake", Reason: "no route to host", Kind: pkgverify.KindUnreachable}}
+
+	snap := snapOf(old)
+	r, rb := rebaseRun(cur, snap, down)
+	if explained(r, "explained:openssl") == nil {
+		t.Fatalf("fixture: the group did not survive the outage: findings %v", keys(r))
+	}
+	if !rb.Routine.Empty() {
+		t.Fatalf("an unchecked version rolls forward: %+v", rb.Routine)
+	}
+	back := archive()
+	back.Unverifiable = []pkgverify.FileVerdict{{Path: "/usr/share/doc/openssl/README", Package: "openssl", Version: "3.0.99-fake", Reason: pkgverify.ReasonNotOfficial, Kind: pkgverify.KindNotFound}}
+	r, _ = rebaseRun(cur, RollForward(snap, cur, checklist.Evaluate(cur, ctx), rb.Routine), back)
+	must(t, r, "snap.pkg_upgraded:openssl", model.SevBackdoor)
+}
+
+// Probe D: a newer kernel entry with no files, nothing confirmed: explained
+// as routine kernel update, but it does not roll forward.
+func TestJudgeRebaseUnconfirmedKernelDoesNotRoll(t *testing.T) {
+	old := clean()
+	old.Packages.Installed = append(old.Packages.Installed, pkg("linux-image-6.1.0-25-amd64", "6.1.106-3"))
+	cur := clone(old)
+	cur.Packages.Installed = append(cur.Packages.Installed, pkg("linux-image-6.1.0-27-amd64", "6.1.115-1"))
+	r, rb := rebaseRun(cur, snapOf(old), archive())
+	if explained(r, "explained:linux-image-6.1.0-27-amd64") == nil {
+		t.Fatalf("fixture: kernel not explained: %v", keys(r))
+	}
+	if !rb.Routine.Empty() {
+		t.Errorf("an unconfirmed kernel rolls forward: %+v", rb.Routine)
+	}
+}
+
+// Accepting a second architecture's install rolls that architecture's
+// record and files forward; the next visit no longer reports it.
+func TestJudgeRebaseAcceptOtherArchInstall(t *testing.T) {
+	old := clean()
+	cur, v := upgradedSSL()
+	helper := file("/usr/lib/i386-linux-gnu/openssl/helper", "helper", 0o4755)
+	cur.Files = append(cur.Files, helper)
+	i386 := pkg("openssl", sslNew, helper.Path)
+	i386.Arch = "i386"
+	cur.Packages.Installed = append(cur.Packages.Installed, i386)
+	vi := pkgverify.FileVerdict{Path: helper.Path, Package: "openssl", Version: sslNew, Expected: helper.SHA256, Actual: helper.SHA256, Source: "archive"}
+
+	snap := snapOf(old)
+	_, rb := rebaseRun(cur, snap, archive(v, vi))
+	s, ok := rb.Accept["snap.pkg_installed:openssl:i386"]
+	if !ok || !slices.Equal(s.Packages, []string{"openssl:i386"}) || !slices.Contains(s.Paths, helper.Path) {
+		t.Fatalf("accept %+v", s)
+	}
+	snap = RollForward(snap, cur, checklist.Evaluate(cur, ctx), rb.Routine)
+	snap = RollForward(snap, cur, checklist.Evaluate(cur, ctx), s)
+	r, _ := rebaseRun(cur, snap, archive())
+	for _, f := range r.Findings {
+		if strings.HasPrefix(f.Key, "snap.") {
+			t.Errorf("after accepting: %s", f.Key)
+		}
+	}
+}
+
+// The grouped note on unverifiable files accepts exactly the files it
+// shows: another single file is another value.
+func TestUnverifiableNoteValueNamesTheFiles(t *testing.T) {
+	value := func(p string) string {
+		c := clean()
+		c.Files = append(c.Files, file(p, p, 0o644))
+		res := archive()
+		res.Unverifiable = []pkgverify.FileVerdict{{Path: p, Package: "localpkg", Reason: pkgverify.ReasonNotOfficial}}
+		return ExceptionValue(must(t, run(c, nil, res), "pkg.unverifiable", model.SevNote))
+	}
+	if a, b := value("/usr/share/a"), value("/usr/share/b"); a == b {
+		t.Errorf("two different files give the same value %q", a)
+	}
+}
+
+func TestPackagesIncomplete(t *testing.T) {
+	if r := run(clean(), nil, archive()); PackagesIncomplete(r) {
+		t.Errorf("a full verification reported incomplete: %v", r.CouldNotRuleOut)
+	}
+	if r := run(clean(), nil, nil); !PackagesIncomplete(r) {
+		t.Errorf("no verification: %v", r.CouldNotRuleOut)
+	}
+	stopped := archive()
+	stopped.Unverifiable = []pkgverify.FileVerdict{{Path: "/usr/bin/ls", Package: "coreutils", Version: "9.1-1", Reason: "deadline", Kind: pkgverify.KindStopped}}
+	if r := run(clean(), nil, stopped); !PackagesIncomplete(r) {
+		t.Errorf("stopped: %v", r.CouldNotRuleOut)
+	}
+	down := archive()
+	down.Unverifiable = []pkgverify.FileVerdict{{Path: "/usr/bin/openssl", Package: "openssl", Version: "3.0.14-1~deb12u2", Reason: "no route to host", Kind: pkgverify.KindUnreachable}}
+	if r := run(clean(), snapOf(clean()), down); !PackagesIncomplete(r) {
+		t.Errorf("unreachable: %v", r.CouldNotRuleOut)
 	}
 }

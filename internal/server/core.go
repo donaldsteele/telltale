@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"slices"
 	"strconv"
 	"strings"
@@ -38,9 +39,12 @@ import (
 )
 
 // AlertSink sends alerts (bubbles, in production). newFindings are findings
-// at the alert level that the owner has not been told about; resolved are
-// findings the owner was told about that are gone. Notify is called with
-// the machine's lock held and must not call back into the Core.
+// at the alert level that the owner has not been told about, or that rose
+// in severity since; resolved are findings the owner was told about that
+// are gone. Notify gets a context that ends after the alert_timeout
+// setting; a call still running then is abandoned and the alert is sent
+// again after the next visit. No lock is held and no visit slot is taken
+// while it runs, but the machine counts as being visited until it returns.
 type AlertSink interface {
 	Notify(ctx context.Context, m store.Machine, newFindings, resolved []model.Finding) error
 }
@@ -71,8 +75,9 @@ func (SSHVisitor) RemoveLeftovers(ctx context.Context, m store.Machine, signer s
 	return visit.RemoveLeftovers(ctx, m, signer, dirs)
 }
 
-// ErrVisitRunning means the machine is being visited already.
-var ErrVisitRunning = errors.New("a visit to this machine is already running")
+// ErrVisitRunning means the machine is being visited: another visit and the
+// owner's actions on its baseline wait until it is done.
+var ErrVisitRunning = errors.New("a visit to this machine is running; try again when it is done")
 
 // Settings the core reads. Durations are Go durations ("45m").
 const (
@@ -82,10 +87,14 @@ const (
 	// SettingVisitTimeout bounds each visit, package verification
 	// included; 30 minutes when unset or unreadable.
 	SettingVisitTimeout = "visit_timeout"
+	// SettingAlertTimeout bounds each Notify; 60 seconds when unset or
+	// unreadable.
+	SettingAlertTimeout = "alert_timeout"
 )
 
 const (
 	defaultVisitTimeout = 30 * time.Minute
+	defaultAlertTimeout = time.Minute
 	// maxVisits is how many visits run at once, across all machines.
 	maxVisits = 4
 	// failingAfter consecutive failed visits store a visit.failing report.
@@ -128,17 +137,27 @@ type Core struct {
 	// in the enrolment snippets. It goes to every scan, with the server's
 	// key, so the server's own root key line and Match block are expected
 	// on every visit, the first included. It must pass
-	// visit.CheckServerAddr.
+	// visit.CheckServerAddr; while it does not, every visit fails and says
+	// so.
 	ServerAddr string
 	// Verify is package verification; nil means pkgverify.Verify.
 	Verify func(ctx context.Context, c *model.Collection, opt pkgverify.Options) *pkgverify.Result
+	// Log is the server log (visit errors the scheduler sees, audit log
+	// failures); nil means the standard logger.
+	Log *log.Logger
 
 	initOnce sync.Once
-	slots    chan struct{} // one per running visit
-	mu       sync.Mutex
-	busy     map[int64]bool        // machines being visited
-	locks    map[int64]*sync.Mutex // per machine: snapshot, reports, alert state
+	slots    chan struct{}         // one per running visit
 	keyMu    sync.Mutex            // digest key creation
+	mu       sync.Mutex            // the maps below
+	busy     map[int64]bool        // machines being visited
+	locks    map[int64]*sync.Mutex // per machine: snapshot, reports, settings
+	gen      map[int64]uint64      // per machine: bumped by every owner action
+	// The schedule: when each machine is next due, the interval that was
+	// worked out with, and the machines Run has started a visit for.
+	due      map[int64]time.Time
+	dueEvery map[int64]time.Duration
+	queued   map[int64]bool
 }
 
 func (c *Core) init() {
@@ -146,6 +165,10 @@ func (c *Core) init() {
 		c.slots = make(chan struct{}, maxVisits)
 		c.busy = map[int64]bool{}
 		c.locks = map[int64]*sync.Mutex{}
+		c.gen = map[int64]uint64{}
+		c.due = map[int64]time.Time{}
+		c.dueEvery = map[int64]time.Duration{}
+		c.queued = map[int64]bool{}
 	})
 }
 
@@ -154,6 +177,14 @@ func (c *Core) now() time.Time {
 		return c.Now()
 	}
 	return time.Now()
+}
+
+func (c *Core) logf(format string, args ...any) {
+	if c.Log != nil {
+		c.Log.Printf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
 }
 
 func (c *Core) visitor() Visitor {
@@ -170,7 +201,7 @@ func (c *Core) verify() func(context.Context, *model.Collection, pkgverify.Optio
 	return pkgverify.Verify
 }
 
-// lock locks the machine's baseline state and returns the unlock.
+// lock locks the machine's stored state and returns the unlock.
 func (c *Core) lock(id int64) func() {
 	c.init()
 	c.mu.Lock()
@@ -184,9 +215,65 @@ func (c *Core) lock(id int64) func() {
 	return l.Unlock
 }
 
-func (c *Core) audit(actor, action, format string, args ...any) {
-	// Only IDs and counts are ever formatted in: see the package comment.
-	c.Store.Audit(actor, action, fmt.Sprintf(format, args...))
+// claim marks the machine as being visited and returns its generation; it
+// fails when a visit is running already.
+func (c *Core) claim(id int64) (uint64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.busy[id] {
+		return 0, false
+	}
+	c.busy[id] = true
+	return c.gen[id], true
+}
+
+func (c *Core) unclaim(id int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.busy, id)
+}
+
+func (c *Core) generation(id int64) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gen[id]
+}
+
+// bumpGeneration marks the machine's baseline as changed by the owner.
+func (c *Core) bumpGeneration(id int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.gen[id]++
+}
+
+// ownerAction starts one of the owner's actions on a machine's baseline: it
+// locks the machine, refuses while a visit of it is running, and returns the
+// function that ends the action. Ending it bumps the machine's generation,
+// so a visit that started meanwhile does not save what it judged against
+// the baseline as it was.
+func (c *Core) ownerAction(id int64) (func(), error) {
+	unlock := c.lock(id)
+	c.mu.Lock()
+	busy := c.busy[id]
+	c.mu.Unlock()
+	if busy {
+		unlock()
+		return nil, ErrVisitRunning
+	}
+	return func() {
+		c.bumpGeneration(id)
+		unlock()
+	}, nil
+}
+
+// audit appends to the audit log. Only IDs and counts are ever formatted
+// in: see the package comment. A failure is logged and returned.
+func (c *Core) audit(actor, action, format string, args ...any) error {
+	if err := c.Store.Audit(actor, action, fmt.Sprintf(format, args...)); err != nil {
+		c.logf("telltale server: could not write \"%s\" to the audit log: %v", action, err)
+		return fmt.Errorf("server: write the audit log: %w", err)
+	}
+	return nil
 }
 
 // Setting keys per machine.
@@ -198,6 +285,23 @@ func attemptSetting(id int64) string   { return "last_attempt:" + strconv.Format
 func rebaseSetting(id int64) string    { return "rebase:" + strconv.FormatInt(id, 10) }
 func alertSetting(id int64) string     { return "alert_state:" + strconv.FormatInt(id, 10) }
 
+// outcome is what a visit leaves for VisitNow: the stored report, the
+// error, and the alert still to send.
+type outcome struct {
+	rid   int64
+	err   error
+	alert *pendingAlert
+}
+
+// pendingAlert is a stored report not yet compared with what the owner was
+// told.
+type pendingAlert struct {
+	m         store.Machine
+	rep       *model.Report
+	synthetic bool
+	rid       int64
+}
+
 // VisitNow visits the machine, judges the collection on the server, stores
 // the report and alerts. It returns the ID of any report it stored, and an
 // error when the visit did not complete or the alert could not be sent:
@@ -207,42 +311,61 @@ func alertSetting(id int64) string     { return "alert_state:" + strconv.FormatI
 //   - a visit that collected but could not remove its temporary directory
 //     is judged as usual, with a note visit.left_on_machine; the next visit
 //     removes the directory first;
-//   - any other failure is recorded on the machine (VisitError), and the
-//     third in a row stores a report with the note visit.failing.
+//   - any other failure, a bad ServerAddr included, is recorded on the
+//     machine (VisitError), and the third in a row stores a report with the
+//     note visit.failing.
 //
-// At most four visits run at once and one per machine (ErrVisitRunning);
-// each is bounded by the visit_timeout setting.
+// At most four visits run at once and one per machine (ErrVisitRunning).
+// The visit is bounded by the visit_timeout setting; the alert is sent
+// after its slot is freed, bounded by alert_timeout. The machine's next
+// scheduled visit moves to an interval from now.
 func (c *Core) VisitNow(ctx context.Context, machineID int64) (int64, error) {
 	c.init()
-	c.mu.Lock()
-	if c.busy[machineID] {
-		c.mu.Unlock()
-		return 0, ErrVisitRunning
-	}
-	c.busy[machineID] = true
-	c.mu.Unlock()
-	defer func() {
-		c.mu.Lock()
-		delete(c.busy, machineID)
-		c.mu.Unlock()
-	}()
 	select {
 	case c.slots <- struct{}{}:
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	}
-	defer func() { <-c.slots }()
+	held := true
+	release := func() {
+		if held {
+			<-c.slots
+			held = false
+		}
+	}
+	defer release()
+	gen, ok := c.claim(machineID)
+	if !ok {
+		return 0, ErrVisitRunning
+	}
+	defer c.unclaim(machineID)
 	vctx, cancel := context.WithTimeout(ctx, c.visitTimeout())
-	defer cancel()
-	return c.visit(ctx, vctx, machineID)
+	out := c.visit(ctx, vctx, machineID, gen)
+	cancel()
+	release()
+	err := out.err
+	if out.alert != nil {
+		if aerr := c.sendAlert(ctx, out.alert); aerr != nil {
+			err = errors.Join(err, aerr)
+		}
+	}
+	c.reschedule(machineID)
+	return out.rid, err
 }
 
-func (c *Core) visitTimeout() time.Duration {
-	v, _ := c.Store.Setting(SettingVisitTimeout)
+func (c *Core) duration(key string, def time.Duration) time.Duration {
+	v, _ := c.Store.Setting(key)
 	if d, err := time.ParseDuration(v); err == nil && d > 0 {
 		return d
 	}
-	return defaultVisitTimeout
+	return def
+}
+
+func (c *Core) visitTimeout() time.Duration {
+	return c.duration(SettingVisitTimeout, defaultVisitTimeout)
+}
+func (c *Core) alertTimeout() time.Duration {
+	return c.duration(SettingAlertTimeout, defaultAlertTimeout)
 }
 
 // scanContext is what every scan of the machine gets: its own digest key
@@ -293,23 +416,24 @@ func (c *Core) digestKey(id int64) ([]byte, error) {
 }
 
 // visit is VisitNow once it may run: parent is the caller's context, ctx
-// the one bounded by the visit timeout.
-func (c *Core) visit(parent, ctx context.Context, id int64) (int64, error) {
+// the one bounded by the visit timeout, gen the machine's generation when
+// the visit claimed it.
+func (c *Core) visit(parent, ctx context.Context, id int64, gen uint64) outcome {
 	m, err := c.Store.Machine(id)
 	if err != nil {
-		return 0, err
+		return c.visitFailed(id, nil, err)
 	}
 	c.Store.SetSetting(attemptSetting(id), strconv.FormatInt(c.now().UnixNano(), 10))
 	sc, signer, err := c.scanContext(id)
 	if err != nil {
-		return 0, err
+		return c.visitFailed(id, m, err)
 	}
 	c.removeLeftovers(ctx, *m, signer)
 	col, verr := c.visitor().Visit(ctx, *m, signer, sc, c.Bins)
 	var left *visit.LeftOnMachineError
 	if verr != nil && errors.As(verr, &left) {
 		if err := c.recordLeftovers(id, left.Dirs); err != nil {
-			return 0, err
+			return outcome{err: err}
 		}
 	}
 	switch {
@@ -317,79 +441,77 @@ func (c *Core) visit(parent, ctx context.Context, id int64) (int64, error) {
 		verr = errors.New("the visit returned no collection")
 	case verr == nil:
 	case errors.Is(verr, visit.ErrHostKeyChanged):
-		return c.hostKeyChanged(parent, m, verr)
+		return c.hostKeyChanged(m, verr)
 	case left != nil && left.Collection != nil:
 		col, verr = left.Collection, nil
 	}
 	if verr != nil {
 		if parent.Err() != nil {
 			// The server is stopping: not the machine's failure.
-			return 0, fmt.Errorf("server: visit to machine %d stopped: %w", id, parent.Err())
+			return outcome{err: fmt.Errorf("server: visit to machine %d stopped: %w", id, parent.Err())}
 		}
-		return c.visitFailed(parent, m, verr)
+		return c.visitFailed(id, m, verr)
 	}
-	return c.judgeAndStore(parent, ctx, m, col, sc)
+	return c.judgeAndStore(parent, ctx, m, col, sc, gen)
 }
 
 // judgeAndStore judges a collection and stores the report: package
 // verification on the server (only the changed package files when there is
 // a snapshot, with the snapshot's repository keys), the judgement with the
-// machine's exceptions, the automatic roll-forward of package-explained
-// changes, and the alert.
-func (c *Core) judgeAndStore(parent, ctx context.Context, m *store.Machine, col *model.Collection, sc model.ScanContext) (int64, error) {
+// machine's exceptions, and the automatic roll-forward of the changes this
+// scan confirmed. When an owner action changed the baseline after the visit
+// started (gen), the report is stored but nothing rolls forward and nothing
+// can be accepted from it.
+func (c *Core) judgeAndStore(parent, ctx context.Context, m *store.Machine, col *model.Collection, sc model.ScanContext, gen uint64) outcome {
 	snap, err := c.Store.Snapshot(m.ID)
 	if err != nil {
-		return 0, err
+		return outcome{err: err}
 	}
 	exc, err := c.Store.Exceptions(m.ID)
 	if err != nil {
-		return 0, err
+		return outcome{err: err}
 	}
 	checks := checklist.Evaluate(col, sc)
 	opt := pkgverify.Options{CacheDir: c.CacheDir}
 	judge.VerifyScope(&opt, snap, col)
 	pkg := c.verify()(ctx, col, opt)
 	if parent.Err() != nil {
-		return 0, fmt.Errorf("server: visit to machine %d stopped: %w", m.ID, parent.Err())
+		return outcome{err: fmt.Errorf("server: visit to machine %d stopped: %w", m.ID, parent.Err())}
 	}
 	rep, rb := judge.JudgeRebase(judge.Input{Collection: col, Snapshot: snap, Context: sc, Pkg: pkg, Now: c.now(), Exceptions: exc})
 
 	unlock := c.lock(m.ID)
 	defer unlock()
 	if left, err := c.Leftovers(m.ID); err != nil {
-		return 0, err
+		return outcome{err: err}
 	} else if len(left) > 0 {
 		judge.AddFindings(rep, leftOnMachine(left))
 	}
 	rid, err := c.Store.PutReport(m.ID, rep, col)
 	if err != nil {
-		return 0, err
+		return outcome{err: err}
 	}
-	st := rebaseState{ReportID: rid}
-	if rb != nil {
+	fail := func(err error) outcome { return outcome{rid: rid, err: err} }
+	st := rebaseState{ReportID: rid, Stale: c.generation(m.ID) != gen}
+	if rb != nil && !st.Stale {
 		st.Accept = rb.Accept
-		// Changes the signed packages explain roll forward by themselves,
-		// onto the snapshot as it is now (the owner may have changed it
-		// during the visit).
+		// Changes this scan confirmed roll forward by themselves.
 		if cur, err := c.Store.Snapshot(m.ID); err != nil {
-			return rid, err
+			return fail(err)
 		} else if cur != nil && !rb.Routine.Empty() {
 			if err := c.Store.PutSnapshot(m.ID, judge.RollForward(cur, col, checks, rb.Routine)); err != nil {
-				return rid, err
+				return fail(err)
 			}
 		}
 	}
 	if err := c.saveSecret(rebaseSetting(m.ID), st); err != nil {
-		return rid, err
+		return fail(err)
 	}
 	if err := c.visitSucceeded(m.ID); err != nil {
-		return rid, err
+		return fail(err)
 	}
-	c.audit(actorServer, "visit", "machine %d report %d", m.ID, rid)
-	if err := c.alert(parent, m, rep, false, rid); err != nil {
-		return rid, err
-	}
-	return rid, nil
+	return outcome{rid: rid, err: c.audit(actorServer, "visit", "machine %d report %d", m.ID, rid),
+		alert: &pendingAlert{m: *m, rep: rep, rid: rid}}
 }
 
 // visitSucceeded resets the failure count and error and records the visit.
@@ -411,39 +533,45 @@ func (c *Core) visitSucceeded(id int64) error {
 	return c.Store.UpdateMachine(*m)
 }
 
-// visitFailed records a failed visit; the third in a row stores a report.
-func (c *Core) visitFailed(parent context.Context, m *store.Machine, verr error) (int64, error) {
-	unlock := c.lock(m.ID)
+// visitFailed records a failed visit (m is nil when the machine could not
+// be read); the third in a row stores a report.
+func (c *Core) visitFailed(id int64, m *store.Machine, verr error) outcome {
+	unlock := c.lock(id)
 	defer unlock()
-	fail := fmt.Errorf("server: visit to machine %d failed: %w", m.ID, verr)
-	if err := c.Store.SetSecretSetting(errorSetting(m.ID), []byte(boundedText(verr.Error()))); err != nil {
-		return 0, errors.Join(fail, err)
+	fail := fmt.Errorf("server: visit to machine %d failed: %w", id, verr)
+	if err := c.Store.SetSecretSetting(errorSetting(id), []byte(boundedText(verr.Error()))); err != nil {
+		return outcome{err: errors.Join(fail, err)}
 	}
-	v, _ := c.Store.Setting(failuresSetting(m.ID))
+	v, _ := c.Store.Setting(failuresSetting(id))
 	n, _ := strconv.Atoi(v)
 	n++
-	if err := c.Store.SetSetting(failuresSetting(m.ID), strconv.Itoa(n)); err != nil {
-		return 0, errors.Join(fail, err)
+	if err := c.Store.SetSetting(failuresSetting(id), strconv.Itoa(n)); err != nil {
+		return outcome{err: errors.Join(fail, err)}
 	}
-	c.audit(actorServer, "visit failed", "machine %d", m.ID)
+	if err := c.audit(actorServer, "visit failed", "machine %d", id); err != nil {
+		fail = errors.Join(fail, err)
+	}
 	if n != failingAfter {
-		return 0, fail
+		return outcome{err: fail}
 	}
 	rep := c.syntheticReport(visitFailing(n))
-	rid, err := c.Store.PutReport(m.ID, rep, &model.Collection{})
+	rid, err := c.Store.PutReport(id, rep, &model.Collection{})
 	if err != nil {
-		return 0, errors.Join(fail, err)
+		return outcome{err: errors.Join(fail, err)}
 	}
-	c.audit(actorServer, "visits failing", "machine %d report %d", m.ID, rid)
-	if err := c.alert(parent, m, rep, true, rid); err != nil {
-		return rid, errors.Join(fail, err)
+	if err := c.audit(actorServer, "visits failing", "machine %d report %d", id, rid); err != nil {
+		fail = errors.Join(fail, err)
 	}
-	return rid, fail
+	mm := store.Machine{ID: id}
+	if m != nil {
+		mm = *m
+	}
+	return outcome{rid: rid, err: fail, alert: &pendingAlert{m: mm, rep: rep, synthetic: true, rid: rid}}
 }
 
 // hostKeyChanged stores the tampering report for a machine whose host key
 // is not the pinned one. Nothing was sent to the machine.
-func (c *Core) hostKeyChanged(parent context.Context, m *store.Machine, verr error) (int64, error) {
+func (c *Core) hostKeyChanged(m *store.Machine, verr error) outcome {
 	unlock := c.lock(m.ID)
 	defer unlock()
 	fail := fmt.Errorf("server: visit to machine %d: %w", m.ID, verr)
@@ -452,14 +580,15 @@ func (c *Core) hostKeyChanged(parent context.Context, m *store.Machine, verr err
 	rep := c.syntheticReport(hostKeyFinding(hk))
 	rid, err := c.Store.PutReport(m.ID, rep, &model.Collection{})
 	if err != nil {
-		return 0, errors.Join(fail, err)
+		return outcome{err: errors.Join(fail, err)}
 	}
-	c.Store.SetSecretSetting(errorSetting(m.ID), []byte(boundedText(verr.Error())))
-	c.audit(actorServer, "host key changed", "machine %d report %d", m.ID, rid)
-	if err := c.alert(parent, m, rep, true, rid); err != nil {
-		return rid, errors.Join(fail, err)
+	if err := c.Store.SetSecretSetting(errorSetting(m.ID), []byte(boundedText(verr.Error()))); err != nil {
+		fail = errors.Join(fail, err)
 	}
-	return rid, fail
+	if err := c.audit(actorServer, "host key changed", "machine %d report %d", m.ID, rid); err != nil {
+		fail = errors.Join(fail, err)
+	}
+	return outcome{rid: rid, err: fail, alert: &pendingAlert{m: *m, rep: rep, synthetic: true, rid: rid}}
 }
 
 // syntheticReport is a report about the visit itself, with no collection.
@@ -589,7 +718,7 @@ func (c *Core) removeLeftovers(ctx context.Context, m store.Machine, signer ssh.
 	}
 	dirs = slices.DeleteFunc(dirs, func(d string) bool { return !visit.IsTempDir(d) })
 	if err := rm.RemoveLeftovers(ctx, m, signer, dirs); err != nil {
-		c.audit(actorServer, "leftovers not removed", "machine %d", m.ID)
+		c.audit(actorServer, "leftovers not removed", "machine %d", m.ID) // logged on failure
 		return
 	}
 	unlock := c.lock(m.ID)
@@ -600,26 +729,34 @@ func (c *Core) removeLeftovers(ctx context.Context, m store.Machine, signer ssh.
 	}
 	have = slices.DeleteFunc(have, func(d string) bool { return slices.Contains(dirs, d) })
 	if c.saveSecret(leftoverSetting(m.ID), have) == nil {
-		c.audit(actorServer, "leftovers removed", "machine %d: %d directories", m.ID, len(dirs))
+		c.audit(actorServer, "leftovers removed", "machine %d: %d directories", m.ID, len(dirs)) // logged on failure
 	}
 }
 
 // rebaseState is what the machine's latest completed visit says about its
 // baseline: the report, and what accepting each of its findings rolls
-// forward.
+// forward. Stale means an owner action changed the baseline while the
+// report was being made, so nothing can be accepted from it.
 type rebaseState struct {
 	ReportID int64                  `json:"report_id"`
+	Stale    bool                   `json:"stale,omitempty"`
 	Accept   map[string]judge.Scope `json:"accept,omitempty"`
 }
 
 // MarkClean takes the machine's snapshot from one of its reports: that
 // report's collection, its checklist results and the machine's digest key.
-// It replaces any snapshot the machine had. The UI calls it only after the
-// owner reviewed the report and confirmed that the machine is believed
-// clean; nothing else may.
+// It replaces any snapshot the machine had.
+//
+// This is an owner action for the web UI only, called after the owner
+// reviewed the report and confirmed that the machine is believed clean. It
+// must never be exposed through MCP or any other automated interface. It
+// returns ErrVisitRunning while the machine is being visited.
 func (c *Core) MarkClean(ctx context.Context, machineID, reportID int64) error {
-	unlock := c.lock(machineID)
-	defer unlock()
+	done, err := c.ownerAction(machineID)
+	if err != nil {
+		return err
+	}
+	defer done()
 	m, err := c.Store.Machine(machineID)
 	if err != nil {
 		return err
@@ -654,8 +791,7 @@ func (c *Core) MarkClean(ctx context.Context, machineID, reportID int64) error {
 	if err := c.saveSecret(rebaseSetting(machineID), st); err != nil {
 		return err
 	}
-	c.audit(actorOwner, "mark clean", "machine %d report %d", machineID, reportID)
-	return nil
+	return c.audit(actorOwner, "mark clean", "machine %d report %d", machineID, reportID)
 }
 
 // ownReport opens a report of the machine; another machine's is refused.
@@ -675,14 +811,22 @@ func (c *Core) ownReport(machineID, reportID int64) (*model.Report, *model.Colle
 // saw them. Only findings about changes since the snapshot can be accepted
 // (anything else is an exception), and findings about the same things go
 // together: accepting one new root key accepts the whole key file, so
-// every finding about that file must be in keys. Package-explained changes
-// need no accepting: they roll forward on every visit.
+// every finding about that file must be in keys. Changes a scan confirmed
+// (package updates verified against the signed archive) need no accepting:
+// they roll forward by themselves.
+//
+// This is an owner action for the web UI only. It must never be exposed
+// through MCP or any other automated interface. It returns ErrVisitRunning
+// while the machine is being visited.
 func (c *Core) AcceptChanges(ctx context.Context, machineID, reportID int64, keys []string) error {
 	if len(keys) == 0 {
 		return errors.New("server: no changes to accept")
 	}
-	unlock := c.lock(machineID)
-	defer unlock()
+	done, err := c.ownerAction(machineID)
+	if err != nil {
+		return err
+	}
+	defer done()
 	snap, err := c.Store.Snapshot(machineID)
 	if err != nil {
 		return err
@@ -696,6 +840,9 @@ func (c *Core) AcceptChanges(ctx context.Context, machineID, reportID int64, key
 	}
 	if st.ReportID != reportID {
 		return fmt.Errorf("server: changes are accepted from the machine's latest report (%d), not report %d", st.ReportID, reportID)
+	}
+	if st.Stale {
+		return fmt.Errorf("server: the baseline changed while report %d was being made; accept changes from the next visit's report", reportID)
 	}
 	accepted := map[string]bool{}
 	for _, k := range keys {
@@ -732,31 +879,28 @@ func (c *Core) AcceptChanges(ctx context.Context, machineID, reportID int64, key
 	if err := c.forget(machineID, keys); err != nil {
 		return err
 	}
-	c.audit(actorOwner, "accept changes", "machine %d report %d: %d findings", machineID, reportID, len(keys))
-	return nil
+	return c.audit(actorOwner, "accept changes", "machine %d report %d: %d findings", machineID, reportID, len(keys))
 }
 
-// AddException accepts a finding of the machine's latest report as a
-// lasting exception: it records the finding's current value, and the
-// finding is dropped from reports for as long as its value stays the same.
-// Findings about the visit itself cannot be accepted.
-func (c *Core) AddException(ctx context.Context, machineID int64, key, note string) error {
-	unlock := c.lock(machineID)
-	defer unlock()
-	if _, err := c.Store.Machine(machineID); err != nil {
-		return err
-	}
+// AddException accepts a finding of one of the machine's reports, the one
+// the owner looked at, as a lasting exception: it records the finding's
+// value in that report, and the finding is dropped from reports for as long
+// as its value stays the same. Findings about the visit itself cannot be
+// accepted.
+//
+// This is an owner action for the web UI only. It must never be exposed
+// through MCP or any other automated interface. It returns ErrVisitRunning
+// while the machine is being visited.
+func (c *Core) AddException(ctx context.Context, machineID, reportID int64, key, note string) error {
 	if strings.HasPrefix(key, sourceVisit+".") {
 		return errors.New("server: findings about the visit itself cannot be accepted")
 	}
-	var st rebaseState
-	if err := c.loadSecret(rebaseSetting(machineID), &st); err != nil {
+	done, err := c.ownerAction(machineID)
+	if err != nil {
 		return err
 	}
-	if st.ReportID == 0 {
-		return fmt.Errorf("server: machine %d has no report yet", machineID)
-	}
-	rep, _, err := c.Store.Report(st.ReportID)
+	defer done()
+	rep, _, err := c.ownReport(machineID, reportID)
 	if err != nil {
 		return err
 	}
@@ -768,7 +912,7 @@ func (c *Core) AddException(ctx context.Context, machineID int64, key, note stri
 		}
 	}
 	if found == nil {
-		return fmt.Errorf("server: no finding \"%s\" in the machine's latest report", escape.Terminal(key))
+		return fmt.Errorf("server: no finding \"%s\" in report %d", escape.Terminal(key), reportID)
 	}
 	e := model.Exception{FindingKey: key, AcceptedValue: judge.ExceptionValue(found), Note: note, At: c.now().UTC()}
 	if err := c.Store.AddException(machineID, e); err != nil {
@@ -777,8 +921,7 @@ func (c *Core) AddException(ctx context.Context, machineID int64, key, note stri
 	if err := c.forget(machineID, []string{key}); err != nil {
 		return err
 	}
-	c.audit(actorOwner, "add exception", "machine %d", machineID)
-	return nil
+	return c.audit(actorOwner, "add exception", "machine %d report %d", machineID, reportID)
 }
 
 // alertState is what the owner has been told about a machine: the
@@ -795,61 +938,96 @@ func (c *Core) urgentOnly() bool {
 	return v != "all"
 }
 
-// alert compares the report with what the owner was told and notifies the
-// new findings at the alert level and the resolved ones. A report about a
-// visit that collected nothing (isSynthetic) resolves nothing.
-func (c *Core) alert(ctx context.Context, m *store.Machine, rep *model.Report, isSynthetic bool, rid int64) error {
-	var st alertState
-	if err := c.loadSecret(alertSetting(m.ID), &st); err != nil {
-		return err
-	}
-	urgent := c.urgentOnly()
+// diffAlerts compares a report with what the owner was told. A finding is
+// new when its key was not told about, or was at a lower severity (an
+// escalation). A report about a visit that collected nothing (isSynthetic)
+// resolves nothing; a completed visit resolves the findings it no longer
+// has, except package findings when package verification did not run or
+// finish (judge.PackagesIncomplete): those may only have gone unchecked, so
+// they stay known.
+func diffAlerts(st alertState, rep *model.Report, urgent, isSynthetic bool) (fresh, resolved []model.Finding, next alertState) {
 	var cur []model.Finding
 	for _, f := range rep.Findings {
 		if !urgent || f.Severity >= model.SevBackdoor {
 			cur = append(cur, f)
 		}
 	}
-	known := func(fs []model.Finding) map[string]bool {
-		k := map[string]bool{}
+	told := func(fs []model.Finding) map[string]model.Severity {
+		m := map[string]model.Severity{}
 		for _, f := range fs {
-			k[f.Key] = true
+			m[f.Key] = f.Severity
 		}
-		return k
+		return m
 	}
-	var fresh, resolved []model.Finding
-	next := st
 	if isSynthetic {
-		was := known(st.Synthetic)
+		was := told(st.Synthetic)
+		next = alertState{Real: st.Real, Synthetic: slices.Clone(st.Synthetic)}
 		for _, f := range cur {
-			if !was[f.Key] {
-				fresh = append(fresh, f)
-				next.Synthetic = append(next.Synthetic, f)
+			if sev, ok := was[f.Key]; ok && f.Severity <= sev {
+				continue
 			}
+			fresh = append(fresh, f)
+			next.Synthetic = slices.DeleteFunc(next.Synthetic, func(g model.Finding) bool { return g.Key == f.Key })
+			next.Synthetic = append(next.Synthetic, f)
 		}
-	} else {
-		was, present := known(st.Real), known(rep.Findings)
-		for _, f := range cur {
-			if !was[f.Key] {
-				fresh = append(fresh, f)
-			}
-		}
-		for _, f := range st.Real {
-			if !present[f.Key] {
-				resolved = append(resolved, f)
-			}
-		}
-		// A visit that worked ends whatever was wrong with visiting.
-		resolved = append(resolved, st.Synthetic...)
-		next = alertState{Real: cur}
+		return fresh, nil, next
 	}
+	was, present := told(st.Real), told(rep.Findings)
+	for _, f := range cur {
+		if sev, ok := was[f.Key]; !ok || f.Severity > sev {
+			fresh = append(fresh, f)
+		}
+	}
+	next = alertState{Real: cur}
+	unchecked := judge.PackagesIncomplete(rep)
+	for _, f := range st.Real {
+		if _, ok := present[f.Key]; ok {
+			continue
+		}
+		if unchecked && strings.HasPrefix(f.Key, "pkg.") {
+			next.Real = append(next.Real, f)
+			continue
+		}
+		resolved = append(resolved, f)
+	}
+	// A visit that worked ends whatever was wrong with visiting.
+	resolved = append(resolved, st.Synthetic...)
+	return fresh, resolved, next
+}
+
+// sendAlert notifies what is new and resolved for a stored report and
+// records what the owner was told. It holds no lock and no visit slot
+// while Notify runs, and gives Notify alert_timeout.
+func (c *Core) sendAlert(ctx context.Context, pa *pendingAlert) error {
+	var st alertState
+	if err := c.loadSecret(alertSetting(pa.m.ID), &st); err != nil {
+		return err
+	}
+	fresh, resolved, next := diffAlerts(st, pa.rep, c.urgentOnly(), pa.synthetic)
 	if len(fresh)+len(resolved) > 0 && c.Alerts != nil {
-		if err := c.Alerts.Notify(ctx, *m, fresh, resolved); err != nil {
-			c.audit(actorServer, "alert not sent", "machine %d report %d", m.ID, rid)
-			return fmt.Errorf("server: report %d stored, but the alert was not sent: %w", rid, err)
+		if err := c.notify(ctx, pa.m, fresh, resolved); err != nil {
+			c.audit(actorServer, "alert not sent", "machine %d report %d", pa.m.ID, pa.rid) // logged on failure
+			return fmt.Errorf("server: report %d stored, but the alert was not sent: %w", pa.rid, err)
 		}
 	}
-	return c.saveSecret(alertSetting(m.ID), next)
+	unlock := c.lock(pa.m.ID)
+	defer unlock()
+	return c.saveSecret(alertSetting(pa.m.ID), next)
+}
+
+// notify calls the sink with alert_timeout. A sink that does not stop when
+// its context ends is abandoned (its goroutine finishes whenever it does).
+func (c *Core) notify(ctx context.Context, m store.Machine, fresh, resolved []model.Finding) error {
+	ctx, cancel := context.WithTimeout(ctx, c.alertTimeout())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.Alerts.Notify(ctx, m, fresh, resolved) }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // forget drops accepted findings from what the owner was told, so their

@@ -166,7 +166,7 @@ func (j *judge) packageChange(ch diff.Change) {
 			j.explain(name, model.Evidence{After: pc.New, Detail: "installed: a newer kernel package of a flavour already installed", When: j.listWhen(name)})
 			return
 		}
-		j.installed(name, pc.New)
+		j.installed(name, pc.Arch, pc.New)
 	case diff.PkgRemoved:
 		switch {
 		case securityPackages[name]:
@@ -207,8 +207,8 @@ func (j *judge) listWhen(name string) *time.Time {
 }
 
 // installed ranks a newly installed package that is not routine.
-func (j *judge) installed(name, version string) {
-	f, reasons := j.installFinding(j.pkgs[name], name, version)
+func (j *judge) installed(name, arch, version string) {
+	f, reasons := j.installFinding(j.entry(name, arch), name, version)
 	// What raised the package is part of the value an exception accepts.
 	j.pkgReasons[name] = append(j.pkgReasons[name], reasons...)
 	j.pkgFinding[name] = j.add(f)
@@ -876,7 +876,7 @@ func (j *judge) pkgDigest(name string, listed bool) string {
 	for p := range j.touched[name] {
 		paths = append(paths, p)
 	}
-	if p := j.pkgs[name]; listed && p != nil {
+	if p := j.changedEntry(name); listed && p != nil {
 		paths = append(paths, p.Files...)
 	}
 	return j.contentDigest(paths)
@@ -937,4 +937,26 @@ func (j *judge) versionOnly(name string, ch diff.Change, g *model.Finding) *mode
 	f = j.add(f)
 	j.pkgFinding[name] = f
 	return f
+}
+
+// entry is the installed package of name for arch, or the first installed
+// package of name when none is for arch. dpkg installs a name once per
+// architecture; most of the judge looks at names, but what a new package
+// brings is read from the architecture that changed.
+func (j *judge) entry(name, arch string) *model.Package {
+	for i := range j.c.Packages.Installed {
+		if p := &j.c.Packages.Installed[i]; p.Name == name && p.Arch == arch {
+			return p
+		}
+	}
+	return j.pkgs[name]
+}
+
+// changedEntry is the installed package of name for the architecture whose
+// change the judge looked at.
+func (j *judge) changedEntry(name string) *model.Package {
+	if ch, ok := j.pkgChange[name]; ok && ch.Pkg != nil {
+		return j.entry(name, ch.Pkg.Arch)
+	}
+	return j.pkgs[name]
 }
