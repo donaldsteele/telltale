@@ -172,7 +172,17 @@ func TestFilesWalksWhatElseIsInTheCollectorsDirectory(t *testing.T) {
 		t.Error("the binary is in the inventory")
 	}
 
+	// The real binary is the running program, whose inode the kernel keeps
+	// while it runs, so a file put in its place never gets its inode
+	// number. Holding the stand-in open does the same; without that a
+	// filesystem such as ext4 hands the freed number straight to the
+	// replacement.
 	bin := filepath.Join(dir, "telltale")
+	running, err := os.Open(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer running.Close()
 	if err := os.Remove(bin); err != nil {
 		t.Fatal(err)
 	}
