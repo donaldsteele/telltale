@@ -1,6 +1,11 @@
 // Package store is the server's SQLite database. Snapshots, reports,
 // collections and secret settings are sealed with a data key that is kept in
 // the database only wrapped with age under the admin's passphrase or key file.
+//
+// Not encrypted, on purpose: machine name, address and host key (the owner
+// types them, and a host key is public), plain settings, and the audit log.
+// Everything derived from a machine's contents, including report time, exit
+// code and finding counts, is sealed.
 package store
 
 import (
@@ -11,6 +16,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -25,6 +31,9 @@ var schemaSQL string
 const schemaVersion = 1
 
 // Settings keys the store owns; SetSetting refuses them.
+// ErrNoKeyButData means the wrapped data key is gone while sealed data remains.
+var ErrNoKeyButData = errors.New("the store holds data but its key is missing")
+
 var reservedSettings = map[string]bool{"wrapped_key": true, "schema_version": true}
 
 // Unlock says how the data key is opened. Exactly one field must be set.
@@ -70,6 +79,13 @@ func Open(path string, u Unlock) (*Store, error) {
 	if (u.Passphrase == "") == (u.KeyFile == "") {
 		return nil, errors.New("store: set exactly one of passphrase or key file")
 	}
+	// An absolute path keeps the file: URI free of an authority part.
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	_, statErr := os.Stat(path)
+	created := errors.Is(statErr, os.ErrNotExist)
 	// Create the file 0600 ourselves so SQLite (which gives -wal and -shm the
 	// main file's mode) never makes a wider one.
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
@@ -77,23 +93,32 @@ func Open(path string, u Unlock) (*Store, error) {
 		return nil, err
 	}
 	f.Close()
-	if err := os.Chmod(path, 0o600); err != nil {
+	fail := func(err error) (*Store, error) {
+		if created {
+			for _, suf := range []string{"", "-wal", "-shm"} {
+				os.Remove(path + suf)
+			}
+		}
 		return nil, err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fail(err)
 	}
 	q := url.Values{}
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Add("_pragma", "journal_mode(WAL)")
+	q.Add("_txlock", "immediate")
 	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}).String()
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
 	if err := s.init(u); err != nil {
 		db.Close()
-		return nil, err
+		return fail(err)
 	}
 	for _, suf := range []string{"-wal", "-shm"} {
 		if _, err := os.Stat(path + suf); err == nil {
@@ -103,15 +128,45 @@ func Open(path string, u Unlock) (*Store, error) {
 	return s, nil
 }
 
+// dataTables are the tables whose rows are sealed with the data key.
+var dataTables = []string{"machines", "secrets", "snapshots", "reports", "exceptions", "audit"}
+
 func (s *Store) init(u Unlock) error {
+	// Refuse a newer schema before running any DDL against it.
+	var has int
+	if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='settings'`).Scan(&has); err != nil {
+		return err
+	}
+	if has > 0 {
+		v, err := s.Setting("schema_version")
+		if err != nil {
+			return err
+		}
+		if n, _ := strconv.Atoi(v); n > schemaVersion {
+			return fmt.Errorf("store: database schema %s is newer than this build (%d)", v, schemaVersion)
+		}
+	}
 	if _, err := s.db.Exec(schemaSQL); err != nil {
 		return fmt.Errorf("store: schema: %w", err)
 	}
-	wrapped, err := s.Setting("wrapped_key")
+	tx, err := s.db.Begin() // immediate: no other opener can race the key creation
 	if err != nil {
 		return err
 	}
-	if wrapped == "" {
+	defer tx.Rollback()
+	var wrapped string
+	err = tx.QueryRow(`SELECT value FROM settings WHERE key='wrapped_key'`).Scan(&wrapped)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		for _, t := range dataTables {
+			var n int
+			if err := tx.QueryRow(`SELECT count(*) FROM ` + t).Scan(&n); err != nil {
+				return err
+			}
+			if n > 0 {
+				return ErrNoKeyButData
+			}
+		}
 		key, err := newDataKey()
 		if err != nil {
 			return err
@@ -120,32 +175,25 @@ func (s *Store) init(u Unlock) error {
 		if err != nil {
 			return err
 		}
-		// INSERT OR IGNORE: if another opener won the race, read its key.
-		res, err := s.db.Exec(`INSERT OR IGNORE INTO settings(key, value) VALUES('wrapped_key', ?)`, base64.StdEncoding.EncodeToString(w))
+		if _, err := tx.Exec(`INSERT INTO settings(key, value) VALUES('wrapped_key', ?)`, base64.StdEncoding.EncodeToString(w)); err != nil {
+			return err
+		}
+		s.key = key
+	case err != nil:
+		return err
+	default:
+		raw, err := base64.StdEncoding.DecodeString(wrapped)
 		if err != nil {
-			return err
+			return fmt.Errorf("store: wrapped key is corrupt: %w", err)
 		}
-		if n, _ := res.RowsAffected(); n == 1 {
-			s.key = key
-			_, err = s.db.Exec(`INSERT OR IGNORE INTO settings(key, value) VALUES('schema_version', ?)`, strconv.Itoa(schemaVersion))
-			return err
-		}
-		if wrapped, err = s.Setting("wrapped_key"); err != nil {
+		if s.key, err = unwrapKey(raw, u); err != nil {
 			return err
 		}
 	}
-	raw, err := base64.StdEncoding.DecodeString(wrapped)
-	if err != nil {
-		return fmt.Errorf("store: wrapped key is corrupt: %w", err)
-	}
-	if s.key, err = unwrapKey(raw, u); err != nil {
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO settings(key, value) VALUES('schema_version', ?)`, strconv.Itoa(schemaVersion)); err != nil {
 		return err
 	}
-	v, _ := s.Setting("schema_version")
-	if n, _ := strconv.Atoi(v); n > schemaVersion {
-		return fmt.Errorf("store: database schema %s is newer than this build (%d)", v, schemaVersion)
-	}
-	return nil
+	return tx.Commit()
 }
 
 // Close closes the database and forgets the data key.
@@ -156,9 +204,20 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func ts(t time.Time) int64 { return t.UTC().UnixNano() }
+// ts stores a zero time as 0 and anything else as UTC nanoseconds.
+func ts(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UTC().UnixNano()
+}
 
-func fromTS(n int64) time.Time { return time.Unix(0, n).UTC() }
+func fromTS(n int64) time.Time {
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n).UTC()
+}
 
 // AddMachine enrols a machine and returns its ID.
 func (s *Store) AddMachine(m Machine) (int64, error) {
@@ -238,10 +297,9 @@ func (s *Store) Machines() ([]Machine, error) {
 }
 
 func snapshotAAD(machineID int64) string { return "snapshot:" + strconv.FormatInt(machineID, 10) }
-func reportAAD(id int64) string          { return "report:" + strconv.FormatInt(id, 10) }
-func collectionAAD(id int64) string      { return "collection:" + strconv.FormatInt(id, 10) }
-func exceptionAAD(machineID int64) string {
-	return "exception:" + strconv.FormatInt(machineID, 10)
+
+func rowAAD(purpose string, machineID, id int64) string {
+	return purpose + ":" + strconv.FormatInt(machineID, 10) + ":" + strconv.FormatInt(id, 10)
 }
 
 // PutSnapshot replaces the machine's snapshot.
@@ -273,6 +331,13 @@ func (s *Store) Snapshot(machineID int64) (*model.Snapshot, error) {
 	return &snap, nil
 }
 
+// reportMeta is the part of a report the history list needs, sealed like the rest.
+type reportMeta struct {
+	Time     time.Time `json:"time"`
+	ExitCode int       `json:"exit_code"`
+	Findings int       `json:"findings"`
+}
+
 // PutReport stores a report and the collection it judged.
 func (s *Store) PutReport(machineID int64, r *model.Report, c *model.Collection) (int64, error) {
 	tx, err := s.db.Begin()
@@ -281,8 +346,7 @@ func (s *Store) PutReport(machineID int64, r *model.Report, c *model.Collection)
 	}
 	defer tx.Rollback()
 	// The blobs are bound to the row ID, so insert first, then seal.
-	res, err := tx.Exec(`INSERT INTO reports(machine_id, time, exit_code, findings, report_blob, collection_blob) VALUES(?,?,?,?,x'',x'')`,
-		machineID, ts(r.Time), r.ExitCode, len(r.Findings))
+	res, err := tx.Exec(`INSERT INTO reports(machine_id, meta_blob, report_blob, collection_blob) VALUES(?,x'',x'',x'')`, machineID)
 	if err != nil {
 		return 0, err
 	}
@@ -290,47 +354,55 @@ func (s *Store) PutReport(machineID int64, r *model.Report, c *model.Collection)
 	if err != nil {
 		return 0, err
 	}
-	rb, err := s.sealJSON(r, reportAAD(id))
+	mb, err := s.sealJSON(reportMeta{r.Time, r.ExitCode, len(r.Findings)}, rowAAD("reportmeta", machineID, id))
 	if err != nil {
 		return 0, err
 	}
-	cb, err := s.sealJSON(c, collectionAAD(id))
+	rb, err := s.sealJSON(r, rowAAD("report", machineID, id))
 	if err != nil {
 		return 0, err
 	}
-	if _, err := tx.Exec(`UPDATE reports SET report_blob=?, collection_blob=? WHERE id=?`, rb, cb, id); err != nil {
+	cb, err := s.sealJSON(c, rowAAD("collection", machineID, id))
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(`UPDATE reports SET meta_blob=?, report_blob=?, collection_blob=? WHERE id=?`, mb, rb, cb, id); err != nil {
 		return 0, err
 	}
 	return id, tx.Commit()
 }
 
-// Reports lists the machine's reports, newest first.
+// Reports lists the machine's reports, newest first (by insertion order).
 func (s *Store) Reports(machineID int64, limit int) ([]ReportMeta, error) {
 	if limit <= 0 {
 		limit = -1
 	}
-	rows, err := s.db.Query(`SELECT id, machine_id, time, exit_code, findings FROM reports WHERE machine_id=? ORDER BY time DESC, id DESC LIMIT ?`, machineID, limit)
+	rows, err := s.db.Query(`SELECT id, meta_blob FROM reports WHERE machine_id=? ORDER BY id DESC LIMIT ?`, machineID, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []ReportMeta
 	for rows.Next() {
-		var m ReportMeta
-		var t int64
-		if err := rows.Scan(&m.ID, &m.MachineID, &t, &m.ExitCode, &m.Findings); err != nil {
+		var id int64
+		var blob []byte
+		if err := rows.Scan(&id, &blob); err != nil {
 			return nil, err
 		}
-		m.Time = fromTS(t)
-		out = append(out, m)
+		var m reportMeta
+		if err := s.openJSON(blob, rowAAD("reportmeta", machineID, id), &m); err != nil {
+			return nil, err
+		}
+		out = append(out, ReportMeta{ID: id, MachineID: machineID, Time: m.Time, ExitCode: m.ExitCode, Findings: m.Findings})
 	}
 	return out, rows.Err()
 }
 
 // Report opens one stored report and its collection.
 func (s *Store) Report(reportID int64) (*model.Report, *model.Collection, error) {
+	var machineID int64
 	var rb, cb []byte
-	err := s.db.QueryRow(`SELECT report_blob, collection_blob FROM reports WHERE id=?`, reportID).Scan(&rb, &cb)
+	err := s.db.QueryRow(`SELECT machine_id, report_blob, collection_blob FROM reports WHERE id=?`, reportID).Scan(&machineID, &rb, &cb)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, fmt.Errorf("store: no report %d", reportID)
 	}
@@ -338,11 +410,11 @@ func (s *Store) Report(reportID int64) (*model.Report, *model.Collection, error)
 		return nil, nil, err
 	}
 	var r model.Report
-	if err := s.openJSON(rb, reportAAD(reportID), &r); err != nil {
+	if err := s.openJSON(rb, rowAAD("report", machineID, reportID), &r); err != nil {
 		return nil, nil, err
 	}
 	var c model.Collection
-	if err := s.openJSON(cb, collectionAAD(reportID), &c); err != nil {
+	if err := s.openJSON(cb, rowAAD("collection", machineID, reportID), &c); err != nil {
 		return nil, nil, err
 	}
 	return &r, &c, nil
@@ -350,29 +422,45 @@ func (s *Store) Report(reportID int64) (*model.Report, *model.Collection, error)
 
 // AddException records a lasting exception for the machine.
 func (s *Store) AddException(machineID int64, e model.Exception) error {
-	blob, err := s.sealJSON(e, exceptionAAD(machineID))
+	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO exceptions(machine_id, blob) VALUES(?,?)`, machineID, blob)
-	return err
+	defer tx.Rollback()
+	res, err := tx.Exec(`INSERT INTO exceptions(machine_id, blob) VALUES(?,x'')`, machineID)
+	if err != nil {
+		return err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return err
+	}
+	blob, err := s.sealJSON(e, rowAAD("exception", machineID, id))
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE exceptions SET blob=? WHERE id=?`, blob, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Exceptions lists the machine's exceptions in the order they were added.
 func (s *Store) Exceptions(machineID int64) ([]model.Exception, error) {
-	rows, err := s.db.Query(`SELECT blob FROM exceptions WHERE machine_id=? ORDER BY id`, machineID)
+	rows, err := s.db.Query(`SELECT id, blob FROM exceptions WHERE machine_id=? ORDER BY id`, machineID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []model.Exception
 	for rows.Next() {
+		var id int64
 		var blob []byte
-		if err := rows.Scan(&blob); err != nil {
+		if err := rows.Scan(&id, &blob); err != nil {
 			return nil, err
 		}
 		var e model.Exception
-		if err := s.openJSON(blob, exceptionAAD(machineID), &e); err != nil {
+		if err := s.openJSON(blob, rowAAD("exception", machineID, id), &e); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -382,6 +470,10 @@ func (s *Store) Exceptions(machineID int64) ([]model.Exception, error) {
 
 // Audit appends an entry to the audit log. There is no way to change or remove
 // one through this API, and the schema's triggers refuse it in SQL too.
+//
+// The audit columns are NOT encrypted. Callers must never put machine content
+// (file text, findings, evidence) in actor, action or detail; names, IDs and
+// verbs only.
 func (s *Store) Audit(actor, action, detail string) error {
 	_, err := s.db.Exec(`INSERT INTO audit(time, actor, action, detail) VALUES(?,?,?,?)`, ts(time.Now()), actor, action, detail)
 	return err

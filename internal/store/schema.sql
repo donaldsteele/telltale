@@ -29,13 +29,11 @@ CREATE TABLE IF NOT EXISTS snapshots (
 CREATE TABLE IF NOT EXISTS reports (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     machine_id      INTEGER NOT NULL REFERENCES machines(id),
-    time            INTEGER NOT NULL,
-    exit_code       INTEGER NOT NULL,
-    findings        INTEGER NOT NULL,
+    meta_blob       BLOB NOT NULL,
     report_blob     BLOB NOT NULL,
     collection_blob BLOB NOT NULL
 );
-CREATE INDEX IF NOT EXISTS reports_by_machine ON reports(machine_id, time DESC, id DESC);
+CREATE INDEX IF NOT EXISTS reports_by_machine ON reports(machine_id, id DESC);
 
 CREATE TABLE IF NOT EXISTS exceptions (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"filippo.io/age"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -167,6 +168,14 @@ func readIdentity(path string) (*age.X25519Identity, error) {
 		return nil, fmt.Errorf("store: key file: %w", err)
 	}
 	defer f.Close()
+	// Like ssh with private keys: refuse a key file others can read.
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("store: key file %s is accessible by group or others (mode %04o); chmod 600 it", path, fi.Mode().Perm())
+	}
 	ids, err := age.ParseIdentities(f)
 	if err != nil {
 		return nil, fmt.Errorf("store: key file %s: %w", path, err)
@@ -194,12 +203,23 @@ func loadOrCreateIdentity(path string) (*age.X25519Identity, error) {
 		return nil, fmt.Errorf("store: create key file: %w", err)
 	}
 	_, werr := fmt.Fprintf(f, "# telltale server key\n# public key: %s\n%s\n", id.Recipient(), id)
+	if werr == nil {
+		werr = f.Sync()
+	}
 	if cerr := f.Close(); werr == nil {
 		werr = cerr
 	}
 	if werr != nil {
 		os.Remove(path)
 		return nil, werr
+	}
+	// Make the new name durable before the wrapped key is committed.
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		err = d.Sync()
+		d.Close()
+		if err != nil {
+			return nil, err
+		}
 	}
 	return id, nil
 }

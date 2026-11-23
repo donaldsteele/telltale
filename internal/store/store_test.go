@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,7 +75,9 @@ func TestOpenCreatesAndUnlocks(t *testing.T) {
 func TestWrongPassphraseFails(t *testing.T) {
 	p := tmpDB(t)
 	s := openPass(t, p, "right")
-	s.SetSecretSetting("x", []byte("y"))
+	if err := s.SetSecretSetting("x", []byte("y")); err != nil {
+		t.Fatal(err)
+	}
 	wrapped, _ := s.Setting("wrapped_key")
 	s.Close()
 	_, err := Open(p, Unlock{Passphrase: "wrong"})
@@ -92,9 +95,14 @@ func TestWrongPassphraseFails(t *testing.T) {
 
 func TestKeyFileUnlock(t *testing.T) {
 	dir := t.TempDir()
-	id, _ := age.GenerateX25519Identity()
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
 	kf := filepath.Join(dir, "key.txt")
-	os.WriteFile(kf, []byte("# comment\n"+id.String()+"\n"), 0o600)
+	if err := os.WriteFile(kf, []byte("# comment\n"+id.String()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	p := filepath.Join(dir, "s.db")
 	s, err := Open(p, Unlock{KeyFile: kf})
 	if err != nil {
@@ -110,9 +118,14 @@ func TestKeyFileUnlock(t *testing.T) {
 		t.Fatal("not reopened")
 	}
 	s2.Close()
-	other, _ := age.GenerateX25519Identity()
+	other, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
 	kf2 := filepath.Join(dir, "other.txt")
-	os.WriteFile(kf2, []byte(other.String()+"\n"), 0o600)
+	if err := os.WriteFile(kf2, []byte(other.String()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := Open(p, Unlock{KeyFile: kf2}); err == nil {
 		t.Fatal("other key file opened the store")
 	}
@@ -151,16 +164,23 @@ func TestSnapshotRoundTripEncryptedAtRest(t *testing.T) {
 	if err != nil || got == nil || got.Collection.Host.Hostname != testHost {
 		t.Fatalf("round trip: %+v %v", got, err)
 	}
-	s.Close()
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		b, err := os.ReadFile(p + suffix)
+	check := func(when string) {
+		t.Helper()
+		b, err := os.ReadFile(p)
 		if err != nil {
-			continue
+			t.Fatal(err)
 		}
 		if bytes.Contains(b, []byte(testHost)) {
-			t.Fatalf("hostname in clear in %s", p+suffix)
+			t.Fatalf("hostname in clear in db %s", when)
+		}
+		// The WAL may or may not exist (a checkpoint can remove it).
+		if w, err := os.ReadFile(p + "-wal"); err == nil && bytes.Contains(w, []byte(testHost)) {
+			t.Fatalf("hostname in clear in wal %s", when)
 		}
 	}
+	check("before close")
+	s.Close()
+	check("after close")
 }
 
 func TestBlobBoundToRow(t *testing.T) {
@@ -177,6 +197,25 @@ func TestBlobBoundToRow(t *testing.T) {
 	if got, err := s.Snapshot(a); err != nil || got == nil {
 		t.Fatalf("original broken: %v", err)
 	}
+	// An exception blob copied over another row of the same machine fails.
+	s.AddException(a, model.Exception{FindingKey: "k1"})
+	s.AddException(a, model.Exception{FindingKey: "k2"})
+	if _, err := s.db.Exec(`UPDATE exceptions SET blob = (SELECT blob FROM exceptions ORDER BY id LIMIT 1) WHERE id = (SELECT max(id) FROM exceptions)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Exceptions(a); err == nil {
+		t.Fatal("exception blob copied into another row decrypted")
+	}
+	// A report row moved to another machine fails to open.
+	mid, _ := s.PutReport(a, &model.Report{}, &model.Collection{})
+	s.db.Exec(`UPDATE reports SET machine_id = ? WHERE id = ?`, b, mid)
+	if _, _, err := s.Report(mid); err == nil {
+		t.Fatal("report moved to another machine opened")
+	}
+	if _, err := s.Reports(b, 10); err == nil {
+		t.Fatal("report meta moved to another machine opened")
+	}
+	s.db.Exec(`UPDATE reports SET machine_id = ? WHERE id = ?`, a, mid)
 	// Purpose binding: a report blob cannot be read as a collection.
 	rid, _ := s.PutReport(a, &model.Report{}, &model.Collection{})
 	s.db.Exec(`UPDATE reports SET collection_blob = report_blob WHERE id = ?`, rid)
@@ -249,7 +288,9 @@ func TestSecretSettings(t *testing.T) {
 	if err := s.SetSecretSetting("ssh", []byte("TOPSECRET-KEY-MATERIAL")); err != nil {
 		t.Fatal(err)
 	}
-	s.SetSecretSetting("ssh", []byte("TOPSECRET-KEY-MATERIAL"))
+	if err := s.SetSecretSetting("ssh", []byte("TOPSECRET-KEY-MATERIAL")); err != nil {
+		t.Fatal(err)
+	}
 	if v, err := s.SecretSetting("ssh"); err != nil || string(v) != "TOPSECRET-KEY-MATERIAL" {
 		t.Fatalf("%q %v", v, err)
 	}
@@ -311,5 +352,126 @@ func TestFileModes(t *testing.T) {
 	fi, _ := os.Stat(p)
 	if fi.Mode().Perm() != 0o600 {
 		t.Fatalf("mode %v", fi.Mode().Perm())
+	}
+}
+
+func TestRelativePath(t *testing.T) {
+	dir := t.TempDir()
+	old, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(old)
+	s, err := Open("rel.db", Unlock{Passphrase: "pw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if _, err := os.Stat(filepath.Join(dir, "rel.db")); err != nil {
+		t.Fatal(err)
+	}
+	openPass(t, "rel.db", "pw")
+}
+
+func TestFailedOpenLeavesNoFile(t *testing.T) {
+	p := tmpDB(t)
+	if _, err := Open(p, Unlock{KeyFile: filepath.Join(t.TempDir(), "no", "such", "key")}); err == nil {
+		t.Fatal("expected error")
+	}
+	if _, err := os.Stat(p); err == nil {
+		t.Fatal("empty db left behind")
+	}
+}
+
+func TestMissingKeyWithDataRefused(t *testing.T) {
+	p := tmpDB(t)
+	s := openPass(t, p, "pw")
+	addM(t, s, "a")
+	if _, err := s.db.Exec(`DELETE FROM settings WHERE key='wrapped_key'`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if _, err := Open(p, Unlock{Passphrase: "other"}); !errors.Is(err, ErrNoKeyButData) {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := Open(p, Unlock{Passphrase: "pw"}); !errors.Is(err, ErrNoKeyButData) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestSchemaVersionChecks(t *testing.T) {
+	p := tmpDB(t)
+	s := openPass(t, p, "pw")
+	if _, err := s.db.Exec(`DELETE FROM settings WHERE key='schema_version'`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s = openPass(t, p, "pw") // backfilled
+	if v, _ := s.Setting("schema_version"); v != "1" {
+		t.Fatalf("backfill = %q", v)
+	}
+	if _, err := s.db.Exec(`UPDATE settings SET value='99' WHERE key='schema_version'`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if _, err := Open(p, Unlock{Passphrase: "pw"}); err == nil || !strings.Contains(err.Error(), "newer") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestKeyFileCreateAndModes(t *testing.T) {
+	dir := t.TempDir()
+	kf := filepath.Join(dir, "new.key")
+	p := filepath.Join(dir, "s.db")
+	s, err := Open(p, Unlock{KeyFile: kf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetSetting("a", "b")
+	s.Close()
+	fi, err := os.Stat(kf)
+	if err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("key file: %v %v", fi, err)
+	}
+	openKF := func() error {
+		s, err := Open(p, Unlock{KeyFile: kf})
+		if err == nil {
+			s.Close()
+		}
+		return err
+	}
+	if err := openKF(); err != nil {
+		t.Fatal(err)
+	}
+	os.Chmod(kf, 0o644)
+	if err := openKF(); err == nil || !strings.Contains(err.Error(), "accessible by group or others") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestZeroTimeStoredAsZero(t *testing.T) {
+	s := openPass(t, tmpDB(t), "pw")
+	id, err := s.AddMachine(Machine{Name: "z", Addr: "z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lv *int64
+	if err := s.db.QueryRow(`SELECT last_visit FROM machines WHERE id=?`, id).Scan(&lv); err != nil || lv != nil {
+		t.Fatalf("last_visit = %v %v", lv, err)
+	}
+	rid, _ := s.PutReport(id, &model.Report{}, &model.Collection{})
+	l, err := s.Reports(id, 1)
+	if err != nil || len(l) != 1 || l[0].ID != rid || !l[0].Time.IsZero() {
+		t.Fatalf("%+v %v", l, err)
+	}
+}
+
+func TestReportMetaSealed(t *testing.T) {
+	s := openPass(t, tmpDB(t), "pw")
+	id := addM(t, s, "a")
+	s.PutReport(id, &model.Report{ExitCode: 7, Time: time.Now()}, &model.Collection{})
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM pragma_table_info('reports') WHERE name IN ('time','exit_code','findings')`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("plaintext metadata columns: %d %v", n, err)
 	}
 }
