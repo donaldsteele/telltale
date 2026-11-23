@@ -1,0 +1,115 @@
+[
+  {
+    "name": "Google Chrome",
+    "url_patterns": ["https://dl.google.com/linux/chrome/deb"],
+    "fingerprints": ["EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796"],
+    "key_file": "google-chrome.asc",
+    "key_source_url": "https://dl.google.com/linux/linux_signing_key.pub",
+    "fingerprint_source_url": "https://www.google.com/linuxrepositories/",
+    "retrieved": "2026-11-22"
+  },
+  {
+    "name": "Microsoft",
+    "url_patterns": ["https://packages.microsoft.com"],
+    "fingerprints": ["BC528686B50D79E339D3721CEB3E94ADBE1229CF"],
+    "key_file": "microsoft.asc",
+    "key_source_url": "https://packages.microsoft.com/keys/microsoft.asc",
+    "fingerprint_source_url": "https://learn.microsoft.com/en-us/linux/packages",
+    "retrieved": "2026-11-22"
+  },
+  {
+    "name": "Microsoft (2025 key)",
+    "url_patterns": ["https://packages.microsoft.com"],
+    "fingerprints": ["AA86F75E427A19DD33346403EE4D7792F748182B"],
+    "key_file": "microsoft-2025.asc",
+    "key_source_url": "https://packages.microsoft.com/keys/microsoft-2025.asc",
+    "fingerprint_source_url": "https://learn.microsoft.com/en-us/linux/packages",
+    "retrieved": "2026-11-22"
+  },
+  {
+    "name": "Docker",
+    "url_patterns": ["https://download.docker.com/linux/debian", "https://download.docker.com/linux/ubuntu"],
+    "fingerprints": ["9DC858229FC7DD38854AE2D88D81803C0EBFCD88"],
+    "key_file": "docker.asc",
+    "key_source_url": "https://download.docker.com/linux/debian/gpg",
+    "fingerprint_source_url": "https://raw.githubusercontent.com/docker/docs/v18.03/install/linux/docker-ce/ubuntu.md",
+    "retrieved": "2026-11-22"
+  },
+  {
+    "name": "HashiCorp",
+    "url_patterns": ["https://apt.releases.hashicorp.com"],
+    "fingerprints": ["D55C0D1AC78A8D8126CB631CFC9CA96ACA026560"],
+    "key_file": "hashicorp.asc",
+    "key_source_url": "https://apt.releases.hashicorp.com/gpg",
+    "fingerprint_source_url": "https://www.hashicorp.com/en/trust/security",
+    "retrieved": "2026-11-22"
+  },
+  {
+    "name": "GitHub CLI",
+    "url_patterns": ["https://cli.github.com/packages"],
+    "fingerprints": ["7F38BBB59D064DBCB3D84D725612B36462313325"],
+    "retired_fingerprints": ["2C6106201985B60E6C7AC87323F3D4EA75716059"],
+    "key_file": "github-cli.gpg",
+    "key_source_url": "https://cli.github.com/packages/githubcli-archive-keyring.gpg",
+    "fingerprint_source_url": "https://raw.githubusercontent.com/cli/cli/trunk/docs/install_linux.md",
+    "retrieved": "2026-11-22"
+  },
+  {
+    "name": "PostgreSQL PGDG",
+    "url_patterns": ["https://apt.postgresql.org/pub/repos/apt"],
+    "fingerprints": ["B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8"],
+    "key_file": "postgresql-pgdg.asc",
+    "key_source_url": "https://www.postgresql.org/media/keys/ACCC4CF8.asc",
+    "fingerprint_source_url": "https://deb.debian.org/debian/pool/main/p/postgresql-common/postgresql-common_248+deb12u1_all.deb",
+    "retrieved": "2026-11-22"
+  },
+  {
+    "name": "Grafana",
+    "url_patterns": ["https://apt.grafana.com"],
+    "fingerprints": ["B53AE77BADB630A683046005963FA27710458545"],
+    "key_file": "grafana.asc",
+    "key_source_url": "https://apt.grafana.com/gpg.key",
+    "fingerprint_source_url": "https://grafana.com/blog/2023/08/24/grafana-security-update-gpg-signing-key-rotation/",
+    "retrieved": "2026-11-22"
+  },
+  {
+    "name": "Elastic",
+    "url_patterns": ["https://artifacts.elastic.co/packages"],
+    "fingerprints": ["46095ACC8548582C1A2699A9D27D666CD88E42B4"],
+    "key_file": "elastic.asc",
+    "key_source_url": "https://artifacts.elastic.co/GPG-KEY-elasticsearch",
+    "fingerprint_source_url": "https://www.elastic.co/guide/en/elasticsearch/reference/current/deb.html",
+    "retrieved": "2026-11-22"
+  },
+  {
+    "name": "Mozilla",
+    "url_patterns": ["https://packages.mozilla.org/apt"],
+    "fingerprints": ["35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3"],
+    "key_file": "mozilla.asc",
+    "key_source_url": "https://packages.mozilla.org/apt/repo-signing-key.gpg",
+    "fingerprint_source_url": "https://blog.nightly.mozilla.org/2023/10/30/introducing-mozillas-firefox-nightly-deb-packages-for-debian-based-linux-distributions/",
+    "retrieved": "2026-11-22"
+  },
+  {
+    "name": "Brave",
+    "url_patterns": ["https://brave-browser-apt-release.s3.brave.com"],
+    "fingerprints": [
+      "DBF1A116C220B8C7164F98230686B78420038257",
+      "47D32A74E9A9E013A4B4926C68D513D36A73CD96",
+      "B2A3DCA350E67256740DF904DE4EC67BE4B0DCA0"
+    ],
+    "key_file": "brave.gpg",
+    "key_source_url": "https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg",
+    "fingerprint_source_url": "https://brave.com/signing-keys/",
+    "retrieved": "2026-11-22"
+  },
+  {
+    "name": "1Password",
+    "url_patterns": ["https://downloads.1password.com/linux/debian"],
+    "fingerprints": ["3FEF9748469ADBE15DA7CA80AC2D62742012EA22"],
+    "key_file": "1password.asc",
+    "key_source_url": "https://downloads.1password.com/linux/keys/1password.asc",
+    "fingerprint_source_url": "https://support.1password.com/install-linux/",
+    "retrieved": "2026-11-22"
+  }
+]
