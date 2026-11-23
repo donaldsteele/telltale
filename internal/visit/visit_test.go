@@ -467,15 +467,33 @@ func noRawControl(t *testing.T, s string) {
 }
 
 func TestEnrolSnippetsExactText(t *testing.T) {
-	const line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExampleExample telltale-server"
-	for _, addr := range []string{"192.0.2.7", "2001:db8::5"} {
-		ak, match := EnrolSnippets(addr, line)
+	line := edKeyLine(t)
+	// The address comes out in canonical form.
+	for in, addr := range map[string]string{"192.0.2.7": "192.0.2.7", "2001:DB8:0::5": "2001:db8::5"} {
+		ak, match, err := EnrolSnippets(in, line)
+		if err != nil {
+			t.Fatalf("EnrolSnippets(%q): %v", in, err)
+		}
 		if want := `from="` + addr + `" ` + line; ak != want {
 			t.Errorf("authorized_keys line:\n got %q\nwant %q", ak, want)
 		}
 		if want := "Match Address " + addr + "\n    PermitRootLogin prohibit-password\n"; match != want {
 			t.Errorf("sshd block:\n got %q\nwant %q", match, want)
 		}
+	}
+	// ServerKey's own line is accepted as it is.
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "server.db"), store.Unlock{KeyFile: filepath.Join(dir, "server.key")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	_, keyLine, err := ServerKey(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := EnrolSnippets("192.0.2.7", keyLine); err != nil {
+		t.Errorf("ServerKey's line %q refused: %v", keyLine, err)
 	}
 }
 
@@ -899,5 +917,330 @@ func TestBinariesFor(t *testing.T) {
 	other := map[string]string{"x86_64": "aarch64", "aarch64": "x86_64"}[own]
 	if p, err := (Binaries{}).For(other); err == nil {
 		t.Errorf("Binaries{}.For(%s) = %q, want an error: nothing for that architecture sits next to the executable", other, p)
+	}
+}
+
+// set gives a package variable a value for the length of a test.
+func set[T any](t *testing.T, p *T, v T) {
+	old := *p
+	*p = v
+	t.Cleanup(func() { *p = old })
+}
+
+// hangServer is a machine holding the fake machine's host keys that runs
+// sessions as the fake machine does, then stops answering: it never
+// answers a channel open (mode "open"), never answers the exec request
+// ("exec"), or accepts the command and never ends it ("silent"). The first
+// connection gets good working sessions, every later one gets later.
+func hangServer(t *testing.T, f *fakeMachine, good, later int, mode string) string {
+	t.Helper()
+	cfg := &ssh.ServerConfig{
+		PublicKeyCallback: func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) { return nil, nil },
+	}
+	for _, k := range f.hostKeys {
+		cfg.AddHostKey(k)
+	}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		l.Close()
+		mu.Lock()
+		for _, c := range conns {
+			c.Close()
+		}
+		mu.Unlock()
+	})
+	go func() {
+		for first := true; ; first = false {
+			nc, err := l.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, nc)
+			mu.Unlock()
+			allowed := later
+			if first {
+				allowed = good
+			}
+			go func() {
+				_, chans, reqs, err := ssh.NewServerConn(nc, cfg)
+				if err != nil {
+					return
+				}
+				go ssh.DiscardRequests(reqs)
+				n := 0
+				for nch := range chans {
+					n++
+					if n <= allowed {
+						ch, creqs, err := nch.Accept()
+						if err == nil {
+							go f.session(ch, creqs, func() { nc.Close() })
+						}
+						continue
+					}
+					if mode == "open" {
+						continue // neither accepted nor rejected
+					}
+					ch, creqs, err := nch.Accept()
+					if err != nil {
+						continue
+					}
+					go func() {
+						for req := range creqs {
+							if mode == "silent" && req.WantReply {
+								req.Reply(true, nil)
+							}
+						}
+					}()
+					go io.Copy(io.Discard, ch)
+				}
+			}()
+		}
+	}()
+	return l.Addr().String()
+}
+
+func TestVisitStopsWhenTheMachineStopsAnswering(t *testing.T) {
+	set(t, &cleanupTimeout, time.Second)
+	set(t, &dialTimeout, 2*time.Second)
+	set(t, &stopGrace, 100*time.Millisecond)
+	cases := []struct {
+		name        string
+		good, later int
+		mode        string
+		stepCap     bool // the hang meets a step's own cap, not the visit's end
+		left        bool // the machine never answers again: the directory stays
+	}{
+		{name: "channel open, first command", mode: "open"},
+		{name: "channel open, after mktemp", good: 2, later: 1, mode: "open"},
+		{name: "exec, first command", mode: "exec"},
+		{name: "exec, after mktemp", good: 2, later: 1, mode: "exec"},
+		{name: "command never ends, upload", good: 2, later: 1, mode: "silent"},
+		{name: "step cap, not the visit's end", mode: "open", stepCap: true},
+		{name: "never answers again", good: 2, mode: "open", left: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFake(t)
+			m := f.machine()
+			m.Addr = hangServer(t, f, tc.good, tc.later, tc.mode)
+			timeout := 2 * time.Second
+			if tc.stepCap {
+				set(t, &commandTimeout, time.Second)
+				timeout = 30 * time.Second
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			done := make(chan error, 1)
+			start := time.Now()
+			go func() {
+				c, err := Visit(ctx, m, f.client, testContext(), f.binaries(t))
+				if c != nil {
+					err = fmt.Errorf("a collection came back: %v", err)
+				}
+				done <- err
+			}()
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(15 * time.Second):
+				t.Fatalf("Visit still running after 15s; commands %q, left %q", f.commands(), f.leftovers(t))
+			}
+			// The longest path: the step's limit, the grace before the
+			// connection is closed, then a clean-up that logs in again.
+			if took := time.Since(start); took > 5*time.Second {
+				t.Errorf("Visit took %v", took)
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("err = %v, want a deadline", err)
+			}
+			noRawControl(t, err.Error())
+			left := f.leftovers(t)
+			var lom *LeftOnMachineError
+			if !tc.left {
+				if len(left) > 0 || errors.As(err, &lom) {
+					t.Errorf("left on the machine: %q (err %v)", left, err)
+				}
+				return
+			}
+			if !errors.As(err, &lom) || !reflect.DeepEqual(lom.Dirs, left) || len(left) != 1 {
+				t.Fatalf("the error does not name what was left %q: %v", left, err)
+			}
+			if lom.Collection != nil {
+				t.Error("a collection in the error of a visit that failed")
+			}
+			if !strings.Contains(err.Error(), left[0]) {
+				t.Errorf("the error text does not name %s: %v", left[0], err)
+			}
+		})
+	}
+}
+
+// Go's JSON errors carry map keys and some values as they came: a hostile
+// collection must not put terminal escapes into an error.
+func TestVisitEscapesDecodeErrors(t *testing.T) {
+	for _, tc := range []struct {
+		body    string
+		mustErr bool
+	}{
+		{`{"schema":1,"sysctl":{"k\u001b]0;owned\u0007":1}}`, true},
+		{`{"schema":1,"time":"\u001b]0;owned\u0007"}`, true},
+		{`{"schema":1,"host":{"hostname":1}}`, true},
+		{`{"schema":1,"files":[{"path":"\u001b[31m","mode":"\u001b[31m"}]}`, false},
+		{"{\"schema\":1,\"x\u001b]0;owned\u0007\":[}", true},
+	} {
+		t.Run(fmt.Sprintf("%.30q", tc.body), func(t *testing.T) {
+			f := newFake(t)
+			f.collect = func(c call) int {
+				zw := gzip.NewWriter(c.stdout)
+				fmt.Fprint(zw, tc.body)
+				zw.Close()
+				return 0
+			}
+			_, err := Visit(testCtx(t), f.machine(), f.client, testContext(), f.binaries(t))
+			if err == nil {
+				if tc.mustErr {
+					t.Fatal("the collection was accepted")
+				}
+				return
+			}
+			noRawControl(t, err.Error())
+			f.check(t)
+		})
+	}
+}
+
+// A machine in the middle that holds only an ECDSA key must not get away
+// with "no common algorithm" when ed25519 was pinned.
+func TestVisitRefusesAnotherKeyType(t *testing.T) {
+	f := newFake(t, newSigner(t, "ecdsa"))
+	m := f.machine()
+	m.HostKey = authorizedLine(newSigner(t, "ed25519").PublicKey())
+	_, err := Visit(testCtx(t), m, f.client, testContext(), f.binaries(t))
+	if !errors.Is(err, ErrHostKeyChanged) {
+		t.Fatalf("err = %v, want ErrHostKeyChanged", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.auths != 0 || len(f.cmds) != 0 {
+		t.Errorf("offered the server's key %d times and ran %q", f.auths, f.cmds)
+	}
+}
+
+func TestTempDirPattern(t *testing.T) {
+	for s, want := range map[string]bool{
+		"/run/telltale.ABCDEFGH":       true,
+		"/var/tmp/telltale.a1b2c3d4":   true,
+		"/run/telltale.ABCDEFGH\n":     false,
+		"/run/telltale.ABCDEFGH\n/etc": false,
+		"/etc\n/run/telltale.ABCDEFGH": false,
+		"/run/telltale.ABCDEFGH\r":     false,
+		"/run/telltale.ABCDEFGHI":      false,
+		"/usr/telltale.ABCDEFGH":       false,
+		"/run/telltale.ABCD/FGH":       false,
+	} {
+		if got := tempDirRE.MatchString(s); got != want {
+			t.Errorf("tempDirRE.MatchString(%q) = %v, want %v", s, got, want)
+		}
+	}
+}
+
+// When everything but the removal worked, the collection is not lost: it
+// comes back inside the *LeftOnMachineError, for the server to keep.
+func TestVisitKeepsTheCollectionWhenCleanupFails(t *testing.T) {
+	set(t, &cleanupTimeout, time.Second)
+	set(t, &dialTimeout, 2*time.Second)
+	set(t, &stopGrace, 100*time.Millisecond)
+	f := newFake(t)
+	m := f.machine()
+	// uname, mktemp, upload, version and collect work; nothing after.
+	m.Addr = hangServer(t, f, 5, 0, "open")
+	c, err := Visit(testCtx(t), m, f.client, testContext(), f.binaries(t))
+	if c != nil {
+		t.Error("Visit returned a collection beside a clean-up failure")
+	}
+	var lom *LeftOnMachineError
+	if !errors.As(err, &lom) {
+		t.Fatalf("err = %v, want a *LeftOnMachineError", err)
+	}
+	if !reflect.DeepEqual(lom.Collection, f.collection) {
+		t.Errorf("collection in the error = %+v, want %+v", lom.Collection, f.collection)
+	}
+	if left := f.leftovers(t); len(lom.Dirs) != 1 || !reflect.DeepEqual(left, []string{lom.Dirs[0], lom.Dirs[0] + "/telltale"}) {
+		t.Errorf("Dirs = %q, left on the machine %q", lom.Dirs, left)
+	}
+	noRawControl(t, err.Error())
+}
+
+// A panic while reading the output is an error, and the clean-up still runs.
+func TestVisitSurvivesAPanicWhileReading(t *testing.T) {
+	set(t, &decodeOutput, func(io.Reader, *model.Collection) error { panic("decoder broke \x1b[2J") })
+	f := newFake(t)
+	_, err := Visit(testCtx(t), f.machine(), f.client, testContext(), f.binaries(t))
+	if err == nil || !strings.Contains(err.Error(), `decoder broke \x1b[2J`) {
+		t.Fatalf("err = %v, want the panic as an error", err)
+	}
+	noRawControl(t, err.Error())
+	f.check(t)
+}
+
+func edKeyLine(t *testing.T) string {
+	t.Helper()
+	return authorizedLine(newSigner(t, "ed25519").PublicKey()) + " telltale-server"
+}
+
+func TestCheckServerAddr(t *testing.T) {
+	for in, want := range map[string]string{
+		"192.0.2.7":            "192.0.2.7",
+		"2001:DB8:0:0:0::5":    "2001:db8::5",
+		"::ffff:192.0.2.7":     "192.0.2.7",
+		"2001:db8:0:1:0:0:0:1": "2001:db8:0:1::1",
+	} {
+		a, err := CheckServerAddr(in)
+		if err != nil || a.String() != want {
+			t.Errorf("CheckServerAddr(%q) = %v, %v; want %s", in, a, err, want)
+		}
+	}
+	for _, in := range []string{
+		"", " 192.0.2.7", "192.0.2.7 ", `192.0.2.7" command="sh`, "192.0.2.7\nPermitRootLogin yes",
+		"*", "192.0.2.*", "10.0.0.0/8", "192.0.2.7/32", "web01.lan", "fe80::1%eth0", "0.0.0.0", "::",
+		"192.0.2.7,192.0.2.8", "!192.0.2.7", "192.000.002.007",
+	} {
+		if a, err := CheckServerAddr(in); err == nil {
+			t.Errorf("CheckServerAddr(%q) = %v, want an error", in, a)
+		}
+	}
+}
+
+func TestEnrolSnippetsRefusesUnsafeInput(t *testing.T) {
+	line := edKeyLine(t)
+	for _, addr := range []string{`192.0.2.7" command="sh`, "192.0.2.7\nPermitRootLogin yes", "*", "10.0.0.0/8", "web01.lan", "fe80::1%eth0"} {
+		if ak, match, err := EnrolSnippets(addr, line); err == nil {
+			t.Errorf("EnrolSnippets(%q) = %q, %q; want an error", addr, ak, match)
+		}
+	}
+	key := strings.Fields(line)[1]
+	rsa := "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQC7 telltale-server"
+	for _, kl := range []string{
+		"",
+		line + "\n",
+		line + "\nssh-ed25519 " + key + " other",
+		`command="sh" ` + line,
+		"ssh-ed25519 " + key, // no comment
+		"ssh-ed25519 " + key + " telltale server",      // a fourth field
+		"ssh-ed25519 " + key + " telltale\"server",     // a quote in the comment
+		"ssh-ed25519  " + key + " telltale-server",     // two spaces
+		"ssh-ed25519 " + key[:20] + " telltale-server", // not a key
+		"ssh-ed25519 !!!! telltale-server",
+		rsa,
+	} {
+		if ak, _, err := EnrolSnippets("192.0.2.7", kl); err == nil {
+			t.Errorf("EnrolSnippets with key line %q = %q, want an error", kl, ak)
+		}
 	}
 }

@@ -2,9 +2,12 @@ package visit
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
+	"regexp"
 	"strings"
 	"time"
 
@@ -17,18 +20,71 @@ import (
 // the end of sshd_config that allows root key login from that address only.
 // The machine's global PermitRootLogin stays as it is.
 //
-// serverAddr is the address the machine sees the server connect from, and
-// keyLine is ServerKey's line. Neither may hold a quote or a line break; the
-// caller checks the address it was configured with.
-func EnrolSnippets(serverAddr, keyLine string) (authorizedKeys, sshdMatch string) {
-	return `from="` + serverAddr + `" ` + keyLine,
-		"Match Address " + serverAddr + "\n    PermitRootLogin prohibit-password\n"
+// serverAddr is the address the machine sees the server connect from. It
+// must pass CheckServerAddr and is written in canonical form. keyLine is
+// ServerKey's line, "ssh-ed25519 <base64> <comment>". Anything else is
+// refused: a quote would add authorized_keys options, a line break sshd
+// directives, and a pattern, range or host name would let in more than the
+// server.
+func EnrolSnippets(serverAddr, keyLine string) (authorizedKeys, sshdMatch string, err error) {
+	a, err := CheckServerAddr(serverAddr)
+	if err != nil {
+		return "", "", fmt.Errorf("visit: %w", err)
+	}
+	if err := checkKeyLine(keyLine); err != nil {
+		return "", "", fmt.Errorf("visit: %w", err)
+	}
+	addr := a.String()
+	return `from="` + addr + `" ` + keyLine,
+		"Match Address " + addr + "\n    PermitRootLogin prohibit-password\n", nil
+}
+
+// CheckServerAddr parses the server's address as the machines see it: one
+// literal IPv4 or IPv6 address, without a zone. Host names, patterns,
+// ranges and the unspecified address are refused. The address is returned
+// in canonical form (an IPv4-mapped IPv6 address becomes IPv4, as sshd
+// sees it).
+func CheckServerAddr(s string) (netip.Addr, error) {
+	a, err := netip.ParseAddr(s)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("the server address %q is not an IP address (host names, patterns and ranges are not allowed)", s)
+	}
+	if a.Zone() != "" {
+		return netip.Addr{}, fmt.Errorf("the server address %q has a zone; give the address without it", s)
+	}
+	a = a.Unmap()
+	if a.IsUnspecified() {
+		return netip.Addr{}, fmt.Errorf("the server address %q is the unspecified address, not the server's", s)
+	}
+	return a, nil
+}
+
+// keyCommentRE is what the comment of the server's key line may hold.
+var keyCommentRE = regexp.MustCompile(`^[A-Za-z0-9._@+-]+$`)
+
+// checkKeyLine accepts one line "ssh-ed25519 <base64> <comment>" holding an
+// ed25519 public key, fields separated by single spaces.
+func checkKeyLine(line string) error {
+	f := strings.Split(line, " ")
+	if len(f) != 3 || f[0] != ssh.KeyAlgoED25519 || !keyCommentRE.MatchString(f[2]) {
+		return errors.New(`the server key line is not "ssh-ed25519 <base64> <comment>" on one line`)
+	}
+	raw, err := base64.StdEncoding.DecodeString(f[1])
+	if err == nil {
+		var k ssh.PublicKey
+		if k, err = ssh.ParsePublicKey(raw); err == nil && k.Type() != ssh.KeyAlgoED25519 {
+			err = errors.New("not an ed25519 key")
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("the server key line does not hold an ed25519 key: %w", err)
+	}
+	return nil
 }
 
 // fetchAlgorithms is the host key preference for FetchHostKey: ed25519
-// first, then ECDSA, then RSA with SHA-2. Visit then asks for the pinned
-// key's algorithm only, so a machine with several host keys always shows the
-// one that was pinned.
+// first, then ECDSA, then RSA with SHA-2. Visit puts the pinned key's
+// algorithm first and keeps the rest (see algorithmsFor).
 var fetchAlgorithms = []string{
 	ssh.KeyAlgoED25519,
 	ssh.KeyAlgoECDSA256, ssh.KeyAlgoECDSA384, ssh.KeyAlgoECDSA521,

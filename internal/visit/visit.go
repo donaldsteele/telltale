@@ -3,7 +3,9 @@
 // enrolment, copies a fresh collector binary into a temporary directory
 // that allows execution, runs "telltale collect --context-stdin --gzip"
 // with the scan context on stdin and reads the collection from stdout. The
-// directory is removed on every path, failures included.
+// directory is removed on every path, failures and a machine that stops
+// answering included; when even that fails, the error is a
+// *LeftOnMachineError naming what stayed behind.
 //
 // The temporary binary is the only thing a visit writes to a machine: no
 // snapshot and no cache is ever put there. Every remote command is built
@@ -60,14 +62,18 @@ var execDirs = []string{"/run", "/var/tmp", "/root", "/tmp"}
 // tempDirRE is the only form of mktemp output a visit uses in a command.
 var tempDirRE = regexp.MustCompile(`^/(run|var/tmp|root|tmp)/telltale\.[A-Za-z0-9]{8}$`)
 
-// Limits on each step. Every step also ends when the visit's context does.
-// Variables, so tests can shorten them.
+// Limits on each step. Every step also ends when the visit's context does;
+// the clean-up's steps do not (see remote.cleanup). Variables, so tests can
+// shorten them.
 var (
 	dialTimeout    = 30 * time.Second // connect, key exchange and login
 	commandTimeout = time.Minute      // uname, mktemp, version
 	uploadTimeout  = 10 * time.Minute // copying the collector
 	collectTimeout = time.Hour        // the collection itself
-	cleanupTimeout = time.Minute      // rm -rf of the directory
+	cleanupTimeout = 30 * time.Second // each rm -rf of the directories
+	// stopGrace is how long a step that is over may take to stop its
+	// command before the whole connection is closed under it.
+	stopGrace = 2 * time.Second
 )
 
 // maxOutput bounds the collector's stdout and the JSON it decompresses to.
@@ -83,11 +89,31 @@ const (
 var (
 	// errSession marks a connection that can no longer run commands.
 	errSession = errors.New("cannot run a command on the machine")
+	// errStopped marks a step that ran out of time. Its connection may
+	// have been closed under it.
+	errStopped = errors.New("stopped")
 	// errOdd marks machine output a visit will not go on with.
 	errOdd = errors.New("unexpected output")
 	// errTooMuch marks output over its limit.
 	errTooMuch = errors.New("too large")
 )
+
+// LeftOnMachineError means the collector's temporary directories could not
+// be removed from the machine: a telltale binary stays there, and the owner
+// should be told. When the collection itself was read, Collection holds it,
+// so the server can keep it. It is nil when the visit had failed anyway;
+// Visit's error then carries that failure as well.
+type LeftOnMachineError struct {
+	Dirs       []string
+	Collection *model.Collection
+	Err        error // why the removal failed
+}
+
+func (e *LeftOnMachineError) Error() string {
+	return fmt.Sprintf("could not remove %s from the machine: %v", strings.Join(e.Dirs, " "), e.Err)
+}
+
+func (e *LeftOnMachineError) Unwrap() error { return e.Err }
 
 // Visit logs into m as root with signer, runs a fresh collector there with
 // sc on its stdin and returns the collection. It accepts only m.HostKey (an
@@ -95,10 +121,16 @@ var (
 // key is ErrHostKeyChanged, an empty one ErrNoHostKey. bins supplies the
 // collector for the architecture uname -m reports.
 //
+// Every step has its own time limit and also ends with ctx. A machine that
+// stops answering cannot hold a step past that: after stopGrace the
+// connection is closed under it.
+//
 // The collector's temporary directory is removed before Visit returns,
-// after a failure or a cancelled ctx too (the removal gets its own short
-// time limit, and logs in again if the connection was lost). When even that
-// fails, the error names the directory.
+// after a failure or a cancelled ctx too: the removal has time limits of its
+// own, and logs in again when the connection was lost or the machine stopped
+// answering on it. When even that fails, the error wraps a
+// *LeftOnMachineError naming the directories (and holding the collection,
+// if it was read), and the returned collection is nil.
 func Visit(ctx context.Context, m store.Machine, signer ssh.Signer, sc model.ScanContext, bins Binaries) (c *model.Collection, err error) {
 	fail := func(err error) (*model.Collection, error) {
 		return nil, fmt.Errorf("visit %s: %w", m.Name, err)
@@ -136,9 +168,20 @@ func Visit(ctx context.Context, m store.Machine, signer ssh.Signer, sc model.Sca
 	r := &remote{client: client, relogin: func(ctx context.Context) (*ssh.Client, error) { return handshake(ctx, hostport, cfg) }}
 	defer func() { r.client.Close() }()
 	defer func() {
-		if cerr := r.cleanup(ctx); cerr != nil {
-			c, err = nil, errors.Join(err, fmt.Errorf("visit %s: %w", m.Name, cerr))
+		cerr := r.cleanup(ctx)
+		if cerr == nil {
+			return
 		}
+		var left *LeftOnMachineError
+		if err == nil && errors.As(cerr, &left) {
+			left.Collection = c
+		}
+		if err == nil {
+			err = fmt.Errorf("visit %s: %w", m.Name, cerr)
+		} else {
+			err = fmt.Errorf("%w; and %w", err, cerr) // one line: no newline from errors.Join
+		}
+		c = nil
 	}()
 	if c, err = r.visit(ctx, input, bins); err != nil {
 		return fail(err)
@@ -161,13 +204,22 @@ func pinnedKey(line string) (ssh.PublicKey, error) {
 	return k, nil
 }
 
-// algorithmsFor asks the machine for the pinned key's own algorithm, so a
-// machine with several host keys shows the pinned one and not another.
+// algorithmsFor lists the pinned key's own algorithm first: SSH takes the
+// client's preference, so a machine with several host keys shows the pinned
+// one. The other algorithms follow, so that a machine (or a man in the
+// middle) holding only another kind of key is ErrHostKeyChanged, not a bare
+// failure to agree on an algorithm.
 func algorithmsFor(k ssh.PublicKey) []string {
+	algs := []string{k.Type()}
 	if k.Type() == ssh.KeyAlgoRSA {
-		return []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256}
+		algs = []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256}
 	}
-	return []string{k.Type()}
+	for _, a := range fetchAlgorithms {
+		if !slices.Contains(algs, a) {
+			algs = append(algs, a)
+		}
+	}
+	return algs
 }
 
 // remote is one visit's connection and the directories it made.
@@ -201,7 +253,7 @@ func (r *remote) visit(ctx context.Context, input []byte, bins Binaries) (*model
 	}
 	var c model.Collection
 	err = r.run(ctx, "collect", quote(d+"/telltale")+" collect --context-stdin --gzip", collectTimeout,
-		bytes.NewReader(input), maxOutput, func(rd io.Reader) error { return decodeCollection(rd, &c) })
+		bytes.NewReader(input), maxOutput, func(rd io.Reader) error { return decodeOutput(rd, &c) })
 	if err != nil {
 		return nil, err
 	}
@@ -221,7 +273,7 @@ func (r *remote) execDir(ctx context.Context, bin *io.SectionReader) (string, er
 				}
 			}
 		}
-		if ctx.Err() != nil || errors.Is(err, errSession) || errors.Is(err, errOdd) {
+		if ctx.Err() != nil || errors.Is(err, errSession) || errors.Is(err, errStopped) || errors.Is(err, errOdd) {
 			return "", err
 		}
 		why = append(why, base+": "+err.Error())
@@ -238,14 +290,15 @@ func (r *remote) mktemp(ctx context.Context, base string) (string, error) {
 	var out []byte
 	err := r.run(ctx, "mktemp", "mktemp -d "+base+"/telltale.XXXXXXXX", commandTimeout, nil, maxShortOutput, keep(&out))
 	if errors.Is(err, errTooMuch) {
-		return "", fmt.Errorf("%w: %w", errOdd, err)
+		return "", fmt.Errorf("%w: %w; a directory mktemp may have made in %s is left on the machine", errOdd, err, base)
 	}
 	if err != nil {
 		return "", err
 	}
 	d := strings.TrimSuffix(string(out), "\n")
 	if !tempDirRE.MatchString(d) || !strings.HasPrefix(d, base+"/telltale.") {
-		return "", fmt.Errorf("%w: mktemp in %s printed \"%s\", not a new directory there; nothing was run with it", errOdd, base, escape.Terminal(d))
+		return "", fmt.Errorf("%w: mktemp in %s printed \"%s\", not a new directory there; nothing was run with it, and a directory mktemp may have made in %s is left on the machine",
+			errOdd, base, escape.Terminal(d), base)
 	}
 	r.made = append(r.made, d)
 	return d, nil
@@ -270,14 +323,13 @@ func (r *remote) check(ctx context.Context, d string) error {
 	return nil
 }
 
-// remove deletes temporary directories. It is not stopped by the end of
-// ctx: a visit that was cancelled still cleans up.
+// remove deletes temporary directories.
 func (r *remote) remove(ctx context.Context, dirs ...string) error {
 	quoted := make([]string, len(dirs))
 	for i, d := range dirs {
 		quoted[i] = quote(d)
 	}
-	err := r.run(context.WithoutCancel(ctx), "remove "+strings.Join(dirs, " "), "rm -rf "+strings.Join(quoted, " "),
+	err := r.run(ctx, "remove "+strings.Join(dirs, " "), "rm -rf "+strings.Join(quoted, " "),
 		cleanupTimeout, nil, maxShortOutput, nil)
 	if err == nil {
 		r.made = slices.DeleteFunc(r.made, func(d string) bool { return slices.Contains(dirs, d) })
@@ -285,26 +337,29 @@ func (r *remote) remove(ctx context.Context, dirs ...string) error {
 	return err
 }
 
-// cleanup removes every directory the visit made and has not removed yet,
-// logging in again when the connection was lost.
+// cleanup removes every directory the visit made and has not removed yet.
+// The end of ctx does not stop it (a cancelled visit still cleans up), but
+// each of its steps has a limit of its own. When the connection is gone or
+// the machine stopped answering on it, it logs in again once and retries.
+// A failure is a *LeftOnMachineError.
 func (r *remote) cleanup(ctx context.Context) error {
 	if len(r.made) == 0 {
 		return nil
 	}
+	ctx = context.WithoutCancel(ctx)
 	dirs := slices.Clone(r.made)
 	err := r.remove(ctx, dirs...)
-	if errors.Is(err, errSession) {
-		c, lerr := r.relogin(context.WithoutCancel(ctx))
-		if lerr == nil {
+	if errors.Is(err, errSession) || errors.Is(err, errStopped) {
+		if c, lerr := r.relogin(ctx); lerr == nil {
 			r.client.Close()
 			r.client = c
 			err = r.remove(ctx, dirs...)
 		} else {
-			err = errors.Join(err, fmt.Errorf("log in again: %w", lerr))
+			err = fmt.Errorf("%w; log in again: %w", err, lerr)
 		}
 	}
 	if err != nil {
-		return fmt.Errorf("could not remove %s from the machine: %w", strings.Join(dirs, " "), err)
+		return &LeftOnMachineError{Dirs: dirs, Err: err}
 	}
 	return nil
 }
@@ -317,26 +372,65 @@ func (r *remote) run(ctx context.Context, what, line string, limit time.Duration
 	ctx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 	start := time.Now()
-	s, err := r.client.NewSession()
+	errs := &tail{max: maxStderr}
+	stopped := func() error {
+		return fmt.Errorf("%s: %w after %v: %w%s", what, errStopped, time.Since(start).Round(time.Millisecond), ctx.Err(), errs.suffix())
+	}
+	// Opening a session, starting a command and even stopping one wait on
+	// the machine, and one that stops answering would hold the step
+	// forever. So once the step is over it has stopGrace to finish, then
+	// the whole connection is closed under it.
+	finished := make(chan struct{})
+	defer close(finished)
+	client := r.client
+	defer context.AfterFunc(ctx, func() {
+		t := time.NewTimer(stopGrace)
+		defer t.Stop()
+		select {
+		case <-finished:
+		case <-t.C:
+			client.Close()
+		}
+	})()
+	s, err := client.NewSession()
 	if err != nil {
+		if ctx.Err() != nil {
+			return stopped()
+		}
 		return fmt.Errorf("%s: %w: %w", what, errSession, escaped{err})
 	}
 	defer s.Close()
 	if stdin != nil {
 		s.Stdin = stdin
 	}
-	errs := &tail{max: maxStderr}
 	s.Stderr = errs
 	stdout, err := s.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("%s: %w", what, err)
 	}
 	if err := s.Start(line); err != nil {
+		if ctx.Err() != nil {
+			return stopped()
+		}
 		return fmt.Errorf("%s: %w: %w", what, errSession, escaped{err})
 	}
 	type result struct{ read, wait error }
 	done := make(chan result, 1)
+	kill := func(rerr error) {
+		s.Signal(ssh.SIGKILL)
+		s.Close()
+		select {
+		case done <- result{read: rerr}:
+		default:
+		}
+	}
 	go func() {
+		// A panic here would end the whole server, clean-up and all.
+		defer func() {
+			if p := recover(); p != nil {
+				kill(fmt.Errorf("reading the output failed: %s", escape.Terminal(fmt.Sprint(p))))
+			}
+		}()
 		out := &capReader{r: stdout, max: max, what: "the output"}
 		var rerr error
 		if read != nil {
@@ -350,9 +444,7 @@ func (r *remote) run(ctx context.Context, what, line string, limit time.Duration
 			}
 		}
 		if errors.Is(rerr, errTooMuch) {
-			s.Signal(ssh.SIGKILL)
-			s.Close()
-			done <- result{read: rerr}
+			kill(rerr)
 			return
 		}
 		done <- result{read: rerr, wait: s.Wait()}
@@ -363,7 +455,7 @@ func (r *remote) run(ctx context.Context, what, line string, limit time.Duration
 	case <-ctx.Done():
 		s.Signal(ssh.SIGKILL)
 		s.Close()
-		return fmt.Errorf("%s: stopped after %v: %w%s", what, time.Since(start).Round(time.Millisecond), ctx.Err(), errs.suffix())
+		return stopped()
 	}
 }
 
@@ -388,21 +480,26 @@ func outcome(what string, rerr, werr error, errs *tail) error {
 	return nil
 }
 
-// decodeCollection reads one gzip-compressed collection and nothing after it.
+// decodeOutput is decodeCollection; tests replace it.
+var decodeOutput = decodeCollection
+
+// decodeCollection reads one gzip-compressed collection and nothing after
+// it. Decoding errors can quote the machine's text (JSON errors name map
+// keys and bad values as they came), so they are escaped.
 func decodeCollection(r io.Reader, c *model.Collection) error {
 	zr, err := gzip.NewReader(r)
 	if err != nil {
-		return fmt.Errorf("the output is not gzip: %w", err)
+		return fmt.Errorf("the output is not gzip: %w", escaped{err})
 	}
 	dec := json.NewDecoder(&capReader{r: zr, max: maxOutput, what: "the decompressed collection"})
 	if err := dec.Decode(c); err != nil {
-		return fmt.Errorf("the output is not a collection: %w", err)
+		return fmt.Errorf("the output is not a collection: %w", escaped{err})
 	}
 	if _, err := dec.Token(); err != io.EOF {
 		if err == nil {
 			return errors.New("unexpected data after the collection")
 		}
-		return fmt.Errorf("after the collection: %w", err)
+		return fmt.Errorf("after the collection: %w", escaped{err})
 	}
 	if c.Schema != model.CollectionSchema {
 		return fmt.Errorf("the collection has schema %d, this server reads %d", c.Schema, model.CollectionSchema)

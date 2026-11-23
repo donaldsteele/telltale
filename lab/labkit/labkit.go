@@ -16,6 +16,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -60,7 +61,7 @@ type Opts struct {
 	Binds []string
 	// Tmpfs are extra tmpfs mounts as docker run --tmpfs takes them,
 	// "dir:options" (for example "/var/tmp:noexec"). Not /tmp or /dev/shm,
-	// which Noexec and ExecShm own, nor /run with Systemd.
+	// which Noexec and ExecShm own, nor /run with Systemd; Start refuses them.
 	Tmpfs []string
 }
 
@@ -325,6 +326,9 @@ func contains(l []string, s string) bool {
 // Start runs image on the lab network. The container is removed by t.Cleanup.
 func Start(t testing.TB, image string, opts Opts) *Machine {
 	t.Helper()
+	if err := checkTmpfs(opts); err != nil {
+		t.Fatal(err)
+	}
 	network := NetworkName
 	if opts.Egress {
 		if opts.Privileged || opts.Ext4Volume || opts.Systemd || len(opts.Caps) > 0 {
@@ -408,6 +412,19 @@ func Start(t testing.TB, image string, opts Opts) *Machine {
 		}
 	}
 	return m
+}
+
+// checkTmpfs refuses Opts.Tmpfs mounts on the directories other options
+// own: /tmp and /dev/shm (Noexec, ExecShm; Noexec can also come from the
+// image's label), and /run with Systemd.
+func checkTmpfs(opts Opts) error {
+	for _, mnt := range opts.Tmpfs {
+		dir := path.Clean(strings.SplitN(mnt, ":", 2)[0])
+		if dir == "/tmp" || dir == "/dev/shm" || (opts.Systemd && dir == "/run") {
+			return fmt.Errorf("labkit: Opts.Tmpfs %q: %s is mounted by another option", mnt, dir)
+		}
+	}
+	return nil
 }
 
 // ext4Volume creates a sparse ext4 image file on the host (no sudo needed) and

@@ -106,7 +106,10 @@ func checkVisit(t *testing.T, distro string, m *labkit.Machine) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	authorizedKeys, match := visit.EnrolSnippets(serverAddr, keyLine)
+	authorizedKeys, match, err := visit.EnrolSnippets(serverAddr, keyLine)
+	if err != nil {
+		t.Fatalf("enrolment snippets: %v", err)
+	}
 	out, code := m.Exec(t, "sh", "-c", `exec 2>&1
 set -e
 umask 077
