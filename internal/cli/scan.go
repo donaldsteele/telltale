@@ -10,15 +10,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/donaldsteele/telltale/internal/collect"
-	"github.com/donaldsteele/telltale/internal/diff"
 	"github.com/donaldsteele/telltale/internal/escape"
-	"github.com/donaldsteele/telltale/internal/heuristics"
 	"github.com/donaldsteele/telltale/internal/judge"
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/internal/pkgverify"
@@ -133,21 +130,11 @@ func runScan(ctx *Context) int {
 	}
 
 	opt := pkgverify.Options{Full: *full, Offline: *offline, RefsDir: *refs, ExtraKeys: extra, Root: *root}
-	// Startup links into package-owned files outside the system directories
-	// are only notes; the target is verified so a tampered one still shows.
-	// A target is named where it really is, which is the path package
-	// verification reports a file under.
-	opt.ExtraPaths = append(opt.ExtraPaths, heuristics.PackageLinkTargets(c, c.Packages.Owners())...)
-	if snap != nil {
-		opt.OnlyPaths = changedOwnedPaths(snap, c)
-		// The keys third-party repositories were signed with when the
-		// machine was clean. The collection just taken holds the same kind
-		// of record (c.Packages.RepoTrust); that one is the examined
-		// machine's word and is never passed here.
-		if snap.Collection != nil {
-			opt.RepoTrust = snap.Collection.Packages.RepoTrust
-		}
-	}
+	// What to verify (the package files changed since the snapshot, startup
+	// link targets) and which recorded keys vouch for third-party
+	// repositories (the snapshot's, never the collection's). The server
+	// uses the same function.
+	judge.VerifyScope(&opt, snap, c)
 	if *refs == "" && !*offline {
 		// Never leave a package cache on the machine being examined.
 		// Written before the directory exists: a closed stderr (SIGPIPE) then
@@ -230,55 +217,6 @@ func writeTo(path string, fill func(io.Writer) error) error {
 	}
 	ok = true
 	return nil
-}
-
-const dpkgInfo = "/var/lib/dpkg/info/"
-
-// changedOwnedPaths is what package verification must look at when a
-// snapshot says what the machine looked like before: the package-owned paths
-// that changed, plus every changed or added dpkg maintainer script.
-func changedOwnedPaths(snap *model.Snapshot, cur *model.Collection) map[string]bool {
-	owned := map[string]bool{}
-	for _, col := range []*model.Collection{cur, snap.Collection} {
-		if col == nil {
-			continue
-		}
-		// Owners applies the merged-/usr aliases (/bin/ls is /usr/bin/ls).
-		// A package path behind a directory that is a link is recorded,
-		// and so changes, where it really is: those paths are verified too.
-		// Asking for more to be verified can only find more.
-		owners, _ := col.Packages.PhysicalOwners(model.Inventory(col.Files))
-		for p := range owners {
-			owned[p] = true
-		}
-	}
-	only := map[string]bool{}
-	for _, ch := range diff.Compare(snap, cur, nil) {
-		switch ch.Kind {
-		case diff.FileModified, diff.FileAdded, diff.FileRemoved, diff.PersistChanged:
-			if owned[ch.Subject] {
-				only[ch.Subject] = true
-			}
-		}
-		if ch.Kind == diff.FileModified || ch.Kind == diff.FileAdded {
-			if isMaintainerScript(ch.Subject) {
-				only[ch.Subject] = true
-			}
-		}
-	}
-	return only
-}
-
-func isMaintainerScript(p string) bool {
-	if !strings.HasPrefix(p, dpkgInfo) || strings.Contains(p[len(dpkgInfo):], "/") {
-		return false
-	}
-	for _, ext := range pkgverify.MaintainerScripts {
-		if strings.HasSuffix(p, "."+ext) {
-			return true
-		}
-	}
-	return false
 }
 
 // scanContext is cancelled by an interrupt, a terminate or a hangup (a dropped
