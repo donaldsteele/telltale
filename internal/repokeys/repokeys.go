@@ -57,9 +57,11 @@ func ReadEntities(data []byte) (openpgp.EntityList, error) {
 		out = append(out, el...)
 		return nil
 	}
-	trimmed := bytes.TrimLeft(data, " \t\r\n")
-	if bytes.HasPrefix(trimmed, []byte("-----BEGIN PGP")) {
-		rest := trimmed
+	// A binary keyring starts with an OpenPGP packet, whose first byte has
+	// the top bit set; anything else is text, with armored blocks somewhere
+	// in it (a file may start with comment lines).
+	if len(data) > 0 && data[0]&0x80 == 0 && bytes.Contains(data, []byte("-----BEGIN PGP")) {
+		rest := data
 		var first error
 		for blocks := 0; blocks < MaxKeys+1; blocks++ {
 			i := bytes.Index(rest, []byte("-----BEGIN PGP"))
