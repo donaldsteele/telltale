@@ -186,7 +186,7 @@ ul.plain li { padding: 6px 0; border-bottom: 1px solid var(--rule); }
 table { width: 100%; border-collapse: collapse; border-top: 2px solid var(--ink); margin: 12px 0; }
 th { font: 500 0.75rem/1.2 var(--mono); text-transform: uppercase; letter-spacing: 0.1em; color: var(--ink-2); text-align: left; padding: 10px 12px 10px 0; border-bottom: 1px solid var(--rule); }
 td { padding: 12px 12px 12px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
-td.actions { text-align: right; white-space: nowrap; }
+td.actions { display: table-cell; margin: 0; text-align: right; white-space: nowrap; }
 tr.selected td { background: var(--paper-2); }
 @media (max-width: 640px) {
   table.machines thead, table.audit thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
