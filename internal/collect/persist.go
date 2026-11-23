@@ -140,6 +140,11 @@ func (c *collector) file(mp, kind string) {
 			// it is seen and compared like any link at a persistence path.
 			c.skip(mp, skipUserLinkPath)
 			c.refuse(pl.link, kind)
+		case errors.Is(err, errKernelFS), errors.Is(err, errLinkLoop):
+			// A link led the walk onto a kernel filesystem or past its
+			// limits: not followed, and recorded like any refused link.
+			c.skip(mp, err.Error())
+			c.refuse(pl.link, kind)
 		case !isNotExist(err) && !errors.Is(err, unix.ENOTDIR):
 			c.skip(mp, err.Error())
 		}
@@ -506,6 +511,9 @@ func (c *collector) systemd(dir string, all bool, b *unitBudget) {
 		case errors.Is(err, errUserLink):
 			c.skip(dir, skipUserLinkPath)
 			c.refuse(pl.link, kind)
+		case errors.Is(err, errKernelFS), errors.Is(err, errLinkLoop):
+			c.skip(dir, err.Error())
+			c.refuse(pl.link, kind)
 		case !isNotExist(err) && !errors.Is(err, unix.ENOTDIR):
 			c.skip(dir, err.Error())
 		}
@@ -535,6 +543,9 @@ func (c *collector) systemd(dir string, all bool, b *unitBudget) {
 			switch {
 			case errors.Is(err, errUserLink):
 				c.skip(dir, skipLinkedUnitDir)
+				c.refuse(dir, kind)
+			case errors.Is(err, errKernelFS), errors.Is(err, errLinkLoop):
+				c.skip(dir, err.Error())
 				c.refuse(dir, kind)
 			case !isNotExist(err) && !errors.Is(err, unix.ENOTDIR):
 				c.skip(dir, err.Error())

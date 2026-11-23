@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/donaldsteele/telltale/internal/model"
+	"golang.org/x/sys/unix"
 )
 
 const malloryUnits = "/home/mallory/.config/systemd/user"
@@ -291,5 +292,83 @@ func TestPersistenceAptConfAndUserEnvironment(t *testing.T) {
 	}
 	if f, ok := findPersist(res.Files, "/home/mallory/.config/environment.d/notes.txt"); !ok || len(f.Lines) != 0 || f.SHA256 == "" {
 		t.Errorf("a file systemd does not read there: %+v ok=%v", f, ok)
+	}
+}
+
+// Every way a walk can stop at a link leaves the link recorded and noted,
+// not only the "another account's link" way: a link through /proc, and a
+// chain of links padded past the walk's step limit.
+func TestPersistenceLinkRefusedForOtherReasonsIsRecorded(t *testing.T) {
+	scan := func(home string) *collector {
+		c := &collector{key: testKey, seen: map[string]bool{}}
+		u := model.User{Name: "mallory", UID: int(selfUID), Home: home}
+		c.user = &u
+		dir := filepath.Join(home, ".config/systemd/user")
+		c.systemd(dir, false, &unitBudget{dir: dir})
+		return c
+	}
+	check := func(t *testing.T, c *collector, link string) {
+		t.Helper()
+		for _, f := range c.out {
+			if strings.HasSuffix(f.Path, "evil.service") {
+				t.Errorf("the unit was read through the refused link: %+v", f)
+			}
+		}
+		f, ok := findPersist(c.out, link)
+		if !ok || len(f.Lines) != 1 || f.Mode&unix.S_IFMT != unix.S_IFLNK {
+			t.Errorf("the link %s is not recorded: %+v ok=%v\nskips %+v", link, f, ok, c.skips)
+		}
+		if !slices.Contains(c.refused, link) {
+			t.Errorf("refused = %v, want %s", c.refused, link)
+		}
+		if len(c.skips) == 0 {
+			t.Error("no skip")
+		}
+	}
+	newHome := func(t *testing.T) string {
+		home := t.TempDir()
+		if err := os.Chmod(home, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, home, "units/evil.service", "[Service]\nExecStart=/tmp/.x\n")
+		return home
+	}
+	if _, err := os.Stat("/proc/self/root"); err == nil {
+		t.Run("the unit directory links through /proc", func(t *testing.T) {
+			home := newHome(t)
+			symlinkAt(t, home, ".config/systemd/user", "/proc/self/root"+home+"/units")
+			check(t, scan(home), filepath.Join(home, ".config/systemd/user"))
+		})
+		t.Run("~/.config links through /proc", func(t *testing.T) {
+			home := newHome(t)
+			writeFile(t, home, "real/systemd/user/evil.service", "[Service]\nExecStart=/tmp/.x\n")
+			symlinkAt(t, home, ".config", "/proc/self/root"+home+"/real")
+			check(t, scan(home), filepath.Join(home, ".config"))
+		})
+	}
+	t.Run("a chain of links padded past the step limit", func(t *testing.T) {
+		home := newHome(t)
+		pad := strings.Repeat("x/../", 810)
+		if err := os.MkdirAll(filepath.Join(home, ".config/systemd/x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, home, ".config/systemd/units/evil.service", "[Service]\nExecStart=/tmp/.x\n")
+		symlinkAt(t, home, ".config/systemd/user", pad+"l2")
+		symlinkAt(t, home, ".config/systemd/l2", pad+"l3")
+		symlinkAt(t, home, ".config/systemd/l3", pad+"units")
+		check(t, scan(home), filepath.Join(home, ".config/systemd/user"))
+	})
+	// The same for a start-up file reached that way.
+	if _, err := os.Stat("/proc/self/root"); err == nil {
+		home := newHome(t)
+		writeFile(t, home, "real/authorized_keys", "ssh-ed25519 AAAA evil\n")
+		symlinkAt(t, home, ".ssh", "/proc/self/root"+home+"/real")
+		c := &collector{key: testKey, seen: map[string]bool{}}
+		u := model.User{Name: "mallory", UID: int(selfUID), Home: home}
+		c.user = &u
+		c.file(filepath.Join(home, ".ssh/authorized_keys"), model.PersistKindAuthorizedKeys)
+		if f, ok := findPersist(c.out, filepath.Join(home, ".ssh")); !ok || len(f.Lines) != 1 || !slices.Contains(c.refused, filepath.Join(home, ".ssh")) {
+			t.Errorf("~/.ssh through /proc: %+v ok=%v refused %v", f, ok, c.refused)
+		}
 	}
 }

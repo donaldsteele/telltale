@@ -74,8 +74,9 @@ type place struct {
 	// everyone nor by its owner being the account the walk was made for.
 	shut bool
 	// link is the machine path of the link the walk refused (errUserLink),
-	// or of the first link followed only because it belongs to the account
-	// the walk was made for (own).
+	// of the first link followed only because it belongs to the account
+	// the walk was made for (own), or, when the walk stopped at a kernel
+	// filesystem or at its step or link limit, of the link that led there.
 	link string
 	// own is true when the walk followed a link only because it belongs to
 	// the account the walk was made for. What was reached is then that
@@ -233,6 +234,14 @@ func walkTo(root, mp string, forUID uint32, followOwn bool) (place, error) {
 	comps := strings.Split(mp, "/")
 	shut, own, ownLink := false, false, ""
 	hops, steps := 0, 0
+	// The link that leads to where the walk is: the first one followed
+	// that is not root's, else the first one followed at all.
+	led, ledByUser := "", false
+	stopped := func(err error) (place, error) {
+		pl := none
+		pl.link = led
+		return pl, err
+	}
 	for {
 		// Drop what names no step: empty components and ".".
 		for len(comps) > 0 && (comps[0] == "" || comps[0] == ".") {
@@ -245,7 +254,7 @@ func walkTo(root, mp string, forUID uint32, followOwn bool) (place, error) {
 		}
 		name := comps[0]
 		if steps++; steps > maxWalkSteps {
-			return none, errLinkLoop
+			return stopped(errLinkLoop)
 		}
 		if name == ".." {
 			if len(stack) > 1 {
@@ -277,8 +286,11 @@ func walkTo(root, mp string, forUID uint32, followOwn bool) (place, error) {
 		}
 		switch st.Mode & unix.S_IFMT {
 		case unix.S_IFLNK:
+			at := strings.TrimSuffix(real(), "/") + "/" + name
+			if o := ownerOf(&st); led == "" || (!ledByUser && o != 0) {
+				led, ledByUser = at, o != 0
+			}
 			if o := ownerOf(&st); !trustedOwner(o) {
-				at := strings.TrimSuffix(real(), "/") + "/" + name
 				if !followOwn || o != forUID {
 					unix.Close(fd)
 					pl := none
@@ -295,7 +307,7 @@ func walkTo(root, mp string, forUID uint32, followOwn bool) (place, error) {
 				return none, &fs.PathError{Op: "readlink", Path: mp, Err: err}
 			}
 			if hops++; hops > maxLinkHops {
-				return none, errLinkLoop
+				return stopped(errLinkLoop)
 			}
 			if target == "" {
 				return none, &fs.PathError{Op: "open", Path: mp, Err: unix.ENOENT}
@@ -310,7 +322,7 @@ func walkTo(root, mp string, forUID uint32, followOwn bool) (place, error) {
 		case unix.S_IFDIR:
 			if kernelFS(fd) {
 				unix.Close(fd)
-				return none, errKernelFS
+				return stopped(errKernelFS)
 			}
 			if st.Mode&0o001 == 0 && ownerOf(&st) != forUID {
 				shut = true
