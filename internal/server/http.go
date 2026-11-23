@@ -423,6 +423,7 @@ func (u *UI) routes() {
 	m.HandleFunc("POST /settings/general", u.authed(u.settingsGeneral))
 	m.HandleFunc("POST /settings/password", u.authed(u.settingsPassword))
 	m.HandleFunc("POST /settings/keys", u.authed(u.settingsAddKey))
+	m.HandleFunc("POST /settings/keys/confirm", u.authed(u.settingsConfirmKey))
 	m.HandleFunc("POST /settings/keys/{id}/remove", u.authed(u.settingsRemoveKey))
 	m.HandleFunc("GET /audit", u.authed(u.auditPage))
 	u.mux = m

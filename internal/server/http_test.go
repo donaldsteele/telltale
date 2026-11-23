@@ -683,34 +683,124 @@ func TestAcceptChangesNeedsConfirmation(t *testing.T) {
 	if strings.Contains(body, "ld.so.preload exists") {
 		t.Errorf("the review offers a finding that is not a change since the snapshot:\n%s", body)
 	}
-	// Accepting the program accepts its package finding with it.
-	acc := url.Values{"report": {strconv.FormatInt(rid, 10)}, "key": {"snap.file:/usr/local/bin/tool", "pkg.mismatch:/usr/local/bin/tool"}}
+	// Accepting the program accepts its package finding with it. The link
+	// names the group by one of its findings; the server works out the rest.
+	groupLink := mp + "/accept?" + url.Values{"report": {strconv.FormatInt(rid, 10)}, "group": {"snap.file:/usr/local/bin/tool"}}.Encode()
+	if !strings.Contains(body, html.EscapeString(groupLink)) {
+		t.Errorf("the review has no link %q:\n%s", groupLink, body)
+	}
+	acc := url.Values{"report": {strconv.FormatInt(rid, 10)}, "group": {"snap.file:/usr/local/bin/tool"}}
 	if rec := w.post(mp+"/accept", acc); rec.Code != http.StatusBadRequest {
 		t.Errorf("accept without confirming: %d", rec.Code)
 	}
 	if len(w.core.accepts) != 0 {
 		t.Fatal("AcceptChanges ran without the confirmation")
 	}
-	rec = w.get(mp + "/accept?" + acc.Encode())
+	rec = w.get(groupLink)
 	wantStatus(t, rec, http.StatusOK)
 	if b := rec.Body.String(); !strings.Contains(b, "A changed program") || !strings.Contains(b, "The program does not match its package") || strings.Contains(b, "A new cron job") {
 		t.Errorf("the confirmation does not list exactly the chosen changes:\n%s", b)
 	}
-	acc.Set("confirm", "yes")
-	wantRedirect(t, w.post(mp+"/accept", acc), mp)
+	wantRedirect(t, w.post(mp+"/accept", confirmForm(t, rec.Body.String())), mp)
 	if len(w.core.accepts) != 1 || w.core.accepts[0].report != rid || !slices.Equal(w.core.accepts[0].keys, []string{"snap.file:/usr/local/bin/tool", "pkg.mismatch:/usr/local/bin/tool"}) {
 		t.Errorf("AcceptChanges calls %+v", w.core.accepts)
 	}
 	// All at once.
-	all := url.Values{"report": {strconv.FormatInt(rid, 10)}, "key": {"snap.persist:/etc/cron.d/job", "snap.file:/usr/local/bin/tool", "pkg.mismatch:/usr/local/bin/tool"}}
 	if !strings.Contains(body, "Accept all 3 changes") {
 		t.Errorf("the review has no all-at-once accept:\n%s", body)
 	}
-	w.get(mp + "/accept?" + all.Encode())
-	all.Set("confirm", "yes")
-	wantRedirect(t, w.post(mp+"/accept", all), mp)
+	rec = w.get(mp + "/accept?" + url.Values{"report": {strconv.FormatInt(rid, 10)}, "all": {"1"}}.Encode())
+	wantStatus(t, rec, http.StatusOK)
+	wantRedirect(t, w.post(mp+"/accept", confirmForm(t, rec.Body.String())), mp)
 	if len(w.core.accepts) != 2 || len(w.core.accepts[1].keys) != 3 {
 		t.Errorf("AcceptChanges calls %+v", w.core.accepts)
+	}
+	// A group that is not in the report, nothing named, or a report that is
+	// not the one the changes come from, is refused.
+	for name, q := range map[string]url.Values{
+		"unknown group": {"report": {strconv.FormatInt(rid, 10)}, "group": {"heur.ld_preload"}},
+		"nothing named": {"report": {strconv.FormatInt(rid, 10)}},
+		"other report":  {"report": {strconv.FormatInt(w.addReport(id), 10)}, "all": {"1"}},
+	} {
+		if rec := w.get(mp + "/accept?" + q.Encode()); rec.Code == http.StatusOK {
+			t.Errorf("%s: the confirmation page was shown", name)
+		}
+	}
+}
+
+// confirmForm reads the hidden fields of a confirmation page's form, the way
+// the browser sends them back.
+func confirmForm(t *testing.T, page string) url.Values {
+	t.Helper()
+	form := url.Values{}
+	for _, m := range regexp.MustCompile(`<input type="hidden" name="([a-z_]+)" value="([^"]*)">`).FindAllStringSubmatch(page, -1) {
+		if m[1] != "csrf" {
+			form.Add(m[1], html.UnescapeString(m[2]))
+		}
+	}
+	if form.Get("confirm") != "yes" {
+		t.Fatalf("the page has no confirmation form:\n%s", page)
+	}
+	return form
+}
+
+// Accepting thousands of changes at once must not put their keys in a URL:
+// the server caps request headers at 64 KiB, which about 1,300 keys fill.
+func TestAcceptAllLargeChangeSet(t *testing.T) {
+	w := loggedIn(t)
+	id := w.addMachine("web01")
+	const n = 3000
+	var fs []model.Finding
+	with := map[string][]string{}
+	for i := range n {
+		k := fmt.Sprintf("snap.file:/usr/share/app/assets/a-rather-long-file-name-number-%05d.js", i)
+		fs = append(fs, finding(k, model.SevNote, "A changed file"))
+		with[k] = nil
+	}
+	rid := w.addReport(id, fs...)
+	w.core.acceptable[id] = Acceptable{ReportID: rid, With: with}
+	mp := "/machines/" + strconv.FormatInt(id, 10)
+	body := w.get(mp + "/changes").Body.String()
+	m := regexp.MustCompile(`<a class="btn" href="([^"]+)">Accept all 3000 changes</a>`).FindStringSubmatch(body)
+	if m == nil {
+		t.Fatal("the review has no accept-all link")
+	}
+	link := html.UnescapeString(m[1])
+	if len(link) > 200 {
+		t.Fatalf("the accept-all link is %d bytes long", len(link))
+	}
+	for _, href := range regexp.MustCompile(`href="(/machines/[^"]+/accept\?[^"]+)"`).FindAllStringSubmatch(body, -1) {
+		if len(href[1]) > 400 {
+			t.Fatalf("an accept link is %d bytes long", len(href[1]))
+		}
+	}
+	rec := w.get(link)
+	wantStatus(t, rec, http.StatusOK)
+	form := confirmForm(t, rec.Body.String())
+	if len(form["key"]) != 0 {
+		t.Errorf("the confirmation form carries %d keys", len(form["key"]))
+	}
+	// Without the confirmation the error page links back to a short URL.
+	noConfirm := url.Values{"report": form["report"], "all": form["all"], "sum": form["sum"]}
+	rec = w.post(mp+"/accept", noConfirm)
+	wantStatus(t, rec, http.StatusBadRequest)
+	if back := regexp.MustCompile(`href="([^"]*accept[^"]*)"`).FindStringSubmatch(rec.Body.String()); back == nil || len(back[1]) > 200 {
+		t.Errorf("the way back from the error page: %q", back)
+	}
+	wantRedirect(t, w.post(mp+"/accept", form), mp)
+	if len(w.core.accepts) != 1 || len(w.core.accepts[0].keys) != n {
+		t.Fatalf("AcceptChanges got %d calls", len(w.core.accepts))
+	}
+	// The set is worked out again when the form comes back: if it changed
+	// since the owner saw it, nothing is accepted.
+	delete(with, fs[0].Key)
+	form = confirmForm(t, w.get(link).Body.String())
+	with[fs[0].Key] = nil
+	if rec := w.post(mp+"/accept", form); rec.Code == http.StatusSeeOther {
+		t.Error("a changed set was accepted without being shown again")
+	}
+	if len(w.core.accepts) != 1 {
+		t.Errorf("AcceptChanges got %d calls", len(w.core.accepts))
 	}
 }
 
@@ -1134,13 +1224,40 @@ func TestSettingsRepositoryKeys(t *testing.T) {
 	w := loggedIn(t)
 	key, fp := armoredKey(t, false)
 	w.get("/settings")
-	wantRedirect(t, w.post("/settings/keys", url.Values{"key": {key}, "url": {"https://Download.Docker.com/linux/debian/"}}), "/settings#keys")
+	// The first step only shows the key: its fingerprint and the addresses
+	// it would vouch for. Nothing is stored yet.
+	rec := w.post("/settings/keys", url.Values{"key": {key}, "url": {"https://Download.Docker.com/linux/debian/"}})
+	wantStatus(t, rec, http.StatusOK)
+	preview := rec.Body.String()
+	if !strings.Contains(preview, groupFingerprint(fp)) || !strings.Contains(preview, "https://download.docker.com/linux/debian") {
+		t.Errorf("the preview does not show the key's fingerprint and address:\n%s", preview)
+	}
+	if keys, _ := OwnerKeys(w.st); len(keys) != 0 {
+		t.Fatalf("the key was stored before the owner confirmed it: %+v", keys)
+	}
+	form := confirmForm(t, preview)
+	if form.Get("pending") == "" || form.Get("key") != "" || form.Get("url") != "" {
+		t.Errorf("the confirmation must name the previewed key by a one-time ID only: %v", form)
+	}
+	// Without the confirmation, or with an ID the server never gave out,
+	// nothing is added.
+	if rec := w.post("/settings/keys/confirm", url.Values{"pending": form["pending"]}); rec.Code == http.StatusSeeOther {
+		t.Error("added without the confirmation")
+	}
+	if rec := w.post("/settings/keys/confirm", url.Values{"pending": {newToken()}, "confirm": {"yes"}}); rec.Code == http.StatusSeeOther {
+		t.Error("added under an unknown ID")
+	}
+	wantRedirect(t, w.post("/settings/keys/confirm", form), "/settings#keys")
 	keys, err := OwnerKeys(w.st)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(keys) != 1 || keys[0].URLPattern != "https://download.docker.com/linux/debian" || keys[0].Key.Fingerprint != fp {
 		t.Fatalf("owner keys %+v", keys)
+	}
+	// The ID works once.
+	if rec := w.post("/settings/keys/confirm", form); rec.Code == http.StatusSeeOther {
+		t.Error("the same preview was added twice")
 	}
 	page := w.get("/settings").Body.String()
 	if !strings.Contains(page, groupFingerprint(fp)) || !strings.Contains(page, "https://download.docker.com/linux/debian") {
@@ -1161,8 +1278,8 @@ func TestSettingsRepositoryKeys(t *testing.T) {
 		"twice":            {"key": {key}, "url": {"https://download.docker.com/linux/debian"}},
 	} {
 		w.get("/settings")
-		if rec := w.post("/settings/keys", form); rec.Code == http.StatusSeeOther {
-			t.Errorf("%s: accepted", name)
+		if rec := w.post("/settings/keys", form); rec.Code == http.StatusOK && strings.Contains(rec.Body.String(), `name="pending"`) {
+			t.Errorf("%s: offered for confirmation", name)
 		}
 	}
 	if keys, _ := OwnerKeys(w.st); len(keys) != 1 {

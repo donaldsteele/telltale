@@ -74,6 +74,9 @@ func runServer(ctx *Context) int {
 	if err != nil {
 		return fail(err)
 	}
+	for _, w := range cfg.Warnings {
+		fmt.Fprintf(ctx.Stderr, "telltale server: warning: %s\n", escape.Terminal(w))
+	}
 	if cfg.AllInterfaces() && !*allowAll {
 		return fail(fmt.Errorf("listen = %q puts the web UI on every interface of this machine; give its LAN address instead, or pass --allow-all-interfaces if that is what you want", cfg.Listen))
 	}

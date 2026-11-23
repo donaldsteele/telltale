@@ -11,7 +11,11 @@
 # systemd reads the passphrase file as root and hands it to the service as a
 # credential ($CREDENTIALS_DIRECTORY/passphrase), so the telltale user never
 # needs to read /etc/telltale/passphrase itself. With key_file set in the
-# configuration, remove the LoadCredential line.
+# configuration, remove the LoadCredential line. ProtectSystem=strict below
+# leaves only /var/lib/telltale writable, so a key file the server creates
+# on first use must be in it (key_file = "/var/lib/telltale/data.key", as in
+# the example). A key file anywhere else must exist before the first start,
+# owned by telltale and mode 0600.
 #
 # The first start prints a one-time setup code: journalctl -u telltale
 

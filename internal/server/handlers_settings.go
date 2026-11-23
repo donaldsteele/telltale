@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -151,12 +152,70 @@ func (u *UI) settingsPassword(c *reqCtx) {
 	http.Redirect(c.w, c.r, "/login?changed=1", http.StatusSeeOther)
 }
 
+// pendingKey is a repository key block checked and shown to the owner,
+// waiting for the owner to confirm it. It is kept in the session, so the
+// keys trusted are exactly the ones previewed, not a form sent back.
+type pendingKey struct {
+	cand    OwnerKeyCandidate
+	created time.Time
+}
+
+func keyCreated(p pendingKey) time.Time { return p.created }
+
+type keyPreviewKey struct {
+	Fingerprint string
+	Names       []string
+}
+
+type keyPreviewView struct {
+	URL     string
+	Keys    []keyPreviewKey
+	Pending string
+}
+
+// settingsAddKey is the first step of adding a repository key: check it
+// and show its fingerprints and the addresses it would vouch for. Nothing
+// is stored yet.
 func (u *UI) settingsAddKey(c *reqCtx) {
 	text, addr := c.r.PostForm.Get("key"), c.r.PostForm.Get("url")
-	added, err := AddOwnerKey(u.o.Store, text, addr, u.o.Now())
+	cand, err := CheckOwnerKey(u.o.Store, text, addr)
 	if err != nil {
 		form := settingsView{KeyURL: strings.TrimSpace(addr), KeyText: text}
 		u.renderSettings(c, http.StatusBadRequest, form, "The key was not added: "+escape.Terminal(err.Error()))
+		return
+	}
+	var id string
+	u.sessions.with(func() {
+		id = keepPending(c.sess.pendingKeys, keyCreated, u.o.Now(), pendingKey{cand: cand, created: u.o.Now()})
+	})
+	v := keyPreviewView{URL: escape.Terminal(cand.URLPattern), Pending: id}
+	for i, k := range cand.Keys {
+		pk := keyPreviewKey{Fingerprint: groupFingerprint(escape.Terminal(k.Fingerprint))}
+		for _, n := range cand.Names[i] {
+			pk.Names = append(pk.Names, escape.Terminal(n))
+		}
+		v.Keys = append(v.Keys, pk)
+	}
+	u.page(c, http.StatusOK, "key_confirm", "Check the repository key", "settings", v, "")
+}
+
+// settingsConfirmKey is the second step, after the owner compared the
+// fingerprints: trust exactly the keys that were shown.
+func (u *UI) settingsConfirmKey(c *reqCtx) {
+	id := c.r.PostForm.Get("pending")
+	if !u.confirmed(c, "/settings#keys") {
+		return
+	}
+	var p pendingKey
+	var ok bool
+	u.sessions.with(func() { p, ok = takePending(c.sess.pendingKeys, keyCreated, u.o.Now(), id) })
+	if !ok {
+		u.fail(c.w, c.r, http.StatusBadRequest, "This confirmation has expired or was already used. Paste the key again.")
+		return
+	}
+	added, err := TrustOwnerKey(u.o.Store, p.cand, u.o.Now())
+	if err != nil {
+		u.renderSettings(c, http.StatusBadRequest, settingsView{}, "The key was not added: "+escape.Terminal(err.Error()))
 		return
 	}
 	for _, k := range added {

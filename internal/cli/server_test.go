@@ -32,6 +32,17 @@ func TestServerRefusesWildcardListenWithoutFlag(t *testing.T) {
 	}
 }
 
+// A loopback server_addr set on purpose is allowed, but the owner is told
+// the enrolment snippets will not work on other machines.
+func TestServerWarnsAboutLoopbackServerAddr(t *testing.T) {
+	t.Setenv(passphraseEnv, "")
+	p := writeConfig(t, "listen = \"0.0.0.0:8443\"\nserver_addr = \"127.0.0.1\"\ndata_dir = \""+t.TempDir()+"\"\n")
+	code, _, errs := run("server", "--config", p)
+	if code != ExitUsage || !strings.Contains(errs, "warning: server_addr 127.0.0.1 is a loopback address") {
+		t.Errorf("code=%d err=%q", code, errs)
+	}
+}
+
 func TestServerNeedsAConfig(t *testing.T) {
 	code, _, errs := run("server")
 	if code != ExitUsage || !strings.Contains(errs, "--config") {

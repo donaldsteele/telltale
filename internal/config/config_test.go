@@ -119,6 +119,78 @@ func TestConfigServerAddrDefaultsAndValidation(t *testing.T) {
 	if c.ServerAddr != "192.0.2.12" {
 		t.Errorf("ServerAddr = %q, want the canonical form", c.ServerAddr)
 	}
+	if len(c.Warnings) != 0 {
+		t.Errorf("warnings for a LAN address: %q", c.Warnings)
+	}
+}
+
+// A loopback listen address is no address machines can reach, so it is
+// never taken as server_addr by default: the enrolment snippets would only
+// fail. Set explicitly it is allowed, with a warning.
+func TestConfigLoopbackServerAddr(t *testing.T) {
+	for _, l := range []string{"127.0.0.1:8443", "[::1]:8443", "127.0.0.53:8443"} {
+		if _, err := parse(t, "listen = \""+l+"\"\n"); err == nil || !strings.Contains(err.Error(), "server_addr") || !strings.Contains(err.Error(), "loopback") {
+			t.Errorf("listen %s without server_addr: err = %v, want a refusal asking for server_addr", l, err)
+		}
+		c, err := parse(t, "listen = \""+l+"\"\nserver_addr = \"192.0.2.10\"\n")
+		if err != nil {
+			t.Errorf("listen %s with a LAN server_addr: %v", l, err)
+		} else if len(c.Warnings) != 0 {
+			t.Errorf("listen %s with a LAN server_addr: warnings %q", l, c.Warnings)
+		}
+	}
+	for _, a := range []string{"127.0.0.1", "::1"} {
+		c, err := parse(t, "listen = \"192.0.2.10:8443\"\nserver_addr = \""+a+"\"\n")
+		if err != nil {
+			t.Fatalf("server_addr %s set explicitly: %v", a, err)
+		}
+		if c.ServerAddr != a || len(c.Warnings) != 1 || !strings.Contains(c.Warnings[0], "loopback") || !strings.Contains(c.Warnings[0], a) {
+			t.Errorf("server_addr %s: %+v, want it kept with one warning naming it", a, c)
+		}
+	}
+}
+
+// The shipped unit makes everything but its state directory read-only
+// (ProtectSystem=strict), so a key_file the server creates on first use
+// must be under a path the unit lets it write.
+func TestExampleKeyFileWritableUnderUnit(t *testing.T) {
+	ex, err := os.ReadFile("../../deploy/telltale.toml.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unit, err := os.ReadFile("../../deploy/systemd/telltale.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`(?m)^#?key_file = "([^"]+)"`).FindSubmatch(ex)
+	if m == nil {
+		t.Fatal("the example has no key_file line")
+	}
+	keyFile := string(m[1])
+	if !strings.Contains(string(unit), "ProtectSystem=strict") {
+		t.Fatal("the unit no longer says ProtectSystem=strict; revisit this test")
+	}
+	var writable []string
+	for _, l := range regexp.MustCompile(`(?m)^ReadWritePaths=(.+)$`).FindAllSubmatch(unit, -1) {
+		writable = append(writable, strings.Fields(string(l[1]))...)
+	}
+	for _, l := range regexp.MustCompile(`(?m)^StateDirectory=(.+)$`).FindAllSubmatch(unit, -1) {
+		for _, d := range strings.Fields(string(l[1])) {
+			writable = append(writable, "/var/lib/"+d)
+		}
+	}
+	ok := false
+	for _, d := range writable {
+		if strings.HasPrefix(keyFile, strings.TrimSuffix(d, "/")+"/") {
+			ok = true
+		}
+	}
+	if !ok {
+		t.Errorf("key_file %s is not under a path the unit can write (%v)", keyFile, writable)
+	}
+	if strings.Contains(string(ex), "/etc/telltale/data.key") || strings.Contains(string(unit), "/etc/telltale/data.key") {
+		t.Error("the example or the unit still names /etc/telltale/data.key")
+	}
 }
 
 func TestConfigWildcard(t *testing.T) {

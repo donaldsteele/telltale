@@ -40,7 +40,7 @@ type Config struct {
 	// ServerAddr is the literal IP address machines see the server connect
 	// from (server_addr); it goes into the enrolment snippets and every
 	// scan. When it is not set it is Listen's address, which must then be
-	// a literal, specific IP.
+	// a literal, specific IP that is not a loopback address.
 	ServerAddr string
 	// DataDir holds the database, the TLS certificate and key and the
 	// package cache (data_dir; DefaultDataDir when not set).
@@ -51,6 +51,9 @@ type Config struct {
 	// Unlock opens the store. KeyFile comes from key_file; without one the
 	// command fills in Passphrase.
 	Unlock store.Unlock
+	// Warnings are settings that work but are probably not what the owner
+	// wants, in plain words; the server prints them at start.
+	Warnings []string
 }
 
 // keys lists every key the file may set.
@@ -185,8 +188,13 @@ func (c *Config) check(vals map[string]setting) error {
 			return fmt.Errorf("%sserver_addr: %w", at("server_addr"), err)
 		}
 		c.ServerAddr = a.String()
+		if a.IsLoopback() {
+			c.Warnings = append(c.Warnings, fmt.Sprintf("server_addr %s is a loopback address: the enrolment snippets allow the server's key only from %s, so they work on no machine but this server itself. Give the LAN address the machines see the server connect from.", c.ServerAddr, c.ServerAddr))
+		}
 	case listen.Addr().IsUnspecified():
 		return fmt.Errorf("%sserver_addr is required when listen is %s: give the IP address the machines see the server connect from", at("listen"), c.Listen)
+	case listen.Addr().IsLoopback():
+		return fmt.Errorf("%sserver_addr is required when listen is the loopback address %s: machines never see the server connect from a loopback address, so the enrolment snippets would only fail. Give the IP address the machines see the server connect from", at("listen"), listen.Addr())
 	default:
 		a, err := visit.CheckServerAddr(listen.Addr().String())
 		if err != nil {

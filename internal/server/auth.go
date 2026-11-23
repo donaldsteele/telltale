@@ -149,6 +149,40 @@ type session struct {
 	flash   string
 	// pending enrolments: host keys fetched and shown, not yet confirmed.
 	pending map[string]pendingEnrol
+	// pendingKeys: repository keys checked and shown, not yet confirmed.
+	pendingKeys map[string]pendingKey
+}
+
+// keepPending puts v in m under a new one-time ID and returns the ID. It
+// first drops entries older than pendingLifetime, then arbitrary ones
+// until fewer than maxPending are left. The session table must be locked.
+func keepPending[T any](m map[string]T, created func(T) time.Time, now time.Time, v T) string {
+	for k, x := range m {
+		if now.Sub(created(x)) > pendingLifetime {
+			delete(m, k)
+		}
+	}
+	for len(m) >= maxPending {
+		for k := range m {
+			delete(m, k)
+			break
+		}
+	}
+	id := newToken()
+	m[id] = v
+	return id
+}
+
+// takePending removes and returns the entry under id, when it is there and
+// not older than pendingLifetime. The session table must be locked.
+func takePending[T any](m map[string]T, created func(T) time.Time, now time.Time, id string) (T, bool) {
+	v, ok := m[id]
+	delete(m, id)
+	if !ok || now.Sub(created(v)) > pendingLifetime {
+		var zero T
+		return zero, false
+	}
+	return v, true
 }
 
 type sessions struct {
@@ -183,7 +217,7 @@ func (s *sessions) create(now time.Time, ip string) (string, *session) {
 	}
 	tok := newToken()
 	h, _ := tokenHash(tok)
-	x := &session{csrf: newToken(), created: now, seen: now, ip: ip, pending: map[string]pendingEnrol{}}
+	x := &session{csrf: newToken(), created: now, seen: now, ip: ip, pending: map[string]pendingEnrol{}, pendingKeys: map[string]pendingKey{}}
 	s.m[h] = x
 	return tok, x
 }

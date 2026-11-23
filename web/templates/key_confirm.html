@@ -1,0 +1,22 @@
+{{define "content"}}
+{{- with .Body}}
+<section class="narrow">
+<h1>Check the repository key</h1>
+<p>You are about to trust {{if eq (len .Keys) 1}}this key{{else}}these {{len .Keys}} keys{{end}} for packages from</p>
+<p><code>{{.URL}}</code></p>
+<p>and from the addresses under it, and for no other repository.</p>
+{{range .Keys}}
+<p class="fingerprint">{{.Fingerprint}}</p>
+{{with .Names}}<p class="small">The key says it belongs to:{{range .}} <code>{{.}}</code>{{end}}</p>{{end}}
+{{end}}
+<p>Compare {{if eq (len .Keys) 1}}the fingerprint{{else}}each fingerprint{{end}} with one the vendor publishes somewhere other than the page you copied the key from, character by character. A key you trust here can vouch for any package at that address.</p>
+<form method="post" action="/settings/keys/confirm" class="confirm">
+<input type="hidden" name="csrf" value="{{$.CSRF}}">
+<input type="hidden" name="pending" value="{{.Pending}}">
+<input type="hidden" name="confirm" value="yes">
+<button type="submit" class="btn primary">They match: trust {{if eq (len .Keys) 1}}this key{{else}}these keys{{end}}</button>
+<a href="/settings#keys">They do not match: stop</a>
+</form>
+</section>
+{{- end}}
+{{end}}

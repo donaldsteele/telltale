@@ -26,6 +26,8 @@ type pendingEnrol struct {
 	created     time.Time
 }
 
+func enrolCreated(p pendingEnrol) time.Time { return p.created }
+
 const (
 	maxPending       = 8
 	pendingLifetime  = 30 * time.Minute
@@ -112,21 +114,8 @@ func (u *UI) enrolFetch(c *reqCtx) {
 		return
 	}
 	p := pendingEnrol{name: name, addr: addr, hostKey: strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key))), fingerprint: fp, created: u.o.Now()}
-	id := newToken()
-	u.sessions.with(func() {
-		for k, x := range c.sess.pending {
-			if u.o.Now().Sub(x.created) > pendingLifetime {
-				delete(c.sess.pending, k)
-			}
-		}
-		for len(c.sess.pending) >= maxPending {
-			for k := range c.sess.pending {
-				delete(c.sess.pending, k)
-				break
-			}
-		}
-		c.sess.pending[id] = p
-	})
+	var id string
+	u.sessions.with(func() { id = keepPending(c.sess.pending, enrolCreated, u.o.Now(), p) })
 	v := enrolKeyView{Name: form.Name, Addr: form.Addr, Fingerprint: fp, KeyType: escape.Terminal(key.Type()), KeyFile: hostKeyFile(key.Type()), Pending: id}
 	u.page(c, http.StatusOK, "enrol_key", "Compare the fingerprint", "enrol", v, "")
 }
@@ -153,11 +142,8 @@ func (u *UI) enrolConfirm(c *reqCtx) {
 	}
 	var p pendingEnrol
 	var ok bool
-	u.sessions.with(func() {
-		p, ok = c.sess.pending[id]
-		delete(c.sess.pending, id)
-	})
-	if !ok || u.o.Now().Sub(p.created) > pendingLifetime {
+	u.sessions.with(func() { p, ok = takePending(c.sess.pending, enrolCreated, u.o.Now(), id) })
+	if !ok {
 		u.fail(c.w, c.r, http.StatusBadRequest, "This confirmation has expired or was already used. Start the enrolment again.")
 		return
 	}

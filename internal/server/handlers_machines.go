@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -519,8 +521,71 @@ type changesView struct {
 	Blocked   bool
 }
 
-func (u *UI) acceptURL(machineID, reportID int64, keys []string) string {
-	q := url.Values{"report": {strconv.FormatInt(reportID, 10)}, "key": keys}
+// acceptGroup is the keys of findings that must be accepted together, in
+// the report's order. Blocked lists the keys accepting them would also
+// hide that are not changes since the snapshot; such a group cannot be
+// accepted.
+type acceptGroup struct {
+	Keys    []string
+	Blocked []string
+}
+
+// acceptGroups groups a report's acceptable changes: findings joined by
+// Acceptable.With, in the report's order. It is worked out again for every
+// page and form, so neither the review's links nor the confirmation form
+// has to carry the keys (a large change set does not fit in a URL).
+func acceptGroups(a Acceptable, rep *model.Report) ([]acceptGroup, map[string]model.Finding) {
+	byKey := map[string]model.Finding{}
+	var order []string
+	for _, f := range rep.Findings {
+		if _, ok := a.With[f.Key]; ok {
+			if _, dup := byKey[f.Key]; !dup {
+				order = append(order, f.Key)
+			}
+			byKey[f.Key] = f
+		}
+	}
+	seen := map[string]bool{}
+	var groups []acceptGroup
+	for _, k := range order {
+		if seen[k] {
+			continue
+		}
+		var g acceptGroup
+		queue := []string{k}
+		seen[k] = true
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			g.Keys = append(g.Keys, cur)
+			for _, w := range a.With[cur] {
+				if _, ok := a.With[w]; !ok {
+					if !slices.Contains(g.Blocked, w) {
+						g.Blocked = append(g.Blocked, w)
+					}
+					continue
+				}
+				if !seen[w] {
+					seen[w] = true
+					queue = append(queue, w)
+				}
+			}
+		}
+		groups = append(groups, g)
+	}
+	return groups, byKey
+}
+
+// acceptLink is the confirmation page for every acceptable change of the
+// report (group "") or for the group the finding group names. It stays
+// short however many changes it covers.
+func acceptLink(machineID, reportID int64, group string) string {
+	q := url.Values{"report": {strconv.FormatInt(reportID, 10)}}
+	if group == "" {
+		q.Set("all", "1")
+	} else {
+		q.Set("group", group)
+	}
 	return fmt.Sprintf("/machines/%d/accept?%s", machineID, q.Encode())
 }
 
@@ -547,58 +612,26 @@ func (u *UI) changesPage(c *reqCtx) {
 		u.fail(c.w, c.r, http.StatusNotFound, "The machine's latest report could not be read.")
 		return
 	}
-	byKey := map[string]model.Finding{}
-	var order []string
-	for _, f := range rep.Findings {
-		if _, ok := a.With[f.Key]; ok {
-			byKey[f.Key] = f
-			order = append(order, f.Key)
-		}
-	}
-	// Groups: findings joined by With, in the report's order.
-	seen := map[string]bool{}
-	var all []string
-	for _, k := range order {
-		if seen[k] {
-			continue
-		}
-		var keys, blocked []string
-		queue := []string{k}
-		seen[k] = true
-		for len(queue) > 0 {
-			cur := queue[0]
-			queue = queue[1:]
-			keys = append(keys, cur)
-			for _, w := range a.With[cur] {
-				if _, ok := a.With[w]; !ok {
-					if !slices.Contains(blocked, escape.Terminal(w)) {
-						blocked = append(blocked, escape.Terminal(w))
-					}
-					continue
-				}
-				if !seen[w] {
-					seen[w] = true
-					queue = append(queue, w)
-				}
-			}
-		}
+	groups, byKey := acceptGroups(a, rep)
+	for _, ag := range groups {
 		var fs []model.Finding
-		for _, key := range keys {
-			if f, ok := byKey[key]; ok {
-				fs = append(fs, f)
-			}
+		for _, key := range ag.Keys {
+			fs = append(fs, byKey[key])
 		}
-		g := changeGroup{Findings: findingViews(fs, 0, 0, fmt.Sprintf("fix-%d-", len(v.Groups))), Blocked: blocked}
-		if len(blocked) == 0 {
-			g.AcceptURL = u.acceptURL(m.ID, a.ReportID, keys)
-			all = append(all, keys...)
+		g := changeGroup{Findings: findingViews(fs, 0, 0, fmt.Sprintf("fix-%d-", len(v.Groups)))}
+		for _, b := range ag.Blocked {
+			g.Blocked = append(g.Blocked, escape.Terminal(b))
+		}
+		if len(ag.Blocked) == 0 {
+			g.AcceptURL = acceptLink(m.ID, a.ReportID, ag.Keys[0])
+			v.AllCount += len(ag.Keys)
 		} else {
 			v.Blocked = true
 		}
 		v.Groups = append(v.Groups, g)
 	}
-	if len(all) > 0 {
-		v.AllURL, v.AllCount = u.acceptURL(m.ID, a.ReportID, all), len(all)
+	if v.AllCount > 0 {
+		v.AllURL = acceptLink(m.ID, a.ReportID, "")
 	}
 	u.page(c, http.StatusOK, "changes", "Changes since the snapshot", "machines", v, "")
 }
@@ -607,11 +640,11 @@ type acceptView struct {
 	MachineID int64
 	Name      string
 	ReportID  int64
-	Keys      []string
+	All       bool
+	Group     string
+	Sum       string
 	Findings  []findingView
 }
-
-const maxAcceptKeys = 10000
 
 // formKey is a finding key as a hidden form field: percent-encoded, so a key
 // holding any byte a machine put in it is plain ASCII in the page.
@@ -630,22 +663,80 @@ func keysFromForm(vs []string) ([]string, bool) {
 	return out, true
 }
 
-// acceptKeys reads the chosen findings and checks each is in the report.
-func (u *UI) acceptKeys(c *reqCtx, rep *model.Report, keys []string) ([]model.Finding, bool) {
-	if len(keys) == 0 || len(keys) > maxAcceptKeys {
-		u.fail(c.w, c.r, http.StatusBadRequest, "No changes were chosen.")
-		return nil, false
-	}
-	var fs []model.Finding
+// selectionSum identifies a set of changes of one report, so a confirmation
+// form can say which set the owner saw without carrying it.
+func selectionSum(reportID int64, keys []string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%d\n", reportID)
 	for _, k := range keys {
-		i := slices.IndexFunc(rep.Findings, func(f model.Finding) bool { return f.Key == k })
-		if i < 0 {
-			u.fail(c.w, c.r, http.StatusBadRequest, "One of the chosen changes is not in that report.")
-			return nil, false
-		}
-		fs = append(fs, rep.Findings[i])
+		fmt.Fprintf(h, "%d:%s\n", len(k), k)
 	}
-	return fs, true
+	return hex.EncodeToString(h.Sum(nil)[:16])
+}
+
+// acceptSelection is the changes an accept link or form names, worked out
+// on the server from the machine's latest report: all of them (all=1) or
+// the group one of them belongs to (group=<key>). The report must be the
+// one the changes come from. On failure it has answered and ok is false.
+type acceptSelection struct {
+	reportID int64
+	all      bool
+	group    string // the key the group was named by, as given
+	keys     []string
+	findings []model.Finding
+}
+
+func (u *UI) acceptSelection(c *reqCtx, m *store.Machine, vals url.Values) (acceptSelection, bool) {
+	rid, rep := u.machineReport(c, m, vals.Get("report"))
+	if rep == nil {
+		return acceptSelection{}, false
+	}
+	a, err := u.o.Core.Acceptable(m.ID)
+	if err != nil {
+		u.serverError(c.w, c.r, err)
+		return acceptSelection{}, false
+	}
+	if a.Stale || a.ReportID != rid {
+		u.fail(c.w, c.r, http.StatusConflict, "Those changes cannot be accepted from that report any more: a newer visit or another change came first. Review the changes again.")
+		return acceptSelection{}, false
+	}
+	groups, byKey := acceptGroups(a, rep)
+	sel := acceptSelection{reportID: rid, all: vals.Get("all") == "1", group: vals.Get("group")}
+	switch {
+	case sel.all:
+		for _, g := range groups {
+			if len(g.Blocked) == 0 {
+				sel.keys = append(sel.keys, g.Keys...)
+			}
+		}
+	case sel.group != "":
+		i := slices.IndexFunc(groups, func(g acceptGroup) bool { return slices.Contains(g.Keys, sel.group) })
+		if i < 0 {
+			u.fail(c.w, c.r, http.StatusBadRequest, "That finding is not one of the changes that can be accepted from that report.")
+			return acceptSelection{}, false
+		}
+		if len(groups[i].Blocked) > 0 {
+			u.fail(c.w, c.r, http.StatusBadRequest, "Those changes cannot be accepted yet: accepting them would also hide a finding that is not a change since the snapshot.")
+			return acceptSelection{}, false
+		}
+		sel.keys = groups[i].Keys
+	}
+	if len(sel.keys) == 0 {
+		u.fail(c.w, c.r, http.StatusBadRequest, "No changes were chosen.")
+		return acceptSelection{}, false
+	}
+	for _, k := range sel.keys {
+		sel.findings = append(sel.findings, byKey[k])
+	}
+	return sel, true
+}
+
+// link is the selection's confirmation page.
+func (s acceptSelection) link(machineID int64) string {
+	if s.all {
+		return acceptLink(machineID, s.reportID, "")
+	}
+	return acceptLink(machineID, s.reportID, s.group)
 }
 
 func (u *UI) acceptPage(c *reqCtx) {
@@ -653,19 +744,13 @@ func (u *UI) acceptPage(c *reqCtx) {
 	if m == nil {
 		return
 	}
-	q := c.r.URL.Query()
-	rid, rep := u.machineReport(c, m, q.Get("report"))
-	if rep == nil {
-		return
-	}
-	keys := q["key"]
-	fs, ok := u.acceptKeys(c, rep, keys)
+	sel, ok := u.acceptSelection(c, m, c.r.URL.Query())
 	if !ok {
 		return
 	}
-	v := acceptView{MachineID: m.ID, Name: escape.Terminal(m.Name), ReportID: rid, Findings: findingViews(fs, 0, 0, "fix-")}
-	for _, k := range keys {
-		v.Keys = append(v.Keys, formKey(k))
+	v := acceptView{MachineID: m.ID, Name: escape.Terminal(m.Name), ReportID: sel.reportID, All: sel.all, Sum: selectionSum(sel.reportID, sel.keys), Findings: findingViews(sel.findings, 0, 0, "fix-")}
+	if !sel.all {
+		v.Group = formKey(sel.group)
 	}
 	u.page(c, http.StatusOK, "accept", "Accept changes", "machines", v, "")
 }
@@ -675,29 +760,35 @@ func (u *UI) acceptPost(c *reqCtx) {
 	if m == nil {
 		return
 	}
-	rid, rep := u.machineReport(c, m, c.r.PostForm.Get("report"))
-	if rep == nil {
-		return
+	form := url.Values{"report": {c.r.PostForm.Get("report")}, "all": {c.r.PostForm.Get("all")}}
+	if g := c.r.PostForm.Get("group"); g != "" {
+		keys, ok := keysFromForm([]string{g})
+		if !ok {
+			u.fail(c.w, c.r, http.StatusBadRequest, "The chosen changes could not be read.")
+			return
+		}
+		form.Set("group", keys[0])
 	}
-	keys, ok := keysFromForm(c.r.PostForm["key"])
+	sel, ok := u.acceptSelection(c, m, form)
 	if !ok {
-		u.fail(c.w, c.r, http.StatusBadRequest, "The chosen changes could not be read.")
 		return
 	}
-	if _, ok := u.acceptKeys(c, rep, keys); !ok {
+	if !u.confirmed(c, sel.link(m.ID)) {
 		return
 	}
-	if !u.confirmed(c, u.acceptURL(m.ID, rid, keys)) {
+	if !sameToken(c.r.PostForm.Get("sum"), selectionSum(sel.reportID, sel.keys)) {
+		u.render(c.w, http.StatusConflict, "error", pageData{Title: "Review the changes again", LoggedIn: true, CSRF: c.sess.csrf,
+			Error: "Nothing was changed: the changes to accept are not the ones you reviewed any more.", Body: errorView{Back: sel.link(m.ID)}})
 		return
 	}
 	to := fmt.Sprintf("/machines/%d", m.ID)
-	if err := u.o.Core.AcceptChanges(c.r.Context(), m.ID, rid, keys); err != nil {
+	if err := u.o.Core.AcceptChanges(c.r.Context(), m.ID, sel.reportID, sel.keys); err != nil {
 		u.redirect(c, to, actionError(err))
 		return
 	}
 	n := "1 change"
-	if len(keys) != 1 {
-		n = strconv.Itoa(len(keys)) + " changes"
+	if len(sel.keys) != 1 {
+		n = strconv.Itoa(len(sel.keys)) + " changes"
 	}
 	u.redirect(c, to, "Accepted "+n+" into the snapshot. The next visit is compared with the new snapshot.")
 }

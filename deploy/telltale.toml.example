@@ -16,7 +16,9 @@ listen = "192.168.1.10:8443"
 # machine (from="..." for root's key and "Match Address ..." in
 # sshd_config), so it must be one literal IP address: no host name, range
 # or pattern. When it is not set it is the address in listen, which then
-# must not be 0.0.0.0 or ::.
+# must not be 0.0.0.0, :: or a loopback address such as 127.0.0.1. A
+# loopback server_addr set here works only for this machine itself, and
+# the server warns about it at start.
 #server_addr = "192.168.1.10"
 
 # data_dir (optional): where the database, the HTTPS certificate and key
@@ -31,8 +33,13 @@ listen = "192.168.1.10:8443"
 #bin_dir = "/usr/lib/telltale"
 
 # key_file (optional): an age key file that unlocks the database instead
-# of a passphrase, for unattended restarts. It is created on first use.
-# Anyone who can read it can read the database, so keep it 0600 on this
-# machine only. Without it the passphrase comes from TELLTALE_PASSPHRASE,
-# from systemd's credential "passphrase", or from a prompt.
-#key_file = "/etc/telltale/data.key"
+# of a passphrase, for unattended restarts. It is created on first use, so
+# the server must be able to write its directory: under the shipped
+# systemd unit only /var/lib/telltale is writable, which is why the
+# example puts it there. A key file kept elsewhere must exist before the
+# first start, owned by the telltale user with mode 0600. Anyone who can
+# read it can read the database, and a copy of the data directory now
+# includes it: back up the data directory with that in mind. Without
+# key_file the passphrase comes from TELLTALE_PASSPHRASE, from systemd's
+# credential "passphrase", or from a prompt.
+#key_file = "/var/lib/telltale/data.key"

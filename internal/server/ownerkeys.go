@@ -72,53 +72,101 @@ func OwnerKeys(st *store.Store) ([]OwnerKey, error) {
 	return l.Keys, err
 }
 
-// AddOwnerKey adds the public keys in an ASCII-armored block as trusted for
-// the repositories repoURL covers, and returns the entries it added. The
+// OwnerKeyCandidate is a pasted key block that passed every check but is
+// not trusted yet: the owner sees its fingerprints and the addresses it
+// would vouch for first (CheckOwnerKey), then confirms (TrustOwnerKey).
+type OwnerKeyCandidate struct {
+	URLPattern string
+	Keys       []model.KeyBlob
+	// Names are each key's user IDs, as the key states them, for the owner
+	// to read; nothing relies on them.
+	Names [][]string
+}
+
+// CheckOwnerKey reads the public keys in an ASCII-armored block, to be
+// trusted for the repositories repoURL covers, and stores nothing. The
 // address must be an http or https repository that is not an official
 // Debian or Ubuntu archive (those are checked with telltale's built-in
 // keys). A private key, a key that cannot sign, or a key already trusted
 // for that address is refused.
-func AddOwnerKey(st *store.Store, armored, repoURL string, now time.Time) ([]OwnerKey, error) {
+func CheckOwnerKey(st *store.Store, armored, repoURL string) (OwnerKeyCandidate, error) {
 	repoURL = strings.TrimSpace(repoURL)
 	if repoURL == "" {
-		return nil, errors.New("give the address of the repository the key signs, as it appears in the machines' APT sources")
+		return OwnerKeyCandidate{}, errors.New("give the address of the repository the key signs, as it appears in the machines' APT sources")
 	}
 	pattern, ok := model.RepoURL(repoURL)
 	if !ok {
-		return nil, errors.New("the repository address must be an http or https address with a host, and no . or .. in its path")
+		return OwnerKeyCandidate{}, errors.New("the repository address must be an http or https address with a host, and no . or .. in its path")
 	}
 	if model.OfficialAptURI(pattern) {
-		return nil, errors.New("that is an official Debian or Ubuntu archive; telltale checks those with its built-in keys only")
+		return OwnerKeyCandidate{}, errors.New("that is an official Debian or Ubuntu archive; telltale checks those with its built-in keys only")
 	}
 	armored = strings.TrimSpace(armored)
 	switch {
 	case len(armored) > maxArmoredKeySize:
-		return nil, fmt.Errorf("the key is larger than %d KiB", maxArmoredKeySize>>10)
+		return OwnerKeyCandidate{}, fmt.Errorf("the key is larger than %d KiB", maxArmoredKeySize>>10)
 	case strings.Contains(armored, "PRIVATE KEY BLOCK"):
-		return nil, errors.New("that is a private key; paste only the repository's public key (and treat that private key as exposed)")
+		return OwnerKeyCandidate{}, errors.New("that is a private key; paste only the repository's public key (and treat that private key as exposed)")
 	case !strings.Contains(armored, "-----BEGIN PGP PUBLIC KEY BLOCK-----"):
-		return nil, errors.New("paste the key as an ASCII-armored block, starting with -----BEGIN PGP PUBLIC KEY BLOCK-----")
+		return OwnerKeyCandidate{}, errors.New("paste the key as an ASCII-armored block, starting with -----BEGIN PGP PUBLIC KEY BLOCK-----")
 	}
 	el, err := repokeys.ReadEntities([]byte(armored))
 	if err != nil {
-		return nil, fmt.Errorf("no usable OpenPGP public key in that text: %v", err)
+		return OwnerKeyCandidate{}, fmt.Errorf("no usable OpenPGP public key in that text: %v", err)
 	}
 	if len(el) > maxKeysPerPaste {
-		return nil, fmt.Errorf("that block holds %d keys; add at most %d at a time", len(el), maxKeysPerPaste)
+		return OwnerKeyCandidate{}, fmt.Errorf("that block holds %d keys; add at most %d at a time", len(el), maxKeysPerPaste)
 	}
-	var blobs []model.KeyBlob
+	c := OwnerKeyCandidate{URLPattern: pattern}
 	for _, e := range el {
 		if e.PrivateKey != nil {
-			return nil, errors.New("that is a private key; paste only the repository's public key")
+			return OwnerKeyCandidate{}, errors.New("that is a private key; paste only the repository's public key")
 		}
 		if len(vendorkeys.SigningKeys(e)) == 0 {
-			return nil, fmt.Errorf("key %s cannot sign repository indexes (it is revoked or has no signing key)", repokeys.Fingerprint(e))
+			return OwnerKeyCandidate{}, fmt.Errorf("key %s cannot sign repository indexes (it is revoked or has no signing key)", repokeys.Fingerprint(e))
 		}
 		b, err := repokeys.Blob(e)
 		if err != nil {
-			return nil, fmt.Errorf("key %s cannot be stored: %v", repokeys.Fingerprint(e), err)
+			return OwnerKeyCandidate{}, fmt.Errorf("key %s cannot be stored: %v", repokeys.Fingerprint(e), err)
 		}
-		blobs = append(blobs, b)
+		var names []string
+		for name := range e.Identities {
+			names = append(names, name)
+		}
+		slices.Sort(names)
+		c.Keys = append(c.Keys, b)
+		c.Names = append(c.Names, names)
+	}
+	l, err := loadOwnerKeys(st)
+	if err != nil {
+		return OwnerKeyCandidate{}, err
+	}
+	if err := checkRoom(l, c); err != nil {
+		return OwnerKeyCandidate{}, err
+	}
+	return c, nil
+}
+
+// checkRoom refuses a candidate the list has no room for, or one with a key
+// already trusted for the same address.
+func checkRoom(l ownerKeyList, c OwnerKeyCandidate) error {
+	if len(l.Keys)+len(c.Keys) > maxOwnerKeys {
+		return fmt.Errorf("at most %d repository keys can be trusted; remove some first", maxOwnerKeys)
+	}
+	for _, b := range c.Keys {
+		if slices.ContainsFunc(l.Keys, func(k OwnerKey) bool { return k.Key.Fingerprint == b.Fingerprint && k.URLPattern == c.URLPattern }) {
+			return fmt.Errorf("key %s is already trusted for %s", b.Fingerprint, c.URLPattern)
+		}
+	}
+	return nil
+}
+
+// TrustOwnerKey stores exactly the keys of a candidate CheckOwnerKey
+// returned, and returns the entries it added. The room and duplicate checks
+// run again, since the list may have changed in between.
+func TrustOwnerKey(st *store.Store, c OwnerKeyCandidate, now time.Time) ([]OwnerKey, error) {
+	if len(c.Keys) == 0 || c.URLPattern == "" {
+		return nil, errors.New("no key to add")
 	}
 	ownerKeysMu.Lock()
 	defer ownerKeysMu.Unlock()
@@ -126,16 +174,13 @@ func AddOwnerKey(st *store.Store, armored, repoURL string, now time.Time) ([]Own
 	if err != nil {
 		return nil, err
 	}
-	if len(l.Keys)+len(blobs) > maxOwnerKeys {
-		return nil, fmt.Errorf("at most %d repository keys can be trusted; remove some first", maxOwnerKeys)
+	if err := checkRoom(l, c); err != nil {
+		return nil, err
 	}
 	var added []OwnerKey
-	for _, b := range blobs {
-		if slices.ContainsFunc(l.Keys, func(k OwnerKey) bool { return k.Key.Fingerprint == b.Fingerprint && k.URLPattern == pattern }) {
-			return nil, fmt.Errorf("key %s is already trusted for %s", b.Fingerprint, pattern)
-		}
+	for _, b := range c.Keys {
 		l.Next++
-		k := OwnerKey{ID: l.Next, URLPattern: pattern, Key: b, Added: now.UTC()}
+		k := OwnerKey{ID: l.Next, URLPattern: c.URLPattern, Key: b, Added: now.UTC()}
 		l.Keys = append(l.Keys, k)
 		added = append(added, k)
 	}
@@ -143,6 +188,16 @@ func AddOwnerKey(st *store.Store, armored, repoURL string, now time.Time) ([]Own
 		return nil, err
 	}
 	return added, nil
+}
+
+// AddOwnerKey is CheckOwnerKey and TrustOwnerKey in one step, for callers
+// that show the owner nothing in between (tests).
+func AddOwnerKey(st *store.Store, armored, repoURL string, now time.Time) ([]OwnerKey, error) {
+	c, err := CheckOwnerKey(st, armored, repoURL)
+	if err != nil {
+		return nil, err
+	}
+	return TrustOwnerKey(st, c, now)
 }
 
 // RemoveOwnerKey stops trusting one of the owner's repository keys.
