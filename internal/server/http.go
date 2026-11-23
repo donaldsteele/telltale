@@ -22,6 +22,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/donaldsteele/telltale/internal/alerts"
 	"github.com/donaldsteele/telltale/internal/escape"
 	"github.com/donaldsteele/telltale/internal/report"
 	"github.com/donaldsteele/telltale/internal/store"
@@ -71,6 +72,9 @@ type UIOptions struct {
 	Context context.Context
 	// Log is the server log; nil means the standard logger.
 	Log *log.Logger
+	// Bubbles is the bubbles alert sink the settings pages pair and test;
+	// nil means one on Store that nothing else sends through.
+	Bubbles *alerts.Bubbles
 }
 
 // UI is the web UI. It is an http.Handler; serve it over TLS only.
@@ -120,6 +124,9 @@ func NewUI(o UIOptions) (*UI, error) {
 	if o.Context == nil {
 		o.Context = context.Background()
 	}
+	if o.Bubbles == nil {
+		o.Bubbles = &alerts.Bubbles{Store: o.Store, Log: o.Log, Context: o.Context}
+	}
 	u := &UI{o: o, listen: netip.AddrPortFrom(lp.Addr().Unmap(), lp.Port()), sessions: newSessions(), limiter: newLimiter()}
 	if err := u.loadTemplates(); err != nil {
 		return nil, err
@@ -163,6 +170,7 @@ type checkNowArgs struct {
 }
 
 var templateFuncs = template.FuncMap{
+	"count": countWord,
 	"checkArgs": func(id int64, csrf string, primary bool) checkNowArgs {
 		return checkNowArgs{ID: id, CSRF: csrf, Primary: primary}
 	},
@@ -391,7 +399,9 @@ type pageData struct {
 	Flash    string
 	Error    string
 	Version  string
-	Body     any
+	// Refresh, when set, reloads the page after that many seconds.
+	Refresh int
+	Body    any
 }
 
 func (u *UI) routes() {
@@ -425,6 +435,17 @@ func (u *UI) routes() {
 	m.HandleFunc("POST /settings/keys", u.authed(u.settingsAddKey))
 	m.HandleFunc("POST /settings/keys/confirm", u.authed(u.settingsConfirmKey))
 	m.HandleFunc("POST /settings/keys/{id}/remove", u.authed(u.settingsRemoveKey))
+	m.HandleFunc("GET /settings/bubbles", u.authed(u.bubblesPage))
+	m.HandleFunc("POST /settings/bubbles/inspect", u.authed(u.bubblesInspect))
+	m.HandleFunc("POST /settings/bubbles/nomatch", u.authed(u.bubblesNoMatch))
+	m.HandleFunc("POST /settings/bubbles/pair", u.authed(u.bubblesPair))
+	m.HandleFunc("POST /settings/bubbles/cancel", u.authed(u.bubblesCancel))
+	m.HandleFunc("POST /settings/bubbles/channels", u.authed(u.bubblesChannels))
+	m.HandleFunc("POST /settings/bubbles/channel", u.authed(u.bubblesChannel))
+	m.HandleFunc("POST /settings/bubbles/test", u.authed(u.bubblesTest))
+	m.HandleFunc("POST /settings/bubbles/retry", u.authed(u.bubblesRetry))
+	m.HandleFunc("GET /settings/bubbles/disconnect", u.authed(u.bubblesDisconnectPage))
+	m.HandleFunc("POST /settings/bubbles/disconnect", u.authed(u.bubblesDisconnect))
 	m.HandleFunc("GET /audit", u.authed(u.auditPage))
 	u.mux = m
 }

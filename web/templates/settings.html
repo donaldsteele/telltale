@@ -54,7 +54,20 @@
 
 <section class="panel" id="bubbles" aria-labelledby="bubbles-title">
 <h2 id="bubbles-title">Alerts through bubbles</h2>
-<p class="dim">Not connected. Pairing with a bubbles server comes in a later version.</p>
+{{- if .Bubbles.Connected}}
+<p>Connected to {{if .Bubbles.ServerName}}<strong>{{.Bubbles.ServerName}}</strong> ({{.Bubbles.Address}}){{else}}<strong>{{.Bubbles.Address}}</strong>{{end}}.{{if .Bubbles.Channel.ID}} Alerts go to <strong>#{{.Bubbles.Channel.Name}}</strong>.{{else}} No channel is chosen yet, so alerts wait.{{end}}</p>
+{{- with .Trouble}}<div class="callout warn"><p>{{.}}</p></div>{{end}}
+{{- if .Bubbles.Pending}}<p>{{count .Bubbles.Pending "alert is" "alerts are"}} waiting to be sent.</p>{{end}}
+<p><a class="btn" href="/settings/bubbles">Manage the connection</a></p>
+{{- else if .Pairing}}
+<p>Waiting for your chat admin to approve telltale.</p>
+<p><a class="btn" href="/settings/bubbles">Show the code</a></p>
+{{- else}}
+{{- with .Trouble}}<div class="callout warn"><p>{{.}}</p></div>{{end}}
+<p class="dim">Not connected.</p>
+<p>Post the alerts set above in your team chat. To connect, you compare the bubbles server's fingerprint, and your chat admin approves telltale.</p>
+<p><a class="btn" href="/settings/bubbles">Connect to bubbles</a></p>
+{{- end}}
 </section>
 
 <section class="panel" id="mcp" aria-labelledby="mcp-title">

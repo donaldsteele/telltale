@@ -1,0 +1,23 @@
+{{define "content"}}
+{{- with .Body}}
+<section class="narrow">
+<h1>Is this the right server?</h1>
+<p>Ask your chat admin to open <strong>Admin &gt; Overview</strong> in bubbles and read out the start of the server fingerprint. It must match:</p>
+<p class="fingerprint fpbig">{{.Start}}</p>
+<p class="mono small fprest">{{.Rest}}</p>
+<p class="small">Server: {{if .ServerName}}{{.ServerName}} ({{.Address}}){{else}}{{.Address}}{{end}}.</p>
+<p>telltale fetched this fingerprint over the network without any protection, so only your comparison makes it trustworthy. If it matches, telltale trusts this server, and only this server, from now on.</p>
+<form method="post" action="/settings/bubbles/pair" class="confirm">
+<input type="hidden" name="csrf" value="{{$.CSRF}}">
+<input type="hidden" name="candidate" value="{{.ID}}">
+<input type="hidden" name="confirm" value="yes">
+<button type="submit" class="btn primary">It matches</button>
+</form>
+<form method="post" action="/settings/bubbles/nomatch" class="inline">
+<input type="hidden" name="csrf" value="{{$.CSRF}}">
+<button type="submit" class="btn">It doesn't</button>
+</form>
+<p><a href="/settings/bubbles">Cancel</a></p>
+</section>
+{{- end}}
+{{end}}

@@ -49,6 +49,14 @@ type AlertSink interface {
 	Notify(ctx context.Context, m store.Machine, newFindings, resolved []model.Finding) error
 }
 
+// AlertRetrier is an AlertSink that keeps the alerts it could not deliver
+// and sends them again (alerts.Bubbles). The core asks it to try after
+// every visit, whether or not the visit had anything new; Kick must not
+// block.
+type AlertRetrier interface {
+	Kick()
+}
+
 // Visitor collects a machine. SSHVisitor is the real one.
 type Visitor interface {
 	Visit(ctx context.Context, m store.Machine, signer ssh.Signer, sc model.ScanContext, bins visit.Binaries) (*model.Collection, error)
@@ -351,6 +359,9 @@ func (c *Core) VisitNow(ctx context.Context, machineID int64) (int64, error) {
 		if aerr := c.sendAlert(ctx, out.alert); aerr != nil {
 			err = errors.Join(err, aerr)
 		}
+	}
+	if r, ok := c.Alerts.(AlertRetrier); ok {
+		r.Kick()
 	}
 	c.reschedule(machineID)
 	return out.rid, err

@@ -12,11 +12,13 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/donaldsteele/telltale/internal/alerts"
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/internal/pkgverify"
 	"github.com/donaldsteele/telltale/internal/store"
@@ -176,6 +178,44 @@ func (a *fakeAlerts) Notify(_ context.Context, m store.Machine, fresh, resolved 
 	}
 	a.got = append(a.got, alert{m.ID, keysOf(fresh), keysOf(resolved)})
 	return nil
+}
+
+// retryingAlerts is a sink that keeps what it could not send (an
+// AlertRetrier) and counts the core's kicks.
+type retryingAlerts struct {
+	fakeAlerts
+	kicks atomic.Int32
+}
+
+func (a *retryingAlerts) Kick() { a.kicks.Add(1) }
+
+// A sink that retries is asked to after every visit, also after one with
+// nothing new to tell: the next visit is when pending alerts go out again.
+func TestVisitKicksRetryingSink(t *testing.T) {
+	fx := newFixture(t)
+	ra := &retryingAlerts{}
+	fx.core.Alerts = ra
+	fx.vis.collect = func(store.Machine, int) (*model.Collection, error) { return hidden(base()), nil }
+	fx.visitOK(t, fx.id)
+	fx.visitOK(t, fx.id)
+	if n := ra.kicks.Load(); n != 2 {
+		t.Errorf("kicked %d times after two visits", n)
+	}
+	// A visit that fails still kicks.
+	fx.vis.collect = func(store.Machine, int) (*model.Collection, error) { return nil, errors.New("no route") }
+	fx.core.VisitNow(context.Background(), fx.id)
+	if n := ra.kicks.Load(); n != 3 {
+		t.Errorf("kicked %d times after a failed visit", n)
+	}
+}
+
+// The alerts package reads the same alert_timeout setting for its retries.
+func TestAlertTimeoutSettingShared(t *testing.T) {
+	if alerts.SettingAlertTimeout != SettingAlertTimeout {
+		t.Errorf("alerts reads %q, the core %q", alerts.SettingAlertTimeout, SettingAlertTimeout)
+	}
+	var _ AlertSink = (*alerts.Bubbles)(nil)
+	var _ AlertRetrier = (*alerts.Bubbles)(nil)
 }
 
 func (a *fakeAlerts) all() []alert {

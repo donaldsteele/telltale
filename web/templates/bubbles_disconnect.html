@@ -1,0 +1,12 @@
+{{define "content"}}
+<section class="narrow">
+<h1>Disconnect from bubbles?</h1>
+<p>telltale stops sending alerts, and drops the alerts still waiting to be sent. Your chat admin should also remove telltale in bubbles under <strong>Admin &gt; Apps</strong>.</p>
+<form method="post" action="/settings/bubbles/disconnect" class="confirm">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<input type="hidden" name="confirm" value="yes">
+<button type="submit" class="btn primary">Disconnect</button>
+<a href="/settings/bubbles">Cancel</a>
+</form>
+</section>
+{{end}}

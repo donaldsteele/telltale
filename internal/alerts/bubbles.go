@@ -1,0 +1,1042 @@
+// Package alerts sends server mode's findings to bubbles, the owner's
+// self-hosted LAN chat, as alerts: one per finding, deduplicated by a key
+// that names the machine and the finding, and resolved when the finding is
+// gone. pairing.go connects to a bubbles server the way netdiag does.
+//
+// What a machine sent (host names, titles, paths, lines, fix commands) is
+// escaped with escape.Terminal and then neutralised for the way bubbles
+// shows it. bubbles shows an alert's title and fields as plain text on its
+// alert card, and writes them into a Markdown body for clients without
+// cards: there the title is escaped by bubbles but entities and links are
+// not, and fields are escaped for a table cell only. So title and field
+// values get no character reference that Markdown would decode and no
+// link scheme a linkifier would follow (plain). The alert text is
+// Markdown on the card too, with links, entities and @mentions: every
+// machine string in it is either backslash-escaped character by
+// character (mdText) or a line in a fenced code block (mdCode), where
+// Markdown interprets nothing. An alert carries at most one line of a
+// file: the first changed line of the finding's evidence, which is kept
+// text and so already redacted, and is redacted once more here.
+//
+// Alerts bubbles cannot take now wait, sealed, in the store (at most
+// MaxPending; past that the oldest are dropped and counted, and the count
+// goes out as one summary alert with the next send). They are sent again
+// after the next visit (Kick) and every RetryEvery (Run).
+package alerts
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"github.com/donaldsteele/bubbles/pkg/bubblesclient"
+	"github.com/donaldsteele/bubbles/pkg/protocol"
+
+	"github.com/donaldsteele/telltale/internal/escape"
+	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/redact"
+	"github.com/donaldsteele/telltale/internal/store"
+)
+
+// Sealed settings. The connection string carries the app token: it is
+// kept in SettingConn only, never logged, audited or shown.
+const (
+	SettingConn    = "bubbles_conn"
+	SettingChannel = "bubbles_channel"
+	SettingPending = "bubbles_pending"
+	// SettingAlertTimeout is the server's alert_timeout setting
+	// (server.SettingAlertTimeout; the server package imports this one).
+	// It bounds every retry the way it bounds Notify.
+	SettingAlertTimeout = "alert_timeout"
+)
+
+const (
+	// AppName is the app name telltale pairs under.
+	AppName = "telltale"
+	// MaxPending bounds the alerts kept while bubbles cannot be reached.
+	MaxPending = 1000
+	// RetryEvery is how often Run tries the pending alerts again.
+	RetryEvery = 5 * time.Minute
+	// TestKey is the test alert's dedupe key.
+	TestKey = "telltale:test"
+	// DroppedKey is the dedupe key of the summary alert about alerts
+	// dropped while bubbles could not be reached.
+	DroppedKey = "telltale:dropped"
+
+	defaultAlertTimeout = time.Minute
+	// callTimeout bounds one call the owner waits for in the web UI.
+	callTimeout = 20 * time.Second
+	// kickGap: a Kick right after a failed try does not try again.
+	kickGap = 30 * time.Second
+	// saveEvery: a flush records its progress every so many alerts.
+	saveEvery = 50
+	// Bounds on the parts of an alert, before Markdown escaping (which at
+	// most doubles them), so the text stays under protocol.MaxAlertText.
+	maxWhy, maxWhere, maxLine, maxFix = 900, 150, 300, 900
+)
+
+// Scopes are the app token scopes telltale asks for: posting and resolving
+// alerts, and listing its bot's channels to choose one.
+var Scopes = []string{protocol.ScopeAlertsWrite, protocol.ScopeChannelsRead}
+
+// Bubbles is the alert sink for bubbles (server.AlertSink), the pairing
+// wizard's state and the retry loop. Set Store, then use it from any
+// goroutine.
+type Bubbles struct {
+	Store *store.Store
+	// Now is the clock; nil means time.Now.
+	Now func() time.Time
+	// Log is the server log; nil means the standard logger.
+	Log *log.Logger
+	// Context ends pairing requests still waiting for the chat admin; nil
+	// means context.Background.
+	Context context.Context
+	// Hostname names this server to bubbles ("telltale server on ...");
+	// "" means os.Hostname.
+	Hostname string
+
+	initOnce   sync.Once
+	retryEvery time.Duration // RetryEvery; tests shorten it
+	qmu        sync.Mutex    // the pending queue in the store
+	sending    chan struct{} // held by the one flush that sends
+	kick       chan struct{}
+	redactKey  []byte
+
+	mu       sync.Mutex // the fields below
+	trouble  Trouble
+	since    time.Time
+	lastTry  time.Time
+	clConn   string // the connection string cl was made from
+	cl       *bubblesclient.Client
+	cands    map[string]candidate
+	pair     *pairSession
+	choices  []Channel // the bot's channels, as last listed
+	choosing bool      // the owner asked to choose a channel again
+}
+
+func (b *Bubbles) init() {
+	b.initOnce.Do(func() {
+		if b.retryEvery == 0 {
+			b.retryEvery = RetryEvery
+		}
+		b.sending = make(chan struct{}, 1)
+		b.kick = make(chan struct{}, 1)
+		b.redactKey = make([]byte, 32)
+		if _, err := rand.Read(b.redactKey); err != nil {
+			panic("telltale: no randomness: " + err.Error())
+		}
+		b.cands = map[string]candidate{}
+	})
+}
+
+func (b *Bubbles) now() time.Time {
+	if b.Now != nil {
+		return b.Now()
+	}
+	return time.Now()
+}
+
+func (b *Bubbles) logf(format string, args ...any) {
+	if b.Log != nil {
+		b.Log.Printf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
+}
+
+func (b *Bubbles) baseContext() context.Context {
+	if b.Context != nil {
+		return b.Context
+	}
+	return context.Background()
+}
+
+func (b *Bubbles) hostname() string {
+	if b.Hostname != "" {
+		return b.Hostname
+	}
+	h, _ := os.Hostname()
+	return strings.TrimSpace(h)
+}
+
+func (b *Bubbles) audit(action string) {
+	if err := b.Store.Audit("server", action, ""); err != nil {
+		b.logf("telltale server: could not write %q to the audit log: %v", action, err)
+	}
+}
+
+// alertTimeout is the alert_timeout setting: 60 seconds when unset or
+// unreadable.
+func (b *Bubbles) alertTimeout() time.Duration {
+	v, _ := b.Store.Setting(SettingAlertTimeout)
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d
+	}
+	return defaultAlertTimeout
+}
+
+// Channel is a bubbles channel telltale's bot is in.
+type Channel struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// channelRecord is SettingChannel: where alerts go, and the server's name
+// as bubbles gave it.
+type channelRecord struct {
+	Channel
+	Server string `json:"server,omitempty"`
+}
+
+func (b *Bubbles) loadSealed(key string, v any) error {
+	raw, err := b.Store.SecretSetting(key)
+	if err != nil || len(raw) == 0 {
+		return err
+	}
+	return json.Unmarshal(raw, v)
+}
+
+func (b *Bubbles) saveSealed(key string, v any) error {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return b.Store.SetSecretSetting(key, raw)
+}
+
+// connection reads SettingConn; ok is false when telltale is not paired.
+func (b *Bubbles) connection() (cfg bubblesclient.Config, raw string, ok bool, err error) {
+	v, err := b.Store.SecretSetting(SettingConn)
+	if err != nil || len(v) == 0 {
+		return bubblesclient.Config{}, "", false, err
+	}
+	cfg, err = bubblesclient.ParseConnectionString(string(v))
+	if err != nil {
+		// The parser's message never holds the token.
+		return bubblesclient.Config{}, "", false, fmt.Errorf("alerts: the stored bubbles connection cannot be read: %w", err)
+	}
+	return cfg, string(v), true, nil
+}
+
+// client is the bubbles client for the stored connection, or nil when
+// telltale is not paired, and where alerts go.
+func (b *Bubbles) client() (*bubblesclient.Client, channelRecord, error) {
+	cfg, raw, ok, err := b.connection()
+	if err != nil || !ok {
+		return nil, channelRecord{}, err
+	}
+	var ch channelRecord
+	if err := b.loadSealed(SettingChannel, &ch); err != nil {
+		return nil, channelRecord{}, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.cl == nil || b.clConn != raw {
+		cl, err := bubblesclient.New(cfg)
+		if err != nil {
+			return nil, channelRecord{}, fmt.Errorf("alerts: the stored bubbles connection cannot be used: %w", err)
+		}
+		b.cl, b.clConn = cl, raw
+	}
+	return b.cl, ch, nil
+}
+
+// Connected reports whether telltale is paired with a bubbles server.
+func (b *Bubbles) Connected() (bool, error) {
+	_, _, ok, err := b.connection()
+	return ok, err
+}
+
+// DedupeKey is the alert key of a finding on a machine:
+// "telltale:<machine>:<finding key>". A key bubbles would refuse as too
+// long (or one holding bytes that are not text) is shortened, stably, to
+// "telltale:<machine>:h:<the first 32 hex digits of its SHA-256>".
+func DedupeKey(machine, findingKey string) string {
+	k := "telltale:" + escape.Terminal(machine) + ":" + findingKey
+	if utf8.RuneCountInString(k) <= protocol.MaxAlertDedupeKey && !escape.HasUnsafe(findingKey) && utf8.ValidString(findingKey) {
+		return k
+	}
+	sum := sha256.Sum256([]byte(findingKey))
+	return "telltale:" + escape.Terminal(machine) + ":h:" + hex.EncodeToString(sum[:16])
+}
+
+// Severity is a finding's alert severity: critical for tampering and
+// backdoor signs, warning for a weak setting, info for a note.
+func Severity(s model.Severity) string {
+	switch {
+	case s >= model.SevBackdoor:
+		return protocol.SeverityCritical
+	case s == model.SevWeak:
+		return protocol.SeverityWarning
+	}
+	return protocol.SeverityInfo
+}
+
+func severityRank(s string) int {
+	switch s {
+	case protocol.SeverityCritical:
+		return 2
+	case protocol.SeverityWarning:
+		return 1
+	}
+	return 0
+}
+
+var (
+	// entityRE is a Markdown character reference ("&#x202e;", "&amp;"),
+	// which would decode to a character the text never showed.
+	entityRE = regexp.MustCompile(`&(#[0-9]{1,8}|#[xX][0-9a-fA-F]{1,8}|[A-Za-z][A-Za-z0-9]{0,31});`)
+	// schemeRE and mailtoRE are what a linkifier turns into a link.
+	schemeRE = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.\-]*):(//)`)
+	mailtoRE = regexp.MustCompile(`(?i)\bmailto:`)
+)
+
+// plain makes a machine string safe for the alert's title and field
+// values: escape.Terminal, then no character reference (its & is written
+// \x26, as escape.Terminal writes bytes it hides) and no link scheme
+// ("https://" is written "https[:]//", the usual way to defang an
+// address).
+func plain(s string) string {
+	s = escape.Terminal(s)
+	s = entityRE.ReplaceAllStringFunc(s, func(m string) string { return `\x26` + m[1:] })
+	s = schemeRE.ReplaceAllString(s, "${1}[:]${2}")
+	return mailtoRE.ReplaceAllStringFunc(s, func(m string) string { return m[:len(m)-1] + "[:]" })
+}
+
+const asciiPunct = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+
+// mdText writes a machine string as literal Markdown text:
+// escape.Terminal, then every ASCII punctuation character backslash-
+// escaped, so nothing in it is emphasis, a link, an image, an entity, an
+// autolink or a mention.
+func mdText(s string) string {
+	s = strings.TrimSpace(escape.Terminal(s))
+	var b strings.Builder
+	for _, r := range s {
+		if r < utf8.RuneSelf && strings.ContainsRune(asciiPunct, r) {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// mdCode writes a machine string as the one line of a fenced code block,
+// where Markdown interprets nothing. escape.Terminal leaves no line break,
+// and the fence is longer than any run of backticks in the line, so the
+// line cannot close it.
+func mdCode(s string) string {
+	s = escape.Terminal(s)
+	run, longest := 0, 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '`' {
+			run++
+			longest = max(longest, run)
+		} else {
+			run = 0
+		}
+	}
+	fence := strings.Repeat("`", max(3, longest+1))
+	return fence + "\n" + s + "\n" + fence
+}
+
+// truncate cuts s to at most n runes, marking a cut with "…".
+func truncate(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	r := []rune(s)
+	return string(r[:n-1]) + "…"
+}
+
+// changedLine is the one line of file content an alert may carry: the
+// first line of the first evidence item with text, the new text when there
+// is one, else the old text (a removed line).
+func changedLine(f model.Finding) (where, line string, removed, ok bool) {
+	for _, e := range f.Evidence {
+		text := e.After
+		if text == "" {
+			text, removed = e.Before, true
+		}
+		if text == "" {
+			removed = false
+			continue
+		}
+		line, _, _ = strings.Cut(text, "\n")
+		where = e.Path
+		if e.Line > 0 && where != "" {
+			where += ":" + strconv.Itoa(e.Line)
+		}
+		return where, line, removed, true
+	}
+	return "", "", false, false
+}
+
+func evidencePath(f model.Finding) string {
+	for _, e := range f.Evidence {
+		if e.Path != "" {
+			return e.Path
+		}
+	}
+	return ""
+}
+
+// alertFor maps a finding to its alert (channel left empty: it is set when
+// the alert is sent, so a channel chosen later applies).
+func (b *Bubbles) alertFor(m store.Machine, f model.Finding, now time.Time) protocol.AlertInput {
+	zero := 0
+	at := now.UTC().Format(time.RFC3339)
+	var why, changed, fix string
+	if w := truncate(escape.Terminal(f.Why), maxWhy); w != "" {
+		why = mdText(w)
+	}
+	if where, line, removed, ok := changedLine(f); ok {
+		line, _ = redact.Line(b.redactKey, line)
+		label := "Changed line"
+		if removed {
+			label = "Removed line"
+		}
+		if where != "" {
+			label += " in " + mdText(truncate(escape.Terminal(where), maxWhere))
+		}
+		changed = label + ":\n" + mdCode(truncate(escape.Terminal(line), maxLine))
+	}
+	if f.Fix != "" {
+		cmd := truncate(escape.Terminal(f.Fix), maxFix)
+		if escape.HasUnsafe(f.Fix) {
+			cmd += "   (contains control characters; do not paste, edit by hand)"
+		}
+		fix = "Fix:\n" + mdCode(cmd)
+	}
+	in := protocol.AlertInput{
+		Severity:       Severity(f.Severity),
+		Title:          truncate(plain(m.Name)+": "+plain(f.Title), protocol.MaxAlertTitle),
+		Text:           alertText(why, changed, fix),
+		DedupeKey:      DedupeKey(m.Name, f.Key),
+		RenotifyAfterS: &zero,
+		OccurredAt:     &at,
+	}
+	field := func(name, value string, short bool) {
+		if value != "" {
+			in.Fields = append(in.Fields, protocol.AlertField{Name: name, Value: truncate(value, protocol.MaxAlertFieldValue), Short: short})
+		}
+	}
+	field("Machine", plain(m.Name), true)
+	field("Address", plain(m.Addr), true)
+	field("Severity", f.Severity.String(), true)
+	field("Path", plain(evidencePath(f)), false)
+	return in
+}
+
+// alertText joins the parts of an alert's text. A code block's fence grows
+// with the backticks its line holds, so the parts can be longer than
+// bubbles takes, and bubbles would refuse the whole alert: then the why
+// goes first, then the fix, then the changed line, and the text says where
+// the rest is. Cutting a part instead could leave a fence open.
+func alertText(why, changed, fix string) string {
+	join := func(parts ...string) string {
+		var keep []string
+		for _, p := range parts {
+			if p != "" {
+				keep = append(keep, p)
+			}
+		}
+		return strings.Join(keep, "\n\n")
+	}
+	const note = "Some of this finding is too long for an alert: see telltale's web UI."
+	for _, t := range []string{join(why, changed, fix), join(changed, fix, note), join(changed, note)} {
+		if utf8.RuneCountInString(t) <= protocol.MaxAlertText {
+			return t
+		}
+	}
+	return note
+}
+
+// pendingItem is one alert or resolve waiting to be sent. Alert's channel
+// is set when it is sent.
+type pendingItem struct {
+	ID      uint64              `json:"id"`
+	Key     string              `json:"key"`
+	Resolve bool                `json:"resolve,omitempty"`
+	Note    string              `json:"note,omitempty"`
+	Alert   protocol.AlertInput `json:"alert"`
+	Queued  time.Time           `json:"queued"`
+}
+
+// pendingQueue is SettingPending: at most MaxPending items, one per
+// dedupe key, oldest first, and how many were dropped since the last
+// summary alert (with the highest severity among them).
+type pendingQueue struct {
+	Next            uint64        `json:"next"`
+	Items           []pendingItem `json:"items"`
+	Dropped         int           `json:"dropped,omitempty"`
+	DroppedSeverity string        `json:"dropped_severity,omitempty"`
+}
+
+func (b *Bubbles) loadQueue() (pendingQueue, error) {
+	var q pendingQueue
+	err := b.loadSealed(SettingPending, &q)
+	return q, err
+}
+
+// updateQueue changes the stored queue under qmu.
+func (b *Bubbles) updateQueue(f func(q *pendingQueue)) error {
+	b.qmu.Lock()
+	defer b.qmu.Unlock()
+	q, err := b.loadQueue()
+	if err != nil {
+		return err
+	}
+	f(&q)
+	return b.saveSealed(SettingPending, q)
+}
+
+// enqueue adds items to the queue. A newer item for a dedupe key replaces
+// the one waiting (only the latest state of an alert matters: a resolve
+// after a post that never went is a resolve bubbles ignores). Past
+// MaxPending the oldest are dropped and counted.
+func (b *Bubbles) enqueue(items []pendingItem) error {
+	return b.updateQueue(func(q *pendingQueue) {
+		for _, it := range items {
+			kept := q.Items[:0]
+			for _, x := range q.Items {
+				if x.Key != it.Key {
+					kept = append(kept, x)
+				}
+			}
+			q.Items = kept
+			q.Next++
+			it.ID = q.Next
+			q.Items = append(q.Items, it)
+		}
+		for len(q.Items) > MaxPending {
+			old := q.Items[0]
+			q.Items = q.Items[1:]
+			q.Dropped++
+			if !old.Resolve && severityRank(old.Alert.Severity) >= severityRank(q.DroppedSeverity) {
+				q.DroppedSeverity = old.Alert.Severity
+			}
+		}
+	})
+}
+
+// Notify queues an alert for each new finding and a resolve for each
+// resolved one, then sends what is queued, within ctx. It returns nil once
+// the alerts are queued: those bubbles cannot take now stay in the store
+// and are sent again later (Run, Kick). It does nothing when telltale is
+// not paired with bubbles.
+func (b *Bubbles) Notify(ctx context.Context, m store.Machine, newFindings, resolved []model.Finding) error {
+	b.init()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if ok, err := b.Connected(); err != nil || !ok {
+		return err
+	}
+	now := b.now()
+	var items []pendingItem
+	for _, f := range newFindings {
+		in := b.alertFor(m, f, now)
+		items = append(items, pendingItem{Key: in.DedupeKey, Alert: in, Queued: now})
+	}
+	for _, f := range resolved {
+		items = append(items, pendingItem{Key: DedupeKey(m.Name, f.Key), Resolve: true, Note: "No longer found on " + now.UTC().Format("2006-01-02 15:04 UTC") + ".", Queued: now})
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	if err := b.enqueue(items); err != nil {
+		return err
+	}
+	if err := b.Flush(ctx); err != nil && !errors.Is(err, ErrNoChannel) {
+		b.logf("telltale server: bubbles alerts for machine %d are queued and will be sent later: %s", m.ID, escape.Terminal(err.Error()))
+	}
+	return nil
+}
+
+// ErrNoChannel means no channel for alerts was chosen yet; alerts wait.
+var ErrNoChannel = errors.New("alerts: no bubbles channel chosen for alerts yet")
+
+// outcome is what a send's error means for the item.
+type outcome int
+
+const (
+	sent    outcome = iota // done: take it off the queue
+	dropped                // bubbles refused it for good: take it off
+	keep                   // try again later; stop for now
+)
+
+// classify reads a send's error, and records what it says about the
+// connection (Trouble). A resolve bubbles answers 404 or 403 to has no
+// alert of telltale's to close, so it is done; a post answered so cannot
+// go to the channel, so it waits for another channel.
+func (b *Bubbles) classify(err error, resolve bool) outcome {
+	var ae *bubblesclient.APIError
+	switch {
+	case err == nil:
+		b.setTrouble(TroubleNone)
+		return sent
+	case errors.Is(err, context.Canceled):
+		// Says nothing about bubbles: the caller stopped waiting.
+		return keep
+	case errors.Is(err, context.DeadlineExceeded):
+		b.setTrouble(TroubleUnreachable)
+		return keep
+	case errors.Is(err, bubblesclient.ErrServerIdentityChanged):
+		b.setTrouble(TroubleIdentityChanged)
+		return keep
+	case errors.Is(err, bubblesclient.ErrUnauthorized):
+		b.setTrouble(TroubleNeedsReconnect)
+		return keep
+	case errors.Is(err, bubblesclient.ErrRateLimited), errors.Is(err, bubblesclient.ErrUnavailable):
+		b.setTrouble(TroubleUnreachable)
+		return keep
+	case errors.As(err, &ae):
+		switch {
+		case ae.Status == http.StatusNotFound || ae.Status == http.StatusForbidden:
+			if resolve {
+				b.setTrouble(TroubleNone)
+				return sent
+			}
+			b.setTrouble(TroubleNotAllowed)
+			return keep
+		case ae.Status == http.StatusConflict && archived(ae) && !resolve:
+			b.setTrouble(TroubleArchived)
+			return keep
+		}
+		b.setTrouble(TroubleNone)
+		b.logf("telltale server: bubbles turned down an alert, which is dropped: %s", refusal(ae))
+		return dropped
+	}
+	b.logf("telltale server: an alert could not be sent to bubbles and is dropped: %s", escape.Terminal(err.Error()))
+	return dropped
+}
+
+// archived is bubbles' 409 for an archived channel; its other 409 is a
+// key whose alert is open in another channel.
+func archived(ae *bubblesclient.APIError) bool { return strings.Contains(ae.Message, "archived") }
+
+func openElsewhere(err error) bool {
+	var ae *bubblesclient.APIError
+	return errors.As(err, &ae) && ae.Status == http.StatusConflict && !archived(ae)
+}
+
+// refusal is what bubbles said when it refused a request, for the log.
+func refusal(ae *bubblesclient.APIError) string {
+	s := fmt.Sprintf("%d %s", ae.Status, ae.Message)
+	for k, v := range ae.FieldErrors() {
+		s += "; " + k + ": " + v
+	}
+	return escape.Terminal(s)
+}
+
+// send posts or resolves one item. A post whose key is still open in
+// another channel (the channel was changed) closes it there and posts
+// again, as netdiag does.
+func send(ctx context.Context, cl *bubblesclient.Client, ch channelRecord, it pendingItem) error {
+	if it.Resolve {
+		return cl.ResolveAlert(ctx, it.Key, it.Note)
+	}
+	in := it.Alert
+	in.Channel = ch.ID
+	_, err := cl.PostAlert(ctx, in)
+	if openElsewhere(err) && cl.ResolveAlert(ctx, it.Key, "Moved to #"+escape.Terminal(ch.Name)+".") == nil {
+		_, err = cl.PostAlert(ctx, in)
+	}
+	return err
+}
+
+// droppedAlert is the summary of n alerts dropped while bubbles could not
+// be reached.
+func droppedAlert(ch channelRecord, n int, sev string, now time.Time) protocol.AlertInput {
+	if sev == "" {
+		sev = protocol.SeverityWarning
+	}
+	zero := 0
+	at := now.UTC().Format(time.RFC3339)
+	what := "1 alert"
+	if n != 1 {
+		what = strconv.Itoa(n) + " alerts"
+	}
+	return protocol.AlertInput{
+		Channel:        ch.ID,
+		Severity:       sev,
+		Title:          "telltale dropped " + what + " while bubbles could not be reached",
+		Text:           fmt.Sprintf("telltale keeps at most %d alerts while it cannot reach bubbles, and dropped the oldest. Open telltale's web UI to see every machine's findings.", MaxPending),
+		Fields:         []protocol.AlertField{{Name: "Dropped", Value: strconv.Itoa(n), Short: true}},
+		DedupeKey:      DroppedKey,
+		RenotifyAfterS: &zero,
+		OccurredAt:     &at,
+	}
+}
+
+// Flush sends the queued alerts in order, until none are left, bubbles
+// cannot take more, or ctx ends. The count of dropped alerts goes first,
+// as one summary alert. Only one flush sends at a time; another waits for
+// it within its ctx. Not being paired is not an error; having no channel
+// yet is ErrNoChannel.
+func (b *Bubbles) Flush(ctx context.Context) error {
+	b.init()
+	select {
+	case b.sending <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-b.sending }()
+	b.mu.Lock()
+	b.lastTry = b.now()
+	b.mu.Unlock()
+	cl, ch, err := b.client()
+	if err != nil || cl == nil {
+		return err
+	}
+	if ch.ID == "" {
+		b.setTrouble(TroubleNoChannel)
+		return ErrNoChannel
+	}
+	q, err := b.loadQueue()
+	if err != nil {
+		return err
+	}
+	if q.Dropped > 0 {
+		n := q.Dropped
+		_, err := cl.PostAlert(ctx, droppedAlert(ch, n, q.DroppedSeverity, b.now()))
+		if b.classify(err, false) == keep {
+			return err
+		}
+		if err := b.updateQueue(func(q *pendingQueue) {
+			if q.Dropped -= n; q.Dropped <= 0 {
+				q.Dropped, q.DroppedSeverity = 0, ""
+			}
+		}); err != nil {
+			return err
+		}
+	}
+	var after uint64 // items up to this ID were tried in this flush
+	for {
+		q, err := b.loadQueue()
+		if err != nil {
+			return err
+		}
+		var batch []pendingItem
+		for _, it := range q.Items {
+			if it.ID > after {
+				batch = append(batch, it)
+			}
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+		done := map[uint64]bool{}
+		save := func() error {
+			if len(done) == 0 {
+				return nil
+			}
+			err := b.updateQueue(func(q *pendingQueue) {
+				kept := q.Items[:0]
+				for _, x := range q.Items {
+					if !done[x.ID] {
+						kept = append(kept, x)
+					}
+				}
+				q.Items = kept
+			})
+			clear(done)
+			return err
+		}
+		for _, it := range batch {
+			if err := ctx.Err(); err != nil {
+				return errors.Join(err, save())
+			}
+			err := send(ctx, cl, ch, it)
+			if b.classify(err, it.Resolve) == keep {
+				return errors.Join(err, save())
+			}
+			done[it.ID] = true
+			after = it.ID
+			if len(done) >= saveEvery {
+				if err := save(); err != nil {
+					return err
+				}
+			}
+		}
+		if err := save(); err != nil {
+			return err
+		}
+	}
+}
+
+// TryNow sends the queued alerts at once, within the alert_timeout
+// setting (the settings page's Try now).
+func (b *Bubbles) TryNow(ctx context.Context) error {
+	b.init()
+	ctx, cancel := context.WithTimeout(ctx, b.alertTimeout())
+	defer cancel()
+	return b.Flush(ctx)
+}
+
+// Kick asks Run to try the queued alerts now (the core calls it after
+// every visit). It never blocks.
+func (b *Bubbles) Kick() {
+	b.init()
+	select {
+	case b.kick <- struct{}{}:
+	default:
+	}
+}
+
+// Run tries the queued alerts again every RetryEvery and after every
+// Kick, each try bounded by the alert_timeout setting, until ctx ends. The
+// server command runs it for as long as the server runs.
+func (b *Bubbles) Run(ctx context.Context) {
+	b.init()
+	t := time.NewTicker(b.retryEvery)
+	defer t.Stop()
+	for {
+		kicked := false
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		case <-b.kick:
+			kicked = true
+		}
+		b.retry(ctx, kicked)
+	}
+}
+
+// retry is one try of Run: nothing when nothing waits, and nothing for a
+// Kick right after a try that failed.
+func (b *Bubbles) retry(ctx context.Context, kicked bool) {
+	q, err := b.loadQueue()
+	if err != nil || (len(q.Items) == 0 && q.Dropped == 0) {
+		return
+	}
+	b.mu.Lock()
+	recent := b.trouble != TroubleNone && b.now().Sub(b.lastTry) < kickGap
+	b.mu.Unlock()
+	if kicked && recent {
+		return
+	}
+	rctx, cancel := context.WithTimeout(ctx, b.alertTimeout())
+	defer cancel()
+	if err := b.Flush(rctx); err != nil && ctx.Err() == nil && !errors.Is(err, ErrNoChannel) {
+		b.logf("telltale server: queued bubbles alerts not sent yet: %s", escape.Terminal(err.Error()))
+	}
+}
+
+// Trouble is what the last call to bubbles found wrong.
+type Trouble string
+
+const (
+	TroubleNone            Trouble = ""
+	TroubleUnreachable     Trouble = "unreachable"
+	TroubleNeedsReconnect  Trouble = "needs_reconnect"
+	TroubleIdentityChanged Trouble = "identity_changed"
+	TroubleNotAllowed      Trouble = "not_allowed"
+	TroubleArchived        Trouble = "archived"
+	TroubleNoChannel       Trouble = "no_channel"
+)
+
+// The UI's words for each trouble, after netdiag's.
+const (
+	identityMsg     = "Warning: the chat server's identity changed. telltale stopped sending alerts. This happens when the chat server is reinstalled, or when something is pretending to be it. Ask your chat admin before you reconnect."
+	unauthorizedMsg = "The chat server no longer accepts telltale. Click Reconnect."
+	unreachableMsg  = "telltale can't reach the chat server. Alerts wait and go out when it can."
+	notAllowedMsg   = "telltale isn't allowed to post in the alert channel. Ask your chat admin to add telltale to it, or choose another channel."
+	archivedMsg     = "The alert channel is archived. Choose another channel."
+	noChannelMsg    = "Choose a channel for alerts. Alerts wait until you do."
+	turnedDownMsg   = "The chat server turned down telltale's request. Ask your chat admin to check bubbles' log."
+	noTalkMsg       = "telltale couldn't talk to the chat server. Try again in a moment, or ask your chat admin whether it is running."
+)
+
+// Message is the trouble in plain words, "" for none.
+func (t Trouble) Message() string {
+	switch t {
+	case TroubleUnreachable:
+		return unreachableMsg
+	case TroubleNeedsReconnect:
+		return unauthorizedMsg
+	case TroubleIdentityChanged:
+		return identityMsg
+	case TroubleNotAllowed:
+		return notAllowedMsg
+	case TroubleArchived:
+		return archivedMsg
+	case TroubleNoChannel:
+		return noChannelMsg
+	}
+	return ""
+}
+
+// setTrouble records what a call found. A changed identity sticks until a
+// new pairing: nothing is trusted again by itself.
+func (b *Bubbles) setTrouble(t Trouble) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.trouble == TroubleIdentityChanged || b.trouble == t {
+		return
+	}
+	b.trouble, b.since = t, b.now()
+	if t != TroubleNone {
+		b.logf("telltale server: bubbles: %s", t.Message())
+	}
+}
+
+// explain puts an error from a call the owner made into plain words; what
+// bubbles said goes to the log only.
+func (b *Bubbles) explain(err error) string {
+	var ae *bubblesclient.APIError
+	switch {
+	case errors.Is(err, bubblesclient.ErrServerIdentityChanged):
+		return identityMsg
+	case errors.Is(err, bubblesclient.ErrUnauthorized):
+		return unauthorizedMsg
+	case errors.Is(err, bubblesclient.ErrRateLimited):
+		return "The chat server is busy. Try again in a minute."
+	case errors.Is(err, bubblesclient.ErrUnavailable), errors.Is(err, context.DeadlineExceeded):
+		return "telltale can't reach the chat server."
+	case errors.As(err, &ae):
+		b.logf("telltale server: bubbles refused a request: %s", refusal(ae))
+		return turnedDownMsg
+	}
+	b.logf("telltale server: talking to bubbles: %s", escape.Terminal(err.Error()))
+	return noTalkMsg
+}
+
+// Status is the connection as the settings page shows it. Every string in
+// it is escaped.
+type Status struct {
+	Connected  bool
+	Address    string // host:port of the bubbles server
+	ServerName string
+	Channel    Channel
+	Pending    int
+	Dropped    int
+	Trouble    Trouble
+	Since      time.Time
+	// Choosing is set when the owner asked to choose the channel again, or
+	// none is chosen; Choices are the bot's channels as last listed.
+	Choosing bool
+	Choices  []Channel
+}
+
+// Status reads the connection, the queue and the last trouble.
+func (b *Bubbles) Status() (Status, error) {
+	b.init()
+	cfg, _, ok, err := b.connection()
+	if err != nil || !ok {
+		return Status{}, err
+	}
+	var ch channelRecord
+	if err := b.loadSealed(SettingChannel, &ch); err != nil {
+		return Status{}, err
+	}
+	q, err := b.loadQueue()
+	if err != nil {
+		return Status{}, err
+	}
+	st := Status{Connected: true, Address: escape.Terminal(strings.TrimPrefix(cfg.BaseURL, "https://")), ServerName: escape.Terminal(ch.Server),
+		Channel: Channel{ID: ch.ID, Name: escape.Terminal(ch.Name)}, Pending: len(q.Items), Dropped: q.Dropped}
+	b.mu.Lock()
+	st.Trouble, st.Since = b.trouble, b.since
+	st.Choosing = b.choosing || ch.ID == ""
+	for _, c := range b.choices {
+		st.Choices = append(st.Choices, Channel{ID: c.ID, Name: escape.Terminal(c.Name)})
+	}
+	b.mu.Unlock()
+	if st.Trouble == TroubleNoChannel && ch.ID != "" {
+		st.Trouble = TroubleNone
+	}
+	return st, nil
+}
+
+// SendTest posts a test alert to the alert channel and resolves it again
+// at once, both directly (not through the queue), so a missing channel
+// membership or scope shows at once. The error is in plain words.
+func (b *Bubbles) SendTest(ctx context.Context) error {
+	b.init()
+	cl, ch, err := b.client()
+	if err != nil {
+		return err
+	}
+	if cl == nil {
+		return errors.New("telltale is not connected to bubbles.")
+	}
+	b.mu.Lock()
+	changed := b.trouble == TroubleIdentityChanged
+	b.mu.Unlock()
+	if changed {
+		return errors.New(identityMsg)
+	}
+	if ch.ID == "" {
+		return errors.New("Choose a channel for alerts first.")
+	}
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+	text := "telltale can post its alerts here. This test closes again at once."
+	if h := b.hostname(); h != "" {
+		text = "The telltale server on " + mdText(h) + " can post its alerts here. This test closes again at once."
+	}
+	zero := 0
+	at := b.now().UTC().Format(time.RFC3339)
+	in := protocol.AlertInput{Channel: ch.ID, Severity: protocol.SeverityInfo, Title: "Test alert from telltale", Text: text,
+		DedupeKey: TestKey, RenotifyAfterS: &zero, OccurredAt: &at}
+	_, err = cl.PostAlert(ctx, in)
+	if openElsewhere(err) && cl.ResolveAlert(ctx, TestKey, "Test finished.") == nil {
+		_, err = cl.PostAlert(ctx, in)
+	}
+	if err != nil {
+		b.classify(err, false)
+		var ae *bubblesclient.APIError
+		if errors.As(err, &ae) {
+			switch {
+			case ae.Status == http.StatusNotFound || ae.Status == http.StatusForbidden:
+				return fmt.Errorf("telltale isn't allowed to post in #%s. Ask your chat admin to add telltale to that channel.", escape.Terminal(ch.Name))
+			case ae.Status == http.StatusConflict && archived(ae):
+				return fmt.Errorf("The channel #%s is archived. Choose another channel.", escape.Terminal(ch.Name))
+			}
+		}
+		return errors.New(b.explain(err))
+	}
+	b.setTrouble(TroubleNone)
+	b.Kick()
+	if err := cl.ResolveAlert(ctx, TestKey, "Test finished."); err != nil {
+		return fmt.Errorf("The test alert reached #%s but telltale could not close it: %s", escape.Terminal(ch.Name), b.explain(err))
+	}
+	return nil
+}
+
+// Disconnect forgets the connection, the channel and the queued alerts.
+// Apps cannot revoke their own token in bubbles, so the page asks the
+// owner to have the chat admin remove telltale in bubbles too.
+func (b *Bubbles) Disconnect() error {
+	b.init()
+	b.mu.Lock()
+	b.stopPairLocked()
+	b.trouble, b.since = TroubleNone, time.Time{}
+	b.cl, b.clConn, b.choices, b.choosing = nil, "", nil, false
+	b.mu.Unlock()
+	if err := b.Store.SetSecretSetting(SettingConn, nil); err != nil {
+		return err
+	}
+	if err := b.Store.SetSecretSetting(SettingChannel, nil); err != nil {
+		return err
+	}
+	b.qmu.Lock()
+	defer b.qmu.Unlock()
+	return b.Store.SetSecretSetting(SettingPending, nil)
+}

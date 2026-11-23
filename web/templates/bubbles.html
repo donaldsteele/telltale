@@ -1,0 +1,88 @@
+{{define "content"}}
+{{- $csrf := .CSRF}}
+{{- with .Body}}
+<h1>Alerts through bubbles</h1>
+{{if .Waiting}}
+<section class="panel narrow" aria-labelledby="approve-title">
+<h2 id="approve-title">Ask your chat admin to approve telltale</h2>
+<p class="paircode mono">{{.Pair.Code}}</p>
+<p>They open <strong>Admin &gt; Pairing</strong> in bubbles, check that the code matches, tick a channel for alerts (or <em>Also create a channel for this app</em>), and click <strong>Approve</strong>.</p>
+<p class="small" role="status">Waiting for your chat admin… This page checks again every few seconds.</p>
+<p class="small">The approval page, for your chat admin: <a href="{{.Pair.AdminURL}}" target="_blank" rel="noopener noreferrer">{{.Pair.AdminURL}}</a>. If the browser warns about the connection, ask your chat admin to approve on their own computer.</p>
+<form method="post" action="/settings/bubbles/cancel" class="inline"><input type="hidden" name="csrf" value="{{$csrf}}"><button type="submit" class="btn">Cancel</button></form>
+</section>
+{{else if .Ended}}
+<div class="callout warn"><p>{{.Pair.Message}}</p></div>
+<p><a class="btn" href="/settings/bubbles">Try again</a></p>
+{{else if .Broken}}
+<div class="callout warn"><p>{{.Trouble}}</p></div>
+<p>Disconnect, then pair again.</p>
+<p><a class="btn" href="/settings/bubbles/disconnect">Disconnect</a></p>
+{{else if not .Status.Connected}}
+<section class="panel narrow" aria-labelledby="connect-title">
+<h2 id="connect-title">Connect to bubbles</h2>
+<p>Post telltale's alerts in your team chat, so everyone sees when a machine shows signs of tampering or a backdoor, and when that is gone.</p>
+<form method="post" action="/settings/bubbles/inspect" class="stack">
+<input type="hidden" name="csrf" value="{{$csrf}}">
+<label for="address">bubbles server address</label>
+<input id="address" name="address" value="{{.Address}}" placeholder="192.168.1.20" maxlength="300" required autocomplete="off" spellcheck="false" aria-describedby="address-help">
+<p class="small" id="address-help">Your chat admin can read it in bubbles under Admin &gt; Overview. Add the port only if your chat admin says it isn't the usual one (28225), for example 192.168.1.20:30000.</p>
+<div><button type="submit" class="btn primary">Check this server</button></div>
+</form>
+</section>
+{{else}}
+{{- with .Status}}
+<section class="panel" aria-labelledby="status-title">
+<h2 id="status-title">Connection</h2>
+<p>Connected to {{if .ServerName}}<strong>{{.ServerName}}</strong> ({{.Address}}){{else}}<strong>{{.Address}}</strong>{{end}}.{{if .Channel.ID}} Alerts go to <strong>#{{.Channel.Name}}</strong>.{{end}}</p>
+{{- if eq .Trouble "identity_changed"}}
+<div class="callout danger" role="alert"><p><strong>Warning: the chat server's identity changed.</strong> telltale stopped sending alerts. This happens when the chat server is reinstalled, or when something is pretending to be it. Ask your chat admin before you reconnect.</p></div>
+{{- else if $.Body.Trouble}}
+<div class="callout warn"><p>{{$.Body.Trouble}}{{with $.Body.Since}} <span class="small">(since {{.}})</span>{{end}}</p></div>
+{{- end}}
+{{- if .Pending}}<p>{{count .Pending "alert is" "alerts are"}} waiting to be sent.</p>{{end}}
+{{- if .Dropped}}<p>{{count .Dropped "older alert was" "older alerts were"}} dropped while bubbles could not be reached: telltale keeps at most 1000. bubbles gets one alert that says so with the next one that goes out.</p>{{end}}
+{{- if .Choosing}}
+{{- if .Choices}}
+<form method="post" action="/settings/bubbles/channel" class="stack">
+<input type="hidden" name="csrf" value="{{$csrf}}">
+<fieldset><legend>Which channel should alerts go to?</legend>
+{{- range .Choices}}
+<label class="check"><input type="radio" name="channel" value="{{.ID}}" required> #{{.Name}}</label>
+{{- end}}
+</fieldset>
+<div><button type="submit" class="btn primary">Use this channel</button></div>
+</form>
+{{- else}}
+<p>telltale isn't in any channel yet. Ask your chat admin to add telltale to a channel, for example #telltale-alerts.</p>
+<form method="post" action="/settings/bubbles/channels" class="inline"><input type="hidden" name="csrf" value="{{$csrf}}"><button type="submit" class="btn primary">Look again</button></form>
+{{- end}}
+{{- end}}
+<div class="actions">
+{{- if .Channel.ID}}
+<form method="post" action="/settings/bubbles/test" class="inline"><input type="hidden" name="csrf" value="{{$csrf}}"><button type="submit" class="btn">Send test alert</button></form>
+{{- end}}
+{{- if .Pending}}
+<form method="post" action="/settings/bubbles/retry" class="inline"><input type="hidden" name="csrf" value="{{$csrf}}"><button type="submit" class="btn">Try now</button></form>
+{{- end}}
+{{- if and .Channel.ID (not .Choosing)}}
+<form method="post" action="/settings/bubbles/channels" class="inline"><input type="hidden" name="csrf" value="{{$csrf}}"><button type="submit" class="btn">Change channel</button></form>
+{{- end}}
+<a class="btn" href="/settings/bubbles/disconnect">Disconnect</a>
+</div>
+</section>
+{{- end}}
+<section class="panel narrow" aria-labelledby="repair-title">
+<h2 id="repair-title">{{if or (eq .Status.Trouble "needs_reconnect") (eq .Status.Trouble "identity_changed")}}Reconnect{{else}}Pair again{{end}}</h2>
+<p>Pair with this or another bubbles server. The connection that works now stays until the chat admin approves the new one.</p>
+<form method="post" action="/settings/bubbles/inspect" class="stack">
+<input type="hidden" name="csrf" value="{{$csrf}}">
+<label for="address">bubbles server address</label>
+<input id="address" name="address" value="{{.Address}}" maxlength="300" required autocomplete="off" spellcheck="false">
+<div><button type="submit" class="btn">Check this server</button></div>
+</form>
+</section>
+{{end}}
+<p><a href="/settings#bubbles">Back to the settings</a></p>
+{{- end}}
+{{end}}

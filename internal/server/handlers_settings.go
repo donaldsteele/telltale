@@ -8,6 +8,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/donaldsteele/telltale/internal/alerts"
 	"github.com/donaldsteele/telltale/internal/escape"
 	"github.com/donaldsteele/telltale/internal/visit"
 )
@@ -30,6 +31,9 @@ type settingsView struct {
 	Keys        []ownerKeyView
 	KeyURL      string
 	KeyText     string
+	Bubbles     alerts.Status
+	Pairing     bool
+	Trouble     string
 }
 
 // groupFingerprint writes an OpenPGP fingerprint in groups of four, the
@@ -65,6 +69,13 @@ func (u *UI) settingsView() (settingsView, error) {
 	} else {
 		v.SSHKeyFP, v.SSHKeyLine = ssh.FingerprintSHA256(signer.PublicKey()), line
 	}
+	// A connection that cannot be read is said so, not a broken page.
+	if v.Bubbles, err = u.o.Bubbles.Status(); err != nil {
+		v.Trouble = "The bubbles connection cannot be read: " + escape.Terminal(err.Error())
+	} else {
+		v.Trouble = v.Bubbles.Trouble.Message()
+	}
+	v.Pairing = u.o.Bubbles.PairStatus().State == alerts.PairPending
 	keys, err := OwnerKeys(u.o.Store)
 	if err != nil {
 		return settingsView{}, err

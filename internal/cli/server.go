@@ -21,6 +21,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/donaldsteele/telltale/internal/alerts"
 	"github.com/donaldsteele/telltale/internal/config"
 	"github.com/donaldsteele/telltale/internal/escape"
 	"github.com/donaldsteele/telltale/internal/server"
@@ -135,11 +136,15 @@ func serve(ctx *Context, cfg *config.Config, st *store.Store) int {
 
 	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Alerts go to bubbles once the owner pairs in the web UI; until then
+	// the sink sends nothing.
+	bub := &alerts.Bubbles{Store: st, Log: logger, Context: runCtx}
 	core := &server.Core{
 		Store:      st,
 		Bins:       visit.Binaries{Dir: cfg.BinDir},
 		CacheDir:   filepath.Join(cfg.DataDir, pkgCacheDir),
 		ServerAddr: cfg.ServerAddr,
+		Alerts:     bub,
 		Log:        logger,
 	}
 	ui, err := server.NewUI(server.UIOptions{
@@ -151,6 +156,7 @@ func serve(ctx *Context, cfg *config.Config, st *store.Store) int {
 		SetupCode:       setupCode,
 		Context:         runCtx,
 		Log:             logger,
+		Bubbles:         bub,
 	})
 	if err != nil {
 		return fail(err)
@@ -175,10 +181,16 @@ func serve(ctx *Context, cfg *config.Config, st *store.Store) int {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(1)
+	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		core.Run(runCtx)
+	}()
+	// Alerts bubbles could not take are sent again every five minutes and
+	// after every visit, until the server stops.
+	go func() {
+		defer wg.Done()
+		bub.Run(runCtx)
 	}()
 	served := make(chan error, 1)
 	go func() { served <- srv.ServeTLS(ln, "", "") }()

@@ -11,7 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"io"
 	"io/fs"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +33,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/donaldsteele/telltale/internal/alerts"
 	"github.com/donaldsteele/telltale/internal/escape"
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/internal/repokeys"
@@ -167,6 +170,7 @@ type webClient struct {
 	jar   map[string]*http.Cookie
 	csrf  string
 	fetch *fakeFetch
+	bub   *alerts.Bubbles
 }
 
 type fakeFetch struct {
@@ -211,6 +215,7 @@ func newWeb(t *testing.T) *webClient {
 		t.Fatal(err)
 	}
 	w := &webClient{t: t, st: st, core: newFakeCore(), clock: &testClock{t: t0}, ip: testClientIP, jar: map[string]*http.Cookie{}, fetch: &fakeFetch{key: hk}}
+	w.bub = &alerts.Bubbles{Store: st, Hostname: "srv1", Log: log.New(io.Discard, "", 0)}
 	ui, err := NewUI(UIOptions{
 		Core:            w.core,
 		Store:           st,
@@ -221,6 +226,7 @@ func newWeb(t *testing.T) *webClient {
 		Now:             w.clock.now,
 		FetchHostKey:    w.fetch.FetchHostKey,
 		Context:         context.Background(),
+		Bubbles:         w.bub,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -231,7 +237,7 @@ func newWeb(t *testing.T) *webClient {
 
 // browser is another browser on the same UI, from ip.
 func (w *webClient) browser(ip string) *webClient {
-	return &webClient{t: w.t, ui: w.ui, st: w.st, core: w.core, clock: w.clock, ip: ip, jar: map[string]*http.Cookie{}, fetch: w.fetch}
+	return &webClient{t: w.t, ui: w.ui, st: w.st, core: w.core, clock: w.clock, ip: ip, jar: map[string]*http.Cookie{}, fetch: w.fetch, bub: w.bub}
 }
 
 var csrfRE = regexp.MustCompile(`name="csrf" value="([^"]+)"`)

@@ -104,6 +104,7 @@ form.inline { display: inline; margin: 0; }
 .alert p:last-child, .callout p:last-child { margin-bottom: 0; }
 .callout { padding: 16px 18px; margin: 24px 0; border: 1px solid var(--ink); background: var(--card); display: grid; gap: 12px; justify-items: start; }
 .callout.warn { border-left: 6px solid var(--amber); }
+.callout.danger { border-left: 6px solid var(--hot); }
 .panel { padding: 14px 18px; margin: 16px 0; border: 1px solid var(--rule); background: var(--card); }
 .panel h2 { margin-top: 4px; }
 .panel p:last-child { margin-bottom: 0; }
@@ -169,6 +170,13 @@ pre { margin: 0; background: var(--code-bg); color: var(--code-fg); padding: 12p
 pre code { background: none; padding: 0; font-size: inherit; color: inherit; }
 .group { border-top: 1px solid var(--rule); padding-top: 8px; margin-top: 16px; }
 .fingerprint { font: 600 clamp(1rem, 3.6vw, 1.5rem)/1.4 var(--mono); padding: 18px; background: var(--card); border: 2px solid var(--ink); overflow-wrap: anywhere; letter-spacing: 0.02em; }
+.fingerprint.fpbig { font-size: clamp(1.5rem, 7vw, 2.4rem); letter-spacing: 0.06em; }
+.fprest { overflow-wrap: anywhere; letter-spacing: 0.04em; }
+.paircode { font: 700 clamp(2rem, 10vw, 3.2rem)/1.2 var(--mono); letter-spacing: 0.12em; margin: 12px 0; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px 14px; margin: 18px 0 4px; }
+fieldset { border: 0; padding: 0; margin: 8px 0 0; display: grid; gap: 6px; }
+legend { font-weight: 500; padding: 0; margin-bottom: 4px; }
+label.check { display: flex; align-items: center; gap: 10px; min-height: 44px; font-weight: 400; margin: 0; }
 .steps { padding-left: 1.4em; }
 .steps li { margin-bottom: 20px; }
 ul.plain { list-style: none; padding: 0; }
