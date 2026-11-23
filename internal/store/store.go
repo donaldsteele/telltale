@@ -2,6 +2,10 @@
 // collections and secret settings are sealed with a data key that is kept in
 // the database only wrapped with age under the admin's passphrase or key file.
 //
+// Open takes an advisory flock on <db>.lock while it sets the database up, so
+// concurrent first opens cannot collide; the lock file is left in place and is
+// harmless. Normal use does not take it.
+//
 // Not encrypted, on purpose: machine name, address and host key (the owner
 // types them, and a host key is public), plain settings, and the audit log.
 // Everything derived from a machine's contents, including report time, exit
@@ -18,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -89,6 +94,17 @@ func Open(path string, u Unlock) (*Store, error) {
 	// using it).
 	if err := checkKeyFile(u.KeyFile); err != nil {
 		return nil, err
+	}
+	// Serialize setup (WAL switch, DDL, key creation) between processes:
+	// SQLite can answer BUSY to the first rollback-to-WAL switch without
+	// calling the busy handler. The lock file is never removed.
+	lock, err := os.OpenFile(path+".lock", os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Close() // closing releases the flock
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return nil, fmt.Errorf("store: lock %s.lock: %w", path, err)
 	}
 	// Create the file 0600 ourselves so SQLite (which gives -wal and -shm the
 	// main file's mode) never makes a wider one. Only the opener whose
