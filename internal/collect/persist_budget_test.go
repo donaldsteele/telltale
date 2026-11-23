@@ -270,3 +270,26 @@ func TestPersistenceLinkedUnitDirectory(t *testing.T) {
 		t.Errorf("skips %+v", res.Skips)
 	}
 }
+
+// APT's configuration snippets and each user's environment.d are read with
+// their text, so that a change can be judged by what it says.
+func TestPersistenceAptConfAndUserEnvironment(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "etc/apt/apt.conf.d/99hook", "DPkg::Post-Invoke { \"/tmp/.x\"; };\n")
+	writeFile(t, root, "etc/apt/apt.conf", "APT::Install-Recommends \"0\";\n")
+	writeFile(t, root, "home/mallory/.config/environment.d/50-x.conf", "LD_PRELOAD=/tmp/.hide.so\n")
+	writeFile(t, root, "home/mallory/.config/environment.d/notes.txt", "not read by systemd\n")
+	res := PersistenceScan(root, mallory(), testKey)
+	for p, kind := range map[string]string{
+		"/etc/apt/apt.conf.d/99hook":                    model.PersistKindAptConf,
+		"/etc/apt/apt.conf":                             model.PersistKindAptConf,
+		"/home/mallory/.config/environment.d/50-x.conf": model.PersistKindUserEnvironment,
+	} {
+		if f, ok := findPersist(res.Files, p); !ok || f.Kind != kind || len(f.Lines) != 1 {
+			t.Errorf("%s: %+v ok=%v", p, f, ok)
+		}
+	}
+	if f, ok := findPersist(res.Files, "/home/mallory/.config/environment.d/notes.txt"); !ok || len(f.Lines) != 0 || f.SHA256 == "" {
+		t.Errorf("a file systemd does not read there: %+v ok=%v", f, ok)
+	}
+}

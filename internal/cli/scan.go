@@ -232,9 +232,9 @@ var scanContext = func() (context.Context, context.CancelFunc) {
 // the examined machine's own CA store and names are resolved by its own
 // resolver, and root on that machine controls both, so a source trusted
 // through HTTPS alone (snapshot.debian.org's file API, Launchpad) proves
-// nothing there. The server, a reference bundle (--refs) built on another
-// machine, and a filesystem mounted on the machine that examines it are
-// not affected. Tests replace it.
+// nothing there. A reference bundle (--refs) is signed-only by itself; the
+// server and a filesystem mounted on the machine that examines it are not
+// affected. Tests replace it.
 var signedSourcesOnly = func(root, refs string, offline bool) bool {
 	return refs == "" && !offline && filepath.Clean("/"+root) == "/"
 }

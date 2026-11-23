@@ -61,9 +61,9 @@ A scan of the machine it runs on uses signed indexes only. Two sources
 that can confirm a few older versions, snapshot.debian.org's file API and
 Launchpad, are trusted through HTTPS alone, and on the examined machine
 HTTPS is checked with that machine's own certificate store and resolver.
-They are used only by the server, or through a reference bundle
-(`fetch-refs`) built on another machine. A version only they could confirm
-is reported as not found.
+They are used only by the server. A reference bundle (`fetch-refs`) never
+holds them either: it carries only what signed indexes confirm. A version
+only they could confirm is reported as not found.
 
 ### Third-party repositories
 

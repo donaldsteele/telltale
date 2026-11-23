@@ -449,6 +449,18 @@ type unitBudget struct {
 	// own: every directory in it is then entered only if uid could.
 	own bool
 	uid uint32
+	// kind, when set, makes the walk one of a user's environment.d
+	// directory instead of a unit directory: its *.conf files are read as
+	// that kind, anything else is recorded by hash.
+	kind string
+}
+
+// kindOf is the kind of what a tree's walk records.
+func (b *unitBudget) kindOf() string {
+	if b != nil && b.kind != "" {
+		return b.kind
+	}
+	return model.PersistKindSystemdUnit
 }
 
 // maxUnitDepth is how deep a unit tree is walked.
@@ -479,7 +491,7 @@ func unitDirInSystem(real string) bool {
 // that a non-root account owns is never followed.
 func (c *collector) systemd(dir string, all bool, b *unitBudget) {
 	dir = path.Clean(dir)
-	const kind = model.PersistKindSystemdUnit
+	kind := b.kindOf()
 	// A user's own unit directory: links that user owns on the way are
 	// followed (~/.config kept in a dotfiles directory), and what is
 	// reached is read only where that user could read it.
@@ -631,16 +643,20 @@ func (c *collector) unitTree(fd int, mp string, all bool, b *unitBudget, depth i
 			if strings.HasSuffix(parent, ".wants") || strings.HasSuffix(parent, ".requires") || strings.HasSuffix(parent, ".upholds") {
 				c.enabledLink(child)
 			} else {
-				c.file(child, model.PersistKindSystemdUnit)
+				c.file(child, b.kindOf())
 			}
 		case d.Type().IsRegular():
 			dropin := strings.HasSuffix(parent, ".d") && strings.HasSuffix(d.Name(), ".conf")
+			wanted := all || isUnitName(d.Name()) || dropin
+			if b != nil && b.kind != "" {
+				wanted = strings.HasSuffix(d.Name(), ".conf")
+			}
 			switch {
-			case all || isUnitName(d.Name()) || dropin:
-				c.file(child, model.PersistKindSystemdUnit)
+			case wanted:
+				c.file(child, b.kindOf())
 			case b != nil:
 				c.hashOnly = true
-				c.file(child, model.PersistKindSystemdUnit)
+				c.file(child, b.kindOf())
 				c.hashOnly = false
 			}
 		case d.IsDir():
@@ -714,6 +730,8 @@ func PersistenceScan(root string, users []model.User, key []byte) PersistResult 
 	c.file("/etc/modules", model.PersistKindModulesLoad)
 	c.dir("/etc/modules-load.d", model.PersistKindModulesLoad)
 	c.dir("/etc/modprobe.d", model.PersistKindModprobe)
+	c.file("/etc/apt/apt.conf", model.PersistKindAptConf)
+	c.dir("/etc/apt/apt.conf.d", model.PersistKindAptConf)
 
 	for _, u := range users {
 		home := path.Clean(u.Home)
@@ -728,6 +746,11 @@ func PersistenceScan(root string, users []model.User, key []byte) PersistResult 
 			dir := path.Join(home, d)
 			c.systemd(dir, false, &unitBudget{dir: dir})
 		}
+		// The environment of everything the user's systemd starts
+		// (LD_PRELOAD, PATH): read like a unit directory, under the same
+		// budgets and link rules.
+		envd := path.Join(home, ".config/environment.d")
+		c.systemd(envd, false, &unitBudget{dir: envd, kind: model.PersistKindUserEnvironment})
 		for _, pat := range akf {
 			c.file(expandAKF(pat, home, u.Name), model.PersistKindAuthorizedKeys)
 		}

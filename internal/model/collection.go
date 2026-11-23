@@ -208,6 +208,12 @@ const (
 	PersistKindResolver       = "resolver"
 	PersistKindModulesLoad    = "modules_load"
 	PersistKindModprobe       = "modprobe"
+	// PersistKindAptConf: APT's configuration (/etc/apt/apt.conf and
+	// apt.conf.d), which can name commands APT and dpkg run.
+	PersistKindAptConf = "apt_conf"
+	// PersistKindUserEnvironment: a user's ~/.config/environment.d, the
+	// environment of everything that user's systemd starts.
+	PersistKindUserEnvironment = "user_environment"
 )
 
 // PersistFile is a persistence-relevant file, stored as redacted text lines.

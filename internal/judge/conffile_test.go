@@ -167,3 +167,17 @@ func TestJudgeOwnedChangedFileWithoutVerdict(t *testing.T) {
 	other.Files = append(other.Files, file("/usr/share/doc/mine/README", "mine", 0o644))
 	must(t, run(other, snapOf(old), archive()), "snap.file_added:/usr/share/doc/mine/README", model.SevNote)
 }
+
+// HTTPS-only sources are used by the server alone: a reference bundle holds
+// only what signed indexes confirm. The note must not say otherwise.
+func TestSignedOnlyNoteNamesOnlyTheServer(t *testing.T) {
+	if strings.Contains(SignedOnlyNote, "bundle") || !strings.Contains(SignedOnlyNote, "only by the server") {
+		t.Errorf("note %q", SignedOnlyNote)
+	}
+	res := archive()
+	res.SignedOnly = true
+	r := run(clean(), nil, res)
+	if !slices.ContainsFunc(r.ComparedAgainst, func(s string) bool { return strings.HasSuffix(s, SignedOnlyNote) }) {
+		t.Errorf("compared against %q", r.ComparedAgainst)
+	}
+}

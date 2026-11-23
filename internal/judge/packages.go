@@ -247,7 +247,7 @@ func (j *judge) pkgNeeded() bool {
 
 // SignedOnlyNote follows the reference in "Compared against" when the scan
 // ran on the machine it examined (pkgverify.Options.SignedOnly).
-const SignedOnlyNote = " (signed indexes only: sources trusted through HTTPS alone, snapshot.debian.org's file API and Launchpad, are used only by the server or with a reference bundle built on another machine)"
+const SignedOnlyNote = " (signed indexes only: sources trusted through HTTPS alone, snapshot.debian.org's file API and Launchpad, are used only by the server)"
 
 func distroPackages(osID string) string {
 	switch osID {

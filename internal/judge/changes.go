@@ -3,6 +3,7 @@ package judge
 import (
 	"fmt"
 	"path"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -856,24 +857,26 @@ type persistKind struct {
 }
 
 var persistKinds = map[string]persistKind{
-	model.PersistKindSudoers:        {"sudo rules", "sudo rules decide who can become root; one added line can give an account root without a password.", []string{"T1548.003"}},
-	model.PersistKindSSHD:           {"SSH server configuration", "The SSH server configuration decides who may log in and how; attackers turn root or password login back on, or add a Match block for themselves.", []string{"T1098.004", "T1021.004"}},
-	model.PersistKindSSHClient:      {"SSH client configuration", "SSH client settings can run commands (ProxyCommand, LocalCommand) whenever someone connects out from this machine.", []string{"T1546"}},
-	model.PersistKindAuthorizedKeys: {"SSH authorized keys", "Each key listed here lets its holder log in as this account without a password.", []string{"T1098.004"}},
-	model.PersistKindCron:           {"scheduled job", "cron runs these commands on a schedule, often as root; a planted line is a classic way back in.", []string{"T1053.003"}},
-	model.PersistKindAt:             {"at job", "at runs this job once at a set time, as the account that queued it.", []string{"T1053.002"}},
-	model.PersistKindSystemdUnit:    {"systemd unit", "systemd starts these services at boot or on a timer, as root unless told otherwise.", []string{"T1543.002"}},
-	model.PersistKindSystemdEnabled: {"systemd enable link", "These links decide which services start at boot.", []string{"T1543.002"}},
-	model.PersistKindRC:             {"start-up script", "Start-up scripts run as root at boot.", []string{"T1037.004"}},
-	model.PersistKindProfile:        {"shell start-up file", "Every login shell runs these lines; they can start a program or set PATH or LD_PRELOAD for everyone.", []string{"T1546.004"}},
-	model.PersistKindShellRC:        {"shell start-up file", "This account's shell runs these lines at every login.", []string{"T1546.004"}},
-	model.PersistKindLDPreload:      {"preload list", "Libraries listed here load into every program; rootkits use it to hide files, processes and connections.", []string{"T1574.006"}},
-	model.PersistKindLDConf:         {"library search path", "These files decide where programs find shared libraries; a directory added here can substitute a library.", []string{"T1574.006"}},
-	model.PersistKindPAM:            {"PAM configuration", "PAM decides how logins are checked; one changed line can accept any password or record every password typed.", []string{"T1556.003"}},
-	model.PersistKindHosts:          {"hosts file", "The hosts file overrides DNS; it can send update or login traffic to a machine an attacker controls.", nil},
-	model.PersistKindResolver:       {"name resolution settings", "These settings decide which DNS servers answer and in what order; an attacker's resolver can redirect any name.", nil},
-	model.PersistKindModulesLoad:    {"boot-time kernel module list", "Kernel modules named here load at every boot.", []string{"T1547.006"}},
-	model.PersistKindModprobe:       {"kernel module options", "modprobe settings can run a command (an install line) whenever a module loads.", []string{"T1547.006"}},
+	model.PersistKindSudoers:         {"sudo rules", "sudo rules decide who can become root; one added line can give an account root without a password.", []string{"T1548.003"}},
+	model.PersistKindSSHD:            {"SSH server configuration", "The SSH server configuration decides who may log in and how; attackers turn root or password login back on, or add a Match block for themselves.", []string{"T1098.004", "T1021.004"}},
+	model.PersistKindSSHClient:       {"SSH client configuration", "SSH client settings can run commands (ProxyCommand, LocalCommand) whenever someone connects out from this machine.", []string{"T1546"}},
+	model.PersistKindAuthorizedKeys:  {"SSH authorized keys", "Each key listed here lets its holder log in as this account without a password.", []string{"T1098.004"}},
+	model.PersistKindCron:            {"scheduled job", "cron runs these commands on a schedule, often as root; a planted line is a classic way back in.", []string{"T1053.003"}},
+	model.PersistKindAt:              {"at job", "at runs this job once at a set time, as the account that queued it.", []string{"T1053.002"}},
+	model.PersistKindSystemdUnit:     {"systemd unit", "systemd starts these services at boot or on a timer, as root unless told otherwise.", []string{"T1543.002"}},
+	model.PersistKindSystemdEnabled:  {"systemd enable link", "These links decide which services start at boot.", []string{"T1543.002"}},
+	model.PersistKindRC:              {"start-up script", "Start-up scripts run as root at boot.", []string{"T1037.004"}},
+	model.PersistKindProfile:         {"shell start-up file", "Every login shell runs these lines; they can start a program or set PATH or LD_PRELOAD for everyone.", []string{"T1546.004"}},
+	model.PersistKindShellRC:         {"shell start-up file", "This account's shell runs these lines at every login.", []string{"T1546.004"}},
+	model.PersistKindLDPreload:       {"preload list", "Libraries listed here load into every program; rootkits use it to hide files, processes and connections.", []string{"T1574.006"}},
+	model.PersistKindLDConf:          {"library search path", "These files decide where programs find shared libraries; a directory added here can substitute a library.", []string{"T1574.006"}},
+	model.PersistKindPAM:             {"PAM configuration", "PAM decides how logins are checked; one changed line can accept any password or record every password typed.", []string{"T1556.003"}},
+	model.PersistKindHosts:           {"hosts file", "The hosts file overrides DNS; it can send update or login traffic to a machine an attacker controls.", nil},
+	model.PersistKindResolver:        {"name resolution settings", "These settings decide which DNS servers answer and in what order; an attacker's resolver can redirect any name.", nil},
+	model.PersistKindModulesLoad:     {"boot-time kernel module list", "Kernel modules named here load at every boot.", []string{"T1547.006"}},
+	model.PersistKindAptConf:         {"APT configuration", "APT's configuration can name commands that APT and dpkg run as root at every update or package operation (Invoke hooks, Pre-Install-Pkgs) and replace the programs they call (Dir::Bin).", []string{"T1546"}},
+	model.PersistKindUserEnvironment: {"user environment file", "Files in a user's environment.d set the environment of everything that user's systemd starts; LD_PRELOAD or PATH set here load a library into, or substitute, every program of the session.", []string{"T1574.006", "T1546"}},
+	model.PersistKindModprobe:        {"kernel module options", "modprobe settings can run a command (an install line) whenever a module loads.", []string{"T1547.006"}},
 }
 
 func kindInfo(kind string) persistKind {
@@ -1118,6 +1121,14 @@ func (j *judge) persistChange(ch diff.Change) {
 		}
 	}
 	info := kindInfo(kind)
+	sev, why := model.SevBackdoor, info.why+" It changed since the machine was known to be clean, and no package update explains it."
+	if kind == model.PersistKindAptConf && !meta && !aptConfRuns(cur) {
+		// Maintainer scripts rewrite these through ucf (20auto-upgrades,
+		// 50unattended-upgrades), so no package owns or explains them.
+		sev = model.SevNote
+		why = "APT's configuration changed since the snapshot, and no package update explains the change. The file as it is now names no hook (nothing APT or dpkg would run) and replaces none of their programs, " +
+			"so this is most likely a setting changed by you or by a package's own configuration script. A snippet that gains a hook is reported as a backdoor sign."
+	}
 	var title string
 	switch {
 	case old == nil:
@@ -1128,9 +1139,9 @@ func (j *judge) persistChange(ch diff.Change) {
 		title = fmt.Sprintf("%s changed since the snapshot: %s", capitalize(info.label), p)
 	}
 	f := j.add(&model.Finding{
-		Key: "snap.persist:" + p, ID: "TT-SNAP-002", Source: srcSnapshot, Severity: model.SevBackdoor,
+		Key: "snap.persist:" + p, ID: "TT-SNAP-002", Source: srcSnapshot, Severity: sev,
 		Title: title,
-		Why:   info.why + " It changed since the machine was known to be clean, and no package update explains it.",
+		Why:   why,
 		Fix:   persistFix(p, cur, old, lines, meta, lv),
 		Refs:  info.refs,
 		// The summary first: its After is the file's full hash.
@@ -1148,6 +1159,33 @@ func (j *judge) persistChange(ch diff.Change) {
 	}
 	j.persistDone[p] = f
 }
+
+// aptHook matches what makes an APT configuration file run something or
+// replace a program: an Invoke hook of APT or dpkg (Pre-Invoke, Post-Invoke,
+// Post-Invoke-Success, ...), DPkg::Pre-Install-Pkgs, and Dir::Bin, written
+// with "::" or as nested blocks.
+var aptHook = regexp.MustCompile(`(?i)invoke|pre-install-pkgs|dir::bin|\bbin\s*(::|\{)`)
+
+// aptConfRuns reports whether an APT configuration file, as it is now, may
+// run something or replace a program. A file that is gone runs nothing; one
+// whose text was not kept is not known to be harmless.
+func aptConfRuns(cur *model.PersistFile) bool {
+	if cur == nil {
+		return false
+	}
+	if len(cur.Lines) == 0 && cur.SHA256 != "" && cur.SHA256 != emptySHA256 {
+		return true
+	}
+	for _, l := range cur.Lines {
+		if t := strings.TrimSpace(l); !strings.HasPrefix(t, "//") && !strings.HasPrefix(t, "#") && aptHook.MatchString(t) {
+			return true
+		}
+	}
+	return false
+}
+
+// emptySHA256 is the hash of no bytes at all.
+const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 func capitalize(s string) string {
 	if s == "" {
@@ -1658,7 +1696,7 @@ func (j *judge) firewallChanged(ch diff.Change) {
 		f.Severity = model.SevWeak
 		f.Title = "The firewall lets more in than at the snapshot"
 		f.Why = "The firewall is still active, but " + strings.Join(weaker, ", ") + " compared with the snapshot. Opening the firewall is how a listener planted on the machine becomes reachable. " +
-			"Services that add and remove their own rules (fail2ban, Docker, libvirt) change the counts too; accept the change if that is what happened."
+			"Chains that services rewrite by themselves (fail2ban, Docker, Podman, libvirt, CNI, Kubernetes) are not counted, so this is a rule somebody or something else removed."
 		f.Evidence[0].Detail = "live firewall summary: " + strings.Join(weaker, ", ")
 		f.Refs = []string{"T1562.004"}
 	}
