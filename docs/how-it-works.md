@@ -290,12 +290,14 @@ snippets, NetworkManager dispatcher scripts, desktop autostart entries,
 polkit rules, `nftables.conf`, the name resolution files, the CA
 certificate store with `/usr/local/share/ca-certificates`, and each
 user's `~/.config/environment.d`. A file added or changed there that no
-confirmed package change explains is a backdoor sign. APT's configuration
-snippets (`apt.conf`, `apt.conf.d`) are judged by what they say: package
-scripts rewrite some of them, so a change is a backdoor sign only when the
-file now names something APT or dpkg runs (an `Invoke` hook,
-`Pre-Install-Pkgs`) or replaces one of their programs (`Dir::Bin`), and a
-note otherwise.
+confirmed package change explains is a backdoor sign. That includes APT's
+configuration snippets (`apt.conf`, `apt.conf.d`), which can name commands
+APT and dpkg run as root, whatever the changed snippet says: a hook can
+hide behind an `#include` or in nested blocks. The cost: some packages
+rewrite their snippet from a maintainer script, so when
+`unattended-upgrades` is upgraded after the snapshot and rewrites
+`50unattended-upgrades` to something other than the package's default,
+that shows as a backdoor sign for you to look at and accept.
 
 On the server, changes explained by a confirmed package update roll forward
 into the snapshot by themselves. Anything else rolls forward only when you

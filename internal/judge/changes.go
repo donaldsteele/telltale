@@ -1121,13 +1121,11 @@ func (j *judge) persistChange(ch diff.Change) {
 		}
 	}
 	info := kindInfo(kind)
-	sev, why := model.SevBackdoor, info.why+" It changed since the machine was known to be clean, and no package update explains it."
-	if kind == model.PersistKindAptConf && !meta && !aptConfRuns(cur) {
-		// Maintainer scripts rewrite these through ucf (20auto-upgrades,
-		// 50unattended-upgrades), so no package owns or explains them.
-		sev = model.SevNote
-		why = "APT's configuration changed since the snapshot, and no package update explains the change. The file as it is now names no hook (nothing APT or dpkg would run) and replaces none of their programs, " +
-			"so this is most likely a setting changed by you or by a package's own configuration script. A snippet that gains a hook is reported as a backdoor sign."
+	why := info.why + " It changed since the machine was known to be clean, and no package update explains it."
+	if kind == model.PersistKindAptConf {
+		// What the file says never lowers the rank: a hook can sit behind
+		// an #include or in blocks no single line names.
+		why += " Package scripts rewrite some of these files themselves (unattended-upgrades does, when it is upgraded): if that is what happened, accept the change."
 	}
 	var title string
 	switch {
@@ -1139,7 +1137,7 @@ func (j *judge) persistChange(ch diff.Change) {
 		title = fmt.Sprintf("%s changed since the snapshot: %s", capitalize(info.label), p)
 	}
 	f := j.add(&model.Finding{
-		Key: "snap.persist:" + p, ID: "TT-SNAP-002", Source: srcSnapshot, Severity: sev,
+		Key: "snap.persist:" + p, ID: "TT-SNAP-002", Source: srcSnapshot, Severity: model.SevBackdoor,
 		Title: title,
 		Why:   why,
 		Fix:   persistFix(p, cur, old, lines, meta, lv),
@@ -1155,37 +1153,21 @@ func (j *judge) persistChange(ch diff.Change) {
 		case lc.Op != "add":
 			e.Detail = "line removed"
 		}
+		// Pointed out, never relied on: see aptHook.
+		if kind == model.PersistKindAptConf && lc.Op == "add" && aptHook.MatchString(lc.New) {
+			e.Detail += "; names a hook or a program APT or dpkg runs"
+		}
 		j.attach(f, e, maxEvidence)
 	}
 	j.persistDone[p] = f
 }
 
-// aptHook matches what makes an APT configuration file run something or
-// replace a program: an Invoke hook of APT or dpkg (Pre-Invoke, Post-Invoke,
-// Post-Invoke-Success, ...), DPkg::Pre-Install-Pkgs, and Dir::Bin, written
-// with "::" or as nested blocks.
+// aptHook matches the plain spellings of what makes an APT configuration
+// file run something or replace a program: an Invoke hook of APT or dpkg,
+// DPkg::Pre-Install-Pkgs, Dir::Bin. It only words the evidence. It decides
+// no rank: the same can be written behind an #include, or in nested blocks
+// where no line holds the whole name.
 var aptHook = regexp.MustCompile(`(?i)invoke|pre-install-pkgs|dir::bin|\bbin\s*(::|\{)`)
-
-// aptConfRuns reports whether an APT configuration file, as it is now, may
-// run something or replace a program. A file that is gone runs nothing; one
-// whose text was not kept is not known to be harmless.
-func aptConfRuns(cur *model.PersistFile) bool {
-	if cur == nil {
-		return false
-	}
-	if len(cur.Lines) == 0 && cur.SHA256 != "" && cur.SHA256 != emptySHA256 {
-		return true
-	}
-	for _, l := range cur.Lines {
-		if t := strings.TrimSpace(l); !strings.HasPrefix(t, "//") && !strings.HasPrefix(t, "#") && aptHook.MatchString(t) {
-			return true
-		}
-	}
-	return false
-}
-
-// emptySHA256 is the hash of no bytes at all.
-const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 func capitalize(s string) string {
 	if s == "" {
