@@ -87,16 +87,16 @@ func TestVerifyScopeOnlyPathsAndLinkTargets(t *testing.T) {
 	setFile(cur, file("/usr/bin/openssl", "changed", 0o755))
 	// A startup link into a package-owned file outside the system
 	// directories: its target is verified too.
-	cur.Packages.Installed = append(cur.Packages.Installed, pkg("agent", "1.0", "/opt/agent/run"))
-	cur.Files = append(cur.Files, file("/opt/agent/run", "agent", 0o755))
-	cur.Persist = append(cur.Persist, model.PersistFile{Path: "/etc/systemd/system/multi-user.target.wants/agent.service",
-		Kind: model.PersistKindSystemdEnabled, Mode: 0o120777, Lines: []string{"/opt/agent/run"}})
+	cur.Packages.Installed = append(cur.Packages.Installed, pkg("relay", "1.0", "/opt/relay/run"))
+	cur.Files = append(cur.Files, file("/opt/relay/run", "relay", 0o755))
+	cur.Persist = append(cur.Persist, model.PersistFile{Path: "/etc/systemd/system/multi-user.target.wants/relay.service",
+		Kind: model.PersistKindSystemdEnabled, Mode: 0o120777, Lines: []string{"/opt/relay/run"}})
 	opt := pkgverify.Options{}
 	VerifyScope(&opt, snapOf(old), inventoried(cur))
 	if !opt.OnlyPaths["/usr/bin/openssl"] || opt.OnlyPaths["/usr/bin/ls"] {
 		t.Errorf("only %v", opt.OnlyPaths)
 	}
-	if len(opt.ExtraPaths) != 1 || opt.ExtraPaths[0] != "/opt/agent/run" {
+	if len(opt.ExtraPaths) != 1 || opt.ExtraPaths[0] != "/opt/relay/run" {
 		t.Errorf("extra %v", opt.ExtraPaths)
 	}
 }

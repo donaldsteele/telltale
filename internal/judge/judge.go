@@ -35,6 +35,10 @@ type Input struct {
 	// note on a machine that trusts another key for a vendor's repository.
 	// Nil means the built-in table.
 	Vendors *vendorkeys.Table
+	// Exceptions are lasting exceptions kept outside the snapshot (server
+	// mode keeps them in its store). They apply as the snapshot's own do,
+	// with or without a snapshot.
+	Exceptions []model.Exception
 }
 
 // Fixed report wording.
@@ -210,6 +214,13 @@ func indexCollection(c *model.Collection) (map[string]string, map[string]*model.
 // Judge combines the snapshot comparison, the checklist, the heuristics and
 // the package verification result into one ranked report.
 func Judge(in Input) *model.Report {
+	r, _ := JudgeRebase(in)
+	return r
+}
+
+// JudgeRebase is Judge, and also says how the snapshot can roll forward from
+// this judgement (nil without a usable snapshot).
+func JudgeRebase(in Input) (*model.Report, *Rebase) {
 	c := in.Collection
 	if c == nil {
 		c = &model.Collection{}
@@ -238,8 +249,14 @@ func Judge(in Input) *model.Report {
 	j.heuristics()
 	j.fillWhen()
 	j.finishGroups()
+	// What the findings hold back from rolling forward is decided before
+	// exceptions drop any: an accepted value is not a new baseline.
+	var held map[string]bool
+	if j.old != nil {
+		held = j.heldBack()
+	}
 	applied := j.exceptions()
-	return j.report(checks, applied)
+	return j.report(checks, applied), j.rebase(held)
 }
 
 // checklist turns failing items into weak settings and skipped items into
@@ -489,10 +506,14 @@ func currentValue(f *model.Finding) string {
 // accepted one stays; a checklist item is then judged by the regression
 // rule against the accepted value.
 func (j *judge) exceptions() []model.Exception {
-	if j.in.Snapshot == nil || len(j.in.Snapshot.Exceptions) == 0 {
+	var all []model.Exception
+	if j.in.Snapshot != nil {
+		all = append(all, j.in.Snapshot.Exceptions...)
+	}
+	all = append(all, j.in.Exceptions...)
+	if len(all) == 0 {
 		return nil
 	}
-	all := j.in.Snapshot.Exceptions
 	byKey := map[string][]int{}
 	for i, e := range all {
 		byKey[e.FindingKey] = append(byKey[e.FindingKey], i)
