@@ -270,7 +270,7 @@ func TestMultiLineFixPrintsUnderTheFixColumn(t *testing.T) {
 	if !strings.Contains(b.String(), "            Fix: # note\n                 grep -rn x /etc\n") || strings.Contains(b.String(), "do not paste") {
 		t.Errorf("%q", b.String())
 	}
-	for _, bad := range []string{"rm ‮", "rm  x", "rm \x00"} {
+	for _, bad := range []string{"rm \u202e", "rm \u00a0x", "rm \x00"} {
 		r.Findings[0].Fix = bad
 		b.Reset()
 		Text(&b, r, TextOptions{})

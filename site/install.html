@@ -40,6 +40,8 @@
 </table>
 <p>Check the download on a machine you trust before you unpack it:</p>
 <pre class="term" role="region" tabindex="0" aria-label="Check the download"><code><span class="p">$ </span>sha256sum --check --ignore-missing SHA256SUMS</code></pre>
+<p>Each release file also has a signed build provenance attestation: it says the file was built by the project's release workflow from the tagged commit. The <a href="https://cli.github.com/">GitHub CLI</a> checks it:</p>
+<pre class="term" role="region" tabindex="0" aria-label="Check where the download was built"><code><span class="p">$ </span>gh attestation verify telltale-carry_0.1.0_linux_amd64.tar.gz --repo donaldsteele/telltale</code></pre>
 </section>
 
 <section id="carry">

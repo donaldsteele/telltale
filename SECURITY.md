@@ -36,6 +36,25 @@ Among the things that are in scope:
 The limits described in the README are known: in particular, a kernel-level
 rootkit can hide from any check that runs on the machine.
 
+## Verifying a release
+
+Every file of a release is listed in its `SHA256SUMS`, and has a signed
+build provenance attestation made by the release workflow: it binds the
+file's hash to this repository, the workflow and the tagged commit it was
+built from. To check a download before you trust it:
+
+```
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify telltale_0.1.0_linux_amd64.tar.gz --repo donaldsteele/telltale
+```
+
+`gh attestation verify` needs the [GitHub CLI](https://cli.github.com/). A
+file that fails either check did not come from this project's release
+workflow: do not run it, and please report it.
+
+The tarballs are also reproducible: `scripts/build.sh` at the same commit,
+with the same Go toolchain, gives the same bytes.
+
 ## Supported versions
 
 Fixes go into the latest release.

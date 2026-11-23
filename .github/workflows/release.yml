@@ -2,7 +2,10 @@ name: release
 
 # A tag vX.Y.Z publishes a GitHub release: the full and carry tarballs for
 # amd64 and arm64, the server .deb packages and SHA256SUMS, with the
-# CHANGELOG.md entry for the version as the release notes.
+# CHANGELOG.md entry for the version as the release notes. Every tarball
+# and package gets a signed build provenance attestation, which says it was
+# built by this workflow from this repository at the tagged commit
+# (gh attestation verify checks it).
 
 on:
   push:
@@ -43,9 +46,13 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Only this job may write: it creates the release.
+    # Only this job may write: it creates the release, and it signs the
+    # build provenance of what it built (id-token: the workflow's identity,
+    # which the signature is bound to; attestations: storing it).
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       # The job that holds a token able to write keeps it out of the
       # checkout, and builds without a cache another run could have filled.
@@ -67,6 +74,13 @@ jobs:
       # package, and each one's architecture and flavour; SHA256SUMS.
       - name: check the artifacts
         run: REQUIRE_DEB=1 bash scripts/check-dist.sh
+
+      # One attestation for everything SHA256SUMS names, made before
+      # anything is published: no release without its provenance.
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
 
       - name: create the release
         env:

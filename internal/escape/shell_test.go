@@ -39,7 +39,7 @@ func TestShellQuoteNULIsNotQuotable(t *testing.T) {
 }
 
 func TestShellQuoteDollarFormIsPlainASCII(t *testing.T) {
-	for _, s := range []string{"中文\\\n", "a b", "a b", "x'y\nz", "\xe4\xb8"} {
+	for _, s := range []string{"中文\\\n", "a\u00a0b", "a\u2028b", "x'y\nz", "\xe4\xb8"} {
 		q := ShellQuote(s)
 		for i := 0; i < len(q); i++ {
 			if q[i] < 0x20 || q[i] >= 0x7f {
@@ -78,8 +78,8 @@ func TestNeedsEscapeOneRule(t *testing.T) {
 			t.Errorf("U+%04X escaped", r)
 		}
 	}
-	if Terminal("a b c") != `a\u{00A0}b\u{2028}c` {
-		t.Errorf("%s", Terminal("a b c"))
+	if Terminal("a\u00a0b\u2028c") != `a\u{00A0}b\u{2028}c` {
+		t.Errorf("%s", Terminal("a\u00a0b\u2028c"))
 	}
 }
 

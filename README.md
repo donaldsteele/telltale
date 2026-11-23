@@ -117,6 +117,15 @@ tar xzf telltale-carry_0.1.0_linux_amd64.tar.gz
 scp telltale web01:
 ```
 
+`SHA256SUMS` only says the file is the one the release page lists. Each
+release file also has a signed build provenance attestation, which says it
+was built by this repository's release workflow from the tagged commit. With
+the [GitHub CLI](https://cli.github.com/) you can check that:
+
+```
+gh attestation verify telltale-carry_0.1.0_linux_amd64.tar.gz --repo donaldsteele/telltale
+```
+
 On the machine, as root (without root it still runs, and lists what it had
 to skip):
 
@@ -306,7 +315,10 @@ bash scripts/build.sh                                 # both builds for amd64 an
 ```
 
 `scripts/build.sh` writes everything to `dist/` (the `.deb` packages need
-Docker), and `scripts/check-dist.sh` checks the result.
+Docker), and `scripts/check-dist.sh` checks the result. The tarballs are
+reproducible: built at the same commit with the same Go toolchain they are
+the same bytes, so you can compare your own build with a release
+(`SOURCE_DATE_EPOCH` defaults to the commit's time).
 
 ## Development
 

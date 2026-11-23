@@ -43,7 +43,7 @@ func TestTerminalEscapesBackslash(t *testing.T) {
 }
 
 func TestTerminalEscapesBidiControl(t *testing.T) {
-	got := Terminal("a‮b")
+	got := Terminal("a\u202eb")
 	want := `a\u{202E}b`
 	if got != want {
 		t.Errorf("Terminal = %q, want %q", got, want)

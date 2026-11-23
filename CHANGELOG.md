@@ -28,7 +28,9 @@ The first release.
 - **Downloads**: the collector build for carry mode
   (`telltale-carry_0.1.0_linux_<arch>.tar.gz`), the full build
   (`telltale_0.1.0_linux_<arch>.tar.gz`), and the server package
-  (`telltale_0.1.0-1_<arch>.deb`), for amd64 and arm64.
+  (`telltale_0.1.0-1_<arch>.deb`), for amd64 and arm64. Each file is
+  listed in `SHA256SUMS` and has a signed build provenance attestation
+  (`gh attestation verify`); the tarballs are reproducible.
 - **The test lab**: Docker machines with inert backdoors planted, checked
   against manifests in CI, on Debian 12 and Ubuntu 24.04, and on Debian 12
   arm64 under emulation.

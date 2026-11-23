@@ -33,6 +33,13 @@
 # or a previous build's output (scripts/dist-dir.sh); anything else is
 # refused.
 #
+# The tarballs are reproducible (scripts/repro-tar.sh): entries in sorted
+# order, dated SOURCE_DATE_EPOCH, owned by root, and gzip without a time.
+# SOURCE_DATE_EPOCH defaults to the time of the commit being built (0
+# outside a git checkout), so two builds of one commit with the same Go
+# toolchain give the same tarballs and the same SHA256SUMS lines for them.
+# The packages are built by dpkg-deb, which uses the same time.
+#
 # LICENSE and NOTICE are always required. A missing README.md is a warning,
 # or an error with RELEASE=1. scripts/check-dist.sh checks the result.
 set -euo pipefail
@@ -53,6 +60,15 @@ case "$VERSION" in
   *) DEBVERSION="0.0.0~${VERSION}-1" ;;
 esac
 DEBVERSION="${DEBVERSION//_/+}"
+
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || echo 0)}"
+case "$SOURCE_DATE_EPOCH" in
+  "" | *[!0-9]*)
+    echo "build.sh: SOURCE_DATE_EPOCH '$SOURCE_DATE_EPOCH' is not a number of seconds" >&2
+    exit 2
+    ;;
+esac
+export SOURCE_DATE_EPOCH
 
 MODULE=github.com/donaldsteele/telltale
 LDFLAGS="-s -w -X $MODULE/internal/version.Version=$VERSION"
@@ -104,6 +120,7 @@ sha256() {
 }
 
 . scripts/dist-dir.sh
+. scripts/repro-tar.sh
 prepare_dist "$DIST" || exit 2
 mkdir -p "$DIST/bin" "$DIST/collector"
 dist_abs="$(cd "$DIST" && pwd)"
@@ -129,7 +146,8 @@ for arch in $ARCHES; do
       tarname="telltale-carry_${VERSION}_linux_${arch}.tar.gz"
     fi
     cp "${docs[@]}" "$pkg/"
-    tar -C "$pkg" -czf "$dist_abs/$tarname" telltale "${docs[@]}"
+    chmod 0755 "$pkg/telltale"
+    repro_tar "$dist_abs/$tarname" "$pkg" telltale "${docs[@]}"
     echo "wrote $DIST/$tarname"
   done
 done
@@ -168,6 +186,7 @@ if [ "$debs" = 1 ]; then
   # telltale-lab container and must never stop a package build.
   # shellcheck disable=SC2086 # ARCHES is a list
   docker run --rm --network none --label telltale-build=1 \
+    -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     --user "$(id -u):$(id -g)" -v "$stage:/work" -w /work "$DEB_IMAGE" \
     sh -euc 'v=$1; shift; for a in "$@"; do dpkg-deb --root-owner-group -Zxz --build "deb-$a" "out/telltale_${v}_$a.deb"; done' \
     sh "$DEBVERSION" $ARCHES >/dev/null
