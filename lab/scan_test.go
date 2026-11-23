@@ -60,6 +60,10 @@ func machineFor(t *testing.T, distro string, c labCase) *labkit.Machine {
 		variant = "clean"
 	}
 	image := labkit.BuildWith(t, distro, variant, labkit.BuildOpts{Newer: req.NewerSnapshot, Systemd: req.Systemd})
+	if variant == "thirdparty" {
+		// Its APT sources name the lab's repository.
+		ensureRepo(t)
+	}
 	return start(t, image, labkit.Opts{
 		Noexec:     variant == "noexec",
 		Privileged: req.Privileged,
@@ -85,12 +89,14 @@ func runCase(t *testing.T, distro string, c labCase) (with, without *model.Repor
 		mustExec(t, m, "sh /lab/"+filepath.Base(filepath.Dir(c.dir))+"/"+c.id+"/apply.sh >/run/telltale-lab/apply.log 2>&1 || { cat /run/telltale-lab/apply.log; exit 1; }")
 	}
 	putSnapshot(t, m, snap)
-	refs, _ := refsFor(t, m)
-
-	with, _ = scan(t, m, "--snapshot", snapInside, "--refs", refs)
+	// With a snapshot the bundle also carries the third-party repositories
+	// whose keys the snapshot recorded; without one, only the distribution.
+	refsSnap, _ := refsWith(t, m, snap)
+	with, _ = scan(t, m, "--snapshot", snapInside, "--refs", refsSnap)
 	saveReport(t, distro, c.id+".with-snapshot", with)
 	checkReport(t, c.man, with, true)
 
+	refs, _ := refsFor(t, m)
 	without, _ = scan(t, m, "--refs", refs)
 	saveReport(t, distro, c.id+".without-snapshot", without)
 	checkReport(t, c.man, without, false)

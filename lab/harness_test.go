@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/donaldsteele/telltale/internal/model"
+	"github.com/donaldsteele/telltale/internal/snapshot"
 	"github.com/donaldsteele/telltale/lab/labkit"
 )
 
@@ -315,16 +316,43 @@ func putSnapshot(t *testing.T, m *labkit.Machine, host string) {
 	mustExec(t, m, "mv /lab/snap.in "+snapInside)
 }
 
+// labRepo is the lab's third-party repository, started on first use and
+// left running for the rest of the run (labkit.Reap removes it).
+var (
+	labRepoOnce sync.Once
+	labRepo     *labkit.Repo
+)
+
+func ensureRepo(t *testing.T) *labkit.Repo {
+	t.Helper()
+	labRepoOnce.Do(func() { labRepo = labkit.StartRepo(t) })
+	if labRepo == nil {
+		t.Fatalf("the lab repository could not be started (see the first test that needed it)")
+	}
+	return labRepo
+}
+
 // refsFor collects the machine as it is now and returns the path, inside the
-// machine, of the reference bundle for it, and the collection.
+// machine, of the reference bundle for it, and the collection. The bundle
+// holds the distribution's packages only: what a scan without a snapshot can
+// verify.
 func refsFor(t *testing.T, m *labkit.Machine) (string, *model.Collection) {
+	t.Helper()
+	return refsWith(t, m, "")
+}
+
+// refsWith is refsFor for a scan with the snapshot at the host path snap:
+// when the snapshot recorded keys for third-party repositories, the bundle
+// is built with "fetch-refs --snapshot" and also carries those repositories,
+// fetched from the server the machine itself reaches.
+func refsWith(t *testing.T, m *labkit.Machine, snap string) (string, *model.Collection) {
 	t.Helper()
 	out, code := m.Exec(t, "sh", "-c", "telltale collect 2>"+errInside)
 	if code != 0 {
 		errs, _ := m.Exec(t, "cat", errInside)
 		t.Fatalf("%s: telltale collect exit %d: %s", m.Name, code, errs)
 	}
-	dir, err := EnsureBundle(binPath, []byte(out))
+	dir, err := EnsureBundle(binPath, []byte(out), bundleTrust(t, m, snap))
 	if err != nil {
 		t.Fatalf("%s: reference bundle: %v", m.Name, err)
 	}
@@ -333,6 +361,57 @@ func refsFor(t *testing.T, m *labkit.Machine) (string, *model.Collection) {
 		t.Fatalf("%s: parse collection: %v", m.Name, err)
 	}
 	return dir, &c
+}
+
+// bundleTrust reads what the snapshot recorded about third-party
+// repositories. No snapshot, or one without such a record, gives the zero
+// value: the plain bundle.
+func bundleTrust(t *testing.T, m *labkit.Machine, snap string) BundleTrust {
+	t.Helper()
+	if snap == "" {
+		return BundleTrust{}
+	}
+	s, err := snapshot.ReadFile(snap, "")
+	if err != nil {
+		t.Fatalf("%s: read the snapshot on the host: %v", m.Name, err)
+	}
+	if s.Collection == nil || len(s.Collection.Packages.RepoTrust) == 0 {
+		return BundleTrust{}
+	}
+	trust := BundleTrust{Snapshot: snap}
+	var id strings.Builder
+	usesLabRepo := false
+	for _, tr := range s.Collection.Packages.RepoTrust {
+		fmt.Fprintf(&id, "%s %s %s\n", tr.URL, tr.Suite, strings.Join(tr.Fingerprints(), ","))
+		usesLabRepo = usesLabRepo || tr.URL == labkit.RepoURL
+	}
+	if usesLabRepo {
+		// Which server the machine reaches under the repository's name: the
+		// bundle is fetched from that one, as a machine with network access
+		// would fetch it.
+		repo := ensureRepo(t)
+		seen := strings.Fields(mustExec(t, m, "getent hosts "+labkit.RepoHost))
+		if len(seen) == 0 {
+			t.Fatalf("%s cannot resolve %s", m.Name, labkit.RepoHost)
+		}
+		ip := seen[0]
+		switch ip {
+		case repo.IP():
+			id.WriteString("server: vendor key\n")
+		case repo.SwappedIP():
+			id.WriteString("server: replacement key\n")
+		default:
+			t.Fatalf("%s resolves %s to %s, which is neither of the lab's repository servers", m.Name, labkit.RepoHost, ip)
+		}
+		_, imageID, err := labkit.RepoImage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		id.WriteString(imageID + "\n")
+		trust.Proxy = ip + ":80"
+	}
+	trust.ID = id.String()
+	return trust
 }
 
 // scan runs "telltale scan ARGS --json -" in the machine.

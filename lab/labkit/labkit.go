@@ -178,13 +178,19 @@ func NetworkInternal(t testing.TB) bool {
 }
 
 // stageContext assembles a build context (Dockerfile, common/, variant.sh) in
-// dir and returns a hash of its contents.
-func stageContext(dir, distro, variant string) (string, error) {
+// dir and returns a hash of its contents. variantNote, when not empty, is
+// appended to variant.sh as a comment: it makes the image, its tag and
+// Docker's cached layer of the variant step depend on something outside the
+// lab's files.
+func stageContext(dir, distro, variant, variantNote string) (string, error) {
 	h := sha256.New()
 	add := func(src, dst string) error {
 		data, err := os.ReadFile(src)
 		if err != nil {
 			return err
+		}
+		if dst == "variant.sh" && variantNote != "" {
+			data = append(data, []byte("\n# "+variantNote+"\n")...)
 		}
 		fmt.Fprintf(h, "%s\x00%d\x00", dst, len(data))
 		h.Write(data)
@@ -235,8 +241,20 @@ func BuildWith(t testing.TB, distro, variant string, bo BuildOpts) string {
 	if !contains(Distros, distro) || !contains(Variants, variant) {
 		t.Fatalf("unknown distro %q or variant %q", distro, variant)
 	}
+	usesRepo := variant == "thirdparty"
+	note := ""
+	if usesRepo {
+		// The image holds the repository's public key and a package
+		// installed from it, so it belongs to one build of the repository
+		// image: the keys are made anew with each.
+		_, id, err := RepoImage()
+		if err != nil {
+			t.Fatalf("repository image: %v", err)
+		}
+		note = "built against the lab repository image " + id
+	}
 	dir := t.TempDir()
-	hash, err := stageContext(dir, distro, variant)
+	hash, err := stageContext(dir, distro, variant, note)
 	if err != nil {
 		t.Fatalf("stage build context: %v", err)
 	}
@@ -257,12 +275,19 @@ func BuildWith(t testing.TB, distro, variant string, bo BuildOpts) string {
 		return tag
 	}
 	if _, _, code := docker("image", "inspect", tag); code != 0 {
-		start := time.Now()
-		so, se, code := docker(append(args, "-t", tag, dir)...)
-		if code != 0 {
-			t.Fatalf("build %s failed (exit %d):\n%s%s", tag, code, so, se)
+		build := func(extra ...string) {
+			start := time.Now()
+			so, se, code := docker(append(append(args, extra...), "-t", tag, dir)...)
+			if code != 0 {
+				t.Fatalf("build %s failed (exit %d):\n%s%s", tag, code, so, se)
+			}
+			t.Logf("built %s in %v", tag, time.Since(start).Round(time.Second))
 		}
-		t.Logf("built %s in %v", tag, time.Since(start).Round(time.Second))
+		if usesRepo {
+			withBuildRepo(t, func(ip string) { build("--add-host", RepoHost+":"+ip) })
+		} else {
+			build()
+		}
 	}
 	built[tag] = true
 	return tag

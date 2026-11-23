@@ -1,5 +1,6 @@
 #!/bin/sh
-# Owner-added third-party APT source with its own key: Tailscale.
+# Owner-added third-party APT sources, each with its own key: Tailscale, and
+# the lab's own signed repository.
 set -eu
 . /lab/os
 export DEBIAN_FRONTEND=noninteractive
@@ -11,50 +12,30 @@ echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://
   > /etc/apt/sources.list.d/tailscale.list
 apt-get update
 apt-get install -y --no-install-recommends tailscale=1.104.7
-apt-get purge -y curl
-rm -rf /var/lib/apt/lists/*
 
 # Real-world patterns that are not backdoors (false-positive controls).
 #
-# (a) A local package that links a cron job into /etc/cron.daily from its
-# postinst, the way Chrome's package does. Version 1.0 is installed; version
-# 2.0 stays in /lab/debs for the upgrade-while-running scenario. lab-vendord is
-# a copy of sleep (a real long-running program), with a byte more in 2.0.
-arch=$(dpkg --print-architecture)
-mkdir -p /lab/debs
-build_vendor() {
-  v=$1
-  root=$(mktemp -d)
-  mkdir -p "$root/DEBIAN" "$root/opt/lab-vendor/bin" "$root/opt/lab-vendor/cron"
-  cat > "$root/DEBIAN/control" <<EOT
-Package: lab-vendor
-Version: $v
-Architecture: $arch
-Maintainer: Lab Vendor <vendor@lab.invalid>
-Description: Lab stand-in for a vendor package that adds a daily cron job
-EOT
-  cp /usr/bin/sleep "$root/opt/lab-vendor/bin/lab-vendord"
-  [ "$v" = 1.0 ] || printf '\n' >> "$root/opt/lab-vendor/bin/lab-vendord"
-  printf '#!/bin/sh\nexit 0\n' > "$root/opt/lab-vendor/cron/lab-vendor"
-  chmod 755 "$root/opt/lab-vendor/bin/lab-vendord" "$root/opt/lab-vendor/cron/lab-vendor"
-  cat > "$root/DEBIAN/postinst" <<'EOT'
-#!/bin/sh
-set -e
-ln -sf /opt/lab-vendor/cron/lab-vendor /etc/cron.daily/lab-vendor
-EOT
-  cat > "$root/DEBIAN/postrm" <<'EOT'
-#!/bin/sh
-set -e
-if [ "$1" = remove ] || [ "$1" = purge ]; then rm -f /etc/cron.daily/lab-vendor; fi
-EOT
-  chmod 755 "$root/DEBIAN/postinst" "$root/DEBIAN/postrm"
-  dpkg-deb --root-owner-group --build "$root" "/lab/debs/lab-vendor_${v}_$arch.deb" >/dev/null
-  rm -rf "$root"
-}
-build_vendor 1.0
-build_vendor 2.0
-dpkg -i "/lab/debs/lab-vendor_1.0_$arch.deb"
+# (a) A vendor's own signed APT repository, added the way an owner adds one:
+# the vendor's key in a keyring the source names with signed-by, then the
+# package through apt. The repository is the lab's (lab/repo, served as
+# telltale-lab-repo; the image build reaches it through --add-host) and the
+# package, lab-vendor, links a cron job into /etc/cron.daily from its
+# postinst, the way Chrome's package does. Version 1.0 is installed; 2.0 is
+# in the repository for the upgrade scenarios.
+curl -fsS http://telltale-lab-repo/keys/lab-vendor.asc -o /usr/share/keyrings/lab-vendor.asc
+echo "deb [signed-by=/usr/share/keyrings/lab-vendor.asc] http://telltale-lab-repo/lab-vendor stable main" \
+  > /etc/apt/sources.list.d/lab-vendor.list
+# The key a swapped copy of the repository is signed with, for the
+# repo-key-swapped scenario (the machines have no way to fetch it later).
+mkdir -p /lab/keys
+curl -fsS http://telltale-lab-repo/keys/lab-vendor-swapped.asc -o /lab/keys/lab-vendor-swapped.asc
+apt-get update
+apt-get install -y --no-install-recommends lab-vendor=1.0
 test -L /etc/cron.daily/lab-vendor
+test -x /opt/lab-vendor/bin/lab-vendord
+
+apt-get purge -y curl
+rm -rf /var/lib/apt/lists/*
 
 # (b) A user unit the way `systemctl --user enable` leaves it: the unit file in
 # the user's home and the enabled link next to it, owned by the user (the lab

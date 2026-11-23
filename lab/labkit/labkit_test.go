@@ -115,6 +115,11 @@ func TestVariants(t *testing.T) {
 		if _, code := m.Exec(t, "sh", "-c", "test -x /usr/sbin/tailscaled && ls /etc/apt/sources.list.d/tailscale.list && ls /usr/share/keyrings/tailscale-archive-keyring.gpg"); code != 0 {
 			t.Fatalf("tailscale source, key or package missing")
 		}
+		// lab-vendor 1.0 came through apt from the lab's signed repository.
+		out, code := m.Exec(t, "sh", "-c", "dpkg-query -W -f '${Version}' lab-vendor && grep -c 'signed-by=/usr/share/keyrings/lab-vendor.asc. "+labkit.RepoURL+" stable main' /etc/apt/sources.list.d/lab-vendor.list && test -s /usr/share/keyrings/lab-vendor.asc && test -s /lab/keys/lab-vendor-swapped.asc && test -x /opt/lab-vendor/bin/lab-vendord")
+		if code != 0 || !strings.HasPrefix(out, "1.0") {
+			t.Fatalf("lab-vendor 1.0, its source or its key missing (exit %d): %s", code, out)
+		}
 	})
 	t.Run("localsoft", func(t *testing.T) {
 		t.Parallel()

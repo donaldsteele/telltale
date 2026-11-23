@@ -1,0 +1,15 @@
+{
+  "requires": {"variant": "thirdparty"},
+  "with_snapshot": {
+    "comment": "The repository is now signed with a key the snapshot does not know, and the machine's keyring was replaced to match. The changed key is a note; the upgrade is not verified with the machine's new key, so it stays unconfirmed and is shown with the files it changed for the owner to check (a vendor rotating its key looks the same).",
+    "must": [
+      {"key_prefix": "pkg.repo_key_changed:http://telltale-lab-repo/lab-vendor", "severity": "note"},
+      {"key_prefix": "snap.pkg_upgraded:lab-vendor", "severity": "backdoor sign"}
+    ],
+    "must_not_severity_above": "backdoor sign"
+  },
+  "without_snapshot": {
+    "comment": "Without a snapshot there is no earlier key to compare with, and nothing vouches for the lab's repository: as on any machine with a third-party repository, nothing above a weak setting.",
+    "must_not_severity_above": "weak setting"
+  }
+}

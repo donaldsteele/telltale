@@ -1,11 +1,15 @@
 {
   "requires": {"variant": "thirdparty"},
   "with_snapshot": {
-    "comment": "without an owner key, a third-party upgrade after a snapshot is unconfirmed (R60) and shown for the owner to accept; tightened once the lab has a signed third-party repo",
-    "must_not_severity_above": "backdoor sign"
+    "comment": "The snapshot remembers the key the vendor's repository was signed with. The upgrade to 2.0 verifies against that key (index, package, files), so it is explained like an upgrade from the distribution; the replaced program that is still running is a note.",
+    "must": [
+      {"key_prefix": "explained:lab-vendor", "severity": "explained"},
+      {"key_prefix": "heur.stale_exe:/opt/lab-vendor/bin/lab-vendord", "severity": "note"}
+    ],
+    "must_not_severity_above": "weak setting"
   },
   "without_snapshot": {
-    "comment": "The running lab-vendord was replaced by the upgrade: a stale program from a package, a note. Nothing above a weak setting.",
+    "comment": "The running lab-vendord was replaced by the upgrade: a stale program from a package, a note. Without a snapshot nothing vouches for the lab's repository (its key is not a built-in vendor key), so the package is unverified as on any machine with a third-party repository. Nothing above a weak setting.",
     "must": [
       {"key_prefix": "heur.stale_exe:/opt/lab-vendor/bin/lab-vendord", "severity": "note"}
     ],
