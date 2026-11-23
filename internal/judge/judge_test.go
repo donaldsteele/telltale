@@ -1117,7 +1117,10 @@ func TestJudgeConffileReplacedByUpgradeIsExplained(t *testing.T) {
 	setVersion(cur, "libpam-modules", "1.5.2-6+deb12u1")
 	setFile(cur, file(p, "limits, new default", 0o644))
 
-	r := run(cur, snapOf(old), archive())
+	// The signed package says this is its default.
+	def := archive()
+	def.ConffileDefaults = []pkgverify.FileVerdict{{Path: p, Package: "libpam-modules", Version: "1.5.2-6+deb12u1", Expected: h("limits, new default"), Actual: h("limits, new default"), Source: "archive", Kind: pkgverify.KindConffileDefault}}
+	r := run(cur, snapOf(old), def)
 	absent(t, r, "snap.file_modified:"+p)
 	if g := explained(r, "explained:libpam-modules"); g == nil || !hasEvidencePath(g, p) {
 		t.Errorf("conffile replaced by the upgrade not explained: %+v", g)
@@ -1175,8 +1178,10 @@ func TestJudgePersistConffileUpgradeExplained(t *testing.T) {
 	setFile(upgraded, nf)
 
 	// The upgrade replaced the conffile and it matches the new default
-	// (package verification reports nothing about it): explained.
-	r := run(upgraded, snapOf(old), archive())
+	// (package verification says so): explained.
+	def := archive()
+	def.ConffileDefaults = []pkgverify.FileVerdict{{Path: p, Package: "logrotate", Version: "3.21.0-2", Expected: nf.SHA256, Actual: nf.SHA256, Source: "archive", Kind: pkgverify.KindConffileDefault}}
+	r := run(upgraded, snapOf(old), def)
 	absent(t, r, "snap.persist:"+p)
 	absent(t, r, "snap.file_modified:"+p)
 	if g := explained(r, "explained:logrotate"); g == nil || !hasEvidencePath(g, p) {
@@ -1187,6 +1192,10 @@ func TestJudgePersistConffileUpgradeExplained(t *testing.T) {
 	res := archive()
 	res.Conffiles = []pkgverify.ConffileDiff{{Path: p, Package: "logrotate", Version: "3.21.0-2", Expected: h("default"), Actual: nf.SHA256}}
 	must(t, run(upgraded, snapOf(old), res), "snap.persist:"+p, model.SevBackdoor)
+
+	// Package verification said nothing about it: dpkg status calling it a
+	// conffile explains nothing.
+	must(t, run(upgraded, snapOf(old), archive()), "snap.persist:"+p, model.SevBackdoor)
 
 	// Same change with no upgrade behind it.
 	same := clone(upgraded)

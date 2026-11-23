@@ -634,9 +634,9 @@ func (j *judge) placed(ch diff.Change, e, old, cur *model.FileEntry, owner strin
 		}
 		return true
 	}
-	// A conffile the package change replaced with the new default: package
-	// verification checked it and said nothing.
-	if name := conffileOwner(j.c.Packages.Installed, p); cur != nil && name != "" && j.unreported(p) {
+	// A conffile the package change replaced with the new default: the
+	// signed package says it is one and that this is its default.
+	if name := j.conffileDefault(p); cur != nil && name != "" {
 		switch j.pkgChange[name].Kind {
 		case diff.PkgUpgraded:
 			ev.Detail += "; the package's default configuration"
@@ -844,16 +844,22 @@ func conffileOwner(pkgs []model.Package, p string) string {
 	return ""
 }
 
-// unreported reports whether package verification ran and said nothing
-// about p. With a snapshot, the scan asks it to check exactly the changed
-// package-owned files, and it is silent only about a conffile that equals
-// its package's default.
-func (j *judge) unreported(p string) bool {
-	if j.in.Pkg == nil || j.reported[p] {
-		return false
+// conffileDefault names the package whose signed copy lists p as a conffile
+// with exactly the content p has now ("" when there is none). Only package
+// verification's own verdict says so (pkgverify.KindConffileDefault): the
+// machine's dpkg status, which root can edit, decides nothing here, and
+// package verification saying nothing about a path confirms nothing. A path
+// the signed package does not ship is therefore never a conffile default.
+func (j *judge) conffileDefault(p string) string {
+	for _, q := range []string{p, usrAlias(p)} {
+		if q == "" {
+			continue
+		}
+		if v, ok := j.confDefault[q]; ok && v.Source != pkgverify.SourceOfflineLocal && j.verifiedNow(v, j.files[p]) {
+			return v.Package
+		}
 	}
-	a := usrAlias(p)
-	return a == "" || !j.reported[a]
+	return ""
 }
 
 // persistExplained names the package that explains a changed persistence
@@ -888,7 +894,7 @@ func (j *judge) persistExplained(p string, cur, old *model.PersistFile) string {
 			}
 		}
 	}
-	if name := conffileOwner(j.c.Packages.Installed, p); name != "" && j.pkgChange[name].Kind == diff.PkgUpgraded && j.unreported(p) {
+	if name := j.conffileDefault(p); name != "" && j.pkgChange[name].Kind == diff.PkgUpgraded {
 		return name
 	}
 	return ""
@@ -909,7 +915,7 @@ func (j *judge) persistOfPackageChange(p string, cur, old *model.PersistFile) (s
 				}
 			}
 		}
-		if name := conffileOwner(j.c.Packages.Installed, p); name != "" && j.pkgChange[name].Kind == diff.PkgInstalled && j.unreported(p) {
+		if name := j.conffileDefault(p); name != "" && j.pkgChange[name].Kind == diff.PkgInstalled {
 			return name, model.SevExplained
 		}
 	case cur == nil && old != nil:

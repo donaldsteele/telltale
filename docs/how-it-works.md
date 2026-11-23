@@ -94,6 +94,10 @@ are the ones the distribution shipped.
 5. Configuration files (`conffiles`) are expected to differ from the
    package's defaults. Their changes are judged by the checklist and the
    snapshot comparison, not reported as tampering.
+   Which files are configuration files comes from the signed package, never
+   from the machine's own package database. A changed configuration file is
+   explained by a package change only when its content equals the default in
+   the signed package; anything else is ranked by where it is.
 
 What gets verified: without a snapshot, every package file in
 security-relevant places (programs, shared libraries, PAM modules, kernel

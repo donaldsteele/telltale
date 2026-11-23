@@ -95,13 +95,12 @@ func (j *judge) packages() {
 		j.couldNot = append(j.couldNot, noPkgLimit)
 		return
 	}
-	for _, list := range [][]pkgverify.FileVerdict{r.Verified, r.Mismatch, r.Unverifiable, r.Suspicious} {
-		for _, v := range list {
-			j.reported[v.Path] = true
+	for _, v := range r.ConffileDefaults {
+		// Kept apart from the verified files: a conffile default confirms
+		// no package version and stands in for no program or library.
+		if _, ok := j.confDefault[v.Path]; !ok && v.Kind == pkgverify.KindConffileDefault && r.Mode != pkgverify.ModeOfflineLocal {
+			j.confDefault[v.Path] = v
 		}
-	}
-	for _, d := range r.Conffiles {
-		j.reported[d.Path] = true
 	}
 
 	lower := map[string]int{}

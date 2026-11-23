@@ -144,6 +144,9 @@ const (
 	// KindDiversion: Suspicious; a diversion by a package that is not
 	// installed or does not ship the file.
 	KindDiversion = "diversion"
+	// KindConffileDefault: a configuration file whose content equals the
+	// signed package's default (Result.ConffileDefaults).
+	KindConffileDefault = "conffile_default"
 	// KindModeLessPermissive: Verified; the mode lacks bits the package sets.
 	KindModeLessPermissive = "mode_less_permissive"
 	// KindModeDiffers: Verified; the mode differs without adding privilege.
@@ -260,9 +263,17 @@ type Result struct {
 	// examined machine explains them: a diversion by a package that is not
 	// installed or does not ship the file, or a local statoverride that
 	// grants privilege the package never gives.
-	Suspicious  []FileVerdict  `json:"suspicious,omitempty"`
-	Conffiles   []ConffileDiff `json:"conffiles,omitempty"`
-	SourcesUsed []string       `json:"sources_used,omitempty"`
+	Suspicious []FileVerdict  `json:"suspicious,omitempty"`
+	Conffiles  []ConffileDiff `json:"conffiles,omitempty"`
+	// ConffileDefaults lists the checked configuration files whose content
+	// equals the default in the signed package installed now (Kind
+	// KindConffileDefault). Which files are conffiles, and what the default
+	// is, comes from the signed package alone, never from the machine's dpkg
+	// status. It is the only thing that says a conffile is the package's
+	// own: no verdict about a path confirms nothing about it. Offline-local
+	// mode, which has only the machine's word, never lists any.
+	ConffileDefaults []FileVerdict `json:"conffile_defaults,omitempty"`
+	SourcesUsed      []string      `json:"sources_used,omitempty"`
 	// Errors lists problems, most serious first: the offline warning, then
 	// evidence of tampering ("BAD SIGNATURE", "HASH MISMATCH"), then
 	// sources that could not be read.
@@ -1490,6 +1501,7 @@ func (s *session) judge(results []*pkgResult) {
 
 	var verified, mismatch, unverifiable, suspicious []FileVerdict
 	var diffs []ConffileDiff
+	var defaults []FileVerdict
 	seen := map[string]bool{}
 	for i := range s.c.Files {
 		e := &s.c.Files[i]
@@ -1510,6 +1522,8 @@ func (s *session) judge(results []*pkgResult) {
 			suspicious = append(suspicious, v)
 		case verdictConffile:
 			diffs = append(diffs, d)
+		case verdictConffileDefault:
+			defaults = append(defaults, v)
 		}
 	}
 	s.res.Verified = append(s.res.Verified, verified...)
@@ -1517,6 +1531,7 @@ func (s *session) judge(results []*pkgResult) {
 	s.res.Unverifiable = append(s.res.Unverifiable, unverifiable...)
 	s.res.Suspicious = append(s.res.Suspicious, suspicious...)
 	s.res.Conffiles = append(s.res.Conffiles, diffs...)
+	s.res.ConffileDefaults = append(s.res.ConffileDefaults, defaults...)
 }
 
 // placeTables maps each install path to the signed files dpkg puts there:
@@ -1590,10 +1605,11 @@ const (
 	verdictUnverifiable
 	verdictSuspicious
 	verdictConffile
+	verdictConffileDefault
 )
 
 func (k verdictKind) String() string {
-	return [...]string{"none", "verified", "mismatch", "unverifiable", "suspicious", "conffile"}[k]
+	return [...]string{"none", "verified", "mismatch", "unverifiable", "suspicious", "conffile", "conffile default"}[k]
 }
 
 // judgeFile decides one collected entry e, given the signed files placed at
@@ -1691,7 +1707,11 @@ func (s *session) judgeFile(e *model.FileEntry, exp []expect, lst []*pkgResult) 
 	case modeV.Reason != "":
 		return modeV, ConffileDiff{}, verdictMismatch
 	case matchedConf:
-		return FileVerdict{}, ConffileDiff{}, verdictNone // an unchanged conffile
+		// An unchanged conffile: said out loud, because only this verdict
+		// tells a caller the file is the signed package's default.
+		v := verdict(conf)
+		v.Kind = KindConffileDefault
+		return v, ConffileDiff{}, verdictConffileDefault
 	case conf != nil:
 		return FileVerdict{}, diff(e.SHA256), verdictConffile
 	}
@@ -1944,6 +1964,7 @@ func (s *session) finish() {
 		})
 	}
 	sort.Slice(r.Conffiles, func(i, j int) bool { return r.Conffiles[i].Path < r.Conffiles[j].Path })
+	sort.Slice(r.ConffileDefaults, func(i, j int) bool { return r.ConffileDefaults[i].Path < r.ConffileDefaults[j].Path })
 	if s.dlFailed > 0 {
 		what := "download"
 		if s.bundle != nil {
