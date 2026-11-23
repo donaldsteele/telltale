@@ -21,6 +21,10 @@ const maxBlobSize = 512 << 20
 // ErrWrongUnlock means the passphrase or key file does not open this store.
 var ErrWrongUnlock = errors.New("wrong passphrase or key file: this store was sealed with a different one")
 
+// ErrClosed means the store was closed: its data key is gone, so nothing can
+// be sealed or opened any more.
+var ErrClosed = errors.New("store: closed")
+
 // scryptWorkFactor is the age scrypt cost; a variable so tests can lower it.
 var scryptWorkFactor = 18
 
@@ -64,6 +68,28 @@ func open(key, blob []byte, aad string) ([]byte, error) {
 	return plain, nil
 }
 
+// seal seals plain with the store's data key, or fails with ErrClosed once
+// the store is closed.
+func (s *Store) seal(plain []byte, aad string) ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.key == nil {
+		return nil, ErrClosed
+	}
+	return seal(s.key, plain, aad)
+}
+
+// open opens a blob with the store's data key, or fails with ErrClosed once
+// the store is closed.
+func (s *Store) open(blob []byte, aad string) ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.key == nil {
+		return nil, ErrClosed
+	}
+	return open(s.key, blob, aad)
+}
+
 func (s *Store) sealJSON(v any, aad string) ([]byte, error) {
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
@@ -73,11 +99,11 @@ func (s *Store) sealJSON(v any, aad string) ([]byte, error) {
 	if err := zw.Close(); err != nil {
 		return nil, err
 	}
-	return seal(s.key, buf.Bytes(), aad)
+	return s.seal(buf.Bytes(), aad)
 }
 
 func (s *Store) openJSON(blob []byte, aad string, v any) error {
-	plain, err := open(s.key, blob, aad)
+	plain, err := s.open(blob, aad)
 	if err != nil {
 		return err
 	}

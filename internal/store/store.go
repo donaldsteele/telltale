@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -49,8 +50,11 @@ type Unlock struct {
 
 // Store is an open, unlocked database.
 type Store struct {
-	db  *sql.DB
-	key []byte
+	db *sql.DB
+	// mu guards key: sealing and opening hold it for reading, Close for
+	// writing, so the key is never read while Close clears it.
+	mu  sync.RWMutex
+	key []byte // nil once the store is closed
 }
 
 // Machine is an enrolled machine.
@@ -259,12 +263,25 @@ func (s *Store) init(u Unlock) error {
 	return tx.Commit()
 }
 
-// Close closes the database and forgets the data key.
+// Close forgets the data key and closes the database. It waits for the
+// seals and opens under way; every one after it fails with ErrClosed.
 func (s *Store) Close() error {
-	for i := range s.key {
-		s.key[i] = 0
-	}
+	s.mu.Lock()
+	clear(s.key)
+	s.key = nil
+	s.mu.Unlock()
 	return s.db.Close()
+}
+
+// closedOr is err, or ErrClosed when the store has been closed: the
+// database's own error then says no more than that.
+func (s *Store) closedOr(err error) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.key == nil {
+		return fmt.Errorf("%w: %w", ErrClosed, err)
+	}
+	return err
 }
 
 // ts stores a zero time as 0 and anything else as UTC nanoseconds.
@@ -662,17 +679,19 @@ func (s *Store) SecretSetting(key string) ([]byte, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, s.closedOr(err)
 	}
-	return open(s.key, blob, secretAAD(key))
+	return s.open(blob, secretAAD(key))
 }
 
 // SetSecretSetting stores v sealed with the data key.
 func (s *Store) SetSecretSetting(key string, v []byte) error {
-	blob, err := seal(s.key, v, secretAAD(key))
+	blob, err := s.seal(v, secretAAD(key))
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO secrets(key, blob) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET blob=excluded.blob`, key, blob)
-	return err
+	if _, err = s.db.Exec(`INSERT INTO secrets(key, blob) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET blob=excluded.blob`, key, blob); err != nil {
+		return s.closedOr(err)
+	}
+	return nil
 }

@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -318,6 +320,56 @@ func TestSecretSettings(t *testing.T) {
 	b, _ := os.ReadFile(p)
 	if bytes.Contains(b, []byte("TOPSECRET")) {
 		t.Fatal("secret in clear")
+	}
+}
+
+// Close can come while other goroutines still seal and open with the data
+// key (a retry loop, a request the shutdown gave up waiting for). It waits
+// for the ones under way and clears the key, and from then on every call
+// fails with ErrClosed: none reads a key that is being cleared, or a
+// cleared one.
+func TestCloseWhileTheDataKeyIsInUse(t *testing.T) {
+	s := openPass(t, tmpDB(t), "pw")
+	if err := s.SetSecretSetting("k", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	var calls atomic.Int64
+	for range 4 {
+		wg.Go(func() {
+			for {
+				v, err := s.SecretSetting("k")
+				if err == nil && string(v) != "v" {
+					t.Errorf("read %q", v)
+				}
+				if err == nil {
+					err = s.SetSecretSetting("k", []byte("v"))
+				}
+				if err != nil {
+					if !errors.Is(err, ErrClosed) {
+						t.Errorf("after Close: %v, want ErrClosed", err)
+					}
+					return
+				}
+				calls.Add(1)
+			}
+		})
+	}
+	for calls.Load() < 20 {
+		time.Sleep(time.Millisecond)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	if _, err := s.SecretSetting("k"); !errors.Is(err, ErrClosed) {
+		t.Errorf("SecretSetting after Close: %v", err)
+	}
+	if err := s.SetSecretSetting("k", []byte("v")); !errors.Is(err, ErrClosed) {
+		t.Errorf("SetSecretSetting after Close: %v", err)
+	}
+	if err := s.PutSnapshot(1, testSnap()); !errors.Is(err, ErrClosed) {
+		t.Errorf("PutSnapshot after Close: %v", err)
 	}
 }
 
