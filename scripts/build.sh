@@ -9,8 +9,10 @@
 #        RELEASE=1 VERSION=v0.1.0 bash scripts/build.sh
 #        TELLTALE_DIST_DIR=/tmp/out bash scripts/build.sh   (writes there, not dist/)
 #
-# The output directory is emptied first, dist/ or the one given (a relative
-# one is relative to the repository).
+# The output directory, dist/ or the one given (a relative one is relative
+# to the repository), is emptied first, but only when it is missing, empty
+# or a previous build's output (scripts/dist-dir.sh); anything else is
+# refused.
 #
 # LICENSE and NOTICE are always required. A missing README.md is a warning,
 # or an error with RELEASE=1.
@@ -57,7 +59,8 @@ sha256() {
   fi
 }
 
-rm -rf "$DIST"
+. scripts/dist-dir.sh
+prepare_dist "$DIST" || exit 2
 mkdir -p "$DIST/bin"
 dist_abs="$(cd "$DIST" && pwd)"
 stage="$(mktemp -d)"
