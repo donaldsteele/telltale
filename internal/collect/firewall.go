@@ -12,14 +12,42 @@ const firewallCheck = "firewall"
 
 type nftChain struct {
 	Family nftables.TableFamily
+	Table  string
+	Name   string
 	Hook   *nftables.ChainHook
 	Policy *nftables.ChainPolicy
 	Rules  int
 }
 
 type nftSnapshot struct {
-	Tables int
-	Chains []nftChain
+	// Tables is the number of tables when TableNames is not given.
+	Tables     int
+	TableNames []string
+	Chains     []nftChain
+}
+
+// managedTables and the chain name patterns below belong to services that
+// rewrite their own rules all the time: fail2ban adds and removes a rule
+// per ban, Docker, Podman (netavark), libvirt, CNI and Kubernetes rewrite
+// theirs as containers and networks come and go. Counting them would make
+// the snapshot comparison report a change at every visit, so they are left
+// out of the summary. DOCKER-USER is the exception among Docker's chains:
+// Docker never writes to it, the owner does.
+var managedTables = map[string]bool{"f2b-table": true, "libvirt_network": true, "netavark": true}
+
+func managedChain(table, name string) bool {
+	if managedTables[table] {
+		return true
+	}
+	if name == "DOCKER-USER" {
+		return false
+	}
+	for _, pre := range []string{"f2b-", "DOCKER", "LIBVIRT_", "CNI-", "KUBE-", "NETAVARK"} {
+		if strings.HasPrefix(name, pre) {
+			return true
+		}
+	}
+	return false
 }
 
 // nftList reads the live ruleset over netlink; tests replace it.
@@ -35,6 +63,10 @@ var nftList = func() (nftSnapshot, error) {
 		return s, err
 	}
 	s.Tables = len(tables)
+	s.TableNames = []string{}
+	for _, t := range tables {
+		s.TableNames = append(s.TableNames, t.Name)
+	}
 	chains, err := c.ListChains()
 	if err != nil {
 		return s, err
@@ -44,7 +76,7 @@ var nftList = func() (nftSnapshot, error) {
 		if err != nil {
 			return s, err
 		}
-		s.Chains = append(s.Chains, nftChain{Family: ch.Table.Family, Hook: ch.Hooknum, Policy: ch.Policy, Rules: len(rules)})
+		s.Chains = append(s.Chains, nftChain{Family: ch.Table.Family, Table: ch.Table.Name, Name: ch.Name, Hook: ch.Hooknum, Policy: ch.Policy, Rules: len(rules)})
 	}
 	return s, nil
 }
@@ -88,10 +120,23 @@ func Firewall(root string) (model.Firewall, []model.Skip) {
 	} else {
 		fw.Backend = "nftables"
 		fw.Tables = snap.Tables
-		for _, c := range snap.Chains {
-			fw.Rules += c.Rules
+		if snap.TableNames != nil {
+			fw.Tables = 0
+			for _, t := range snap.TableNames {
+				if !managedTables[t] {
+					fw.Tables++
+				}
+			}
 		}
-		fw.InputPolicy, fw.InputRules = inputPolicy(snap.Chains)
+		// Only the rules somebody wrote: see managedChain.
+		var own []nftChain
+		for _, c := range snap.Chains {
+			if !managedChain(c.Table, c.Name) {
+				own = append(own, c)
+				fw.Rules += c.Rules
+			}
+		}
+		fw.InputPolicy, fw.InputRules = inputPolicy(own)
 	}
 	b, err := readRaw(root, "/etc/ufw/ufw.conf", 64<<10)
 	if err != nil {
