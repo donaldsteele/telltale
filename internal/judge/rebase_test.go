@@ -401,3 +401,29 @@ func TestPackagesIncomplete(t *testing.T) {
 		t.Errorf("unreachable: %v", r.CouldNotRuleOut)
 	}
 }
+
+// A checklist item that failed in the snapshot too is a weak setting, not a
+// change since the snapshot: accepting it would change nothing, so it is not
+// offered, and the web UI does not count it as a change. The same holds once
+// an accepted regression has rolled forward.
+func TestStandingChecklistFailureIsNotAChange(t *testing.T) {
+	old := clean()
+	old.Sysctl["kernel.randomize_va_space"] = "0"
+	snap := snapOf(old)
+	r, rb := rebaseRun(clone(old), snap, nil)
+	must(t, r, "check:TT-KERN-001", model.SevWeak)
+	if s, ok := rb.Accept["check:TT-KERN-001"]; ok {
+		t.Errorf("a weak setting the snapshot already had is offered as a change: %+v", s)
+	}
+
+	cur := clean()
+	snap = snapOf(clone(cur))
+	cur.Sysctl["kernel.randomize_va_space"] = "0"
+	r, rb = rebaseRun(cur, snap, nil)
+	must(t, r, "check:TT-KERN-001", model.SevTampering)
+	r, rb = rebaseRun(cur, RollForward(snap, cur, checklist.Evaluate(cur, ctx), rb.Accept["check:TT-KERN-001"]), nil)
+	must(t, r, "check:TT-KERN-001", model.SevWeak)
+	if s, ok := rb.Accept["check:TT-KERN-001"]; ok {
+		t.Errorf("after the regression was accepted, the weak setting is offered again: %+v", s)
+	}
+}

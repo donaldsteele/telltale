@@ -132,6 +132,10 @@ type judge struct {
 	// changed since the snapshot: what package verification checks then.
 	ownedChanged bool
 	foldedMax    map[*model.Finding]model.Severity
+	// regressedSnap holds the checklist items that held in the snapshot and
+	// fail now: of the checklist findings, the only changes since the
+	// snapshot, and so the only ones accepting can roll forward.
+	regressedSnap map[string]bool
 }
 
 func newJudge(in Input, c *model.Collection) *judge {
@@ -146,6 +150,7 @@ func newJudge(in Input, c *model.Collection) *judge {
 		acctDirty: map[string]bool{}, touched: map[string]map[string]bool{}, privGID: map[int]bool{},
 		stopped: map[string]bool{}, confirmed: map[string]bool{},
 		residual: map[string][]string{}, unreachable: map[string]pkgverify.FileVerdict{},
+		regressedSnap: map[string]bool{},
 	}
 	for _, p := range c.Packages.Residual {
 		j.residual[p.Name] = append(j.residual[p.Name], p.Version)
@@ -309,6 +314,7 @@ func (j *judge) regressed(id, before string, accepted *model.Exception) {
 	}
 	f.Severity = model.SevTampering
 	if accepted == nil {
+		j.regressedSnap[id] = true
 		day := j.in.Snapshot.Taken.UTC().Format("2006-01-02")
 		f.Title = "No longer met since the snapshot of " + day + ": " + it.Title
 		f.Why = it.Why + " It held in the known-good snapshot and fails now, so the setting was changed since: attackers loosen settings like this to keep a way back in."

@@ -340,6 +340,13 @@ func (j *judge) changeScope(f *model.Finding) (Scope, bool) {
 	case "snap.pkg_upgraded", "snap.pkg_downgraded", "snap.pkg_removed", "snap.pkg_version_only":
 		return j.packageScope(subj), true
 	case strings.TrimSuffix(checkKeyPrefix, ":"):
+		// Only an item that held in the snapshot and fails now changed. One
+		// that failed in the snapshot too is a standing weak setting, and one
+		// that moved off a value an exception accepted is the exception's
+		// business: rolling the snapshot forward changes neither.
+		if !j.regressedSnap[subj] {
+			return Scope{}, false
+		}
 		return Scope{Checks: []string{subj}}, true
 	case "pkg.unchecked_changes":
 		var s Scope
