@@ -1374,20 +1374,20 @@ func (s *session) onePackage(ctx context.Context, r *pkgResult) {
 
 // historyHasNone reports whether the distribution's history answered that
 // it has no usable copy of a version: it is not found, or (with sources
-// trusted through HTTPS alone left out) no signed index has it and the
-// signed lookups ended in "not found", not in an error.
+// trusted through HTTPS alone left out) no signed index has it and every
+// signed lookup made for it ended in "not found". One that ended in an
+// error, earlier or later, leaves the history unknown.
 func historyHasNone(err error) bool {
 	if err == nil || errors.Is(err, errOldBudget) {
 		return false
 	}
-	if errors.Is(err, ErrNotFound) {
-		return true
-	}
+	// Asked first: its last lookup's "not found" would otherwise speak for
+	// the earlier ones.
 	var so *signedOnlyErr
 	if errors.As(err, &so) {
-		return so.last == nil || errors.Is(so.last, errHTTPNotFound)
+		return !so.failed
 	}
-	return false
+	return errors.Is(err, ErrNotFound)
 }
 
 func oldSource(ref DebRef) string {

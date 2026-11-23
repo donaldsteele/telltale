@@ -220,6 +220,7 @@ func (f *OldFinder) findDebian(ctx context.Context, key PkgKey) (DebRef, error) 
 
 	attempts := 0
 	var lastErr error
+	var tried []error
 	for _, fi := range infos {
 		if fi.ArchiveName != "debian" && fi.ArchiveName != "debian-security" {
 			continue
@@ -242,10 +243,11 @@ func (f *OldFinder) findDebian(ctx context.Context, key PkgKey) (DebRef, error) 
 				return DebRef{}, err
 			}
 			lastErr = err
+			tried = append(tried, err)
 		}
 	}
 	if f.SignedOnly {
-		return DebRef{}, signedOnlyError(key, lastErr)
+		return DebRef{}, signedOnlyError(key, tried)
 	}
 	ref, err := f.snapshotFile(ctx, hash, infos)
 	if err != nil && lastErr != nil {
@@ -341,7 +343,7 @@ func (f *OldFinder) findUbuntu(ctx context.Context, key PkgKey) (DebRef, error) 
 	slices.SortStableFunc(matches, func(a, b match) int { return a.published.Compare(b.published) })
 
 	attempts := 0
-	var lastErr error
+	var tried []error
 	for _, m := range matches {
 		if m.published.Before(ubuntuSnapshotStart) || !componentName.MatchString(m.Component) {
 			continue
@@ -362,30 +364,43 @@ func (f *OldFinder) findUbuntu(ctx context.Context, key PkgKey) (DebRef, error) 
 			if tampered(err) {
 				return DebRef{}, err
 			}
-			lastErr = err
+			tried = append(tried, err)
 		}
 	}
 	if f.SignedOnly {
-		return DebRef{}, signedOnlyError(key, lastErr)
+		return DebRef{}, signedOnlyError(key, tried)
 	}
 	return f.launchpadFile(ctx, key, matches[0].Self)
 }
 
 // signedOnlyError explains why a SignedOnly lookup gave up. It is not
 // ErrNotFound: the version exists, only not where the built-in keys reach.
-func signedOnlyError(key PkgKey, lastErr error) error {
+// tried holds the error of every signed lookup made for the version.
+func signedOnlyError(key PkgKey, tried []error) error {
 	msg := fmt.Sprintf("%s %s %s: no signed snapshot index has it, and sources trusted through HTTPS alone are not used here", key.Name, key.Version, key.Arch)
-	if lastErr != nil {
-		msg += ": " + lastErr.Error()
+	e := &signedOnlyErr{}
+	for _, err := range tried {
+		e.last = err
+		if !errors.Is(err, ErrNotFound) && !errors.Is(err, errHTTPNotFound) {
+			e.failed = true
+		}
 	}
-	return &signedOnlyErr{msg: msg, last: lastErr}
+	if e.last != nil {
+		msg += ": " + e.last.Error()
+	}
+	e.msg = msg
+	return e
 }
 
 // signedOnlyErr is the error signedOnlyError returns; last is the last
-// signed lookup's error, if any, and stays reachable with errors.Is.
+// signed lookup's error, if any, and stays reachable with errors.Is. failed
+// is true when any signed lookup ended in something other than "not found"
+// (the network, a bad answer): the signed history is then not known to lack
+// the version.
 type signedOnlyErr struct {
-	msg  string
-	last error
+	msg    string
+	last   error
+	failed bool
 }
 
 func (e *signedOnlyErr) Error() string { return e.msg }

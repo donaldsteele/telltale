@@ -149,9 +149,14 @@ func TestHistoryHasNone(t *testing.T) {
 	}{
 		{"not found", fmt.Errorf("x: %w", ErrNotFound), true},
 		{"signed only, nothing tried", signedOnlyError(key, nil), true},
-		{"signed only, index lacks it", signedOnlyError(key, fmt.Errorf("dists: %w", ErrNotFound)), true},
-		{"signed only, no such index", signedOnlyError(key, fmt.Errorf("u: %w", errHTTPNotFound)), true},
-		{"signed only, network", signedOnlyError(key, errors.New("dial tcp: i/o timeout")), false},
+		{"signed only, index lacks it", signedOnlyError(key, []error{fmt.Errorf("dists: %w", ErrNotFound)}), true},
+		{"signed only, no such index", signedOnlyError(key, []error{fmt.Errorf("u: %w", errHTTPNotFound)}), true},
+		{"signed only, network", signedOnlyError(key, []error{errors.New("dial tcp: i/o timeout")}), false},
+		// Every signed lookup must have ended in not found: one that failed
+		// earlier leaves the history unknown, whatever the last one said.
+		{"signed only, network then not found", signedOnlyError(key, []error{errors.New("dial tcp: i/o timeout"), fmt.Errorf("dists: %w", ErrNotFound)}), false},
+		{"signed only, not found then network", signedOnlyError(key, []error{fmt.Errorf("dists: %w", ErrNotFound), errors.New("unexpected EOF")}), false},
+		{"signed only, not found twice", signedOnlyError(key, []error{fmt.Errorf("dists: %w", ErrNotFound), fmt.Errorf("u: %w", errHTTPNotFound)}), true},
 		{"network", errors.New("dial tcp: i/o timeout"), false},
 		{"API answer missing", fmt.Errorf("u: %w", errHTTPNotFound), false},
 		{"garbage", errors.New("invalid character '<'"), false},
