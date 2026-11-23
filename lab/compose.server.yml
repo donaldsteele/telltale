@@ -15,12 +15,15 @@
 #
 # Every container carries the label telltale-lab=1, so labkit's reaper
 # removes whatever a killed run leaves. Nothing here makes a volume: the
-# server's and bubbles' data live in tmpfs mounts.
+# server's and bubbles' data live in tmpfs mounts. Every image is one the
+# test builds and tags telltale-lab/..., so Compose never pulls one
+# (pull_policy: never).
 name: telltale-lab-e2e
 
 services:
   server:
     image: ${TELLTALE_LAB_SERVER_IMAGE:?the server base image}
+    pull_policy: never
     # The collector binaries from scripts/build.sh; the server runs the one
     # for its own architecture. It runs as the user who started the test,
     # so the package cache it shares with the host stays theirs.
@@ -43,6 +46,7 @@ services:
 
   bubbles:
     image: ${TELLTALE_LAB_BUBBLES_IMAGE:?the bubbles image}
+    pull_policy: never
     environment:
       BUBBLES_NO_MDNS: "true"
     tmpfs:
@@ -53,6 +57,7 @@ services:
 
   debian12:
     image: ${TELLTALE_LAB_DEBIAN12_IMAGE:?the debian12 clean image}
+    pull_policy: never
     hostname: debian12
     # As labkit.Start: root sees other accounts' programs, as on a real machine.
     cap_add: [SYS_PTRACE]
@@ -62,6 +67,7 @@ services:
 
   ubuntu2404-noexec:
     image: ${TELLTALE_LAB_UBUNTU2404_NOEXEC_IMAGE:?the ubuntu2404 noexec image}
+    pull_policy: never
     hostname: ubuntu2404-noexec
     cap_add: [SYS_PTRACE]
     # /tmp and /dev/shm noexec, as the noexec variant is run, and /run and

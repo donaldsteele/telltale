@@ -151,7 +151,10 @@ func TestServerEndToEnd(t *testing.T) {
 		t.Fatalf("login ended on %s (%d):\n%s", p.path, p.status, p.text())
 	}
 	p = e.ui.get("/settings")
-	e.ui.post("/settings/general", url.Values{"csrf": {csrfOf(t, p)}, "schedule": {server.ScheduleManual}, "alert_level": {"urgent"}}).want(t, http.StatusOK)
+	p = e.ui.post("/settings/general", url.Values{"csrf": {csrfOf(t, p)}, "schedule": {server.ScheduleManual}, "alert_level": {"urgent"}}).want(t, http.StatusOK)
+	if !strings.Contains(p.body, "Settings saved.") || !strings.Contains(p.body, `<option value="`+server.ScheduleManual+`" selected>`) {
+		t.Fatalf("the manual schedule was not saved:\n%s", p.text())
+	}
 	p = e.ui.get("/settings")
 	p = e.ui.post("/settings/tokens", url.Values{"csrf": {csrfOf(t, p)}, "name": {"lab-e2e"}})
 	token := codeByID(t, p, "api-token")
@@ -417,6 +420,7 @@ func (e *e2eLab) enrol(m *e2eMachine) {
 	if reload := codeByID(t, p, "snippet-reload"); reload != "sshd -t && systemctl reload ssh" {
 		t.Fatalf("%s: the reload step is %q", m.name, reload)
 	}
+	before := e.sshListener(m)
 	e.mustExec(m, `set -e
 umask 077
 mkdir -p /root/.ssh
@@ -424,12 +428,12 @@ printf '%s\n' "$1" >> /root/.ssh/authorized_keys
 printf '\n%s\n' "$2" >> /etc/ssh/sshd_config
 /usr/sbin/sshd -t
 kill -HUP "$(pgrep -o -x sshd)"`, keys, block)
+	e.waitReload(m, before)
 	// Root may log in from the server's address, by key only, and from
 	// nowhere else.
-	waitFor(t, 30*time.Second, "sshd to reload on "+m.name, func() bool {
-		out, err := exec.Command("docker", "exec", m.ctr, "sh", "-c", "ss -ltn && /usr/sbin/sshd -T -C user=root,host=server,addr="+e.serverIP+" | grep -i '^permitrootlogin '").Output()
-		return err == nil && strings.Contains(string(out), ":22 ") && strings.Contains(string(out), "permitrootlogin without-password")
-	})
+	if out := e.mustExec(m, "/usr/sbin/sshd -T -C user=root,host=server,addr="+e.serverIP+" | grep -i '^permitrootlogin '"); !strings.Contains(out, "permitrootlogin without-password") {
+		t.Fatalf("%s: root login from the server: %q", m.name, out)
+	}
 	if out := e.mustExec(m, "/usr/sbin/sshd -T -C user=root,host=other,addr=192.0.2.1 | grep -i '^permitrootlogin '"); !strings.Contains(out, "permitrootlogin no") {
 		t.Fatalf("%s: root login from another address: %q", m.name, out)
 	}
@@ -457,7 +461,11 @@ func (e *e2eLab) checkNow(m *e2eMachine) page {
 	t := e.t
 	p := e.ui.get(m.path())
 	before := reportIDs(p.body)
-	e.ui.post(m.path()+"/check", url.Values{"csrf": {csrfOf(t, p)}}).want(t, http.StatusOK)
+	p = e.ui.post(m.path()+"/check", url.Values{"csrf": {csrfOf(t, p)}}).want(t, http.StatusOK)
+	if flash := firstGroup(flashRE, p.body); flash != "The visit is done. The report below is the new one." &&
+		flash != "The visit has started. Reload this page in a minute or two to see its report." {
+		t.Fatalf("%s: Check now was refused (%q):\n%s", m.name, flash, p.text())
+	}
 	deadline := time.Now().Add(e2eVisitLimit)
 	for {
 		p = e.ui.get(m.path())
@@ -478,6 +486,13 @@ func (e *e2eLab) checkNow(m *e2eMachine) page {
 	}
 	if left := strings.TrimSpace(e.mustExec(m, "find /run /var/tmp /root /tmp /dev/shm -maxdepth 1 -name 'telltale.*'")); left != "" {
 		t.Errorf("%s: the visit left on the machine:\n%s", m.name, left)
+	}
+	// Nor anything wrong with the visit itself: no leftover, and the
+	// collector ran from the directory the visit made (visit.own_dir_mismatch).
+	for _, f := range findingsOf(p) {
+		if strings.HasPrefix(f.key, "visit.") {
+			t.Errorf("%s: a finding about the visit: %s %s\n%s", m.name, f.class, f.key, f.text)
+		}
 	}
 	return p
 }
@@ -571,16 +586,48 @@ func (e *e2eLab) markClean(m *e2eMachine) {
 
 // apply plants a break on the machine.
 func (e *e2eLab) apply(m *e2eMachine, name string) {
+	// Only a machine with no route out may get anything planted.
+	if out, err := exec.Command("docker", "inspect", "--format", "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}", m.ctr).Output(); err != nil ||
+		strings.TrimSpace(string(out)) != labkit.NetworkName {
+		e.t.Fatalf("%s is on the networks %q, not only on %s: nothing is planted on it (%v)", m.name, strings.TrimSpace(string(out)), labkit.NetworkName, err)
+	}
+	script, err := os.ReadFile(filepath.Join("breaks", name, "apply.sh"))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	before := e.sshListener(m)
 	if out, err := exec.Command("docker", "cp", filepath.Join("breaks", name), m.ctr+":/lab/"+name).CombinedOutput(); err != nil {
 		e.t.Fatalf("copy %s to %s: %v\n%s", name, m.name, err, out)
 	}
 	e.mustExec(m, "sh /lab/"+name+"/apply.sh && rm -rf /lab/"+name)
-	// A break may reload sshd (SIGHUP: it starts itself again), which
-	// stops listening for a moment once the signal is handled.
-	time.Sleep(time.Second)
-	waitFor(e.t, 30*time.Second, "sshd on "+m.name, func() bool {
-		out, err := exec.Command("docker", "exec", m.ctr, "ss", "-ltn").Output()
-		return err == nil && strings.Contains(string(out), ":22 ")
+	if strings.Contains(string(script), "-HUP") {
+		e.waitReload(m, before)
+	}
+}
+
+// sshListener names the sockets sshd listens on port 22 with (their
+// inodes); "" when it does not listen.
+func (e *e2eLab) sshListener(m *e2eMachine) string {
+	out, _ := exec.Command("docker", "exec", m.ctr, "ss", "-Hltne", "sport = :22").Output()
+	var inos []string
+	for _, g := range regexp.MustCompile(`\bino:([0-9]+)`).FindAllStringSubmatch(string(out), -1) {
+		inos = append(inos, g[1])
+	}
+	slices.Sort(inos)
+	return strings.Join(inos, " ")
+}
+
+// waitReload waits for sshd to have reloaded after a SIGHUP: it starts
+// itself again with the same PID, so the sign is a new listening socket,
+// and then that the server's container gets sshd's banner from it.
+func (e *e2eLab) waitReload(m *e2eMachine, before string) {
+	waitFor(e.t, 30*time.Second, "sshd to reload on "+m.name, func() bool {
+		now := e.sshListener(m)
+		if now == "" || now == before {
+			return false
+		}
+		out, err := exec.Command("docker", "exec", e.ctr("server"), "bash", "-c", `exec 3<>"/dev/tcp/$1/22" && head -c 4 <&3`, "bash", m.ip).Output()
+		return err == nil && string(out) == "SSH-"
 	})
 }
 
@@ -691,7 +738,7 @@ func (e *e2eLab) checkMCP(binDir, srv, fp, token, keyFinding string) {
 	if err := json.Unmarshal(b, &out); err != nil {
 		t.Fatalf("latest_report: %v\n%s", err, b)
 	}
-	want := map[string]string{keyFinding: "backdoor sign", "check:TT-SSH-001": "tampering"}
+	want := map[string]string{keyFinding: "backdoor sign", "check:TT-SSH-001": "tampering", dropInKey: "backdoor sign"}
 	for _, f := range out.Report.Findings {
 		if sev, ok := want[f.Key]; ok {
 			if f.Severity != sev {
@@ -734,6 +781,7 @@ var (
 	findingRE   = regexp.MustCompile(`(?s)<article class="finding (\w+)">(.*?)</article>`)
 	findingKey  = regexp.MustCompile(`ID <code>([^<]*)</code>`)
 	tagRE       = regexp.MustCompile(`<[^>]*>`)
+	flashRE     = regexp.MustCompile(`<p class="flash" role="status">([^<]*)</p>`)
 )
 
 // browser is the owner's browser: cookies, the Origin a browser sends with
