@@ -1,0 +1,205 @@
+package store
+
+import (
+	"bytes"
+	"compress/gzip"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+
+	"filippo.io/age"
+	"golang.org/x/crypto/chacha20poly1305"
+)
+
+// maxBlobSize bounds a decompressed blob so a corrupt row cannot exhaust memory.
+const maxBlobSize = 512 << 20
+
+// ErrWrongUnlock means the passphrase or key file does not open this store.
+var ErrWrongUnlock = errors.New("wrong passphrase or key file: this store was sealed with a different one")
+
+// scryptWorkFactor is the age scrypt cost; a variable so tests can lower it.
+var scryptWorkFactor = 18
+
+// newDataKey returns 32 random bytes.
+func newDataKey() ([]byte, error) {
+	k := make([]byte, 32)
+	if _, err := rand.Read(k); err != nil {
+		return nil, err
+	}
+	return k, nil
+}
+
+// seal encrypts plain with XChaCha20-Poly1305 under a fresh random nonce,
+// binding it to aad. The nonce is prepended to the result.
+func seal(key, plain []byte, aad string) ([]byte, error) {
+	aead, err := chacha20poly1305.NewX(key)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, aead.NonceSize(), aead.NonceSize()+len(plain)+aead.Overhead())
+	if _, err := rand.Read(out); err != nil {
+		return nil, err
+	}
+	return aead.Seal(out, out[:aead.NonceSize()], plain, []byte(aad)), nil
+}
+
+// open reverses seal. It fails when the key, the data or aad differ.
+func open(key, blob []byte, aad string) ([]byte, error) {
+	aead, err := chacha20poly1305.NewX(key)
+	if err != nil {
+		return nil, err
+	}
+	if len(blob) < aead.NonceSize()+aead.Overhead() {
+		return nil, errors.New("store: blob too short")
+	}
+	n := aead.NonceSize()
+	plain, err := aead.Open(nil, blob[:n], blob[n:], []byte(aad))
+	if err != nil {
+		return nil, fmt.Errorf("store: cannot decrypt %s: %w", aad, err)
+	}
+	return plain, nil
+}
+
+func (s *Store) sealJSON(v any, aad string) ([]byte, error) {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if err := json.NewEncoder(zw).Encode(v); err != nil {
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return seal(s.key, buf.Bytes(), aad)
+}
+
+func (s *Store) openJSON(blob []byte, aad string, v any) error {
+	plain, err := open(s.key, blob, aad)
+	if err != nil {
+		return err
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(plain))
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+	b, err := io.ReadAll(io.LimitReader(zr, maxBlobSize+1))
+	if err != nil {
+		return err
+	}
+	if len(b) > maxBlobSize {
+		return errors.New("store: blob too large")
+	}
+	return json.Unmarshal(b, v)
+}
+
+// wrapKey seals the data key with age: scrypt for a passphrase, X25519 for a
+// key file. A key file that does not exist is created (mode 0600) holding a
+// new identity.
+func wrapKey(key []byte, u Unlock) ([]byte, error) {
+	var rcpt age.Recipient
+	if u.Passphrase != "" {
+		r, err := age.NewScryptRecipient(u.Passphrase)
+		if err != nil {
+			return nil, err
+		}
+		r.SetWorkFactor(scryptWorkFactor)
+		rcpt = r
+	} else {
+		id, err := loadOrCreateIdentity(u.KeyFile)
+		if err != nil {
+			return nil, err
+		}
+		rcpt = id.Recipient()
+	}
+	var buf bytes.Buffer
+	w, err := age.Encrypt(&buf, rcpt)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := w.Write(key); err != nil {
+		return nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func unwrapKey(wrapped []byte, u Unlock) ([]byte, error) {
+	var id age.Identity
+	if u.Passphrase != "" {
+		i, err := age.NewScryptIdentity(u.Passphrase)
+		if err != nil {
+			return nil, err
+		}
+		id = i
+	} else {
+		i, err := readIdentity(u.KeyFile)
+		if err != nil {
+			return nil, err
+		}
+		id = i
+	}
+	r, err := age.Decrypt(bytes.NewReader(wrapped), id)
+	if err != nil {
+		var nm *age.NoIdentityMatchError
+		if errors.As(err, &nm) || errors.Is(err, age.ErrIncorrectIdentity) {
+			return nil, ErrWrongUnlock
+		}
+		return nil, fmt.Errorf("%w (%v)", ErrWrongUnlock, err)
+	}
+	key, err := io.ReadAll(io.LimitReader(r, 64))
+	if err != nil {
+		return nil, err
+	}
+	if len(key) != chacha20poly1305.KeySize {
+		return nil, errors.New("store: unwrapped data key has the wrong size")
+	}
+	return key, nil
+}
+
+func readIdentity(path string) (*age.X25519Identity, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("store: key file: %w", err)
+	}
+	defer f.Close()
+	ids, err := age.ParseIdentities(f)
+	if err != nil {
+		return nil, fmt.Errorf("store: key file %s: %w", path, err)
+	}
+	for _, i := range ids {
+		if x, ok := i.(*age.X25519Identity); ok {
+			return x, nil
+		}
+	}
+	return nil, fmt.Errorf("store: key file %s holds no X25519 identity", path)
+}
+
+func loadOrCreateIdentity(path string) (*age.X25519Identity, error) {
+	if _, err := os.Stat(path); err == nil {
+		return readIdentity(path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("store: create key file: %w", err)
+	}
+	_, werr := fmt.Fprintf(f, "# telltale server key\n# public key: %s\n%s\n", id.Recipient(), id)
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		os.Remove(path)
+		return nil, werr
+	}
+	return id, nil
+}
