@@ -63,17 +63,24 @@ func isPAMModule(p string) bool {
 // specialCategory names the kinds of file that are a backdoor sign when they
 // cannot be verified: setuid/setgid programs, kernel modules, PAM modules
 // and boot files. "" for anything else.
-func (j *judge) specialCategory(p string) string {
+//
+// The kind is told from the path dpkg installs the file at. listed holds
+// dpkg's spellings when p is where the file really is, behind a package
+// directory that is a link now (pkgverify.FileVerdict.Listed): a PAM module
+// moved to /srv is still a PAM module.
+func (j *judge) specialCategory(p string, listed ...string) string {
 	if e := j.files[p]; e != nil && e.Type == "file" && e.Mode&0o6000 != 0 {
 		return "setuid/setgid program"
 	}
-	switch {
-	case isKernelModule(p):
-		return "kernel module"
-	case isPAMModule(p):
-		return "PAM module"
-	case strings.HasPrefix(p, "/boot/"):
-		return "boot file"
+	for _, q := range append([]string{p}, listed...) {
+		switch {
+		case isKernelModule(q):
+			return "kernel module"
+		case isPAMModule(q):
+			return "PAM module"
+		case strings.HasPrefix(q, "/boot/"):
+			return "boot file"
+		}
 	}
 	return ""
 }
@@ -280,7 +287,7 @@ func (j *judge) unverifiable(vs []pkgverify.FileVerdict) {
 		if owner == "" {
 			owner = j.owned[v.Path]
 		}
-		cat := j.specialCategory(v.Path)
+		cat := j.specialCategory(v.Path, v.Listed...)
 		class := j.classify(v.Kind)
 		switch {
 		case v.Kind == pkgverify.KindBudget && !slices.Contains(j.budget, v.Reason):
@@ -470,8 +477,17 @@ func indexSignature(errs []string) *model.Finding {
 // backdoor sign when the link leads into a temporary, user-writable or
 // hidden place or nowhere the inventory can follow, and when a listed file
 // below it has no entry: then nobody looked at what the package's name leads
-// to. The links merged /usr consists of are left out.
+// to. The machine's file lists do not bound that: root can delete a line
+// from one. A file the signed package installs below the directory, with no
+// entry where the link leads (pkgverify.Result.MovedUnseen), counts the same
+// whether or not a list still names it. The links merged /usr consists of
+// are left out.
 func (j *judge) packageDirLinks() {
+	phys := model.NewPhysicalResolver(j.files)
+	var signed []pkgverify.MovedFile
+	if j.in.Pkg != nil {
+		signed = j.in.Pkg.MovedUnseen
+	}
 	for _, l := range j.c.Packages.DirLinks(j.files) {
 		d, pkgName, to := l.Dir, l.Package, l.To
 		f := &model.Finding{
@@ -488,10 +504,23 @@ func (j *judge) packageDirLinks() {
 		}
 		// Listed files below the link that have no entry where they are.
 		var unseen []string
+		// Files the signed packages install below it, listed or not.
+		var unlisted []pkgverify.MovedFile
 		if to != "" {
+			at := map[string]bool{}
 			for _, p := range l.Below {
-				if phys, ok := model.PhysicalPath(j.files, p); !ok || j.files[phys] == nil {
+				q, ok := phys.Path(p)
+				if ok {
+					at[q] = true
+				}
+				if !ok || j.files[q] == nil {
 					unseen = append(unseen, p)
+				}
+			}
+			for _, m := range signed {
+				if strings.HasPrefix(m.At, to+"/") && !at[m.At] && j.files[m.At] == nil {
+					at[m.At] = true
+					unlisted = append(unlisted, m)
 				}
 			}
 		}
@@ -505,11 +534,28 @@ func (j *judge) packageDirLinks() {
 			reason = "it leads into " + underTemp(to)
 		case hiddenPath(to):
 			reason = "it leads into a hidden directory"
-		case len(unseen) > 0:
-			reason = fmt.Sprintf("%d of the %d files the package lists below it could not be checked where the link leads (they are missing there, or telltale could not look)", len(unseen), len(l.Below))
+		case len(unseen)+len(unlisted) > 0:
+			if len(unseen) > 0 {
+				reason = fmt.Sprintf("%d of the %d files the package lists below it could not be checked where the link leads (they are missing there, or telltale could not look)", len(unseen), len(l.Below))
+			}
+			if len(unlisted) > 0 {
+				if reason != "" {
+					reason += ", and "
+				}
+				reason += fmt.Sprintf("%d %s the signed package installs below it %s not in the machine's file list any more and could not be checked where the link leads",
+					len(unlisted), plural(len(unlisted), "file", "files"), plural(len(unlisted), "is", "are"))
+			}
 			tail = "What programs get when they ask for those files is unknown: they were not compared with the package."
-			for i, p := range unseen {
-				if i == maxEvidence-1 {
+			// The files no list names come first: a line deleted from a
+			// file list is what hides a replaced file.
+			for _, m := range unlisted {
+				if len(f.Evidence) == maxEvidence {
+					break
+				}
+				f.Evidence = append(f.Evidence, model.Evidence{Path: m.Path, Detail: "installed by the signed package " + m.Package + " " + m.Version + ", in no file list on the machine; nothing was recorded for it at " + m.At})
+			}
+			for _, p := range unseen {
+				if len(f.Evidence) == maxEvidence {
 					break
 				}
 				f.Evidence = append(f.Evidence, model.Evidence{Path: p, Detail: "listed by a package below " + d + "; nothing was found for it where the link leads"})

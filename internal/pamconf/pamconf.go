@@ -98,13 +98,21 @@ func Candidates(module string, extra []string) []string {
 // directories that hold files in the inventory, sorted.
 func MultiarchDirs(files []model.FileEntry) []string {
 	seen := map[string]bool{}
-	for _, f := range files {
-		d := path.Dir(f.Path)
+	isDir := func(d string) bool {
 		if path.Base(d) != "security" {
-			continue
+			return false
 		}
-		if p := path.Dir(path.Dir(d)); p == "/lib" || p == "/usr/lib" {
+		p := path.Dir(path.Dir(d))
+		return p == "/lib" || p == "/usr/lib"
+	}
+	for _, f := range files {
+		if d := path.Dir(f.Path); isDir(d) {
 			seen[d] = true
+		}
+		// The directory itself, when it is a link now: its files are
+		// recorded where the link leads, not below it.
+		if f.Type == "symlink" && isDir(f.Path) {
+			seen[f.Path] = true
 		}
 	}
 	var out []string

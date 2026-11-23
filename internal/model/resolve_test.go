@@ -221,3 +221,22 @@ func TestWalkIsCapped(t *testing.T) {
 		t.Errorf("seven padded links resolved to %q", got)
 	}
 }
+
+func TestPhysicalResolverAgreesWithPhysicalPath(t *testing.T) {
+	files := []FileEntry{
+		{Path: "/usr", Type: "dir"}, {Path: "/usr/lib", Type: "dir"}, {Path: "/usr/lib/foo", Type: "symlink", Target: "/srv/foo"},
+		{Path: "/srv", Type: "dir"}, {Path: "/srv/foo", Type: "dir"}, {Path: "/srv/foo/a", Type: "file"},
+		{Path: "/usr/lib/gone", Type: "symlink", Target: "/nowhere/x"},
+	}
+	inv := Inventory(files)
+	r := NewPhysicalResolver(inv)
+	for _, p := range []string{"/usr/lib/foo/a", "/usr/lib/foo/b", "/usr/lib/foo/a", "/usr/lib/gone/x", "/usr/lib/plain", "/usr/lib/gone/y"} {
+		want, wantOK := PhysicalPath(inv, p)
+		if got, ok := r.Path(p); got != want || ok != wantOK {
+			t.Errorf("Path(%q) = %q, %v; PhysicalPath gives %q, %v", p, got, ok, want, wantOK)
+		}
+	}
+	if len(r.dirs) != 3 {
+		t.Errorf("%d directories resolved for three distinct ones", len(r.dirs))
+	}
+}

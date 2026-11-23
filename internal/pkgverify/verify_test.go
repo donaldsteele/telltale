@@ -15,6 +15,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -526,7 +527,7 @@ func TestVerifyDetectsTamperedBinary(t *testing.T) {
 	}
 	wantPaths(t, "Mismatch", res.Mismatch, "/usr/bin/tool")
 	want := FileVerdict{Path: "/usr/bin/tool", Package: "tool", Version: "1.0-1", Expected: sha256hex([]byte(toolBin)), Actual: sha256hex([]byte("evil\n")), Source: SourceArchive}
-	if got, _ := find(res.Mismatch, "/usr/bin/tool"); got.Reason == "" || (got != FileVerdict{Path: want.Path, Package: want.Package, Version: want.Version, Expected: want.Expected, Actual: want.Actual, Reason: got.Reason, Source: want.Source, Kind: KindContentDiffers}) {
+	if got, _ := find(res.Mismatch, "/usr/bin/tool"); got.Reason == "" || !reflect.DeepEqual(got, FileVerdict{Path: want.Path, Package: want.Package, Version: want.Version, Expected: want.Expected, Actual: want.Actual, Reason: got.Reason, Source: want.Source, Kind: KindContentDiffers}) {
 		t.Errorf("mismatch = %+v, want %+v with a reason", got, want)
 	}
 	// /bin/toolctl in the package is /usr/bin/toolctl on a merged-/usr
@@ -2116,5 +2117,41 @@ func TestVerifyLiteralOwnerWinsOverAMovedDirectory(t *testing.T) {
 	}
 	if m, ok := find(res.Mismatch, "/usr/bin/tool"); !ok || m.Package != "tool" {
 		t.Errorf("offline: want a mismatch for package tool, got %+v", res.Mismatch)
+	}
+}
+
+// Root moves a package's directory away, replaces a file behind the link and
+// deletes that file's line from the package's file list. The collector, which
+// walks listed paths, then has no entry for it. The signed package still
+// ships the file: it is reported as not seen, whatever the list says.
+func TestSignedFileBehindAMovedDirectoryWithNoEntryIsReported(t *testing.T) {
+	f := toolFixture(t)
+	const to = "/srv/lib"
+	const lit, phys = libDir + "/libtool.so.1", to + "/libtool.so.1"
+
+	c := movedLib(to, "evil lib\n", 0o644)
+	c.Files = slices.DeleteFunc(c.Files, func(e model.FileEntry) bool { return e.Path == phys })
+	pk := &c.Packages.Installed[0]
+	pk.Files = slices.DeleteFunc(pk.Files, func(p string) bool { return p == lit })
+	res := Verify(context.Background(), c, f.opts())
+	if len(res.MovedUnseen) != 1 || res.MovedUnseen[0] != (MovedFile{Path: lit, At: phys, Package: "tool", Version: "1.0-1"}) {
+		t.Errorf("MovedUnseen = %+v, want %s at %s", res.MovedUnseen, lit, phys)
+	}
+
+	// With an entry where the file really is, it is compared instead, and
+	// the verdict says how dpkg spells it.
+	res = Verify(context.Background(), movedLib(to, "evil lib\n", 0o644), f.opts())
+	if len(res.MovedUnseen) != 0 {
+		t.Errorf("a collected file is not unseen: %+v", res.MovedUnseen)
+	}
+	if m, ok := find(res.Mismatch, phys); !ok || !slices.Contains(m.Listed, lit) {
+		t.Errorf("the verdict behind a moved directory does not carry dpkg's spelling: %+v", res.Mismatch)
+	}
+
+	// Nothing moved: a file merely absent is not reported here.
+	c = collectionOf(toolDisk(nil), toolPackage())
+	c.Files = slices.DeleteFunc(c.Files, func(e model.FileEntry) bool { return e.Path == lit })
+	if res = Verify(context.Background(), c, f.opts()); len(res.MovedUnseen) != 0 {
+		t.Errorf("no directory is moved: MovedUnseen = %+v", res.MovedUnseen)
 	}
 }

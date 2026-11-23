@@ -387,3 +387,29 @@ func TestSetuidPackagedCopyKeyIncludesModeAndOwner(t *testing.T) {
 		t.Errorf("a true copy lost its note: %v", keys(fs))
 	}
 }
+
+// The PAM module directory is a link now (root moved it away). A module the
+// configuration loads is the file behind the link: one no package owns there
+// is unowned, not "missing", and an owned one is neither.
+func TestPAMModuleBehindAMovedDirectory(t *testing.T) {
+	const sec = "/usr/lib/x86_64-linux-gnu/security"
+	c := cleanCollection()
+	c.Files = append(c.Files,
+		model.FileEntry{Path: "/usr", Type: "dir"}, model.FileEntry{Path: "/usr/lib", Type: "dir"}, model.FileEntry{Path: "/usr/lib/x86_64-linux-gnu", Type: "dir"},
+		model.FileEntry{Path: sec, Type: "symlink", Target: "/srv/pam"},
+		model.FileEntry{Path: "/srv", Type: "dir"}, model.FileEntry{Path: "/srv/pam", Type: "dir"},
+		model.FileEntry{Path: "/srv/pam/pam_unix.so", Type: "file"},
+		model.FileEntry{Path: "/srv/pam/pam_deny.so", Type: "file"})
+	owned := cleanOwned()
+	owned["/srv/pam/pam_deny.so"] = "libpam-modules" // the ownership index is keyed by where a file really is too
+	c.Persist = append(c.Persist, pamFile("auth [success=1 default=ignore] pam_unix.so nullok", "auth requisite pam_deny.so"))
+	fs := Run(c, ctx, owned)
+	if f := find(fs, "heur.pam_unowned:/srv/pam/pam_unix.so"); f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("the module behind the moved directory that no package owns: %v", keys(fs))
+	}
+	for _, k := range []string{"heur.pam_missing:pam_unix.so", "heur.pam_missing:pam_deny.so", "heur.pam_unowned:/srv/pam/pam_deny.so"} {
+		if find(fs, k) != nil {
+			t.Errorf("unexpected %s", k)
+		}
+	}
+}

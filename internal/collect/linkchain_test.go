@@ -482,3 +482,98 @@ func TestUserLinksCannotStarveSystemLinks(t *testing.T) {
 		}
 	}
 }
+
+// /run/systemd/system holds root's runtime units. Its links are not in the
+// file scan's paths, and must still be followed before a user's padded links
+// can spend the budget: a link nobody followed is reported as one that
+// cannot be resolved.
+func TestUserLinksCannotStarveRuntimeUnitLinks(t *testing.T) {
+	root := t.TempDir()
+	const home = "/home/u"
+	wants := home + "/.config/systemd/user/default.target.wants"
+	os.MkdirAll(root+wants, 0o755)
+	os.MkdirAll(root+home+"/x", 0o755)
+	os.MkdirAll(root+"/usr/lib/systemd/system", 0o755)
+	os.MkdirAll(root+"/run/systemd/system/network-online.target.wants", 0o755)
+	os.WriteFile(root+"/usr/lib/systemd/system/systemd-networkd-wait-online.service", []byte("[Service]\n"), 0o644)
+	const run = "/run/systemd/system/network-online.target.wants/systemd-networkd-wait-online.service"
+	os.Symlink("/usr/lib/systemd/system/systemd-networkd-wait-online.service", root+run)
+	pad := strings.Repeat("x/../", 800)
+	for i := 1; i <= 8; i++ {
+		next := fmt.Sprintf("L%d", i+1)
+		if i == 8 {
+			next = "end"
+		}
+		os.Symlink(pad+next, fmt.Sprintf("%s%s/L%d", root, home, i))
+	}
+	var persist []model.PersistFile
+	for i := 0; i < 100; i++ {
+		a := fmt.Sprintf("%s/A%d", home, i)
+		os.Symlink(pad+"L1", root+a)
+		p := fmt.Sprintf("%s/u%d.service", wants, i)
+		os.Symlink(a, root+p)
+		persist = append(persist, model.PersistFile{Path: p, Mode: 0o120777, Lines: []string{a}})
+	}
+	// Sorted by path, as Persistence returns them: /home before /run.
+	persist = append(persist, model.PersistFile{Path: run, Mode: 0o120777, Lines: []string{"/usr/lib/systemd/system/systemd-networkd-wait-online.service"}})
+	mounts := []model.Mount{{Path: "/", FSType: "ext4"}, {Path: "/run", FSType: "tmpfs"}}
+	files, _ := Files(root, SystemPaths, FileOptions{Mounts: mounts})
+	files, _ = ensureEntriesIn(root, files, linkTargets(persist), mounts, 1<<20, underNeverRead, linkSkipFS)
+	res := followLinks(root, persist, files, SystemPaths, func(p string) bool { return RefusedForLinks(p, mounts) }, linkChainBudget)
+	if res.unwalked == 0 {
+		t.Fatalf("the user's links did not spend the budget: this test shows nothing (%d lookups)", res.spent)
+	}
+	if slices.Contains(res.refused, run) {
+		t.Errorf("%s was not followed: a user's links spent the budget first", run)
+	}
+}
+
+// Root moves the PAM module directory out of the scanned paths and deletes a
+// module's line from the package's file list. The PAM configuration still
+// loads that module through the link: it is recorded where it really is.
+func TestPAMModuleBehindAMovedDirectoryIsCollected(t *testing.T) {
+	root := t.TempDir()
+	const sec = "/usr/lib/x86_64-linux-gnu/security"
+	os.MkdirAll(root+"/usr/lib/x86_64-linux-gnu", 0o755)
+	os.MkdirAll(root+"/etc/pam.d", 0o755)
+	os.MkdirAll(root+"/srv/pam", 0o755)
+	os.WriteFile(root+"/srv/pam/pam_unix.so", []byte("evil"), 0o644)
+	os.Symlink("/srv/pam", root+sec)
+	os.WriteFile(root+"/etc/pam.d/common-auth", []byte("auth required pam_unix.so\n"), 0o644)
+	persist, _ := Persistence(root, nil, []byte("k"))
+	files, _ := Files(root, []string{"/usr", "/etc"}, FileOptions{})
+	res := followLinks(root, persist, files, nil, underNeverRead, linkChainBudget)
+	files, _ = ensureChainEntries(root, files, res.chain, nil, 1<<20)
+	files, _ = ensurePAMEntries(root, files, nil, persist, 1<<20)
+	if e, ok := byPath(files)["/srv/pam/pam_unix.so"]; !ok || e.SHA256 == "" {
+		t.Errorf("the module the configuration loads through the moved directory was not recorded: %v", e)
+	}
+}
+
+// A package's file list is root's to write: twenty thousand paths below a
+// package directory that is a link with a padded target. The directory is
+// resolved once, not once per listed path.
+func TestHostileFileListBelowAPaddedDirectoryLinkIsCheap(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(root+"/usr/lib", 0o755)
+	os.MkdirAll(root+"/srv/foo/x", 0o755)
+	os.Symlink("/srv/foo/"+strings.Repeat("x/../", 800), root+"/usr/lib/foo")
+	const n = 20000
+	list := []string{"/usr/lib/foo"}
+	for i := 0; i < n; i++ {
+		list = append(list, fmt.Sprintf("/usr/lib/foo/f%d", i))
+	}
+	pkgs := model.Packages{Installed: []model.Package{{Name: "foo", Files: list}}}
+	files, _ := Files(root, []string{"/usr"}, FileOptions{})
+	res := followLinks(root, nil, files, nil, underNeverRead, linkChainBudget)
+	files, _ = ensureChainEntries(root, files, res.chain, nil, 1<<20)
+	start := time.Now()
+	left := packageDirPaths(pkgs, files)
+	if len(left) != n {
+		t.Fatalf("%d paths left to look for, want %d", len(left), n)
+	}
+	// Unmemoized this takes seconds (one 1600-component walk per path).
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("packageDirPaths over %d listed paths took %v: the directory is resolved again for every path", n, d)
+	}
+}

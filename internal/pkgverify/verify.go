@@ -234,6 +234,21 @@ type Result struct {
 	// indexes it fetched, or past the Valid-Until of one that is still
 	// valid at that date. The clock decides nothing else: see signedClock.
 	ClockSkew *ClockSkew `json:"clock_skew,omitempty"`
+	// MovedUnseen lists the files of the signed packages that lie below a
+	// directory which is a symbolic link now, and for which nothing was
+	// collected where the link leads. The signed package says they belong
+	// there, whatever the machine's file lists (which root can edit) say, so
+	// nobody looked at what a program gets when it asks for them.
+	MovedUnseen []MovedFile `json:"moved_unseen,omitempty"`
+}
+
+// MovedFile is a signed package's file whose directory is a link now. Path
+// is where dpkg installs it, At where that really is.
+type MovedFile struct {
+	Path    string `json:"path"`
+	At      string `json:"at"`
+	Package string `json:"package"`
+	Version string `json:"version"`
 }
 
 // ClockSkew is a disagreement between the machine's clock and the signed
@@ -257,6 +272,11 @@ type FileVerdict struct {
 	Source   string `json:"source,omitempty"`
 	// Kind says why an Unverifiable file could not be verified (Kind*).
 	Kind string `json:"kind,omitempty"`
+	// Listed holds dpkg's spellings of the package paths that really are
+	// Path, when a directory on the way to them is a symbolic link: what
+	// kind of file this is (a PAM module, a kernel module) is told from
+	// where the package installs it, not from where the link leads.
+	Listed []string `json:"listed,omitempty"`
 }
 
 // ConffileDiff is a configuration file that differs from its package's
@@ -1348,6 +1368,7 @@ func (s *session) judge(results []*pkgResult) {
 		}
 		seen[e.Path] = true
 		v, d, kind := s.judgeFile(e, idx[e.Path], listers[e.Path])
+		v.Listed = s.physLit[e.Path]
 		switch kind {
 		case verdictVerified:
 			verified = append(verified, v)
@@ -1373,6 +1394,10 @@ func (s *session) judge(results []*pkgResult) {
 // path, and both merged-/usr spellings are entered.
 func (s *session) placeTables(results []*pkgResult) map[string][]expect {
 	idx := map[string][]expect{}
+	unseen := map[string]bool{}
+	defer func() {
+		sort.Slice(s.res.MovedUnseen, func(i, j int) bool { return s.res.MovedUnseen[i].Path < s.res.MovedUnseen[j].Path })
+	}()
 	place := func(at string, x expect) {
 		idx[at] = append(idx[at], x)
 		if a := usrAlias(at); a != "" {
@@ -1383,6 +1408,13 @@ func (s *session) placeTables(results []*pkgResult) map[string][]expect {
 		// whatever its type.
 		if q := s.physicalEntry(at); q != "" && !slices.ContainsFunc(idx[q], func(y expect) bool { return y.r == x.r && y.path == x.path }) {
 			idx[q] = append(idx[q], x)
+		}
+		// The directory is somewhere else and nothing was collected for
+		// the file there: the signed package, not the machine's file
+		// list, says a file belongs there.
+		if q := s.physical(at); q != "" && q != usrAlias(at) && s.files[q] == nil && s.files[at] == nil && !unseen[at] {
+			unseen[at] = true
+			s.res.MovedUnseen = append(s.res.MovedUnseen, MovedFile{Path: at, At: q, Package: x.r.pkg.Name, Version: x.r.pkg.Version})
 		}
 	}
 	for _, r := range results {

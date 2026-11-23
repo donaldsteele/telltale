@@ -2,6 +2,7 @@ package heuristics
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/donaldsteele/telltale/internal/model"
@@ -28,11 +29,21 @@ func usrSpellings(p string) []string {
 // resolve to. A bare name stops at the first directory that has it (the one
 // the loader reaches); a name with a slash lists them all, since the path
 // that really loads depends on which directory libpam prepends.
-func existingPAMModules(name string, have map[string]bool, multiarch []string) []string {
+//
+// A module directory that is a symbolic link now (moved away, a link left)
+// holds nothing under its own spelling: the candidate is then looked for
+// where the link leads (phys), and that path is what is returned and judged.
+func existingPAMModules(name string, have map[string]bool, multiarch []string, phys *model.PhysicalResolver) []string {
 	var out []string
 	seen := map[string]bool{}
 	for _, cand := range pamconf.Candidates(name, multiarch) {
-		for _, s := range usrSpellings(cand) {
+		spellings := usrSpellings(cand)
+		if phys != nil {
+			if at, ok := phys.Path(cand); ok && !slices.Contains(spellings, at) {
+				spellings = append(spellings, at)
+			}
+		}
+		for _, s := range spellings {
 			if have[s] {
 				if !seen[s] {
 					seen[s] = true
@@ -58,6 +69,7 @@ func pamModules(c *model.Collection, owned map[string]string) []model.Finding {
 		have[f.Path] = true
 	}
 	multi := pamconf.MultiarchDirs(c.Files)
+	phys := model.NewPhysicalResolver(model.Inventory(c.Files))
 
 	type group struct {
 		key  string
@@ -79,7 +91,7 @@ func pamModules(c *model.Collection, owned map[string]string) []model.Finding {
 			add("e:"+r.Module, r)
 		}
 		found := false
-		for _, mod := range existingPAMModules(r.Module, have, multi) {
+		for _, mod := range existingPAMModules(r.Module, have, multi, phys) {
 			found = true
 			if owned[mod] == "" {
 				add("u:"+mod, r)

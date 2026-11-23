@@ -3531,3 +3531,48 @@ func TestChangedLinkIntoAUserWritableRuntimeDirectory(t *testing.T) {
 		}
 	}
 }
+
+// Root moves the PAM module directory away, replaces pam_unix.so and deletes
+// its line from the package's file list, so nothing lists it and nothing was
+// collected for it. The signed package still ships it there: the moved
+// directory is a backdoor sign that names the file, not a note.
+func TestMovedDirectoryIsBoundedByTheSignedPackageNotTheFileList(t *testing.T) {
+	const sec = "/usr/lib/x86_64-linux-gnu/security"
+	const key = "pkg.dir_now_link:" + sec
+	mk := func() *model.Collection {
+		c := clean()
+		c.Files = append(c.Files, dirAt("/usr/lib"), dirAt("/usr/lib/x86_64-linux-gnu"), symlinkAt(sec, "/srv/pam", changed), dirAt("/srv"), dirAt("/srv/pam"), file("/srv/pam/pam_deny.so", "deny", 0o644))
+		c.Packages.Installed = append(c.Packages.Installed, pkg("libpam-modules", "1.5.2-6", sec, sec+"/pam_deny.so")) // the pam_unix.so line is gone
+		return c
+	}
+	res := archive(verdict("/srv/pam/pam_deny.so", "libpam-modules", "1.5.2-6", "deny"))
+	must(t, run(mk(), nil, res), key, model.SevNote)
+
+	res = archive(verdict("/srv/pam/pam_deny.so", "libpam-modules", "1.5.2-6", "deny"))
+	// The signed package spells the directory the pre-merge way.
+	res.MovedUnseen = []pkgverify.MovedFile{{Path: "/lib/x86_64-linux-gnu/security/pam_unix.so", At: "/srv/pam/pam_unix.so", Package: "libpam-modules", Version: "1.5.2-6"}}
+	f := must(t, run(mk(), nil, res), key, model.SevBackdoor)
+	if !hasEvidencePath(f, "/lib/x86_64-linux-gnu/security/pam_unix.so") || !strings.Contains(f.Why, "could not be checked") {
+		t.Errorf("the finding does not name the file the signed package ships: %s / %+v", f.Why, f.Evidence)
+	}
+	// A file reported for another place does not count against this link.
+	res.MovedUnseen = []pkgverify.MovedFile{{Path: "/opt/x/y", At: "/data/x/y", Package: "x", Version: "1"}}
+	must(t, run(mk(), nil, res), key, model.SevNote)
+}
+
+// A PAM module or kernel module that is really behind a moved directory is
+// still one: what kind of file it is comes from where dpkg installs it.
+func TestSpecialFilesBehindAMovedDirectoryKeepTheirRanking(t *testing.T) {
+	const sec = "/usr/lib/x86_64-linux-gnu/security"
+	c := clean()
+	c.Files = append(c.Files, dirAt("/usr/lib"), dirAt("/usr/lib/x86_64-linux-gnu"), symlinkAt(sec, "/srv/pam", taken), dirAt("/srv"), dirAt("/srv/pam"),
+		file("/srv/pam/pam_unix.so", "unix", 0o644), symlinkAt("/usr/lib/modules", "/srv/mod", taken), dirAt("/srv/mod"), dirAt("/srv/mod/6.1"), file("/srv/mod/6.1/x.ko", "ko", 0o644))
+	c.Packages.Installed = append(c.Packages.Installed, pkg("libpam-modules", "1.5.2-6+fake", sec, sec+"/pam_unix.so"), pkg("linux-image", "6.1+fake", "/usr/lib/modules", "/usr/lib/modules/6.1", "/usr/lib/modules/6.1/x.ko"))
+	res := archive()
+	res.Unverifiable = append(res.Unverifiable,
+		pkgverify.FileVerdict{Path: "/srv/pam/pam_unix.so", Listed: []string{sec + "/pam_unix.so"}, Package: "libpam-modules", Version: "1.5.2-6+fake", Reason: "version not found", Kind: pkgverify.KindNotFound},
+		pkgverify.FileVerdict{Path: "/srv/mod/6.1/x.ko", Listed: []string{"/usr/lib/modules/6.1/x.ko"}, Package: "linux-image", Version: "6.1+fake", Reason: "version not found", Kind: pkgverify.KindNotFound})
+	r := run(c, nil, res)
+	must(t, r, "pkg.unverifiable:/srv/pam/pam_unix.so", model.SevBackdoor)
+	must(t, r, "pkg.unverifiable:/srv/mod/6.1/x.ko", model.SevBackdoor)
+}

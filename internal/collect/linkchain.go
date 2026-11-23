@@ -196,7 +196,8 @@ func (w *linkWalker) done(what string) linkResult {
 // budget. The others are walked on the machine, in this order:
 //
 //  1. the start paths of the file scan;
-//  2. the startup links in the system paths (SystemPaths), which root made;
+//  2. the startup links in the system paths (SystemPaths) and root's
+//     runtime units (/run/systemd/system), which root made;
 //  3. the links the file scan recorded whose target the inventory cannot
 //     follow, because a path on the way is not recorded;
 //  4. the startup links outside the system paths (any user can plant them
@@ -228,7 +229,7 @@ func followLinks(root string, persist []model.PersistFile, files []model.FileEnt
 		model.WalkPath(w.lookup, filepath.Clean("/"+s), model.LinkHops)
 	}
 	for _, p := range persist {
-		if isLink(p) && underSystemPath(p.Path) {
+		if isLink(p) && rootStartupPath(p.Path) {
 			follow(p.Path)
 		}
 	}
@@ -238,7 +239,7 @@ func followLinks(root string, persist []model.PersistFile, files []model.FileEnt
 		}
 	}
 	for _, p := range persist {
-		if isLink(p) && !underSystemPath(p.Path) {
+		if isLink(p) && !rootStartupPath(p.Path) {
 			follow(p.Path)
 		}
 	}
@@ -248,6 +249,13 @@ func followLinks(root string, persist []model.PersistFile, files []model.FileEnt
 		}
 	}
 	return w.done("links")
+}
+
+// rootStartupPath reports whether a startup link at p is one only root can
+// have made: it is in the file scan's paths or among root's runtime units,
+// which the file scan does not walk (/run is a tmpfs).
+func rootStartupPath(p string) bool {
+	return underSystemPath(p) || strings.HasPrefix(p, "/run/systemd/system/")
 }
 
 // underSystemPath reports whether p is in one of the file scan's paths.
@@ -268,6 +276,7 @@ func packageDirPaths(pkgs model.Packages, files []model.FileEntry) []string {
 	inv := model.Inventory(files)
 	var out []string
 	seen := map[string]bool{}
+	phys := model.NewPhysicalResolver(inv)
 	for _, l := range pkgs.DirLinks(inv) {
 		if l.To == "" {
 			continue // nowhere to look; the judge reports the link
@@ -277,7 +286,7 @@ func packageDirPaths(pkgs model.Packages, files []model.FileEntry) []string {
 				continue
 			}
 			seen[p] = true
-			if phys, ok := model.PhysicalPath(inv, p); !ok || inv[phys] == nil {
+			if at, ok := phys.Path(p); !ok || inv[at] == nil {
 				out = append(out, p)
 			}
 		}

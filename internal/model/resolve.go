@@ -349,6 +349,39 @@ func (p Packages) DirLinks(files map[string]*FileEntry) []PackageDirLink {
 	return out
 }
 
+// PhysicalResolver answers PhysicalPath for many paths, resolving each
+// directory once: a package lists thousands of files below one directory,
+// and a padded link target makes every resolution of it expensive.
+type PhysicalResolver struct {
+	files map[string]*FileEntry
+	dirs  map[string]physDir
+}
+
+type physDir struct {
+	real string
+	ok   bool
+}
+
+// NewPhysicalResolver returns a resolver over the inventory files, which
+// must not change while the resolver is used.
+func NewPhysicalResolver(files map[string]*FileEntry) *PhysicalResolver {
+	return &PhysicalResolver{files: files, dirs: map[string]physDir{}}
+}
+
+// Path is PhysicalPath(files, p).
+func (r *PhysicalResolver) Path(p string) (string, bool) {
+	dir := path.Dir(p)
+	d, seen := r.dirs[dir]
+	if !seen {
+		d.real, d.ok = ResolveInInventory(r.files, dir, LinkHops)
+		r.dirs[dir] = d
+	}
+	if !d.ok {
+		return "", false
+	}
+	return path.Join(d.real, path.Base(p)), true
+}
+
 // PhysicalPath returns where the listed path p is when the directories on
 // the way to it are followed in the inventory; its own last component is not
 // followed. ok is false when the directory cannot be resolved.

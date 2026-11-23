@@ -13,11 +13,21 @@ import (
 // bare names that PAM's own directories reach through "..". They are
 // collected like startup-link targets, so a module planted in /opt or
 // /dev/shm is seen (and judged unowned) rather than reported as missing.
-func pamModulePaths(persist []model.PersistFile) []string {
+//
+// A module directory may itself be a symbolic link now (root moved it away
+// and left a link): each candidate is looked for where it really is, by the
+// inventory files, so a module behind such a link is recorded even when no
+// package's file list names it any more.
+func pamModulePaths(persist []model.PersistFile, files []model.FileEntry) []string {
 	var out []string
 	seen := map[string]bool{}
+	phys := model.NewPhysicalResolver(model.Inventory(files))
+	multi := pamconf.MultiarchDirs(files)
 	for _, r := range pamconf.Refs(persist) {
-		for _, p := range pamconf.Candidates(r.Module, nil) {
+		for _, p := range pamconf.Candidates(r.Module, multi) {
+			if at, ok := phys.Path(p); ok {
+				p = at
+			}
 			if seen[p] || inSystemPaths(p) {
 				continue
 			}
@@ -52,5 +62,5 @@ func pamNever(p string) bool {
 func ensurePAMEntries(root string, files []model.FileEntry, mounts []model.Mount, persist []model.PersistFile, maxHash int64) ([]model.FileEntry, []model.Skip) {
 	// tmpfs is allowed, judged by the nearest mount
 	skip := func(t string) bool { return t != "tmpfs" && skipFS(t) }
-	return ensureEntriesIn(root, files, pamModulePaths(persist), mounts, maxHash, pamNever, skip)
+	return ensureEntriesIn(root, files, pamModulePaths(persist, files), mounts, maxHash, pamNever, skip)
 }
