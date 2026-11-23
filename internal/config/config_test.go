@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -270,11 +271,11 @@ func TestUnitBoundsMemory(t *testing.T) {
 	}
 }
 
-// max_collection_mib bounds what one visit may send; 256 by default.
+// max_collection_mib bounds what one visit may send; 64 by default.
 func TestConfigMaxCollection(t *testing.T) {
 	const base = "listen = \"192.0.2.10:8443\"\n"
 	c, err := Parse(strings.NewReader(base))
-	if err != nil || c.MaxCollectionBytes != visit.DefaultMaxCollection || visit.DefaultMaxCollection != 256<<20 {
+	if err != nil || c.MaxCollectionBytes != visit.DefaultMaxCollection || visit.DefaultMaxCollection != 64<<20 {
 		t.Fatalf("default: %d, %v (default constant %d)", c.MaxCollectionBytes, err, visit.DefaultMaxCollection)
 	}
 	c, err = Parse(strings.NewReader(base + "max_collection_mib = \"384\"\n"))
@@ -294,7 +295,26 @@ func TestConfigMaxCollection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(ex), "#max_collection_mib = \"256\"") {
+	if !strings.Contains(string(ex), "#max_collection_mib = \"64\"") {
 		t.Error("the example configuration does not show max_collection_mib")
+	}
+}
+
+// The Go runtime is told to keep its heap below the unit's MemoryMax, so
+// that it collects garbage harder before the kernel has to kill the service.
+func TestUnitSetsGoMemoryLimitBelowMemoryMax(t *testing.T) {
+	unit, err := os.ReadFile("../../deploy/systemd/telltale.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`(?m)^Environment=GOMEMLIMIT=(\d+)MiB$`).FindSubmatch(unit)
+	x := regexp.MustCompile(`(?m)^MemoryMax=(\d+)G$`).FindSubmatch(unit)
+	if m == nil || x == nil {
+		t.Fatalf("GOMEMLIMIT %q, MemoryMax %q", m, x)
+	}
+	limit, _ := strconv.Atoi(string(m[1]))
+	most, _ := strconv.Atoi(string(x[1]))
+	if limit <= 0 || limit >= most*1024 || limit < most*1024/2 {
+		t.Errorf("GOMEMLIMIT %d MiB against MemoryMax %d GiB", limit, most)
 	}
 }

@@ -86,8 +86,9 @@ var (
 const (
 	// DefaultMaxCollection is the bound unless the server's configuration
 	// sets another (max_collection_mib). A machine's collection is a few
-	// tens of MiB; one near the bound has been filled on purpose.
-	DefaultMaxCollection int64 = 256 << 20
+	// MiB to a few tens of MiB; decoded it takes several times that in
+	// memory, which is why the default is no higher.
+	DefaultMaxCollection int64 = 64 << 20
 	// MinMaxCollection and MaxMaxCollection are the range the bound can
 	// be set in. The store cannot hold a collection larger than the
 	// upper end.
@@ -121,6 +122,9 @@ var (
 	// errStopped marks a step that ran out of time. Its connection may
 	// have been closed under it.
 	errStopped = errors.New("stopped")
+	// errNoExit: the session ended and no exit status came, which is what
+	// a dropped connection looks like from here.
+	errNoExit = errors.New("the command or the connection ended without an exit status")
 	// errOdd marks machine output a visit will not go on with.
 	errOdd = errors.New("unexpected output")
 	// errTooMuch marks output over its limit.
@@ -340,6 +344,11 @@ func (r *remote) visit(ctx context.Context, input []byte, bins Binaries) (*model
 	err = r.run(ctx, "collect", quote(d+"/telltale")+" collect --context-stdin --gzip", collectTimeout,
 		bytes.NewReader(input), maxOutput, func(rd io.Reader) error { return decodeOutput(rd, &c) })
 	if err != nil {
+		// The machine let the server in and ran the collector; what came
+		// back is its doing, unless the connection broke or time ran out.
+		if ctx.Err() == nil && !errors.Is(err, errSession) && !errors.Is(err, errStopped) && !errors.Is(err, errNoExit) {
+			err = fmt.Errorf("%w: %w", ErrCollectorFailed, err)
+		}
 		return nil, err
 	}
 	// What the collector says it ran from (OwnDir) is compared with this
@@ -646,7 +655,7 @@ func outcome(what string, rerr, werr error, errs *tail) error {
 		}
 		return fmt.Errorf("%s: exit status %d%s", what, exit.ExitStatus(), errs.suffix())
 	case errors.As(werr, &missing):
-		return fmt.Errorf("%s: the command or the connection ended without an exit status%s", what, errs.suffix())
+		return fmt.Errorf("%s: %w%s", what, errNoExit, errs.suffix())
 	case rerr != nil:
 		return fmt.Errorf("%s: %w%s", what, rerr, errs.suffix())
 	case werr != nil:
@@ -666,7 +675,19 @@ func decodeCollection(r io.Reader, c *model.Collection) error {
 	if err != nil {
 		return fmt.Errorf("the output is not gzip: %w", escaped{err})
 	}
-	dec := json.NewDecoder(&capReader{r: zr, max: maxOutput, what: "the decompressed collection"})
+	// Held as text first: its entries are counted before any is decoded
+	// (checkEntries), and it is at most maxOutput bytes.
+	data, err := readBounded(zr, maxOutput, "the decompressed collection")
+	if err != nil {
+		if errors.Is(err, errTooMuch) {
+			return err
+		}
+		return fmt.Errorf("the output is not a collection: %w", escaped{err})
+	}
+	if err := checkEntries(data, maxEntries); err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
 	if err := dec.Decode(c); err != nil {
 		return fmt.Errorf("the output is not a collection: %w", escaped{err})
 	}

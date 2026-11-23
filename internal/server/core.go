@@ -124,17 +124,23 @@ const (
 	KeyHostKeyChanged = "visit.host_key_changed"
 	KeyLeftOnMachine  = "visit.left_on_machine"
 	KeyVisitFailing   = "visit.failing"
+	// KeyVisitOversized: the visits fail because the machine sends a
+	// collection with more entries than any machine has.
+	KeyVisitOversized = "visit.oversized"
 	KeyOwnDirMismatch = "visit.own_dir_mismatch"
 )
 
 // Core is server mode's engine. Set the exported fields, then call Run (the
 // scheduler) and the owner's actions from any goroutine.
 //
-// Memory: each visit can hold up to 256 MiB of collector output (visit's
-// limit, visit.SetMaxCollection) plus the decoded collection, and up to four
-// visits run at once. The shipped systemd unit caps the service at 2 GiB
-// (MemoryMax) and stops it as a whole if the kernel has to kill part of it
-// (OOMPolicy=stop).
+// Memory: each visit can hold up to 64 MiB of collector output (visit's
+// limit, visit.SetMaxCollection) plus the decoded collection, whose entries
+// are counted and capped before any is decoded, and up to four visits run
+// at once. The shipped systemd unit caps the service at 2 GiB (MemoryMax),
+// sets GOMEMLIMIT below that, and stops the service as a whole if the
+// kernel has to kill part of it (OOMPolicy=stop). A visit is counted as
+// failed from its start until it succeeds, so one that kills the server
+// still counts.
 type Core struct {
 	Store *store.Store
 	// Bins supplies the collector binaries copied to machines.
@@ -441,9 +447,26 @@ func (c *Core) digestKey(id int64) ([]byte, error) {
 // the visit claimed it.
 func (c *Core) visit(parent, ctx context.Context, id int64, gen uint64) outcome {
 	m, err := c.Store.Machine(id)
+	// The attempt is counted as a failure before anything is sent to the
+	// machine, and the count is cleared only by a visit that works
+	// (visitSucceeded). A visit that kills the server (a collection that
+	// exhausts its memory) is then still counted: nothing else would
+	// remember it.
+	prev := c.failureCount(id)
 	if err != nil {
+		c.Store.SetSetting(failuresSetting(id), strconv.Itoa(prev+1))
 		return c.visitFailed(id, nil, err)
 	}
+	if told, _ := c.Store.Setting(outageSetting(id)); prev >= failingAfter && told == "" {
+		// Attempts were counted and nothing was ever recorded about them:
+		// the server stopped during each one. Say so before trying again.
+		return c.reportOutage(id, m, prev, causeServerStopped, errors.New("the server stopped during each of the last visits to this machine"))
+	}
+	if err := c.Store.SetSetting(failuresSetting(id), strconv.Itoa(prev+1)); err != nil {
+		return outcome{err: err}
+	}
+	// What is not the machine's failure is not counted.
+	uncount := func() { c.Store.SetSetting(failuresSetting(id), strconv.Itoa(prev)) }
 	c.Store.SetSetting(attemptSetting(id), strconv.FormatInt(c.now().UnixNano(), 10))
 	sc, signer, err := c.scanContext(id)
 	if err != nil {
@@ -454,6 +477,7 @@ func (c *Core) visit(parent, ctx context.Context, id int64, gen uint64) outcome 
 	var left *visit.LeftOnMachineError
 	if verr != nil && errors.As(verr, &left) {
 		if err := c.recordLeftovers(id, left.Dirs); err != nil {
+			uncount()
 			return outcome{err: err}
 		}
 	}
@@ -462,6 +486,7 @@ func (c *Core) visit(parent, ctx context.Context, id int64, gen uint64) outcome 
 		verr = errors.New("the visit returned no collection")
 	case verr == nil:
 	case errors.Is(verr, visit.ErrHostKeyChanged):
+		uncount()
 		return c.hostKeyChanged(m, verr)
 	case left != nil && left.Collection != nil:
 		col, verr = left.Collection, nil
@@ -469,11 +494,25 @@ func (c *Core) visit(parent, ctx context.Context, id int64, gen uint64) outcome 
 	if verr != nil {
 		if parent.Err() != nil {
 			// The server is stopping: not the machine's failure.
+			uncount()
 			return outcome{err: fmt.Errorf("server: visit to machine %d stopped: %w", id, parent.Err())}
 		}
 		return c.visitFailed(id, m, verr)
 	}
-	return c.judgeAndStore(parent, ctx, m, col, sc, gen)
+	out := c.judgeAndStore(parent, ctx, m, col, sc, gen)
+	if out.err != nil && c.failureCount(id) == prev+1 {
+		// The collection arrived; storing or judging it failed here.
+		uncount()
+	}
+	return out
+}
+
+// failureCount is how many visits to the machine in a row did not end in
+// success, the one under way included once it has started.
+func (c *Core) failureCount(id int64) int {
+	v, _ := c.Store.Setting(failuresSetting(id))
+	n, _ := strconv.Atoi(v)
+	return max(n, 0)
 }
 
 // judgeAndStore judges a collection and stores the report: package
@@ -581,21 +620,35 @@ func (c *Core) visitFailed(id int64, m *store.Machine, verr error) outcome {
 	if err := c.Store.SetSecretSetting(errorSetting(id), []byte(boundedText(verr.Error()))); err != nil {
 		return outcome{err: errors.Join(fail, err)}
 	}
-	v, _ := c.Store.Setting(failuresSetting(id))
-	n, _ := strconv.Atoi(v)
-	n++
-	if err := c.Store.SetSetting(failuresSetting(id), strconv.Itoa(n)); err != nil {
-		return outcome{err: errors.Join(fail, err)}
-	}
+	// The attempt was counted when the visit started.
+	n := c.failureCount(id)
 	if err := c.audit(actorServer, "visit failed", "machine %d", id); err != nil {
 		fail = errors.Join(fail, err)
 	}
 	if n < failingAfter {
 		return outcome{err: fail}
 	}
-	f := visitFailing(n, m != nil && m.LastVisit != nil, errors.Is(verr, visit.ErrLoginRefused))
+	return c.outageLocked(id, m, n, causeOf(verr), fail)
+}
+
+// reportOutage is outageLocked for a caller that does not hold the
+// machine's lock.
+func (c *Core) reportOutage(id int64, m *store.Machine, n int, why failureCause, verr error) outcome {
+	unlock := c.lock(id)
+	defer unlock()
+	fail := fmt.Errorf("server: visit to machine %d failed: %w", id, verr)
+	if err := c.Store.SetSecretSetting(errorSetting(id), []byte(boundedText(verr.Error()))); err != nil {
+		return outcome{err: errors.Join(fail, err)}
+	}
+	return c.outageLocked(id, m, n, why, fail)
+}
+
+// outageLocked stores the report about n failed visits in a row, once per
+// outage (again only when the outage turned into a worse kind).
+func (c *Core) outageLocked(id int64, m *store.Machine, n int, why failureCause, fail error) outcome {
+	f := visitFailing(n, m != nil && m.LastVisit != nil, why)
 	told, _ := c.Store.Setting(outageSetting(id))
-	if was, err := strconv.Atoi(told); n != failingAfter && (err != nil || int(f.Severity) <= was) {
+	if was, err := strconv.Atoi(told); err == nil && int(f.Severity) <= was {
 		return outcome{err: fail} // the owner knows about this outage
 	}
 	rep := c.syntheticReport(f)
@@ -655,7 +708,7 @@ func (c *Core) syntheticReport(f model.Finding) *model.Report {
 // nothing.
 func synthetic(r *model.Report) bool {
 	return slices.ContainsFunc(r.Findings, func(f model.Finding) bool {
-		return f.Key == KeyHostKeyChanged || f.Key == KeyVisitFailing
+		return f.Key == KeyHostKeyChanged || f.Key == KeyVisitFailing || f.Key == KeyVisitOversized
 	})
 }
 
@@ -678,19 +731,60 @@ func hostKeyFinding(hk *visit.HostKeyMismatchError) model.Finding {
 	}
 }
 
+// failureCause is why visits to a machine fail, as far as it decides how
+// the outage is ranked.
+type failureCause int
+
+const (
+	// causeUnreachable: the machine is down or out of reach, the
+	// connection breaks, time runs out, or it has no directory the
+	// collector can run from.
+	causeUnreachable failureCause = iota
+	// causeRefused: it shows its pinned host key and rejects the server's
+	// key.
+	causeRefused
+	// causeCollector: it let the server in and the collector then did not
+	// return a usable collection (killed, too much output, not a
+	// collection).
+	causeCollector
+	// causeOversized: the collection holds more entries than any machine
+	// has.
+	causeOversized
+	// causeServerStopped: the server itself stopped during each visit.
+	causeServerStopped
+)
+
+// causeOf sorts a visit's error.
+func causeOf(verr error) failureCause {
+	switch {
+	case errors.Is(verr, visit.ErrLoginRefused):
+		return causeRefused
+	case errors.Is(verr, visit.ErrNoExecDir):
+		return causeUnreachable
+	case errors.Is(verr, visit.ErrOversized):
+		return causeOversized
+	case errors.Is(verr, visit.ErrCollectorFailed):
+		return causeCollector
+	}
+	return causeUnreachable
+}
+
 // visitFailing is the finding for n failed visits in a row. visited says
-// the machine had a visit that worked; refused that it answered with its
-// pinned host key and did not let the server log in.
+// the machine had a visit that worked.
 //
 //   - A machine never visited successfully: a note. Enrolment is not done.
-//   - Visited before, and now it refuses the login: a backdoor sign. The
-//     server's key line or Match block was removed, or its access is gone
-//     some other way, which is what someone who wants to stay unseen does.
-//   - Visited before, and now it cannot be reached or the visit fails some
-//     other way: a weak setting. Nothing on it is being checked.
+//   - Visited before, and now it cannot be reached, the connection breaks or
+//     it has nowhere to run the collector: a weak setting. Nothing on it is
+//     being checked.
+//   - Visited before, and now it refuses the login, or lets the server in
+//     and then returns nothing usable (the collector is killed, sends too
+//     much, sends something that is not a collection or one with more
+//     entries than any machine has), or the server stops during each visit:
+//     a backdoor sign. Each is something whoever controls the machine can
+//     do to stay unseen, and none is quieter than another.
 //
 // Every text here is fixed: nothing from the machine or the error goes in.
-func visitFailing(n int, visited, refused bool) model.Finding {
+func visitFailing(n int, visited bool, why failureCause) model.Finding {
 	f := model.Finding{
 		Key: KeyVisitFailing, ID: "TT-VISIT-002", Source: sourceVisit, Severity: model.SevNote,
 		Title: fmt.Sprintf("The last %d visits to the machine failed", n),
@@ -699,22 +793,51 @@ func visitFailing(n int, visited, refused bool) model.Finding {
 		Fix:      "# Check that the machine is up and reachable from the server, that sshd runs, and that the enrolment snippets are still in place; the machine page shows the last error.",
 		Evidence: []model.Evidence{{After: "failing", Detail: fmt.Sprintf("%d visits in a row failed", n)}},
 	}
-	switch {
-	case !visited:
-	case refused:
-		f.Severity = model.SevBackdoor
+	if why == causeOversized {
+		f.Key, f.ID = KeyVisitOversized, "TT-VISIT-005"
+	}
+	if !visited {
+		return f
+	}
+	const unchecked = " Nothing on the machine has been checked since the last visit that worked."
+	const console = "# Look at the machine from its console, not over the connection the server uses: what runs as root, who changed /root/.ssh/authorized_keys and the SSH server configuration, and when.\n" +
+		"# If you cannot explain it, treat the machine as compromised. The machine page shows the last error."
+	f.Severity = model.SevBackdoor
+	switch why {
+	case causeRefused:
 		f.Title = "The machine no longer lets the telltale server log in"
 		f.Why = "The machine answers with the SSH host key pinned at enrolment and refuses the server's login, after visits that worked. " +
 			"The server's key line in root's authorized_keys or its Match block in the SSH server configuration was removed or changed, or root login was closed some other way. " +
-			"Someone who wants to stay unseen does exactly that. Nothing on the machine has been checked since the last visit that worked."
+			"Someone who wants to stay unseen does exactly that." + unchecked
 		f.Fix = "# On the machine's console, look at /root/.ssh/authorized_keys and the SSH server configuration, and at who changed them and when.\n" +
 			"# If you did not change them, treat the machine as compromised. To let the server in again, put the enrolment snippets back (the machine page shows them) and visit again."
 		f.Evidence = []model.Evidence{{Before: "visits worked", After: "login refused", Detail: fmt.Sprintf("%d visits in a row failed; the machine showed its pinned host key and refused the server's key", n)}}
 		f.Refs = []string{"T1562", "T1098.004"}
+	case causeCollector:
+		f.Title = "The machine lets the telltale server in, but the collector no longer returns a collection"
+		f.Why = "The server logs in as before, and the collector it runs there is then killed, fails, sends more than a collection may hold or sends something that is not one, visit after visit. " +
+			"Whoever controls the machine can do that to keep it from being checked without refusing the login outright." + unchecked
+		f.Fix = console
+		f.Evidence = []model.Evidence{{Before: "visits worked", After: "no usable collection", Detail: fmt.Sprintf("%d visits in a row failed after the login", n)}}
+		f.Refs = []string{"T1562"}
+	case causeOversized:
+		f.Title = "The machine sends a collection with more entries than any machine has"
+		f.Why = "The collector on the machine returned a collection that lists more entries (files, startup files, processes or packages) than the server accepts, visit after visit. " +
+			"The server counts them before it reads any, and refuses. A collection like that is built to exhaust the server's memory, or the machine was filled to the same end." + unchecked
+		f.Fix = console
+		f.Evidence = []model.Evidence{{Before: "visits worked", After: "oversized collection", Detail: fmt.Sprintf("%d visits in a row failed; the collection was refused before it was read", n)}}
+		f.Refs = []string{"T1562", "T1499"}
+	case causeServerStopped:
+		f.Title = "The telltale server stopped during each of its last visits to this machine"
+		f.Why = "The server started a visit to this machine and never finished it, several times in a row: it was killed or restarted while the visit ran, most likely for memory while it read what the machine sent. " +
+			"A machine can cause that on purpose. The server reports it before it visits the machine again; if it keeps happening, set the machine's schedule to manual and look at it from its console." + unchecked
+		f.Fix = "journalctl -u telltale --since -2d | grep -i -E 'oom|killed|memory'   # on the server: see why it stopped\n" + console
+		f.Evidence = []model.Evidence{{Before: "visits worked", After: "server stopped", Detail: fmt.Sprintf("%d visits in a row ended with the server stopping", n)}}
+		f.Refs = []string{"T1499"}
 	default:
 		f.Severity = model.SevWeak
 		f.Title = "The machine can no longer be checked"
-		f.Why = "The machine was visited before and the visits now fail: it is down or out of reach, or the visit breaks off. " +
+		f.Why = "The machine was visited before and the visits now fail: it is down or out of reach, the visit breaks off, or it has no directory the collector may run from. " +
 			"Nothing on it has been checked since the last visit that worked, and a machine nobody is checking is where an intruder would rather be."
 		f.Evidence = []model.Evidence{{Before: "visits worked", After: "failing", Detail: fmt.Sprintf("%d visits in a row failed", n)}}
 	}
@@ -1110,7 +1233,7 @@ func diffAlerts(st alertState, rep *model.Report, urgent, isSynthetic bool) (fre
 		// A machine that was being checked and no longer can be is always
 		// said, whatever the alert level: silence about it would be the
 		// worst gap an alert level could leave.
-		outage := isSynthetic && f.Key == KeyVisitFailing && f.Severity >= model.SevWeak
+		outage := isSynthetic && (f.Key == KeyVisitFailing || f.Key == KeyVisitOversized) && f.Severity >= model.SevWeak
 		if !urgent || f.Severity >= model.SevBackdoor || outage {
 			cur = append(cur, f)
 		}

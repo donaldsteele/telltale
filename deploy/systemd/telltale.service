@@ -46,13 +46,20 @@ ReadWritePaths=/var/lib/telltale
 UMask=0077
 
 # Memory. A visit holds what the machine sent (at most max_collection_mib,
-# 256 MiB by default) and its decoded copy, and four visits run at once.
+# 64 MiB by default) and its decoded copy, which takes several times that,
+# and four visits run at once. The server counts a collection's entries
+# before it decodes any and refuses one with more than any machine has.
 # MemoryMax bounds the whole service, so a machine that sends far too much
-# cannot take this host down with it; raise it together with
-# max_collection_mib. OOMPolicy=stop stops the service as a whole when the
-# kernel kills one of its processes for memory, instead of leaving half of
-# it running; Restart=on-failure then starts it again.
+# cannot take this host down with it. GOMEMLIMIT tells the Go runtime to
+# keep its heap below that (three quarters of it), so it frees memory
+# harder before the kernel has to step in. Raise both together with
+# max_collection_mib, GOMEMLIMIT to about three quarters of MemoryMax.
+# OOMPolicy=stop stops the service as a whole when the kernel kills one of
+# its processes for memory, instead of leaving half of it running;
+# Restart=on-failure then starts it again. A visit under way when that
+# happens stays counted as a failed visit.
 MemoryMax=2G
+Environment=GOMEMLIMIT=1536MiB
 OOMPolicy=stop
 
 # No privileges at all: the web UI listens on an unprivileged port and the

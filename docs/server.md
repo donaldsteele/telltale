@@ -81,7 +81,7 @@ One setting per line, `key = "value"`:
 | `data_dir` | Where the database, the HTTPS certificate and key and the package cache live. Default `/var/lib/telltale`. |
 | `bin_dir` | Where the collectors are. By default they are looked for next to the binary and then in `../lib/telltale` beside it, which is where the package puts them. |
 | `key_file` | An age key file that unlocks the database instead of a passphrase, for restarts with nobody there. See [the passphrase](#the-passphrase-or-a-key-file). |
-| `max_collection_mib` | The most one visit may send, in MiB (the collector's output, and the collection it unpacks to). Default `256`, at least 16 and at most 512. An ordinary machine sends a few tens of MiB; a visit that passes the limit fails. Raise the unit's `MemoryMax` with it (see [the systemd unit](#the-systemd-unit)). |
+| `max_collection_mib` | The most one visit may send, in MiB (the collector's output, and the collection it unpacks to). Default `64`, at least 16 and at most 512. An ordinary machine sends a few MiB to a few tens of MiB; a visit that passes the limit fails. Raise the unit's `MemoryMax` and `GOMEMLIMIT` with it (see [the systemd unit](#the-systemd-unit)). |
 
 ## The passphrase, or a key file
 
@@ -239,8 +239,13 @@ the settings page, so you can audit each machine's
   before, that report is a **backdoor sign** when the machine still answers
   with its pinned host key but refuses the server's login (the server's key
   line or Match block was removed, or its access is gone some other way),
-  and a **weak setting** when the machine cannot be reached or the visit
-  breaks off. Either way an alert is sent, once per outage, whatever the
+  as it is when the machine lets the server in and the collector then
+  returns nothing usable (it is killed, sends too much, sends something
+  that is not a collection, or one with more entries than any machine has),
+  so that no way of blinding the server is quieter than another. It is a
+  **weak setting** when the machine cannot be reached, the connection
+  breaks, or it has no directory the collector may run from. Either way an
+  alert is sent, once per outage, whatever the
   alert level; the next visit that works resolves it. A changed host key is
   reported as tampering at once. A machine that never had a successful
   visit gets a note. A temporary directory a broken connection left behind
@@ -342,14 +347,26 @@ passphrase file, and start it.
   local sockets, a system call filter, and the kernel, clock, devices and
   other processes out of reach;
 - `MemoryMax=2G`: the most memory the service may use. A visit holds what
-  the machine sent (at most `max_collection_mib`, 256 MiB by default) and
-  its decoded copy, and four visits run at once; the limit keeps a machine
-  that sends far too much from taking the server's host down with it. If
-  you raise `max_collection_mib`, raise this too;
+  the machine sent (at most `max_collection_mib`, 64 MiB by default) and
+  its decoded copy, which takes several times that, and four visits run at
+  once; the limit keeps a machine that sends far too much from taking the
+  server's host down with it;
+- `Environment=GOMEMLIMIT=1536MiB`: tells the Go runtime to keep its heap
+  below `MemoryMax` (about three quarters of it), so it frees memory
+  harder before the kernel has to kill anything. If you raise
+  `max_collection_mib`, raise `MemoryMax` and this with it;
 - `OOMPolicy=stop`: when the kernel has to kill one of the service's
   processes for memory, systemd stops the whole service rather than
   leaving part of it running, and `Restart=on-failure` starts it again.
-  The visit that was running fails and is tried at its next turn.
+
+A machine you no longer trust writes its own collection, so the server
+defends itself against one built to exhaust it. It counts the collection's
+entries (files, startup files, processes, packages, lines) on the raw text
+before it decodes any, and refuses one with more than any machine has
+(`visit.oversized`). And every visit is counted as failed from the moment it
+starts until it succeeds: if the server is killed during a visit, three
+times in a row for one machine, it reports that at its next start, before it
+visits that machine again.
 
 To change it, use `sudo systemctl edit telltale` rather than editing the
 file, so a package upgrade keeps your change.

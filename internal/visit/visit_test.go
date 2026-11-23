@@ -1641,7 +1641,7 @@ func TestVisitMarksARefusedLogin(t *testing.T) {
 // One visit may send 256 MiB by default; the server's configuration can set
 // another bound, within what the store can hold.
 func TestMaxCollection(t *testing.T) {
-	if maxOutput != DefaultMaxCollection || DefaultMaxCollection != 256<<20 {
+	if maxOutput != DefaultMaxCollection || DefaultMaxCollection != 64<<20 {
 		t.Fatalf("default bound %d", maxOutput)
 	}
 	old := maxOutput
