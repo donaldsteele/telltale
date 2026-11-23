@@ -3419,3 +3419,55 @@ func TestChangedLinkPastTheInventoryEdge(t *testing.T) {
 		}
 	}
 }
+
+// A setuid or capability file behind a package directory that was moved is
+// not "unowned" when package verification compared it, where it really is,
+// with the signed package and found it the package's own: the moved
+// directory is already reported. The machine's own checksums, which root can
+// edit, prove nothing of the kind, and neither does the absence of a verdict.
+func TestVerifiedFileBehindAMovedDirectoryIsNotUnowned(t *testing.T) {
+	const lit, phys = "/opt/google/chrome/chrome-sandbox", "/data/opt/google/chrome/chrome-sandbox"
+	const capLit, capPhys = "/opt/google/chrome/nethelper", "/data/opt/google/chrome/nethelper"
+	mk := func() *model.Collection {
+		c := clean()
+		helper := file(capPhys, "nethelper", 0o755)
+		helper.Caps = "cap_net_raw=ep"
+		c.Files = append(c.Files, symlinkAt("/opt", "/data/opt", taken), file(phys, "sandbox", 0o4755), helper)
+		c.Packages.Installed = append(c.Packages.Installed, pkg("google-chrome-stable", "131.0-1", "/opt", "/opt/google", "/opt/google/chrome", lit, capLit))
+		return c
+	}
+	signed := func(src string) *pkgverify.Result {
+		a, b := verdict(phys, "google-chrome-stable", "131.0-1", "sandbox"), verdict(capPhys, "google-chrome-stable", "131.0-1", "nethelper")
+		a.Source, b.Source = src, src
+		res := archive(a, b)
+		if src == pkgverify.SourceOfflineLocal {
+			res.Mode = pkgverify.ModeOfflineLocal
+		}
+		return res
+	}
+	for _, src := range []string{pkgverify.SourceArchive, pkgverify.SourceRefs, pkgverify.SourceSnapshot} {
+		r := run(mk(), nil, signed(src))
+		absent(t, r, "heur.unowned_setuid:"+phys)
+		absent(t, r, "heur.unowned_caps:"+capPhys)
+		must(t, r, "pkg.dir_now_link:/opt", model.SevNote)
+	}
+	// Only the machine's own checksums say so.
+	r := run(mk(), nil, signed(pkgverify.SourceOfflineLocal))
+	must(t, r, "heur.unowned_setuid:"+phys, model.SevBackdoor)
+	must(t, r, "heur.unowned_caps:"+capPhys, model.SevBackdoor)
+	// Nothing says so.
+	r = run(mk(), nil, archive())
+	must(t, r, "heur.unowned_setuid:"+phys, model.SevBackdoor)
+	must(t, r, "heur.unowned_caps:"+capPhys, model.SevBackdoor)
+	// The verdict is about another content than the file has now.
+	stale := signed(pkgverify.SourceArchive)
+	stale.Verified[0].Actual, stale.Verified[0].Expected = h("older"), h("older")
+	must(t, run(mk(), nil, stale), "heur.unowned_setuid:"+phys, model.SevBackdoor)
+	// A verified file that is not behind any package path stays unowned: a
+	// verdict alone is not what clears it.
+	c := mk()
+	c.Files = append(c.Files, file("/srv/x/sandbox", "sandbox", 0o4755))
+	res := signed(pkgverify.SourceArchive)
+	res.Verified = append(res.Verified, verdict("/srv/x/sandbox", "google-chrome-stable", "131.0-1", "sandbox"))
+	must(t, run(c, nil, res), "heur.unowned_setuid:/srv/x/sandbox", model.SevBackdoor)
+}

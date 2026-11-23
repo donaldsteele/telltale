@@ -298,12 +298,46 @@ func (j *judge) heuristics() {
 		if strings.HasPrefix(f.Key, "heur.crossview:") {
 			f.Source = srcCrossview
 		}
+		if p, ok := unownedPrivileged(f.Key); ok && j.verifiedBehindMovedDir(p) {
+			continue
+		}
 		f := f
 		if strings.HasPrefix(f.Key, "heur.persist_link_pkg:") {
 			j.rankPackageLink(&f)
 		}
 		j.add(&f)
 	}
+}
+
+// unownedPrivileged returns the path of an "unowned setuid" or "unowned
+// capability" heuristic finding.
+func unownedPrivileged(key string) (string, bool) {
+	for _, pre := range []string{"heur.unowned_setuid:", "heur.unowned_caps:"} {
+		if p, ok := strings.CutPrefix(key, pre); ok {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+// verifiedBehindMovedDir reports whether the file at p is a package's file
+// that lies behind a directory of the package which is now a link (dpkg
+// lists it under another spelling), and package verification compared it,
+// where it is, with that package from a signed source and found it the
+// package's own, as the file is now. Such a file is not "owned by no
+// package": the moved directory is reported by itself (pkg.dir_now_link),
+// and a privilege the package does not give would have been a mismatch.
+// The machine's own checksums, which root can edit, never count, and
+// neither does a file with no verdict.
+func (j *judge) verifiedBehindMovedDir(p string) bool {
+	if j.literal[p] == "" {
+		return false
+	}
+	v, ok := j.verified[p]
+	if !ok || v.Source == "" || v.Source == pkgverify.SourceOfflineLocal || v.Package != j.physOwned[p] {
+		return false
+	}
+	return j.verifiedNow(v, j.files[p])
 }
 
 // accountAnomalies flags what the collector found in the account databases
