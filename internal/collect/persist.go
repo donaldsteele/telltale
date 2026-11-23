@@ -89,6 +89,9 @@ type collector struct {
 	out   []model.PersistFile
 	skips []model.Skip
 	seen  map[string]bool
+	// user is set while a user's own paths are read: the account they
+	// belong to.
+	user *model.User
 }
 
 func (c *collector) skip(mp, reason string) {
@@ -113,8 +116,22 @@ func (c *collector) file(mp, kind string) {
 	if c.seen[kind+"\x00"+mp] {
 		return
 	}
-	var lst unix.Stat_t
-	if err := unix.Lstat(filepath.Join(c.root, mp), &lst); err != nil {
+	pl, err := walkTo(c.root, mp, 0)
+	if err != nil {
+		switch {
+		case errors.Is(err, errUserLink):
+			// Not followed, but not lost either: the link is recorded, so
+			// it is seen and compared like any link at a persistence path.
+			c.skip(mp, skipUserLinkPath)
+			c.refusedLink(pl.link, kind)
+		case !isNotExist(err) && !errors.Is(err, unix.ENOTDIR):
+			c.skip(mp, err.Error())
+		}
+		return
+	}
+	defer pl.close()
+	lst, err := pl.lstat()
+	if err != nil {
 		if !errors.Is(err, unix.ENOENT) && !errors.Is(err, unix.ENOTDIR) {
 			c.skip(mp, err.Error())
 		}
@@ -122,10 +139,10 @@ func (c *collector) file(mp, kind string) {
 	}
 	if lst.Mode&unix.S_IFMT == unix.S_IFLNK {
 		c.seen[kind+"\x00"+mp] = true
-		c.link(mp, kind, lst, true)
+		c.link(pl, mp, kind, lst, true)
 		return
 	}
-	f, st, err := openRegular(c.root, mp)
+	f, st, err := pl.open()
 	if err != nil {
 		if !isNotExist(err) && !errors.Is(err, unix.ENOTDIR) {
 			c.skip(mp, err.Error())
@@ -137,6 +154,14 @@ func (c *collector) file(mp, kind string) {
 
 	pf := model.PersistFile{Path: mp, Kind: kind}
 	c.meta(st, &pf)
+	// A second name for a file of another account that not everyone may
+	// read (ln /etc/shadow ~/.bashrc, where the kernel still allows it):
+	// the user chose what is read here.
+	if c.user != nil && st.Nlink > 1 && st.Mode&0o004 == 0 && int64(ownerOf(&st)) != int64(c.user.UID) {
+		c.skip(mp, skipHardLink)
+		c.out = append(c.out, pf)
+		return
+	}
 	if st.Size > maxHashBytes {
 		c.skip(mp, fmt.Sprintf("larger than %d bytes: metadata only, not read", maxHashBytes))
 		c.out = append(c.out, pf)
@@ -177,13 +202,34 @@ func (c *collector) redactLines(b []byte, pf *model.PersistFile) []string {
 }
 
 // secretTarget reports whether a symlink target must never have its content
-// kept.
+// kept: the password files' hashes, the backups the account tools and
+// editors leave of them and of passwd and group, and the SSH host keys.
 func secretTarget(tp string) bool {
 	switch tp {
 	case "/etc/shadow", "/etc/gshadow", "/etc/security/opasswd":
 		return true
 	}
+	if name, ok := strings.CutPrefix(tp, "/etc/"); ok {
+		for _, base := range []string{"passwd", "shadow", "gshadow", "group"} {
+			for _, suffix := range []string{"-", "~", ".bak", ".old"} {
+				if name == base+suffix {
+					return true
+				}
+			}
+		}
+	}
 	return strings.HasPrefix(tp, "/etc/ssh/") && strings.HasSuffix(tp, "_key")
+}
+
+// hasPrivateKey reports whether any line of the text starts a PEM private
+// key block.
+func hasPrivateKey(b []byte) bool {
+	for _, l := range strings.Split(string(b), "\n") {
+		if l = strings.TrimLeft(l, " \t\ufeff"); strings.HasPrefix(l, "-----BEGIN") && strings.Contains(l, "PRIVATE KEY") {
+			return true
+		}
+	}
+	return false
 }
 
 // linkTarget resolves a symlink's target text to a machine path.
@@ -194,12 +240,18 @@ func linkTarget(mp, target string) string {
 	return path.Join(path.Dir(mp), target)
 }
 
-// link records the symlink at mp. Lines[0] is the redacted target text. When
-// readContent is set and the target resolves to a regular file, its redacted
-// lines follow and SHA256 is the hash of the target's raw bytes; otherwise
-// SHA256 is the hash of the target text.
-func (c *collector) link(mp, kind string, lst unix.Stat_t, readContent bool) {
-	target, err := os.Readlink(filepath.Join(c.root, mp))
+// link records the symlink at mp, which is the name in pl. Lines[0] is the
+// redacted target text. When readContent is set and the target resolves to
+// a regular file whose content may be kept, its redacted lines follow and
+// SHA256 is the hash of the target's raw bytes; otherwise SHA256 is the hash
+// of the target text.
+//
+// The content is not kept, and a Skip with a fixed reason says so, when the
+// target is a secret file by name or holds a private key, lies on a kernel
+// filesystem or behind a link a non-root account owns, or is a file the
+// link's owner could not read (see safeopen.go).
+func (c *collector) link(pl place, mp, kind string, lst unix.Stat_t, readContent bool) {
+	target, err := pl.readlink()
 	if err != nil {
 		c.skip(mp, err.Error())
 		return
@@ -212,12 +264,34 @@ func (c *collector) link(mp, kind string, lst unix.Stat_t, readContent bool) {
 	if !readContent {
 		return
 	}
-	tp := linkTarget(mp, target)
-	if secretTarget(tp) {
-		c.skip(mp, "target is a secret file, content not kept")
+	if secretTarget(linkTarget(mp, target)) {
+		c.skip(mp, skipSecretTarget)
 		return
 	}
-	f, st, err := openRegular(c.root, tp)
+	// Walked from the directory the link is really in, through the target
+	// as written, so that ".." and every link on the way mean what they
+	// mean to the kernel.
+	owner := ownerOf(&lst)
+	from := target
+	if !path.IsAbs(target) {
+		from = pl.real + "/" + target
+	}
+	tpl, err := walkTo(c.root, from, owner)
+	if err != nil {
+		switch {
+		case errors.Is(err, errUserLink):
+			c.skip(mp, skipUserLinkTarget)
+		case errors.Is(err, errKernelFS):
+			c.skip(mp, "target: "+err.Error())
+		}
+		return // dangling: target text only
+	}
+	defer tpl.close()
+	if secretTarget(tpl.path()) {
+		c.skip(mp, skipSecretTarget)
+		return
+	}
+	f, st, err := tpl.open()
 	if err != nil {
 		if errors.Is(err, errKernelFS) {
 			c.skip(mp, "target: "+err.Error())
@@ -225,6 +299,11 @@ func (c *collector) link(mp, kind string, lst unix.Stat_t, readContent bool) {
 		return // dangling, device, FIFO or another symlink: target text only
 	}
 	defer f.Close()
+	// Decided on the opened file, so it cannot be swapped afterwards.
+	if !trustedOwner(owner) && !readableBy(owner, &st, tpl.shut) {
+		c.skip(mp, skipUnreadable)
+		return
+	}
 	if st.Size > maxPersistBytes {
 		c.skip(mp, fmt.Sprintf("target larger than %d bytes: content not kept", maxPersistBytes))
 		return
@@ -233,8 +312,8 @@ func (c *collector) link(mp, kind string, lst unix.Stat_t, readContent bool) {
 	if err != nil || len(buf) > maxPersistBytes {
 		return
 	}
-	if first, _, _ := strings.Cut(string(buf), "\n"); strings.HasPrefix(first, "-----BEGIN") && strings.Contains(first, "PRIVATE KEY") {
-		c.skip(mp, "target is a secret file, content not kept")
+	if hasPrivateKey(buf) {
+		c.skip(mp, skipSecretTarget)
 		return
 	}
 	raw := sha256.Sum256(buf)
@@ -262,11 +341,25 @@ func (c *collector) dir(dir, kind string) {
 // enabledLink records a systemd *.wants/*.requires/*.upholds link: the
 // target text is the only line.
 func (c *collector) enabledLink(mp string) {
-	var st unix.Stat_t
-	if err := unix.Lstat(filepath.Join(c.root, mp), &st); err != nil {
+	c.refusedLink(mp, model.PersistKindSystemdEnabled)
+}
+
+// refusedLink records the symbolic link at mp by its target text alone.
+func (c *collector) refusedLink(mp, kind string) {
+	if mp == "" || c.seen[kind+"\x00"+mp] {
 		return
 	}
-	c.link(mp, model.PersistKindSystemdEnabled, st, false)
+	pl, err := walkTo(c.root, mp, 0)
+	if err != nil {
+		return
+	}
+	defer pl.close()
+	st, err := pl.lstat()
+	if err != nil || st.Mode&unix.S_IFMT != unix.S_IFLNK {
+		return
+	}
+	c.seen[kind+"\x00"+mp] = true
+	c.link(pl, mp, kind, st, false)
 }
 
 func isUnitName(n string) bool {
@@ -361,6 +454,7 @@ func Persistence(root string, users []model.User, key []byte) ([]model.PersistFi
 		if u.Home == "" || !path.IsAbs(home) {
 			continue
 		}
+		c.user = &u
 		for _, n := range []string{".bashrc", ".profile", ".bash_profile", ".bash_login", ".zshrc"} {
 			c.file(path.Join(home, n), model.PersistKindShellRC)
 		}
@@ -369,6 +463,7 @@ func Persistence(root string, users []model.User, key []byte) ([]model.PersistFi
 		for _, pat := range akf {
 			c.file(expandAKF(pat, home, u.Name), model.PersistKindAuthorizedKeys)
 		}
+		c.user = nil
 	}
 
 	sort.Slice(c.out, func(i, j int) bool {

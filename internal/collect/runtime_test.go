@@ -468,8 +468,21 @@ func TestPersistenceLinkIntoKernelFSIsNotRead(t *testing.T) {
 	os.MkdirAll(filepath.Join(root, "etc/cron.daily"), 0o755)
 	os.WriteFile(filepath.Join(root, "kmsg"), []byte("secret kernel log\n"), 0o644)
 	os.Symlink("/kmsg", filepath.Join(root, "etc/cron.daily/x"))
+	// Only the target is on the stand-in procfs: the directories on the way
+	// to the link are ordinary ones.
+	var target unix.Stat_t
+	if err := unix.Stat(filepath.Join(root, "kmsg"), &target); err != nil {
+		t.Fatal(err)
+	}
 	old := fstatfsFn
-	fstatfsFn = func(fd int, st *unix.Statfs_t) error { st.Type = unix.PROC_SUPER_MAGIC; return nil }
+	fstatfsFn = func(fd int, st *unix.Statfs_t) error {
+		var fst unix.Stat_t
+		if err := unix.Fstat(fd, &fst); err == nil && fst.Ino == target.Ino && fst.Dev == target.Dev {
+			st.Type = unix.PROC_SUPER_MAGIC
+			return nil
+		}
+		return old(fd, st)
+	}
 	t.Cleanup(func() { fstatfsFn = old })
 	pf, skips := Persistence(root, nil, testKey)
 	for _, p := range pf {

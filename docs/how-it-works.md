@@ -64,6 +64,16 @@ built around that.
   keeps from startup files, secrets (`Environment=` values, exported
   tokens, `password=...`, the password in a URL) are replaced by keyed
   digests. Reports and alerts carry only redacted lines.
+- **A user's link cannot aim the scan at root's files.** The scan runs as
+  root and reads startup files that ordinary users own (shell start-up
+  files, systemd user units). Where one of those is a symbolic link, the
+  text behind it is kept only when the link's owner could have read it
+  anyway: root owns the link, or the link's owner owns the target, or
+  everyone may read it. A link on the way that a non-root account owns is
+  not followed, nothing is read through `/proc`, and the password files,
+  their backups and anything holding a private key are never kept. The
+  link itself is still recorded and reported, with a note that its content
+  was not read.
 
 What no on-machine check can rule out is a **kernel-level rootkit**: code in
 the kernel can hide anything from anything that runs on top of it, telltale
