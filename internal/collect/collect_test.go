@@ -29,6 +29,12 @@ func TestCollectAsNonRootListsSkips(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("running as root")
 	}
+	// This walks the live system. On a build machine with many gigabytes
+	// of toolchains, hashing every file and sweeping every disk takes far
+	// longer than the test needs: it only checks which checks are skipped.
+	hash, total, first := defaultMaxHash, sweepMaxEntries, sweepFirstBudget
+	defaultMaxHash, sweepMaxEntries, sweepFirstBudget = 1, 20_000, 2_000
+	t.Cleanup(func() { defaultMaxHash, sweepMaxEntries, sweepFirstBudget = hash, total, first })
 	c, err := All(Options{Root: "/", ProcRoot: "/proc", SysRoot: "/sys"})
 	if err != nil {
 		t.Fatal(err)

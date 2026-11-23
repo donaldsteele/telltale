@@ -11,8 +11,9 @@ import (
 	"github.com/donaldsteele/telltale/internal/model"
 )
 
-// defaultMaxHash is the largest file All will hash (2 GiB).
-const defaultMaxHash = 2 << 30
+// defaultMaxHash is the largest file All will hash (2 GiB). It is a
+// variable only so a test of the live system can keep its run short.
+var defaultMaxHash int64 = 2 << 30
 
 // Options tunes a collection run.
 type Options struct {
