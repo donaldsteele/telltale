@@ -184,8 +184,12 @@ kill -HUP "$(pgrep -o -x sshd)"`, "enrol", authorizedKeys, match)
 			t.Errorf("the collector's own process is in the collection: pid %d %s", p.PID, p.Exe)
 		}
 	}
-	// Nor its directory: under /root it would be in the file inventory,
-	// with a new name on every visit.
+	// It checked the directory the visit made as its own and left out its
+	// binary there, and the directory's own entry, which under /root would
+	// be in the file inventory with a new name on every visit.
+	if c.OwnDir == "" || c.OwnDir != c.VisitDir {
+		t.Errorf("the collector left its binary out in %q; the visit made %q", c.OwnDir, c.VisitDir)
+	}
 	for _, f := range c.Files {
 		if tempDirRE.MatchString(f.Path + "/") {
 			t.Errorf("the collector's own directory is in the collection: %s", f.Path)

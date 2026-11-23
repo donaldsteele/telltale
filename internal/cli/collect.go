@@ -64,10 +64,12 @@ func runCollect(ctx *Context) int {
 		}
 		opt.DigestKey = sc.DigestKey
 		// A server visit runs the collector from a temporary directory it
-		// made for it, which is not part of the machine.
+		// made for it. When that directory checks out as the collector's
+		// own (root's, 0700, holding only the running binary), the binary
+		// is left out of the inventory; anything else there is not.
 		if exe, err := os.Executable(); err == nil && filepath.Clean(*root) == "/" {
 			if d, ok := visitDir(exe); ok {
-				opt.OwnDir = d
+				opt.Self, _ = collect.FindSelf(d, "/proc/self/exe", 0)
 			}
 		}
 	}

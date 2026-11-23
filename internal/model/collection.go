@@ -45,6 +45,16 @@ type Collection struct {
 	// links and found absent. A path the inventory merely lacks may exist
 	// where the scan does not record; one listed here does not exist.
 	LinkMissing []string `json:"link_missing,omitempty"`
+	// OwnDir is the directory a server visit ran the collector from, when
+	// the collector checked it was its own (a root-owned 0700 directory
+	// holding nothing but the running binary) and so left that one binary
+	// out of the file inventory. Everything else in it was walked. The
+	// server compares it with the directory it made.
+	OwnDir string `json:"own_dir,omitempty"`
+	// VisitDir is the directory the server's visit made for the collector.
+	// The visit sets it after reading the collection; it is never read
+	// from a machine and never stored.
+	VisitDir string `json:"-"`
 }
 
 // Host identifies the machine a collection came from.

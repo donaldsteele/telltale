@@ -548,6 +548,11 @@ func TestVisitFallsBackToNextExecDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Visit: %v", err)
 	}
+	// The visit says which directory it made for the collector.
+	if !IsTempDir(c.VisitDir) || !strings.HasPrefix(c.VisitDir, "/root/telltale.") {
+		t.Errorf("VisitDir = %q, want the /root directory the collector ran from", c.VisitDir)
+	}
+	c.VisitDir = ""
 	if !reflect.DeepEqual(c, f.collection) {
 		t.Errorf("collection = %+v, want %+v", c, f.collection)
 	}
@@ -1168,6 +1173,9 @@ func TestVisitKeepsTheCollectionWhenCleanupFails(t *testing.T) {
 	var lom *LeftOnMachineError
 	if !errors.As(err, &lom) {
 		t.Fatalf("err = %v, want a *LeftOnMachineError", err)
+	}
+	if lom.Collection != nil {
+		lom.Collection.VisitDir = ""
 	}
 	if !reflect.DeepEqual(lom.Collection, f.collection) {
 		t.Errorf("collection in the error = %+v, want %+v", lom.Collection, f.collection)

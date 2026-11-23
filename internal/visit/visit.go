@@ -318,6 +318,9 @@ func (r *remote) visit(ctx context.Context, input []byte, bins Binaries) (*model
 	if err != nil {
 		return nil, err
 	}
+	// What the collector says it ran from (OwnDir) is compared with this
+	// on the server.
+	c.VisitDir = d
 	return &c, nil
 }
 

@@ -1298,3 +1298,33 @@ func (s *syncBuffer) String() string {
 	defer s.mu.Unlock()
 	return s.b.String()
 }
+
+// The collector says which directory it left its own binary out of; one
+// that is not the directory the visit made is a note. The same directory,
+// or none (nothing was left out), is not.
+func TestOwnDirMismatchIsANote(t *testing.T) {
+	fx := newFixture(t)
+	made := "/root/telltale.AbCd1234"
+	said := made
+	fx.vis.collect = func(store.Machine, int) (*model.Collection, error) {
+		c := base()
+		c.OwnDir, c.VisitDir = said, made
+		return c, nil
+	}
+	if _, r := fx.visitOK(t, fx.id); find(r, KeyOwnDirMismatch) != nil {
+		t.Errorf("a note for the directory the visit made: %v", keysOf(r.Findings))
+	}
+	said = "/tmp/telltale.EfGh5678\x1b[2J"
+	_, r := fx.visitOK(t, fx.id)
+	f := find(r, KeyOwnDirMismatch)
+	if f == nil || f.Severity != model.SevNote || f.ID != "TT-VISIT-004" {
+		t.Fatalf("no note for another directory: %v", keysOf(r.Findings))
+	}
+	if ev := f.Evidence[0]; ev.Before != made || !strings.HasPrefix(ev.After, "/tmp/telltale.EfGh5678") || strings.Contains(ev.After, "\x1b") {
+		t.Errorf("evidence %+v", ev)
+	}
+	said = ""
+	if _, r := fx.visitOK(t, fx.id); find(r, KeyOwnDirMismatch) != nil {
+		t.Errorf("a note when the collector left nothing out: %v", keysOf(r.Findings))
+	}
+}

@@ -20,13 +20,12 @@ type Options struct {
 	DigestKey               []byte // empty: a random key is generated for this run
 	CrossView               bool
 	Now                     func() time.Time
-	// OwnDir is the directory the collector itself runs from when a
-	// server visit put it there: a temporary directory the visit made and
-	// removes again. It is left out of the file inventory with all it
-	// holds, as the collector leaves its own process out of the process
-	// list: it is telltale, not the machine. A machine path; "" leaves
-	// nothing out.
-	OwnDir string
+	// Self is the collector's own binary in the temporary directory a
+	// server visit made for it (FindSelf). The file inventory leaves out
+	// that one file, as the collector leaves its own process out of the
+	// process list: it is telltale, not the machine. Everything else in
+	// the directory is walked. The zero value leaves nothing out.
+	Self Self
 }
 
 // All runs every collector and assembles a Collection.
@@ -72,7 +71,8 @@ func All(opt Options) (*model.Collection, error) {
 	// crossing into network and proc mounts.
 	c.Runtime, c.Sysctl, s = Runtime(opt.ProcRoot, opt.SysRoot, opt.Root)
 	add(s)
-	c.Files, s = Files(opt.Root, SystemPaths, FileOptions{MaxHashBytes: defaultMaxHash, Mounts: c.Runtime.Mounts, Exclude: opt.OwnDir})
+	c.Files, s = Files(opt.Root, SystemPaths, FileOptions{MaxHashBytes: defaultMaxHash, Mounts: c.Runtime.Mounts, Self: opt.Self})
+	c.OwnDir = opt.Self.Dir
 	add(s)
 	// Setuid, setgid and capability files on every local filesystem, outside
 	// the system paths too. Before ensureEntries so that a swept file is a

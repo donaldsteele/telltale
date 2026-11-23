@@ -123,6 +123,7 @@ const (
 	KeyHostKeyChanged = "visit.host_key_changed"
 	KeyLeftOnMachine  = "visit.left_on_machine"
 	KeyVisitFailing   = "visit.failing"
+	KeyOwnDirMismatch = "visit.own_dir_mismatch"
 )
 
 // Core is server mode's engine. Set the exported fields, then call Run (the
@@ -507,6 +508,9 @@ func (c *Core) judgeAndStore(parent, ctx context.Context, m *store.Machine, col 
 	} else if len(left) > 0 {
 		judge.AddFindings(rep, leftOnMachine(left))
 	}
+	if f, ok := ownDirMismatch(col); ok {
+		judge.AddFindings(rep, f)
+	}
 	rid, err := c.Store.PutReport(m.ID, rep, col)
 	if err != nil {
 		return outcome{err: err}
@@ -676,6 +680,28 @@ func leftOnMachine(dirs []string) model.Finding {
 	}
 	f.Fix = "rm -rf -- " + strings.Join(quoted, " ")
 	return f
+}
+
+// ownDirMismatch is the note for a collector that left its own binary out
+// of the inventory in a directory other than the one the visit made for it
+// (col.OwnDir against col.VisitDir): it ran from somewhere the server did
+// not put it, so what it left out is not what the server expects.
+func ownDirMismatch(col *model.Collection) (model.Finding, bool) {
+	if col.OwnDir == "" || col.OwnDir == col.VisitDir {
+		return model.Finding{}, false
+	}
+	made, said := escape.Terminal(col.VisitDir), escape.Terminal(col.OwnDir)
+	if made == "" {
+		made = "(none)"
+	}
+	return model.Finding{
+		Key: KeyOwnDirMismatch, ID: "TT-VISIT-004", Source: sourceVisit, Severity: model.SevNote,
+		Title: "The collector ran from another directory than the one the visit made for it",
+		Why: "The server copies the collector into a new directory of its own and runs it there; the collector leaves only that binary out of what it records. " +
+			"This collector said it ran from another directory, so the file it left out may not be telltale's. Something on the machine may be steering where the visit's files go.",
+		Fix:      "# Look at the directory the collector named on the machine, and at what mktemp and the shell resolve /run, /var/tmp, /root and /tmp to for root.",
+		Evidence: []model.Evidence{{Before: made, After: said, Detail: "the directory the visit made (before), the one the collector ran from (after)"}},
+	}, true
 }
 
 // boundedText is s escaped for display and cut to maxErrorText bytes.
