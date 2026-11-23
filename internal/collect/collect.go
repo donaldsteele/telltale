@@ -82,13 +82,14 @@ func All(opt Options) (*model.Collection, error) {
 	c.Files, s = ensureEntriesIn(opt.Root, c.Files, linkTargets(c.Persist), c.Runtime.Mounts, defaultMaxHash, underNeverRead, linkSkipFS)
 	add(s)
 	// Every directory and link the kernel passes through on the way to a
-	// startup link's target, so that links can be resolved as the kernel
-	// resolves them. These exist and are not in refused places, so recording
-	// them adds entries and no skips of its own.
-	chain, refused, s := linkChains(opt.Root, c.Persist, SystemPaths, func(p string) bool { return RefusedForLinks(p, c.Runtime.Mounts) })
-	c.LinkRefused = refused
-	add(s)
-	c.Files, s = ensureEntriesIn(opt.Root, c.Files, chain, c.Runtime.Mounts, defaultMaxHash, underNeverRead, linkSkipFS)
+	// startup link's target, and to the target of any link of the inventory
+	// that leads out of what the file scan recorded, so that links can be
+	// resolved as the kernel resolves them. These exist and are not in
+	// refused places, so recording them adds entries and no skips of its own.
+	links := followLinks(opt.Root, c.Persist, c.Files, SystemPaths, func(p string) bool { return RefusedForLinks(p, c.Runtime.Mounts) }, linkChainBudget)
+	c.LinkRefused, c.LinkMissing = links.refused, links.missing
+	add(links.skips)
+	c.Files, s = ensureEntriesIn(opt.Root, c.Files, links.chain, c.Runtime.Mounts, defaultMaxHash, underNeverRead, linkSkipFS)
 	add(s)
 	// Modules the PAM configuration loads from outside the system paths.
 	c.Files, s = ensurePAMEntries(opt.Root, c.Files, c.Runtime.Mounts, c.Persist, defaultMaxHash)

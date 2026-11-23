@@ -2,6 +2,7 @@ package judge
 
 import (
 	"fmt"
+	"path"
 	"slices"
 	"strings"
 	"time"
@@ -269,27 +270,46 @@ var systemDirs = []string{"/usr", "/lib", "/lib32", "/lib64", "/libx32", "/bin",
 // was pointed somewhere new, out of the system directories. The target is
 // where the kernel ends up, not what the link's text cleans to: every link on
 // the way is followed in the inventory and ".." is applied to the directory
-// really reached. Beyond what the inventory records the rest of the path is
-// taken as written, unless it climbs with ".." or cannot be followed at all
-// (a loop, a file in the middle): then nothing is known about where the link
-// leads, and that is the reason.
+// really reached.
+//
+// The collector follows every link of the inventory that leads out of what
+// the file scan recorded, so on a machine it could look at, the walk ends at
+// the target or at a name it found absent (Collection.LinkMissing); beyond
+// an absent name nothing exists, and the rest of the path is where the file
+// would be. A walk that stops anywhere else stops at something that was not
+// looked at (a mount the collector stays out of, a link past the work
+// budget, a collection that carries no such record). The rest of the path is
+// then only text: it is still checked for temporary and hidden places, and a
+// path that reads as a system directory from there on is reported as leading
+// nobody knows where, because /run/systemd/q/x is a system path only if q is
+// not a link. A path that climbs with "..", a loop and a file in the middle
+// of a path are reported the same way.
 func (j *judge) badLink(p string, old, cur *model.FileEntry) string {
 	if cur == nil || cur.Type != "symlink" {
 		return ""
 	}
-	t, ok := model.ResolveToInventoryEdge(j.files, model.LinkWalk(p, cur.Target), model.LinkHops)
-	if !ok {
-		return "where it leads cannot be told: its path climbs out of what telltale recorded, or cannot be followed"
-	}
-	for _, d := range []string{"/tmp", "/dev/shm", "/var/tmp"} {
-		if t == d || strings.HasPrefix(t, d+"/") {
-			return "it points into " + d
+	const unknown = "where it leads cannot be told: "
+	reached, rest, end := model.WalkInventory(j.files, model.LinkWalk(p, cur.Target), model.LinkHops)
+	t, textOnly := reached, false
+	switch end {
+	case model.WalkDone:
+	case model.WalkMissing:
+		if slices.Contains(rest, "..") {
+			return unknown + "its path climbs out of what telltale recorded"
 		}
+		t = path.Join(append([]string{reached}, rest...)...)
+		textOnly = !slices.Contains(j.c.LinkMissing, path.Join(reached, rest[0]))
+	default:
+		return unknown + "its path climbs out of what telltale recorded, or cannot be followed"
 	}
-	for _, comp := range strings.Split(t, "/") {
-		if strings.HasPrefix(comp, ".") {
-			return "it points into a hidden directory"
-		}
+	if d := underTemp(t); d != "" {
+		return "it points into " + d
+	}
+	if hiddenPath(t) {
+		return "it points into a hidden directory"
+	}
+	if textOnly && slices.ContainsFunc(append([]string{"/run"}, systemDirs...), func(d string) bool { return t == d || strings.HasPrefix(t, d+"/") }) {
+		return unknown + "telltale could not look at " + path.Join(reached, rest[0]) + ", and what the path passes through from there on may be a link to anywhere"
 	}
 	// /etc/mtab is a link to the kernel's own mount table on every current
 	// system; packages re-point it between the two spellings of that file.
@@ -316,7 +336,7 @@ func (j *judge) linkStaysWithPackages(p string, cur *model.FileEntry, owner stri
 	if !ok {
 		return false
 	}
-	to := j.owned[t]
+	to := j.physOwned[t]
 	return to != "" && (to == owner || j.pkgChanged(to))
 }
 
@@ -862,7 +882,7 @@ func (j *judge) persistOfPackageChange(p string, cur, old *model.PersistFile) (s
 		if cur.Kind == model.PersistKindSystemdEnabled && len(cur.Lines) > 0 {
 			// The unit the link really enables, not the one its text names.
 			if t, ok := heuristics.LinkFile(j.files, *cur); ok {
-				if name := j.owned[t]; name != "" && j.pkgChange[name].Kind == diff.PkgInstalled {
+				if name := j.physOwned[t]; name != "" && j.pkgChange[name].Kind == diff.PkgInstalled {
 					return name, model.SevBackdoor // it also raises the package
 				}
 			}

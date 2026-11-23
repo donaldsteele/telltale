@@ -2,6 +2,7 @@ package judge
 
 import (
 	"fmt"
+	"path"
 	"slices"
 	"sort"
 	"strings"
@@ -454,4 +455,115 @@ func indexSignature(errs []string) *model.Finding {
 		f.Evidence = append(f.Evidence, model.Evidence{Detail: e})
 	}
 	return f
+}
+
+// mergedTop are the top-level directories that are links into /usr on a
+// merged-/usr machine. Packages still list paths below them.
+var mergedTop = []string{"/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32"}
+
+// packageDirLinks reports each directory dpkg lists that is a symbolic link
+// now. dpkg unpacks a package into real directories; a link in the place of
+// one means every file the package lists below it is really somewhere else.
+// An admin moving /opt to another disk does that, and so does someone who
+// wants a package's names to cover other files. The files reached are
+// compared with the package by package verification; this finding says that
+// the directory itself is not what the package installed. A link that leads
+// to an ordinary place on the machine is a note; one that leads into a
+// temporary or hidden place, or nowhere the inventory can follow, is a
+// backdoor sign. The links merged /usr consists of are left out.
+func (j *judge) packageDirLinks() {
+	lister := map[string]string{} // listed directory -> the first package listing something below it
+	for i := range j.c.Packages.Installed {
+		p := &j.c.Packages.Installed[i]
+		for _, f := range p.Files {
+			if !path.IsAbs(f) {
+				continue
+			}
+			for d := path.Dir(path.Clean(f)); d != "/"; d = path.Dir(d) {
+				if _, seen := lister[d]; seen {
+					break // its parents were entered with it
+				}
+				lister[d] = p.Name
+			}
+		}
+	}
+	dirs := make([]string, 0, len(lister))
+	for d := range lister {
+		dirs = append(dirs, d)
+	}
+	sort.Strings(dirs)
+	parents := map[string]string{} // directory as dpkg spells it -> where it is ("" = cannot be told)
+	for _, d := range dirs {
+		up := path.Dir(d)
+		real, seen := parents[up]
+		if !seen {
+			real, _ = model.ResolveInInventory(j.files, up, model.LinkHops)
+			parents[up] = real
+		}
+		if real == "" {
+			continue // below a link that is itself reported, or not recorded
+		}
+		at := path.Join(real, path.Base(d))
+		e := j.files[at]
+		if e == nil || e.Type != "symlink" {
+			continue
+		}
+		to, ok := model.ResolveInInventory(j.files, model.LinkWalk(at, e.Target), model.LinkHops)
+		if ok && slices.Contains(mergedTop, d) && to == "/usr"+d {
+			continue
+		}
+		pkgName := lister[d]
+		f := &model.Finding{
+			Key: "pkg.dir_now_link:" + d, ID: "TT-PKG-010", Source: srcPackage, Severity: model.SevNote,
+			Title: fmt.Sprintf("%s, a directory of package %s, is now a link to %s", d, pkgName, to),
+			Why: "dpkg unpacked this package into a real directory here; a symbolic link is in its place now, so every file the package lists below it is really somewhere else. " +
+				"Moving a directory to another disk and leaving a link looks like this. It is also a way to put other files under a package's names, " +
+				"so the files the link leads to are compared with the package where they are, and none of them counts as the package's own just for being there.",
+			Fix: command([]string{d}, func(q []string) string {
+				return "ls -ld -- " + q[0] + " && readlink -f -- " + q[0] + "   # nothing to do if you moved this directory yourself"
+			}),
+			Evidence: []model.Evidence{{Path: d, After: "symlink -> " + e.Target, Detail: "listed as a directory by package " + pkgName + "; leads to " + to, When: j.whenFor(at)}},
+			Refs:     []string{"T1574"},
+		}
+		reason := ""
+		switch {
+		case !ok:
+			reason = "it leads nowhere telltale could follow"
+			f.Title = fmt.Sprintf("%s, a directory of package %s, is now a link that cannot be followed", d, pkgName)
+			f.Evidence[0].Detail = "listed as a directory by package " + pkgName + "; where the link leads cannot be told"
+		case underTemp(to) != "":
+			reason = "it leads into " + underTemp(to)
+		case hiddenPath(to):
+			reason = "it leads into a hidden directory"
+		}
+		if reason != "" {
+			f.Severity = model.SevBackdoor
+			f.Why = "dpkg unpacked this package into a real directory here; a symbolic link is in its place now, and " + reason + ". " +
+				"Nobody keeps a package's files there: whatever the link leads to is what programs get when they ask for this package's files."
+			f.Fix = command([]string{d, pkgName}, func(q []string) string {
+				return keep(q[0]) + " && ls -la -- " + q[0] + "/   # the link is saved; look at what it leads to. To put the package's directory back: rm -- " + q[0] + " && apt-get install --reinstall -- " + q[1]
+			})
+		}
+		j.add(f)
+	}
+}
+
+// underTemp names the world-writable temporary tree p is in, or "".
+func underTemp(p string) string {
+	for _, d := range []string{"/tmp", "/dev/shm", "/var/tmp"} {
+		if p == d || strings.HasPrefix(p, d+"/") {
+			return d
+		}
+	}
+	return ""
+}
+
+// hiddenPath reports whether a component of p starts with a dot.
+func hiddenPath(p string) bool {
+	for _, comp := range strings.Split(p, "/") {
+		if strings.HasPrefix(comp, ".") {
+			return true
+		}
+	}
+	return false
 }

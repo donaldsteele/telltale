@@ -364,3 +364,38 @@ func TestCompareDirectoryBookkeepingIsNotAChange(t *testing.T) {
 		t.Errorf("a file's size and flags still count: got %q -> %q", m.Before, m.After)
 	}
 }
+
+// What a link chain passes through on a tmpfs (/run) is made anew at every
+// boot. Such an entry is compared for what it is and where it leads, never
+// for content, size, mode, owner or times.
+func TestCompareVolatileEntriesOnlyByTypeAndPlace(t *testing.T) {
+	const stub = "/run/systemd/resolve/stub-resolv.conf"
+	vol := func(e model.FileEntry) model.FileEntry { e.Supplementary, e.Volatile = true, true; return e }
+	dirs := []model.FileEntry{vol(model.FileEntry{Path: "/run", Type: "dir", Mode: 0o40755}), vol(model.FileEntry{Path: "/run/systemd", Type: "dir", Mode: 0o40755}),
+		vol(model.FileEntry{Path: "/run/systemd/resolve", Type: "dir", Mode: 0o40755}), {Path: "/run/a", Type: "file"}, {Path: "/run/b", Type: "file"}}
+	col := func(es ...model.FileEntry) *model.Collection {
+		return &model.Collection{Files: append(dirs[:len(dirs):len(dirs)], es...)}
+	}
+	old := col(vol(model.FileEntry{Path: stub, Type: "file", SHA256: "aa", Size: 10, Mode: 0o100644, UID: 101}),
+		vol(model.FileEntry{Path: "/run/l", Type: "symlink", Target: "/run/a"}))
+
+	// After a reboot: new content, size, mode and owner; the link written
+	// another way, to the same place.
+	cur := col(vol(model.FileEntry{Path: stub, Type: "file", SHA256: "bb", Size: 12, Mode: 0o100600, UID: 102}),
+		vol(model.FileEntry{Path: "/run/l", Type: "symlink", Target: "a"}))
+	if chs := Compare(snap(old), cur, nil); len(chs) != 0 {
+		t.Errorf("a rewritten runtime file is reported: %+v", chs)
+	}
+	// It became a link, and the link leads somewhere else: both reported.
+	cur = col(vol(model.FileEntry{Path: stub, Type: "symlink", Target: "/var/tmp/x"}),
+		vol(model.FileEntry{Path: "/run/l", Type: "symlink", Target: "/run/b"}))
+	chs := Compare(snap(old), cur, nil)
+	find(t, chs, FileModified, stub)
+	find(t, chs, FileModified, "/run/l")
+	// A link whose new target cannot be followed is a change.
+	cur = col(vol(model.FileEntry{Path: stub, Type: "file", SHA256: "aa"}), vol(model.FileEntry{Path: "/run/l", Type: "symlink", Target: "/nowhere/a"}))
+	find(t, Compare(snap(old), cur, nil), FileModified, "/run/l")
+	// An entry of the file scan at the same path is compared in full.
+	plain := col(model.FileEntry{Path: stub, Type: "file", SHA256: "bb", Size: 10, Mode: 0o100644, UID: 101}, model.FileEntry{Path: "/run/l", Type: "symlink", Target: "/run/a"})
+	find(t, Compare(snap(old), plain, nil), FileModified, stub)
+}

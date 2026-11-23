@@ -1,0 +1,35 @@
+{
+  "requires": {},
+  "with_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.unowned_setuid:/usr/share/misc-data/sftp-server",
+        "severity": "backdoor sign"
+      },
+      {
+        "key_prefix": "pkg.mismatch:/usr/share/misc-data/sftp-server",
+        "severity": "tampering"
+      },
+      {
+        "key_prefix": "pkg.dir_now_link:/usr/lib/openssh",
+        "severity": "note"
+      }
+    ]
+  },
+  "without_snapshot": {
+    "must": [
+      {
+        "key_prefix": "heur.unowned_setuid:/usr/share/misc-data/sftp-server",
+        "severity": "backdoor sign"
+      },
+      {
+        "key_prefix": "pkg.mismatch:/usr/share/misc-data/sftp-server",
+        "severity": "tampering"
+      },
+      {
+        "key_prefix": "pkg.dir_now_link:/usr/lib/openssh",
+        "severity": "note"
+      }
+    ]
+  }
+}

@@ -132,15 +132,9 @@ func runScan(ctx *Context) int {
 	opt := pkgverify.Options{Full: *full, Offline: *offline, RefsDir: *refs, ExtraKeys: extra, Root: *root}
 	// Startup links into package-owned files outside the system directories
 	// are only notes; the target is verified so a tampered one still shows.
-	// Ownership is by where a file really is; package verification wants
-	// dpkg's spelling of the path.
-	owners, literal := c.Packages.PhysicalOwners(model.Inventory(c.Files))
-	for _, t := range heuristics.PackageLinkTargets(c, owners) {
-		if lit := literal[t]; lit != "" {
-			t = lit
-		}
-		opt.ExtraPaths = append(opt.ExtraPaths, t)
-	}
+	// A target is named where it really is, which is the path package
+	// verification reports a file under.
+	opt.ExtraPaths = append(opt.ExtraPaths, heuristics.PackageLinkTargets(c, c.Packages.Owners())...)
 	if snap != nil {
 		opt.OnlyPaths = changedOwnedPaths(snap, c)
 	}
@@ -240,7 +234,11 @@ func changedOwnedPaths(snap *model.Snapshot, cur *model.Collection) map[string]b
 			continue
 		}
 		// Owners applies the merged-/usr aliases (/bin/ls is /usr/bin/ls).
-		for p := range col.Packages.Owners() {
+		// A package path behind a directory that is a link is recorded,
+		// and so changes, where it really is: those paths are verified too.
+		// Asking for more to be verified can only find more.
+		owners, _ := col.Packages.PhysicalOwners(model.Inventory(col.Files))
+		for p := range owners {
 			owned[p] = true
 		}
 	}

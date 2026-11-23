@@ -42,7 +42,10 @@ type linkDest struct {
 	null bool
 }
 
-func resolveLink(inv map[string]*model.FileEntry, p model.PersistFile) (linkDest, bool) {
+// cut says the collector did not follow this link to the end (see
+// Collection.LinkRefused): it is then not walked here either, and stays
+// unresolved.
+func resolveLink(inv map[string]*model.FileEntry, p model.PersistFile, cut bool) (linkDest, bool) {
 	lexical, ok := p.LinkTarget()
 	if !ok {
 		return linkDest{}, false
@@ -55,27 +58,36 @@ func resolveLink(inv map[string]*model.FileEntry, p model.PersistFile) (linkDest
 		d.null = true
 		return d, true
 	}
+	if cut {
+		return d, true
+	}
 	// Walk from the link's directory through the target as written (not
 	// cleaned), so that the directory the link is really in and every link
 	// inside the target are followed.
-	walk := model.LinkWalk(p.Path, p.Lines[0])
-	if t, ok := model.ResolveInInventory(inv, walk, model.LinkHops); ok {
-		d.file, d.shown = t, t
-	} else if t, ok := model.ResolveDangling(inv, walk, model.LinkHops); ok {
-		d.dangling, d.shown = t, t
+	reached, rest, end := model.WalkInventory(inv, model.LinkWalk(p.Path, p.Lines[0]), model.LinkHops)
+	switch {
+	case end == model.WalkDone:
+		d.file, d.shown = reached, reached
+	case end == model.WalkMissing && len(rest) == 1 && rest[0] != "..":
+		// Everything on the way resolved; only the last name is not there.
+		d.dangling = path.Join(reached, rest[0])
+		d.shown = d.dangling
 	}
 	return d, true
 }
 
 // PackageLinkTargets returns the targets of startup links that lie outside
 // the system directories and are owned by an installed package. The scan has
-// them verified against the package.
+// them verified against the package. owned is c.Packages.Owners(); a target
+// is a package's also when it is where one of those paths really is.
 func PackageLinkTargets(c *model.Collection, owned map[string]string) []string {
 	var out []string
 	seen := map[string]bool{}
 	inv := model.Inventory(c.Files)
+	owned, _ = model.PhysicalOwnersOf(owned, inv)
+	cut := cutLinks(c)
 	for _, p := range c.Persist {
-		d, ok := resolveLink(inv, p)
+		d, ok := resolveLink(inv, p, cut[p.Path])
 		if !ok || d.file == "" || inSystemDir(d.file) || owned[d.file] == "" || seen[d.file] {
 			continue
 		}
@@ -88,7 +100,7 @@ func PackageLinkTargets(c *model.Collection, owned map[string]string) []string {
 // LinkFile is the file a startup link opens, resolved as the heuristics here
 // resolve it; ok is false when the inventory cannot tell.
 func LinkFile(inv map[string]*model.FileEntry, p model.PersistFile) (string, bool) {
-	d, ok := resolveLink(inv, p)
+	d, ok := resolveLink(inv, p, false)
 	return d.file, ok && d.file != ""
 }
 
@@ -154,8 +166,11 @@ func execStarts(c *model.Collection, inv map[string]*model.FileEntry, p string) 
 func persistLinks(c *model.Collection, owned map[string]string) []model.Finding {
 	var out []model.Finding
 	inv := model.Inventory(c.Files)
+	// Whose file a link leads to is asked of the place the file really is.
+	owned, _ = model.PhysicalOwnersOf(owned, inv)
+	cut := cutLinks(c)
 	for _, p := range c.Persist {
-		d, ok := resolveLink(inv, p)
+		d, ok := resolveLink(inv, p, cut[p.Path])
 		if !ok {
 			continue
 		}
@@ -246,6 +261,19 @@ func persistLinks(c *model.Collection, owned map[string]string) []model.Finding 
 		})
 	}
 	return out
+}
+
+// cutLinks is the set of paths the collector lists as not looked at. A
+// startup link among them was cut off in its walk or never followed.
+func cutLinks(c *model.Collection) map[string]bool {
+	if len(c.LinkRefused) == 0 {
+		return nil
+	}
+	cut := make(map[string]bool, len(c.LinkRefused))
+	for _, p := range c.LinkRefused {
+		cut[p] = true
+	}
+	return cut
 }
 
 // notLookedAt reports whether p is at or below a path the collector refused

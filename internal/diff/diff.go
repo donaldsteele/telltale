@@ -135,6 +135,14 @@ func compareFiles(old, cur []model.FileEntry, incomplete []string) []Change {
 	}
 	seen := make(map[string]bool, len(cur))
 	var out []Change
+	// Where a link leads on each side, asked only for volatile entries.
+	var oldInv, curInv map[string]*model.FileEntry
+	leadsTo := func(inv *map[string]*model.FileEntry, files []model.FileEntry, e model.FileEntry) (string, bool) {
+		if *inv == nil {
+			*inv = model.Inventory(files)
+		}
+		return model.ResolveInInventory(*inv, model.LinkWalk(e.Path, e.Target), model.LinkHops)
+	}
 	for _, n := range cur {
 		seen[n.Path] = true
 		o, ok := om[n.Path]
@@ -149,6 +157,21 @@ func compareFiles(old, cur []model.FileEntry, incomplete []string) []Change {
 			continue
 		}
 		var s summary
+		if n.Supplementary && n.Volatile && o.Supplementary {
+			// On a tmpfs along a link chain: rewritten at every boot. What
+			// it is and where it leads are what a link through it depends
+			// on; its content, size, mode, owner and times are not.
+			moved := false
+			if o.Type == "symlink" && n.Type == "symlink" && o.Target != n.Target {
+				was, ok1 := leadsTo(&oldInv, old, o)
+				is, ok2 := leadsTo(&curInv, cur, n)
+				moved = !ok1 || !ok2 || was != is
+			}
+			if o.Type != n.Type || moved {
+				out = append(out, Change{Kind: FileModified, Subject: n.Path, Before: "type " + typeTarget(o), After: "type " + typeTarget(n)})
+			}
+			continue
+		}
 		if n.Err != "" && o.Err == "" {
 			s.add("err", "", n.Err)
 		} else {

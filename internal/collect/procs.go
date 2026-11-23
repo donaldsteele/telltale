@@ -423,6 +423,8 @@ func ensureEntriesIn(root string, files []model.FileEntry, paths []string, mount
 		}
 		if e, ok := statEntry(root+p, p, FileOptions{MaxHashBytes: maxHash, MD5: true}, &skips); ok {
 			e.Supplementary = true
+			// Only the link passes get as far as a tmpfs (linkSkipFS).
+			e.Volatile = underMountOf(p, mounts, func(t string) bool { return t == "tmpfs" })
 			files = append(files, e)
 		}
 	}

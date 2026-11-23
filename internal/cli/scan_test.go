@@ -266,3 +266,18 @@ func TestScanNULAccountNamesNoCommandOnRoot(t *testing.T) {
 		t.Error("no note about the NUL account")
 	}
 }
+
+// A package file behind a directory that is a link changes under the path it
+// really has; it is still handed to package verification.
+func TestChangedOwnedPathsBehindADirectoryLink(t *testing.T) {
+	file := func(p, sha string) model.FileEntry { return model.FileEntry{Path: p, Type: "file", SHA256: sha} }
+	dir := func(p string) model.FileEntry { return model.FileEntry{Path: p, Type: "dir"} }
+	pk := model.Packages{Installed: []model.Package{{Name: "chrome", Files: []string{"/opt/google/chrome"}}}}
+	base := []model.FileEntry{{Path: "/opt", Type: "symlink", Target: "/data/opt"}, dir("/data"), dir("/data/opt"), dir("/data/opt/google")}
+	old := &model.Collection{Packages: pk, Files: append(base[:len(base):len(base)], file("/data/opt/google/chrome", "a"))}
+	cur := &model.Collection{Packages: pk, Files: append(base[:len(base):len(base)], file("/data/opt/google/chrome", "b"), file("/data/opt/google/stray", "c"))}
+	got := changedOwnedPaths(&model.Snapshot{Collection: old}, cur)
+	if !got["/data/opt/google/chrome"] || got["/data/opt/google/stray"] {
+		t.Fatalf("got %v", got)
+	}
+}

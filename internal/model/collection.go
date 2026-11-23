@@ -33,11 +33,18 @@ type Collection struct {
 	// (/etc/ld.so.cache) sends programs to, sorted; nil when there is no
 	// cache or it could not be parsed.
 	LinkerCache []string `json:"linker_cache,omitempty"`
-	// LinkRefused lists the paths at which following a startup link
-	// stopped because the collector does not look there (a kernel or
-	// device tree, a network or FUSE mount). Nothing is known about what
-	// is at or below them, not even that it is missing.
+	// LinkRefused lists the paths at which following a link stopped
+	// without an answer: the collector does not look there (a kernel or
+	// device tree, a network or FUSE mount), the path is too deep, or it
+	// could not be read. A link whose walk was cut off at the depth or
+	// length cap, or never started because the work budget was spent, is
+	// listed by its own path. Nothing is known about what is at or below
+	// these, not even that it is missing.
 	LinkRefused []string `json:"link_refused,omitempty"`
+	// LinkMissing lists the paths the collector looked for while following
+	// links and found absent. A path the inventory merely lacks may exist
+	// where the scan does not record; one listed here does not exist.
+	LinkMissing []string `json:"link_missing,omitempty"`
 }
 
 // Host identifies the machine a collection came from.
@@ -92,6 +99,10 @@ type FileEntry struct {
 	// exists only while something refers to it, so a snapshot comparison
 	// never reports it as added or removed.
 	Supplementary bool `json:"supplementary,omitempty"`
+	// Volatile marks a supplementary entry on a tmpfs (/run): it is made
+	// anew at every boot, so a snapshot comparison looks only at its type
+	// and at where it leads, never at content, size, mode or times.
+	Volatile bool `json:"volatile,omitempty"`
 	// Swept marks an entry found by the setuid/capability sweep rather than the
 	// system-path walk. The sweep can stop early, so a one-sided swept entry
 	// under Collection.SweepIncomplete is not evidence of a change.

@@ -1,6 +1,9 @@
 package model
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func inv(entries ...FileEntry) map[string]*FileEntry { return Inventory(entries) }
 
@@ -156,5 +159,65 @@ func TestPhysicalOwners(t *testing.T) {
 	// Without the inventory nothing is added.
 	if o, l := pk.PhysicalOwners(nil); len(l) != 0 || o[phys] != "" {
 		t.Errorf("no inventory: %v", l)
+	}
+}
+
+// Two packages whose paths really are the same file: the owner chosen must
+// not depend on the order a map happens to be walked in.
+func TestPhysicalOwnersIsDeterministic(t *testing.T) {
+	pk := Packages{Installed: []Package{
+		{Name: "zeta", Files: []string{"/srv/x/f"}},
+		{Name: "alpha", Files: []string{"/opt/x/f"}},
+		{Name: "mid", Files: []string{"/mnt/x/f"}},
+	}}
+	files := inv(append(dirs("/data", "/data/x", "/opt", "/srv", "/mnt"),
+		lnk("/opt/x", "/data/x"), lnk("/srv/x", "/data/x"), lnk("/mnt/x", "/data/x"), reg("/data/x/f"))...)
+	for i := 0; i < 200; i++ {
+		owners, literal := pk.PhysicalOwners(files)
+		// The first of dpkg's spellings in path order.
+		if owners["/data/x/f"] != "mid" || literal["/data/x/f"] != "/mnt/x/f" {
+			t.Fatalf("run %d: owner %q through %q", i, owners["/data/x/f"], literal["/data/x/f"])
+		}
+	}
+}
+
+// One walk looks at no more than MaxWalkSteps components, however the path
+// and the link targets on it are padded.
+func TestWalkIsCapped(t *testing.T) {
+	files := inv(append(dirs("/h", "/h/x"), reg("/h/end"), lnk("/h/pad", strings.Repeat("x/../", 800)+"end"))...)
+	lookups := 0
+	count := func(p string) (PathNode, bool) {
+		lookups++
+		e := files[p]
+		if e == nil {
+			return PathNode{}, false
+		}
+		return PathNode{Type: e.Type, Target: e.Target}, true
+	}
+	under := "/h/" + strings.Repeat("x/../", (MaxWalkSteps-10)/2) + "end"
+	if got, ok := ResolveInInventory(files, under, LinkHops); !ok || got != "/h/end" {
+		t.Errorf("a path just under the cap: %q (ok %v)", got, ok)
+	}
+	over := "/h/" + strings.Repeat("x/../", MaxWalkSteps) + "end"
+	if got, ok := ResolveInInventory(files, over, LinkHops); ok {
+		t.Errorf("a path over the cap resolved to %q", got)
+	}
+	if _, ok := ResolveToInventoryEdge(files, over, LinkHops); ok {
+		t.Errorf("a path over the cap has no edge")
+	}
+	if _, _, ok, missing := WalkPath(count, over, LinkHops); ok || missing || lookups > MaxWalkSteps {
+		t.Errorf("over the cap: ok %v missing %v after %d lookups", ok, missing, lookups)
+	}
+	// The cap is on the whole walk: padding spread over several links counts.
+	chain := []FileEntry{reg("/h/end")}
+	for i := 1; i <= 7; i++ {
+		next := "end"
+		if i < 7 {
+			next = "L" + string(rune('0'+i+1))
+		}
+		chain = append(chain, lnk("/h/L"+string(rune('0'+i)), strings.Repeat("x/../", 800)+next))
+	}
+	if got, ok := ResolveInInventory(inv(append(dirs("/h", "/h/x"), chain...)...), "/h/L1", LinkHops); ok {
+		t.Errorf("seven padded links resolved to %q", got)
 	}
 }

@@ -15,6 +15,7 @@ import (
 
 	"github.com/donaldsteele/telltale/internal/checklist"
 	"github.com/donaldsteele/telltale/internal/collect"
+	"github.com/donaldsteele/telltale/internal/escape"
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/internal/pkgverify"
 )
@@ -960,7 +961,12 @@ func TestJudgeRoutineChangesAreNotBackdoorSigns(t *testing.T) {
 	setFile(cur, file("/boot/initrd.img-6.1.0-25-amd64", "initrd 2", 0o644))
 	setFile(cur, file("/etc/shadow", "shadow 2", 0o640))
 	cur.Accounts.Users[0].Password.Digest = "digest-root-2"
+	// A new alternatives link, with what it leads to recorded as the file
+	// scan records it on a real machine: the link is judged by where it
+	// really leads, and what the inventory cannot follow is not a note.
 	setFile(cur, model.FileEntry{Path: "/usr/bin/awk", Type: "symlink", Target: "/etc/alternatives/awk", Mode: 0o120777})
+	old.Files = append(old.Files, symlinkAt("/etc/alternatives/awk", "/usr/bin/mawk", taken), file("/usr/bin/mawk", "mawk", 0o755))
+	cur.Files = append(cur.Files, symlinkAt("/etc/alternatives/awk", "/usr/bin/mawk", taken), file("/usr/bin/mawk", "mawk", 0o755))
 
 	// Nothing was updated: a rebuilt initrd is a backdoor sign.
 	r := run(cur, snapOf(old), nil)
@@ -3201,5 +3207,215 @@ func TestPackageLinkBehindALinkedDirectory(t *testing.T) {
 	r = run(mk("0123abcd"), nil, res)
 	if f := find(r, "heur.persist_link:"+l); f == nil || f.Severity != model.SevBackdoor {
 		t.Errorf("mismatch verdict: want a backdoor sign, got %v", keys(r))
+	}
+	// So does one under the path the file really has, which is how package
+	// verification names a file it reached through a directory link.
+	res = archive()
+	res.Mismatch = []pkgverify.FileVerdict{{Path: phys, Package: "google-chrome-stable", Version: "131.0-1", Expected: h("job"), Actual: h("other"), Source: "archive"}}
+	r = run(mk("0123abcd"), nil, res)
+	if f := find(r, "heur.persist_link:"+l); f == nil || f.Severity != model.SevBackdoor {
+		t.Errorf("mismatch verdict at the physical path: want a backdoor sign, got %v", keys(r))
+	}
+	// A verified verdict there keeps the note, whatever the machine's own
+	// checksum says, and /opt being a link is a note of its own.
+	r = run(mk("ffff0000"), nil, archive(verdict(phys, "google-chrome-stable", "131.0-1", "job")))
+	must(t, r, "heur.persist_link_pkg:"+l, model.SevNote)
+	must(t, r, "pkg.dir_now_link:/opt", model.SevNote)
+}
+
+func symlinkAt(p, target string, when time.Time) model.FileEntry {
+	return model.FileEntry{Path: p, Type: "symlink", Target: target, Mode: 0o120777, MTime: when, CTime: when}
+}
+
+func dirAt(p string) model.FileEntry {
+	return model.FileEntry{Path: p, Type: "dir", Mode: 0o40755, MTime: taken, CTime: taken}
+}
+
+// Root moves a package's directory away, leaves a link in its place and
+// plants a setuid shell behind it under a name the package lists. A file is
+// a package's only under the path dpkg lists it at: the shell and its
+// listener stay unowned, and the directory that became a link is reported.
+func TestPackageDirectoryLinkDoesNotOwnWhatItLeadsTo(t *testing.T) {
+	for _, target := range []string{"/usr/share/evil", "/srv/evil"} {
+		c := clean()
+		c.Files = append(c.Files, dirAt("/usr/lib"), symlinkAt("/usr/lib/foo", target, taken), file(target+"/helper", "bash 5.2", 0o4755))
+		c.Packages.Installed = append(c.Packages.Installed, pkg("foo", "1.0-1", "/usr/lib/foo", "/usr/lib/foo/helper", "/usr/lib/foo/README"))
+		c.Runtime.Processes = append(c.Runtime.Processes, model.Process{PID: 4242, PPID: 1, UID: 0, Exe: target + "/helper", Comm: "helper", Cmdline: target + "/helper"})
+		c.Runtime.Sockets = append(c.Runtime.Sockets, model.Socket{Proto: "tcp", Local: "0.0.0.0:31337", State: "LISTEN", PID: 4242, Listening: true})
+		r := run(c, nil, archive())
+		must(t, r, "heur.unowned_setuid:"+target+"/helper", model.SevBackdoor)
+		if find(r, "heur.unowned_listener:"+target+"/helper") == nil {
+			t.Errorf("%s: the listener's program counts as package-owned: %v", target, keys(r))
+		}
+		must(t, r, "pkg.dir_now_link:/usr/lib/foo", model.SevNote)
+	}
+}
+
+// The same with a snapshot taken before, and with what package verification
+// says about the file really reached.
+func TestPackageDirectoryLinkWithSnapshot(t *testing.T) {
+	old := clean()
+	old.Files = append(old.Files, dirAt("/usr/lib"), dirAt("/usr/lib/foo"), file("/usr/lib/foo/helper", "helper 1.0", 0o755))
+	old.Packages.Installed = append(old.Packages.Installed, pkg("foo", "1.0-1", "/usr/lib/foo", "/usr/lib/foo/helper"))
+	cur := clone(old)
+	cur.Files = slices.DeleteFunc(cur.Files, func(f model.FileEntry) bool { return strings.HasPrefix(f.Path, "/usr/lib/foo") })
+	sh := file("/usr/share/evil/helper", "bash 5.2", 0o4755)
+	sh.MTime, sh.CTime = changed, changed
+	cur.Files = append(cur.Files, symlinkAt("/usr/lib/foo", "/usr/share/evil", changed), sh)
+	res := archive()
+	res.Mismatch = []pkgverify.FileVerdict{{Path: "/usr/share/evil/helper", Package: "foo", Version: "1.0-1", Expected: h("helper 1.0"), Actual: h("bash 5.2"),
+		Reason: "differs from the file in the signed package", Kind: pkgverify.KindContentDiffers, Source: "archive"}}
+	r := run(cur, snapOf(old), res)
+	must(t, r, "heur.unowned_setuid:/usr/share/evil/helper", model.SevBackdoor)
+	must(t, r, "pkg.mismatch:/usr/share/evil/helper", model.SevTampering)
+	if f := find(r, "pkg.dir_now_link:/usr/lib/foo"); f == nil {
+		t.Errorf("the directory that became a link is not reported: %v", keys(r))
+	}
+	for _, f := range r.Explained {
+		for _, e := range f.Evidence {
+			if strings.Contains(e.Path, "evil") {
+				t.Errorf("%s explains %s", f.Key, e.Path)
+			}
+		}
+	}
+}
+
+// A directory dpkg lists that is now a symbolic link: a note when it leads
+// somewhere ordinary on the machine (an admin moved /opt to another disk), a
+// backdoor sign when it leads into a temporary or hidden place or nowhere
+// that can be followed. The links merged /usr consists of are not reported.
+func TestPackageDirectoryNowALink(t *testing.T) {
+	const key = "pkg.dir_now_link:"
+	for _, tc := range []struct {
+		name  string
+		files []model.FileEntry
+		lists []string
+		want  map[string]model.Severity
+		quiet []string
+	}{
+		{"an admin moved /opt", []model.FileEntry{symlinkAt("/opt", "/data/opt", taken), file("/data/opt/google/chrome/chrome", "chrome", 0o755)},
+			[]string{"/opt", "/opt/google", "/opt/google/chrome", "/opt/google/chrome/chrome"},
+			map[string]model.Severity{"/opt": model.SevNote}, []string{"/opt/google", "/opt/google/chrome"}},
+		{"into /var/tmp", []model.FileEntry{symlinkAt("/opt", "/var/tmp/opt", taken), file("/var/tmp/opt/google/chrome/chrome", "chrome", 0o755)},
+			[]string{"/opt", "/opt/google", "/opt/google/chrome", "/opt/google/chrome/chrome"},
+			map[string]model.Severity{"/opt": model.SevBackdoor}, nil},
+		{"into /dev/shm through a second link", []model.FileEntry{dirAt("/usr/lib"), symlinkAt("/usr/lib/foo", "/srv/foo", taken), symlinkAt("/srv/foo", "/dev/shm/foo", taken), dirAt("/dev"), dirAt("/dev/shm"), dirAt("/dev/shm/foo")},
+			[]string{"/usr/lib/foo", "/usr/lib/foo/helper"},
+			map[string]model.Severity{"/usr/lib/foo": model.SevBackdoor}, nil},
+		{"into a hidden directory", []model.FileEntry{dirAt("/usr/lib"), symlinkAt("/usr/lib/foo", "/srv/.cache/foo", taken), file("/srv/.cache/foo/helper", "x", 0o755)},
+			[]string{"/usr/lib/foo", "/usr/lib/foo/helper"},
+			map[string]model.Severity{"/usr/lib/foo": model.SevBackdoor}, nil},
+		{"nowhere that can be followed", []model.FileEntry{dirAt("/usr/lib"), symlinkAt("/usr/lib/foo", "/mnt/gone/foo", taken)},
+			[]string{"/usr/lib/foo", "/usr/lib/foo/helper"},
+			map[string]model.Severity{"/usr/lib/foo": model.SevBackdoor}, nil},
+		{"a link below a moved directory", []model.FileEntry{symlinkAt("/opt", "/data/opt", taken), symlinkAt("/data/opt/google", "/tmp/g", taken), file("/tmp/g/chrome/chrome", "chrome", 0o755)},
+			[]string{"/opt", "/opt/google", "/opt/google/chrome", "/opt/google/chrome/chrome"},
+			map[string]model.Severity{"/opt": model.SevNote, "/opt/google": model.SevBackdoor}, nil},
+		{"merged /usr", []model.FileEntry{symlinkAt("/bin", "usr/bin", taken), symlinkAt("/lib", "usr/lib", taken), symlinkAt("/lib64", "/usr/lib64", taken), dirAt("/usr/lib"), dirAt("/usr/lib64"), file("/usr/bin/ls", "ls 9.1", 0o755)},
+			[]string{"/bin", "/bin/ls", "/lib", "/lib/x.so", "/lib64", "/lib64/ld.so"},
+			nil, []string{"/bin", "/lib", "/lib64"}},
+		{"/lib pointed somewhere else", []model.FileEntry{symlinkAt("/lib", "/var/tmp/lib", taken), file("/var/tmp/lib/x.so", "x", 0o644)},
+			[]string{"/lib", "/lib/x.so"},
+			map[string]model.Severity{"/lib": model.SevBackdoor}, nil},
+		{"a link the package ships as its last component", []model.FileEntry{dirAt("/usr/lib"), dirAt("/usr/lib/jvm"), dirAt("/usr/lib/jvm/java-17"), symlinkAt("/usr/lib/jvm/default-java", "java-17", taken)},
+			[]string{"/usr/lib/jvm", "/usr/lib/jvm/default-java", "/usr/lib/jvm/java-17"},
+			nil, []string{"/usr/lib/jvm/default-java"}},
+	} {
+		c := clean()
+		c.Files = append(c.Files, tc.files...)
+		c.Packages.Installed = append(c.Packages.Installed, pkg("vendor", "1.0-1", tc.lists...))
+		r := run(c, nil, archive())
+		for p, sev := range tc.want {
+			f := find(r, key+p)
+			if f == nil || f.Severity != sev {
+				t.Errorf("%s: %s: want %q, got %+v", tc.name, p, sev, f)
+				continue
+			}
+			if !strings.Contains(f.Fix, "'"+p+"'") {
+				t.Errorf("%s: the fix does not quote the path: %s", tc.name, f.Fix)
+			}
+		}
+		for _, p := range tc.quiet {
+			absent(t, r, key+p)
+		}
+	}
+	// The path in the fix is quoted like any machine value.
+	c := clean()
+	const odd = "/opt/it's here"
+	c.Files = append(c.Files, dirAt("/opt"), symlinkAt(odd, "/var/tmp/x", taken))
+	c.Packages.Installed = append(c.Packages.Installed, pkg("vendor", "1.0-1", odd, odd+"/f"))
+	if f := find(run(c, nil, archive()), key+odd); f == nil || !strings.Contains(f.Fix, escape.ShellQuote(odd)) || strings.Contains(f.Fix, " "+odd) {
+		t.Errorf("fix for an odd name: %+v", f)
+	}
+}
+
+// A changed link whose target the inventory cannot follow to the end is not
+// judged by the text beyond the last recorded path: /run/systemd/q/x reads as
+// a system path, and q may be a link into /var/tmp. Unless the collector
+// looked and found the next name absent, a path that stops inside the system
+// directories leads nobody knows where.
+func TestChangedLinkPastTheInventoryEdge(t *testing.T) {
+	const alt = "/etc/alternatives/awk"
+	const snapKey = "snap.file_modified:" + alt
+	old := clean()
+	old.Files = append(old.Files, dirAt("/etc/alternatives"), symlinkAt(alt, "/usr/bin/mawk", taken), file("/usr/bin/mawk", "mawk", 0o755))
+	for _, tc := range []struct {
+		name    string
+		target  string
+		extra   []model.FileEntry
+		missing []string
+		sev     model.Severity
+		why     string
+	}{
+		{"through /run/systemd, nothing of /run recorded", "/run/systemd/q/mawk", nil, nil, model.SevBackdoor, "cannot be told"},
+		{"control: /run/systemd/q recorded as a link into /var/tmp", "/run/systemd/q/mawk",
+			[]model.FileEntry{dirAt("/run"), dirAt("/run/systemd"), symlinkAt("/run/systemd/q", "/var/tmp/x", taken)}, nil, model.SevBackdoor, "points into /var/tmp"},
+		{"control: followed to a file in /run/systemd", "/run/systemd/q/mawk",
+			[]model.FileEntry{dirAt("/run"), dirAt("/run/systemd"), dirAt("/run/systemd/q"), file("/run/systemd/q/mawk", "mawk", 0o755)}, nil, model.SevNote, ""},
+		{"into a mount under /usr the scan stayed out of", "/usr/lib/q/mawk", []model.FileEntry{dirAt("/usr/lib"), dirAt("/usr/lib/q")}, nil, model.SevBackdoor, "cannot be told"},
+		{"anywhere else under /run", "/run/q/mawk", nil, nil, model.SevBackdoor, "cannot be told"},
+		{"a file the collector found missing", "/usr/bin/gawk", nil, []string{"/usr/bin/gawk"}, model.SevNote, ""},
+		{"a directory the collector found missing", "/usr/share/man/man1/awk.1.gz", []model.FileEntry{dirAt("/usr/share")}, []string{"/usr/share/man"}, model.SevNote, ""},
+		{"unfollowed into /var/tmp as written", "/var/tmp/z/mawk", nil, nil, model.SevBackdoor, "points into /var/tmp"},
+		{"unfollowed into a hidden directory as written", "/usr/lib/.q/mawk", nil, nil, model.SevBackdoor, "hidden"},
+		{"unfollowed outside the system directories", "/opt/q/mawk", nil, nil, model.SevBackdoor, "outside the system directories"},
+	} {
+		c := clean()
+		c.Files = append(c.Files, dirAt("/etc/alternatives"), file("/usr/bin/mawk", "mawk", 0o755), symlinkAt(alt, tc.target, changed))
+		c.Files = append(c.Files, tc.extra...)
+		c.LinkMissing = tc.missing
+		f := find(run(c, snapOf(clone(old)), archive()), snapKey)
+		if f == nil || f.Severity != tc.sev || !strings.Contains(f.Why, tc.why) {
+			t.Errorf("%s: want %q (%q), got %+v", tc.name, tc.sev, tc.why, f)
+		}
+	}
+
+	// zlib1g's soname link through /run/systemd, with and without an upgrade
+	// of the package: never folded into the package change, never a note.
+	const zlink, zfile = "/usr/lib/x86_64-linux-gnu/libz.so.1", "/usr/lib/x86_64-linux-gnu/libz.so.1.2.13"
+	const newVersion = "1:1.2.13.dfsg-1+deb12u1"
+	mk := func(version, content string, extra ...model.FileEntry) *model.Collection {
+		c := clean()
+		c.Files = append(c.Files, file(zfile, content, 0o644))
+		c.Files = append(c.Files, extra...)
+		c.Packages.Installed = append(c.Packages.Installed, pkg("zlib1g", version, zlink, zfile))
+		return c
+	}
+	snapC := func() *model.Snapshot {
+		return snapOf(mk("1:1.2.13.dfsg-1", "zlib old", symlinkAt(zlink, "libz.so.1.2.13", taken)))
+	}
+	bent := symlinkAt(zlink, "/run/systemd/q/libz.so.1.2.13", changed)
+	for name, r := range map[string]*model.Report{
+		"with the upgrade":  run(mk(newVersion, "zlib new", bent), snapC(), archive(verdict(zfile, "zlib1g", newVersion, "zlib new"))),
+		"no package change": run(mk("1:1.2.13.dfsg-1", "zlib old", bent), snapC(), archive()),
+	} {
+		if f := find(r, "snap.file_modified:"+zlink); f == nil || f.Severity != model.SevBackdoor || !strings.Contains(f.Why, "cannot be told") {
+			t.Errorf("zlib soname link, %s: want a backdoor sign, got %+v", name, f)
+		}
+		for _, f := range r.Explained {
+			if hasEvidencePath(&f, zlink) {
+				t.Errorf("zlib soname link, %s: explained by %s", name, f.Key)
+			}
+		}
 	}
 }

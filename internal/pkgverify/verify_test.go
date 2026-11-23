@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -1970,4 +1971,81 @@ func TestPkgverifyExtraPathsMergedUsrAlias(t *testing.T) {
 	opt.ExtraPaths = []string{"/usr/bin/toolctl"}
 	res = Verify(context.Background(), c, opt)
 	wantPaths(t, "with extra", res.Mismatch, "/usr/bin/toolctl")
+}
+
+// movedLib is the tool machine after root moved the library directory away
+// and left a link in its place: dpkg still lists the library under the old
+// path, and the file a program loads is the one behind the link.
+func movedLib(to, body string, perm uint32, extra ...model.FileEntry) *model.Collection {
+	disk := toolDisk(nil)
+	delete(disk, libDir+"/libtool.so.1")
+	c := collectionOf(disk, toolPackage())
+	dir := func(p string) model.FileEntry { return model.FileEntry{Path: p, Type: "dir", Mode: 0o40755} }
+	c.Files = append(c.Files, dir("/usr"), dir("/usr/lib"), dir(path.Dir(to)), dir(to),
+		symlinkEntry(libDir, to), regular(to+"/libtool.so.1", body, perm))
+	c.Files = append(c.Files, extra...)
+	return c
+}
+
+func TestVerifyFollowsAPackageDirectoryThatIsNowALink(t *testing.T) {
+	f := toolFixture(t)
+	const to = "/data/lib"
+	const phys = to + "/libtool.so.1"
+
+	// Moved by an admin, untouched: the file is verified where it is.
+	res := Verify(context.Background(), movedLib(to, toolLib, 0o644), f.opts())
+	if _, ok := find(res.Verified, phys); !ok {
+		t.Errorf("an intact file behind a directory link: Verified %v, Mismatch %v", paths(res.Verified), paths(res.Mismatch))
+	}
+
+	// Replaced: compared with the package's file, never skipped.
+	res = Verify(context.Background(), movedLib(to, "evil lib\n", 0o644), f.opts())
+	if m, ok := find(res.Mismatch, phys); !ok || m.Kind != KindContentDiffers || m.Package != "tool" || m.Expected != sha256hex([]byte(toolLib)) {
+		t.Errorf("a replaced file behind a directory link: Mismatch %+v", res.Mismatch)
+	}
+
+	// The package's content with a setuid bit added.
+	res = Verify(context.Background(), movedLib(to, toolLib, 0o4755), f.opts())
+	if m, ok := find(res.Mismatch, phys); !ok || m.Kind != KindModeAddsPrivilege {
+		t.Errorf("a setuid bit behind a directory link: Mismatch %+v", res.Mismatch)
+	}
+
+	// A name added to the package's file list that the signed package does
+	// not ship, planted behind the link.
+	c := movedLib(to, toolLib, 0o644, regular(to+"/helper", "bash\n", 0o4755))
+	c.Packages.Installed[0].Files = append(c.Packages.Installed[0].Files, libDir+"/helper")
+	res = Verify(context.Background(), c, f.opts())
+	if m, ok := find(res.Mismatch, to+"/helper"); !ok || m.Kind != KindNotShipped {
+		t.Errorf("a listed, unshipped file behind a directory link: Mismatch %+v", res.Mismatch)
+	}
+
+	// With a snapshot the changed path may be named either way.
+	for _, only := range []string{phys, libDir + "/libtool.so.1"} {
+		opt := f.opts()
+		opt.OnlyPaths = map[string]bool{only: true}
+		res = Verify(context.Background(), movedLib(to, "evil lib\n", 0o644), opt)
+		if _, ok := find(res.Mismatch, phys); !ok {
+			t.Errorf("OnlyPaths %s: Mismatch %v", only, paths(res.Mismatch))
+		}
+	}
+}
+
+func TestVerifyOfflineFollowsAPackageDirectoryThatIsNowALink(t *testing.T) {
+	const to = "/data/lib"
+	const phys = to + "/libtool.so.1"
+	for body, wantMismatch := range map[string]bool{toolLib: false, "evil lib\n": true} {
+		root := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(root, to), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, phys), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		res := Verify(context.Background(), movedLib(to, body, 0o644), Options{Offline: true, Root: root})
+		_, mis := find(res.Mismatch, phys)
+		_, ver := find(res.Verified, phys)
+		if mis != wantMismatch || ver == wantMismatch {
+			t.Errorf("content %q: Verified %v, Mismatch %v, Unverifiable %v", body, paths(res.Verified), paths(res.Mismatch), paths(res.Unverifiable))
+		}
+	}
 }

@@ -53,15 +53,19 @@ type judge struct {
 	old *model.Collection // the snapshot's collection; nil without a usable snapshot
 	ctx model.ScanContext
 
+	// owned and oldOwned say whose file a path is: the paths dpkg lists,
+	// under both merged-/usr spellings. Nothing else makes a file found on
+	// the machine a package's own.
 	owned, oldOwned map[string]string
-	// literal maps a path that is owned by where it really is (see
-	// model.PhysicalOwners) to the spelling dpkg and package verification
-	// use for it.
-	literal         map[string]string
-	files, oldFiles map[string]*model.FileEntry
-	persist         map[string]*model.PersistFile
-	oldPersist      map[string]*model.PersistFile
-	pkgs            map[string]*model.Package
+	// physOwned is owned plus each listed path where it really is when a
+	// directory on the way is a link (model.PhysicalOwners). It answers only
+	// "whose file does this link lead to"; literal maps such a path back to
+	// dpkg's spelling of it.
+	physOwned, literal map[string]string
+	files, oldFiles    map[string]*model.FileEntry
+	persist            map[string]*model.PersistFile
+	oldPersist         map[string]*model.PersistFile
+	pkgs               map[string]*model.Package
 
 	findings []*model.Finding
 	byKey    map[string]*model.Finding
@@ -131,10 +135,9 @@ func newJudge(in Input, c *model.Collection) *judge {
 		j.old = in.Snapshot.Collection
 	}
 	j.owned, j.files, j.persist, j.pkgs = indexCollection(c)
-	j.owned, j.literal = c.Packages.PhysicalOwners(j.files)
+	j.physOwned, j.literal = model.PhysicalOwnersOf(j.owned, j.files)
 	if j.old != nil {
 		j.oldOwned, j.oldFiles, j.oldPersist, _ = indexCollection(j.old)
-		j.oldOwned, _ = j.old.Packages.PhysicalOwners(j.oldFiles)
 	} else {
 		j.oldOwned, j.oldFiles, j.oldPersist = map[string]string{}, map[string]*model.FileEntry{}, map[string]*model.PersistFile{}
 	}
@@ -217,6 +220,7 @@ func Judge(in Input) *model.Report {
 		j.index(chs)
 	}
 	j.packages()
+	j.packageDirLinks()
 	if j.old != nil {
 		j.changes(chs)
 		j.finishPackages()
@@ -609,16 +613,18 @@ func (j *judge) rankPackageLink(f *model.Finding) {
 				return
 			}
 		}
-		if v, ok := j.verified[target]; ok {
-			if v.Source == pkgverify.SourceOfflineLocal {
-				f.Why += localOnly
+		for _, p := range []string{physical, target} {
+			if v, ok := j.verified[p]; ok {
+				if v.Source == pkgverify.SourceOfflineLocal {
+					f.Why += localOnly
+				}
+				return
 			}
-			return
 		}
 	}
 	// No trusted verdict: the machine's own md5 for the file decides.
 	var want, got string
-	if p := j.pkgs[j.owned[target]]; p != nil {
+	if p := j.pkgs[j.physOwned[physical]]; p != nil {
 		want = strings.ToLower(p.LocalMD5[target])
 	}
 	if e := j.files[physical]; e != nil {

@@ -182,8 +182,8 @@ func TestLinkChainsBudget(t *testing.T) {
 		os.Symlink(target, root+p)
 		persist = append(persist, model.PersistFile{Path: p, Mode: 0o120777, Lines: []string{target}})
 	}
-	// Each link costs two new paths (the link and its target) after the
-	// shared directories: a budget of 100 covers fewer than 50 of them.
+	// Each link costs six lookups (three components to the link, three to
+	// its target), new or remembered: a budget of 100 covers under 20.
 	chain, _, skips := linkChainsWithin(root, persist, nil, underNeverRead, 100)
 	if len(chain) > 100 {
 		t.Errorf("looked at %d paths with a budget of 100", len(chain))
@@ -205,5 +205,146 @@ func TestLinkChainsBudget(t *testing.T) {
 	all, _, skips := linkChains(root, append(persist, persist...), nil, underNeverRead)
 	if len(skips) != 0 || len(all) != 2*n+4 {
 		t.Errorf("%d paths (want %d), skips %+v", len(all), 2*n+4, skips)
+	}
+}
+
+// Memo hits are work too. Links whose targets are 4 KB of "x/../" through a
+// chain of such links cost thousands of lookups each without one new lstat:
+// every lookup is counted, one walk is cut at model.MaxWalkSteps, and the
+// pass stops at its budget with the links it left named as not looked at.
+func TestLinkChainsCountEveryLookup(t *testing.T) {
+	root := t.TempDir()
+	const home = "/home/alice"
+	wants := home + "/.config/systemd/user/default.target.wants"
+	os.MkdirAll(root+wants, 0o755)
+	os.MkdirAll(root+home+"/x", 0o755)
+	pad := strings.Repeat("x/../", 800)
+	for i := 1; i <= 8; i++ {
+		next := fmt.Sprintf("L%d", i+1)
+		if i == 8 {
+			next = "end"
+		}
+		os.Symlink(pad+next, fmt.Sprintf("%s%s/L%d", root, home, i))
+	}
+	os.WriteFile(root+home+"/end", []byte("x"), 0o644)
+	const n = 2000
+	var persist []model.PersistFile
+	for i := 0; i < n; i++ {
+		p := fmt.Sprintf("%s/u%d.service", wants, i)
+		tgt := "../../../../" + pad[:len(pad)-25*5] + "L1"
+		os.Symlink(tgt, root+p)
+		persist = append(persist, model.PersistFile{Path: p, Mode: 0o120777, Lines: []string{tgt}})
+	}
+	start := time.Now()
+	res := followLinks(root, persist, nil, nil, underNeverRead, linkChainBudget)
+	if el := time.Since(start); el > time.Second {
+		t.Errorf("%d padded links took %v", n, el)
+	}
+	if res.spent > linkChainBudget+model.MaxWalkSteps {
+		t.Errorf("%d lookups with a budget of %d", res.spent, linkChainBudget)
+	}
+	var budget, long string
+	for _, s := range res.skips {
+		if s.Check != linkChainCheck {
+			t.Errorf("skip %+v", s)
+		}
+		if strings.Contains(s.Reason, "stopped following") {
+			budget = s.Reason
+		} else {
+			long = s.Reason
+		}
+	}
+	if budget == "" || long == "" {
+		t.Fatalf("want a budget skip and a cut-off skip, got %+v", res.skips)
+	}
+	// Every link is accounted for: cut off in its walk, or never started.
+	if res.cut == 0 || res.unwalked == 0 || res.cut+res.unwalked != n {
+		t.Errorf("%d cut off + %d not started, want %d in all", res.cut, res.unwalked, n)
+	}
+	if !strings.Contains(budget, fmt.Sprintf("%d links were not followed", res.unwalked)) || !strings.Contains(long, fmt.Sprintf("%d links", res.cut)) {
+		t.Errorf("counts in the skips: %q / %q", budget, long)
+	}
+	// None of them can pass for a link to a file that is merely missing.
+	for _, i := range []int{0, n / 2, n - 1} {
+		if !slices.Contains(res.refused, persist[i].Path) {
+			t.Errorf("link %d is not among the paths not looked at", i)
+		}
+	}
+}
+
+// A link the file scan recorded whose target the inventory cannot follow to
+// the end (it leads through /run, which the file scan stays out of) is
+// walked on the machine, so that it is judged by where it really leads. A
+// link that resolves in the inventory costs nothing.
+func TestInventoryLinksAreFollowedToTheEnd(t *testing.T) {
+	root := t.TempDir()
+	mk := func(p string) { os.MkdirAll(filepath.Join(root, p), 0o755) }
+	ln := func(target, p string) {
+		if err := os.Symlink(target, filepath.Join(root, p)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("etc/alternatives")
+	mk("usr/bin")
+	mk("usr/share")
+	mk("run/systemd")
+	mk("var/tmp/x")
+	os.WriteFile(root+"/usr/bin/mawk", []byte("mawk"), 0o755)
+	os.WriteFile(root+"/var/tmp/x/mawk", []byte("evil"), 0o755)
+	ln("/var/tmp/x", "run/systemd/q")
+	ln("/run/systemd/q/mawk", "etc/alternatives/awk")
+	ln("/usr/bin/mawk", "etc/alternatives/nawk")
+	ln("/usr/share/man/man1/mawk.1.gz", "etc/alternatives/awk.1.gz")
+	ln("/proc/1/root/x", "etc/alternatives/kernel")
+
+	// What the file scan records: the system paths only.
+	files, _ := Files(root, []string{"/etc", "/usr"}, FileOptions{})
+	var looked []string
+	refuse := func(p string) bool { looked = append(looked, p); return underNeverRead(p) }
+	res := followLinks(root, nil, files, nil, refuse, linkChainBudget)
+	for _, want := range []string{"/run", "/run/systemd", "/run/systemd/q", "/var", "/var/tmp", "/var/tmp/x", "/var/tmp/x/mawk"} {
+		if !slices.Contains(res.chain, want) {
+			t.Errorf("chain lacks %s: %q", want, res.chain)
+		}
+	}
+	if slices.Contains(looked, "/usr/bin/mawk") || slices.Contains(looked, "/etc/alternatives/nawk") {
+		t.Errorf("a link that resolves in the inventory was looked at again: %q", looked)
+	}
+	// The dangling link: the first name that is not there is known to be
+	// missing, which is different from not having been looked at.
+	if !slices.Contains(res.missing, "/usr/share/man") || slices.Contains(res.refused, "/usr/share/man") {
+		t.Errorf("missing %q refused %q", res.missing, res.refused)
+	}
+	if !slices.Contains(res.refused, "/proc") || slices.Contains(res.missing, "/proc") {
+		t.Errorf("a kernel tree is refused, not missing: missing %q refused %q", res.missing, res.refused)
+	}
+	files, _ = ensureEntriesIn(root, files, res.chain, nil, 1<<20, underNeverRead, linkSkipFS)
+	if got, ok := model.ResolveInInventory(model.Inventory(files), "/etc/alternatives/awk", model.LinkHops); !ok || got != "/var/tmp/x/mawk" {
+		t.Errorf("awk resolves to %q (ok %v), want the file in /var/tmp", got, ok)
+	}
+
+	// Past the budget an inventory link is not walked, and says so.
+	res = followLinks(root, nil, []model.FileEntry{{Path: "/etc/alternatives/awk", Type: "symlink", Target: "/run/systemd/q/mawk"}}, nil, underNeverRead, 0)
+	if res.unwalked != 1 || !slices.Contains(res.refused, "/etc/alternatives/awk") || len(res.skips) != 1 {
+		t.Errorf("no budget: %+v", res)
+	}
+}
+
+// Entries recorded along a link chain on a tmpfs are marked: what is in /run
+// is rewritten at every boot.
+func TestChainEntriesOnTmpfsAreMarkedVolatile(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(root+"/run/systemd/resolve", 0o755)
+	os.MkdirAll(root+"/opt/pkg", 0o755)
+	os.WriteFile(root+"/run/systemd/resolve/stub-resolv.conf", []byte("nameserver 127.0.0.53\n"), 0o644)
+	os.WriteFile(root+"/opt/pkg/file", []byte("x"), 0o644)
+	mounts := []model.Mount{{Path: "/", FSType: "ext4"}, {Path: "/run", FSType: "tmpfs"}}
+	files, _ := ensureEntriesIn(root, nil, []string{"/run", "/run/systemd/resolve/stub-resolv.conf", "/opt/pkg/file"}, mounts, 1<<20, underNeverRead, linkSkipFS)
+	got := map[string]bool{}
+	for _, f := range files {
+		got[f.Path] = f.Volatile
+	}
+	if len(got) != 3 || !got["/run"] || !got["/run/systemd/resolve/stub-resolv.conf"] || got["/opt/pkg/file"] {
+		t.Errorf("volatile marks: %v", got)
 	}
 }

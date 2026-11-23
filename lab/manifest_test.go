@@ -152,7 +152,7 @@ func TestCommittedManifests(t *testing.T) {
 	breaks := []string{"root-key", "uid0-account", "sudo-nopasswd", "cron-callback", "systemd-callback", "profile-script",
 		"ld-preload", "pam-module", "replaced-binary", "setuid-shell", "immutable-file", "devshm-process", "deleted-exe-process",
 		"listener-port", "hider-rootkit", "regress-root-login", "regress-firewall-off", "regress-empty-password",
-		"downgrade-package", "new-service-package"}
+		"downgrade-package", "new-service-package", "package-dir-link"}
 	scenarios := []string{"weak-password-to-root", "web-shell-persistence", "upgrade-while-running"}
 	check := func(dir string) {
 		if _, err := LoadManifest(dir); err != nil {

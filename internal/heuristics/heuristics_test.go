@@ -1,6 +1,7 @@
 package heuristics
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path"
@@ -962,6 +963,11 @@ func TestPersistLinkDanglingAndRun(t *testing.T) {
 		{"missing file outside the system directories", "/srv/app/removed.service", []model.FileEntry{dir("/srv"), dir("/srv/app")}, nil, backdoor},
 		// "Missing" on a mount the scan stays out of is not known to be missing.
 		{"missing on a network mount", "/usr/lib/systemd/system/removed.service", sysDirs, nfs, backdoor},
+		// A link the collector did not follow to the end (past its work
+		// budget, or cut off at the depth cap) is listed by its own path:
+		// what seems missing was not looked for.
+		{"link past the collector's budget", "/usr/lib/systemd/system/removed.service", sysDirs, []string{l}, backdoor},
+		{"/run/systemd, link past the collector's budget", "/run/systemd/system/removed.service", run, []string{l}, backdoor},
 		// /run/systemd counts only for a target that is really there.
 		{"/run/systemd, existing file", "/run/systemd/system/x.service", append(run[:len(run):len(run)], reg("/run/systemd/system/x.service")), nil, quiet},
 		{"/run/systemd, nothing recorded", "/run/systemd/system/x.service", nil, nil, backdoor},
@@ -1009,7 +1015,8 @@ func TestPersistLinkPackageFileBehindALinkedDirectory(t *testing.T) {
 		model.FileEntry{Path: lit, Type: "file", Mode: 0o100755}) // the entry recorded for the link's text
 	inventoried(c)
 	pk := model.Packages{Installed: []model.Package{{Name: "google-chrome-stable", Files: []string{lit}}}}
-	owned, literal := pk.PhysicalOwners(model.Inventory(c.Files))
+	_, literal := pk.PhysicalOwners(model.Inventory(c.Files))
+	owned := pk.Owners()
 	fs := Run(c, ctx, owned)
 	if f := find(fs, "heur.persist_link_pkg:"+l); f == nil || f.Severity != model.SevNote {
 		t.Fatalf("want the package-file note, got %v", keys(fs))
@@ -1023,8 +1030,7 @@ func TestPersistLinkPackageFileBehindALinkedDirectory(t *testing.T) {
 	c.Files = append(c.Files, symlinkEntry("/opt", "/var/tmp/opt"),
 		model.FileEntry{Path: "/var/tmp/opt/google/chrome/cron/google-chrome", Type: "file", Mode: 0o100755})
 	inventoried(c)
-	owned, _ = pk.PhysicalOwners(model.Inventory(c.Files))
-	fs = Run(c, ctx, owned)
+	fs = Run(c, ctx, pk.Owners())
 	if f := find(fs, "heur.persist_link:"+l); f == nil || f.Severity != model.SevBackdoor {
 		t.Errorf("a package path that really lies in /var/tmp: want a backdoor sign, got %v", keys(fs))
 	}
@@ -1084,4 +1090,57 @@ func TestUserUnitLinkResolvedAsTheKernelDoes(t *testing.T) {
 	if f := find(fs, "heur.persist_link:"+l); f == nil || f.Severity != model.SevBackdoor {
 		t.Errorf("want a backdoor sign, got %v", keys(fs))
 	}
+}
+
+// Any user can plant startup links whose targets are 4 KB of "x/../" through
+// a chain of such links. The collector cuts their walks off and lists them
+// (Collection.LinkRefused); the heuristics do not walk them again. A
+// collection without that record still costs no more than the cap on one
+// walk, once per link.
+func TestPaddedStartupLinksAreNotWalkedAgain(t *testing.T) {
+	const home = "/home/alice"
+	const wants = home + "/.config/systemd/user/default.target.wants"
+	pad := strings.Repeat("x/../", 800)
+	build := func() *model.Collection {
+		c := cleanCollection()
+		for _, d := range []string{"/home", home, home + "/x", home + "/.config", home + "/.config/systemd", home + "/.config/systemd/user", wants} {
+			c.Files = append(c.Files, model.FileEntry{Path: d, Type: "dir", Mode: 0o40755})
+		}
+		for i := 1; i <= 7; i++ {
+			next := fmt.Sprintf("L%d", i+1)
+			if i == 7 {
+				next = "end"
+			}
+			c.Files = append(c.Files, symlinkEntry(fmt.Sprintf("%s/L%d", home, i), pad+next))
+		}
+		c.Files = append(c.Files, model.FileEntry{Path: home + "/end", Type: "file", Mode: 0o100644})
+		for i := 0; i < 2000; i++ {
+			c.Persist = append(c.Persist, link(fmt.Sprintf("%s/u%d.service", wants, i), "../../../../"+pad[:len(pad)-25*5]+"L1"))
+		}
+		return c
+	}
+	check := func(name string, c *model.Collection, limit time.Duration) {
+		start := time.Now()
+		fs := Run(c, ctx, cleanOwned())
+		if el := time.Since(start); el > limit {
+			t.Errorf("%s: 2000 padded links took %v, limit %v", name, el, limit)
+		}
+		n := 0
+		for _, f := range fs {
+			if strings.HasPrefix(f.Key, "heur.persist_link:"+wants) && f.Severity == model.SevBackdoor {
+				n++
+			}
+		}
+		if n != 2000 {
+			t.Errorf("%s: %d of 2000 links are backdoor signs", name, n)
+		}
+	}
+	c := build()
+	for _, p := range c.Persist {
+		c.LinkRefused = append(c.LinkRefused, p.Path)
+	}
+	check("listed as cut off", c, 300*time.Millisecond)
+	// Without the record each link is walked once, up to the cap. That is
+	// bounded work; how long it takes depends on the machine running this.
+	check("no record", build(), time.Minute)
 }

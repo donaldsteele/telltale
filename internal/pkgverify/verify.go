@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -408,6 +409,8 @@ type session struct {
 	files     map[string]*model.FileEntry
 	owners    map[string]string
 	divs      map[string]model.Diversion    // by original path
+	physDir   map[string]string             // directory as dpkg spells it -> where it is ("" = unknown)
+	physLit   map[string][]string           // where a regular file is -> dpkg's spellings of it
 	overrides map[string]model.StatOverride // by path
 	installed map[string]bool               // package names
 	byName    map[string]*pkgResult         // set by judge
@@ -454,6 +457,8 @@ func newSession(c *model.Collection, opt Options, res *Result) *session {
 		files:      make(map[string]*model.FileEntry, len(c.Files)),
 		owners:     c.Packages.Owners(),
 		divs:       map[string]model.Diversion{},
+		physDir:    map[string]string{},
+		physLit:    map[string][]string{},
 		overrides:  map[string]model.StatOverride{},
 		found:      map[PkgKey]DebRef{},
 		thirdFound: map[PkgKey]DebRef{},
@@ -512,6 +517,74 @@ func (s *session) locate(p string) (string, *model.FileEntry, entryKind) {
 		return a, ea, otherFile
 	}
 	return "", nil, absent
+}
+
+// physical returns where the package path p really is when a directory on
+// the way to it is a symbolic link in the inventory (root moved a package's
+// directory away and left a link, or /opt is a link to another disk): the
+// directory is resolved the way the kernel resolves it and the file's name
+// is looked for there. It returns "" when the directory is where dpkg says,
+// or cannot be resolved. The path's own last component is never followed: a
+// link where the package has a file is a difference, not a place to look.
+func (s *session) physical(p string) string {
+	dir := path.Dir(p)
+	real, seen := s.physDir[dir]
+	if !seen {
+		real, _ = model.ResolveInInventory(s.files, dir, model.LinkHops)
+		s.physDir[dir] = real
+	}
+	if real == "" || real == dir {
+		return ""
+	}
+	return path.Join(real, path.Base(p))
+}
+
+// physicalFile is physical for a package path that is not a regular file
+// under dpkg's spelling: the regular file really reached, or "".
+func (s *session) physicalFile(p string) string {
+	if e := s.files[p]; e != nil && isRegular(e) {
+		return ""
+	}
+	q := s.physical(p)
+	if q == "" {
+		return ""
+	}
+	if e := s.files[q]; e == nil || !isRegular(e) {
+		return ""
+	}
+	if !slices.Contains(s.physLit[q], p) {
+		s.physLit[q] = append(s.physLit[q], p)
+	}
+	return q
+}
+
+// wanted reports whether the collected path cp is one the options name
+// (OnlyPaths, ExtraPaths), under its own spelling or under dpkg's spelling
+// of a package path that really is cp.
+func (s *session) wanted(cp string) bool {
+	if s.opt.OnlyPaths[cp] || s.opt.isExtra(cp) {
+		return true
+	}
+	for _, lit := range s.physLit[cp] {
+		if s.opt.OnlyPaths[lit] || s.opt.isExtra(lit) {
+			return true
+		}
+	}
+	return false
+}
+
+// candidate is Options.candidate, also trying dpkg's spellings of the
+// package paths that really are cp.
+func (s *session) candidate(cp, p string, diskMode uint32, deb *DebFile) bool {
+	if s.opt.candidate(cp, p, diskMode, deb) {
+		return true
+	}
+	for _, lit := range s.physLit[cp] {
+		if s.opt.candidate(lit, p, diskMode, deb) {
+			return true
+		}
+	}
+	return false
 }
 
 // isRegular accepts regular files and entries the collector could not stat,
@@ -611,6 +684,10 @@ func (s *session) listsChanged(p *model.Package) bool {
 			return true
 		}
 		if a := usrAlias(f); a != "" && (s.opt.OnlyPaths[a] || s.opt.isExtra(a)) {
+			return true
+		}
+		// The changed file may be recorded where it really is.
+		if q := s.physicalFile(f); q != "" && (s.opt.OnlyPaths[q] || s.opt.isExtra(q)) {
 			return true
 		}
 	}
@@ -1230,6 +1307,9 @@ func (s *session) judge(results []*pkgResult) {
 			if a := usrAlias(f); a != "" {
 				listers[a] = append(listers[a], r)
 			}
+			if q := s.physicalFile(f); q != "" && !slices.Contains(listers[q], r) {
+				listers[q] = append(listers[q], r)
+			}
 		}
 	}
 	s.byName = map[string]*pkgResult{}
@@ -1249,7 +1329,7 @@ func (s *session) judge(results []*pkgResult) {
 	seen := map[string]bool{}
 	for i := range s.c.Files {
 		e := &s.c.Files[i]
-		if seen[e.Path] || (s.opt.OnlyPaths != nil && !s.opt.OnlyPaths[e.Path] && !s.opt.isExtra(e.Path)) {
+		if seen[e.Path] || (s.opt.OnlyPaths != nil && !s.wanted(e.Path)) {
 			continue
 		}
 		seen[e.Path] = true
@@ -1283,6 +1363,11 @@ func (s *session) placeTables(results []*pkgResult) map[string][]expect {
 		idx[at] = append(idx[at], x)
 		if a := usrAlias(at); a != "" {
 			idx[a] = append(idx[a], x)
+		}
+		// Not a regular file where dpkg installs it: when a directory on
+		// the way is a link, the file really reached is the one to compare.
+		if q := s.physicalFile(at); q != "" && !slices.ContainsFunc(idx[q], func(y expect) bool { return y.r == x.r && y.path == x.path }) {
+			idx[q] = append(idx[q], x)
 		}
 	}
 	for _, r := range results {
@@ -1343,7 +1428,7 @@ func (s *session) judgeFile(e *model.FileEntry, exp []expect, lst []*pkgResult) 
 	}
 	inScope := false
 	for i := range exp {
-		if exp[i].control || s.opt.candidate(e.Path, exp[i].path, mode, &exp[i].f) {
+		if exp[i].control || s.candidate(e.Path, exp[i].path, mode, &exp[i].f) {
 			inScope = true
 			break
 		}
@@ -1471,7 +1556,7 @@ func (s *session) judgeUnshipped(e *model.FileEntry, regular bool, lst []*pkgRes
 		v.Reason, v.Kind = "the signed package has no "+script+" maintainer script", KindNotShipped
 		return v, ConffileDiff{}, verdictMismatch
 	}
-	if !regular || !s.opt.candidate(e.Path, e.Path, e.Mode, nil) {
+	if !regular || !s.candidate(e.Path, e.Path, e.Mode, nil) {
 		return none()
 	}
 	v := FileVerdict{Path: e.Path, Actual: e.SHA256, Source: s.source}
@@ -1723,6 +1808,11 @@ func (s *session) offline() {
 		seen := map[string]bool{}
 		for _, lp := range append(slices.Clone(p.Files), extra...) {
 			cp, e, kind := s.locate(lp)
+			// Not a regular file under dpkg's spelling: a directory on the
+			// way may be a link, and the file really reached is checked.
+			if q := s.physicalFile(lp); q != "" {
+				cp, e, kind = q, s.files[q], regularFile
+			}
 			if kind != regularFile || seen[cp] || !s.opt.candidate(cp, lp, e.Mode, nil) {
 				continue
 			}

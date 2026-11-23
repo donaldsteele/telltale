@@ -40,7 +40,10 @@ const (
 )
 
 // Run returns findings for a collection. owned maps path to owning package
-// (c.Packages.Owners()). Findings are sorted by Key.
+// (c.Packages.Owners()): the paths dpkg lists, which is all that makes a file
+// a package's own. Only the startup-link check also asks where a listed path
+// really is (model.PhysicalOwnersOf), to tell whose file a link leads to.
+// Findings are sorted by Key.
 func Run(c *model.Collection, ctx model.ScanContext, owned map[string]string) []model.Finding {
 	var out []model.Finding
 	out = append(out, accounts(c)...)
