@@ -82,9 +82,32 @@ var (
 	keepaliveInterval = 30 * time.Second
 )
 
+// Bounds on what one visit may send.
+const (
+	// DefaultMaxCollection is the bound unless the server's configuration
+	// sets another (max_collection_mib). A machine's collection is a few
+	// tens of MiB; one near the bound has been filled on purpose.
+	DefaultMaxCollection int64 = 256 << 20
+	// MinMaxCollection and MaxMaxCollection are the range the bound can
+	// be set in. The store cannot hold a collection larger than the
+	// upper end.
+	MinMaxCollection int64 = 16 << 20
+	MaxMaxCollection int64 = 512 << 20
+)
+
 // maxOutput bounds the collector's stdout and the JSON it decompresses to.
-// The store cannot hold a larger collection either.
-var maxOutput int64 = 512 << 20
+var maxOutput = DefaultMaxCollection
+
+// SetMaxCollection sets how many bytes one visit may send (the collector's
+// output, and the collection it decompresses to). Call it before any visit
+// starts.
+func SetMaxCollection(n int64) error {
+	if n < MinMaxCollection || n > MaxMaxCollection {
+		return fmt.Errorf("the bound on a visit's collection must be between %d and %d MiB", MinMaxCollection>>20, MaxMaxCollection>>20)
+	}
+	maxOutput = n
+	return nil
+}
 
 const (
 	maxStderr      = 64 << 10 // the last 64 KiB of a command's stderr are kept for its error

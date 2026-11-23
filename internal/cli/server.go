@@ -141,6 +141,11 @@ func serve(ctx *Context, cfg *config.Config, st *store.Store) int {
 	// Alerts go to bubbles once the owner pairs in the web UI; until then
 	// the sink sends nothing.
 	bub := &alerts.Bubbles{Store: st, Log: logger, Context: runCtx}
+	if cfg.MaxCollectionBytes > 0 {
+		if err := visit.SetMaxCollection(cfg.MaxCollectionBytes); err != nil {
+			return fail(err)
+		}
+	}
 	core := &server.Core{
 		Store:      st,
 		Bins:       visit.Binaries{Dir: cfg.BinDir, Log: logger},

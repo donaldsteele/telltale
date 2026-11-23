@@ -1637,3 +1637,24 @@ func TestVisitMarksARefusedLogin(t *testing.T) {
 		t.Fatalf("changed host key: err = %v", err)
 	}
 }
+
+// One visit may send 256 MiB by default; the server's configuration can set
+// another bound, within what the store can hold.
+func TestMaxCollection(t *testing.T) {
+	if maxOutput != DefaultMaxCollection || DefaultMaxCollection != 256<<20 {
+		t.Fatalf("default bound %d", maxOutput)
+	}
+	old := maxOutput
+	t.Cleanup(func() { maxOutput = old })
+	if err := SetMaxCollection(384 << 20); err != nil || maxOutput != 384<<20 {
+		t.Errorf("384 MiB: %v, bound %d", err, maxOutput)
+	}
+	for _, n := range []int64{0, -1, MinMaxCollection - 1, MaxMaxCollection + 1} {
+		if err := SetMaxCollection(n); err == nil {
+			t.Errorf("SetMaxCollection(%d) accepted", n)
+		}
+	}
+	if maxOutput != 384<<20 {
+		t.Errorf("a refused value changed the bound to %d", maxOutput)
+	}
+}

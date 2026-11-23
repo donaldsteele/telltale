@@ -1,6 +1,7 @@
 package config
 
 import (
+	"github.com/donaldsteele/telltale/internal/visit"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -251,5 +252,49 @@ func TestExampleDocumentsEveryKey(t *testing.T) {
 	}
 	if c.Unlock.KeyFile == "" || c.BinDir == "" || c.ServerAddr == "" {
 		t.Errorf("uncommented example: %+v", c)
+	}
+}
+
+// The unit bounds the server's memory, and stops it as a whole when the
+// kernel has to kill part of it, so that a machine sending far too much
+// cannot take the host down with the server.
+func TestUnitBoundsMemory(t *testing.T) {
+	unit, err := os.ReadFile("../../deploy/systemd/telltale.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"MemoryMax=2G", "OOMPolicy=stop"} {
+		if !regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(want) + `$`).Match(unit) {
+			t.Errorf("the unit has no %s line", want)
+		}
+	}
+}
+
+// max_collection_mib bounds what one visit may send; 256 by default.
+func TestConfigMaxCollection(t *testing.T) {
+	const base = "listen = \"192.0.2.10:8443\"\n"
+	c, err := Parse(strings.NewReader(base))
+	if err != nil || c.MaxCollectionBytes != visit.DefaultMaxCollection || visit.DefaultMaxCollection != 256<<20 {
+		t.Fatalf("default: %d, %v (default constant %d)", c.MaxCollectionBytes, err, visit.DefaultMaxCollection)
+	}
+	c, err = Parse(strings.NewReader(base + "max_collection_mib = \"384\"\n"))
+	if err != nil || c.MaxCollectionBytes != 384<<20 {
+		t.Fatalf("384: %d, %v", c.MaxCollectionBytes, err)
+	}
+	for _, bad := range []string{"0", "-1", "8", "4096", "many", "256MiB", "1e3", ""} {
+		_, err := Parse(strings.NewReader(base + "max_collection_mib = \"" + bad + "\"\n"))
+		if bad == "" {
+			continue // an empty value is caught as any empty value is, or means unset
+		}
+		if err == nil || !strings.Contains(err.Error(), "line 2") || !strings.Contains(err.Error(), "max_collection_mib") {
+			t.Errorf("max_collection_mib = %q: %v", bad, err)
+		}
+	}
+	ex, err := os.ReadFile("../../deploy/telltale.toml.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(ex), "#max_collection_mib = \"256\"") {
+		t.Error("the example configuration does not show max_collection_mib")
 	}
 }

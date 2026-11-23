@@ -81,6 +81,7 @@ One setting per line, `key = "value"`:
 | `data_dir` | Where the database, the HTTPS certificate and key and the package cache live. Default `/var/lib/telltale`. |
 | `bin_dir` | Where the collectors are. By default they are looked for next to the binary and then in `../lib/telltale` beside it, which is where the package puts them. |
 | `key_file` | An age key file that unlocks the database instead of a passphrase, for restarts with nobody there. See [the passphrase](#the-passphrase-or-a-key-file). |
+| `max_collection_mib` | The most one visit may send, in MiB (the collector's output, and the collection it unpacks to). Default `256`, at least 16 and at most 512. An ordinary machine sends a few tens of MiB; a visit that passes the limit fails. Raise the unit's `MemoryMax` with it (see [the systemd unit](#the-systemd-unit)). |
 
 ## The passphrase, or a key file
 
@@ -339,7 +340,16 @@ passphrase file, and start it.
   `ProtectHome=yes`, `PrivateTmp=yes`);
 - no capabilities at all, `NoNewPrivileges`, no new namespaces, only IP and
   local sockets, a system call filter, and the kernel, clock, devices and
-  other processes out of reach.
+  other processes out of reach;
+- `MemoryMax=2G`: the most memory the service may use. A visit holds what
+  the machine sent (at most `max_collection_mib`, 256 MiB by default) and
+  its decoded copy, and four visits run at once; the limit keeps a machine
+  that sends far too much from taking the server's host down with it. If
+  you raise `max_collection_mib`, raise this too;
+- `OOMPolicy=stop`: when the kernel has to kill one of the service's
+  processes for memory, systemd stops the whole service rather than
+  leaving part of it running, and `Restart=on-failure` starts it again.
+  The visit that was running fails and is tried at its next turn.
 
 To change it, use `sudo systemctl edit telltale` rather than editing the
 file, so a package upgrade keeps your change.

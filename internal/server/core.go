@@ -130,9 +130,11 @@ const (
 // Core is server mode's engine. Set the exported fields, then call Run (the
 // scheduler) and the owner's actions from any goroutine.
 //
-// Memory: each visit can hold up to 512 MiB of collector output (visit's
-// limit) plus the decoded collection, and up to four visits run at once, so
-// plan on a few GiB for a server visiting large machines.
+// Memory: each visit can hold up to 256 MiB of collector output (visit's
+// limit, visit.SetMaxCollection) plus the decoded collection, and up to four
+// visits run at once. The shipped systemd unit caps the service at 2 GiB
+// (MemoryMax) and stops it as a whole if the kernel has to kill part of it
+// (OOMPolicy=stop).
 type Core struct {
 	Store *store.Store
 	// Bins supplies the collector binaries copied to machines.

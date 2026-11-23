@@ -45,6 +45,16 @@ StateDirectoryMode=0700
 ReadWritePaths=/var/lib/telltale
 UMask=0077
 
+# Memory. A visit holds what the machine sent (at most max_collection_mib,
+# 256 MiB by default) and its decoded copy, and four visits run at once.
+# MemoryMax bounds the whole service, so a machine that sends far too much
+# cannot take this host down with it; raise it together with
+# max_collection_mib. OOMPolicy=stop stops the service as a whole when the
+# kernel kills one of its processes for memory, instead of leaving half of
+# it running; Restart=on-failure then starts it again.
+MemoryMax=2G
+OOMPolicy=stop
+
 # No privileges at all: the web UI listens on an unprivileged port and the
 # server reaches machines over outgoing SSH.
 NoNewPrivileges=yes

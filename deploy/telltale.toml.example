@@ -46,3 +46,12 @@ listen = "192.168.1.10:8443"
 # key_file the passphrase comes from TELLTALE_PASSPHRASE, from systemd's
 # credential "passphrase", or from a prompt.
 #key_file = "/var/lib/telltale/data.key"
+
+# max_collection_mib (optional): the most one visit may send, in MiB: the
+# collector's output and the collection it unpacks to. Default 256, at
+# least 16 and at most 512. An ordinary machine sends a few tens of MiB; a
+# visit that passes the limit fails and is reported as a failed visit. Up
+# to four visits run at once, so the server's memory (MemoryMax=2G in the
+# shipped systemd unit) has to hold four of these and their decoded copies:
+# raise that limit too if you raise this one.
+#max_collection_mib = "256"

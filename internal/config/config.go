@@ -48,6 +48,10 @@ type Config struct {
 	// BinDir holds the collector binaries copied to machines (bin_dir;
 	// next to the running executable when not set).
 	BinDir string
+	// MaxCollectionBytes bounds what one visit may send
+	// (max_collection_mib, in MiB; visit.DefaultMaxCollection when not
+	// set).
+	MaxCollectionBytes int64
 	// Unlock opens the store. KeyFile comes from key_file; without one the
 	// command fills in Passphrase.
 	Unlock store.Unlock
@@ -57,7 +61,7 @@ type Config struct {
 }
 
 // keys lists every key the file may set.
-var keys = map[string]bool{"listen": true, "server_addr": true, "data_dir": true, "bin_dir": true, "key_file": true}
+var keys = map[string]bool{"listen": true, "server_addr": true, "data_dir": true, "bin_dir": true, "key_file": true, "max_collection_mib": true}
 
 // Load reads and checks the file at path; errors name the file and line.
 func Load(path string) (*Config, error) {
@@ -201,6 +205,15 @@ func (c *Config) check(vals map[string]setting) error {
 			return fmt.Errorf("%sserver_addr: %w", at("listen"), err)
 		}
 		c.ServerAddr = a.String()
+	}
+	c.MaxCollectionBytes = visit.DefaultMaxCollection
+	if s, ok := vals["max_collection_mib"]; ok {
+		lo, hi := visit.MinMaxCollection>>20, visit.MaxMaxCollection>>20
+		n, err := strconv.ParseInt(s.value, 10, 64)
+		if err != nil || n < lo || n > hi {
+			return fmt.Errorf("%smax_collection_mib must be a whole number of MiB between %d and %d, not %q", at("max_collection_mib"), lo, hi, s.value)
+		}
+		c.MaxCollectionBytes = n << 20
 	}
 	for _, d := range []struct{ key, val string }{{"data_dir", c.DataDir}, {"bin_dir", c.BinDir}, {"key_file", c.Unlock.KeyFile}} {
 		if d.val != "" && !filepath.IsAbs(d.val) {
