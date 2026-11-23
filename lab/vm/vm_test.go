@@ -3,6 +3,14 @@
 // Package vm runs the kernel checks that a container cannot exercise, because
 // a container shares the host's kernel: loaded modules, the kernel command
 // line and the live firewall. It boots a real Debian 12 machine in QEMU.
+//
+// Run it with a generous timeout, because the first run downloads the image
+// and installs packages in the VM:
+//
+//	go test -tags "lab vm" -timeout 30m ./lab/vm/
+//
+// It needs read and write access to /dev/kvm (else it is skipped) and network
+// access. A VM left behind by a killed test ends itself after an hour.
 package vm
 
 import (
@@ -10,13 +18,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -24,7 +34,11 @@ import (
 	"github.com/donaldsteele/telltale/internal/model"
 )
 
-const exitSkip = 77
+// run.sh up exit codes: no usable /dev/kvm, and the forwarded port is taken.
+const (
+	exitSkip      = 77
+	exitPortTaken = 78
+)
 
 // machine is the running VM and how to reach it.
 type machine struct {
@@ -85,29 +99,76 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
+// Every VM that is running, by working directory, so that a signal can stop
+// them all. (A -timeout panic cannot be caught: the tests keep inside the
+// deadline instead, and run.sh's watchdog ends a VM that is left behind.)
+var (
+	regMu sync.Mutex
+	reg   = map[string]string{} // working directory -> run.sh
+)
+
+func TestMain(m *testing.M) {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		regMu.Lock()
+		for dir, runSh := range reg {
+			teardown(runSh, dir)
+		}
+		regMu.Unlock()
+		os.Exit(130)
+	}()
+	os.Exit(m.Run())
+}
+
+// teardown stops QEMU through run.sh, then through its pidfile, and removes
+// the working directory.
+func teardown(runSh, dir string) {
+	exec.Command(runSh, "down", dir).Run()
+	if b, err := os.ReadFile(filepath.Join(dir, "qemu.pid")); err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 1 {
+			if p, err := os.FindProcess(pid); err == nil {
+				p.Kill()
+			}
+		}
+	}
+	os.RemoveAll(dir)
+}
+
+// budget is how long a wait may take: want, but never past the test's
+// -timeout (less a margin), so that the test fails, and cleans up, before the
+// testing package panics.
+func budget(t *testing.T, want time.Duration) time.Duration {
+	t.Helper()
+	if dl, ok := t.Deadline(); ok {
+		if left := time.Until(dl) - 45*time.Second; left < want {
+			if left <= 0 {
+				t.Fatal("no time left before the test timeout (run with -timeout 30m)")
+			}
+			return left
+		}
+	}
+	return want
+}
+
 // boot starts the VM with run.sh and registers its teardown before anything
-// can fail: QEMU is stopped through run.sh, then through its pidfile, and the
-// temporary directory is removed, whether the test passes, fails or panics.
+// can fail, whether the test passes, fails or panics.
 func boot(t *testing.T) *machine {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "telltale-vm-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := &machine{t: t, dir: dir, key: filepath.Join(dir, "id_ed25519"), port: freePort(t)}
+	m := &machine{t: t, dir: dir, key: filepath.Join(dir, "id_ed25519")}
 	runSh, err := filepath.Abs("run.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
+	regMu.Lock()
+	reg[dir] = runSh
+	regMu.Unlock()
 	t.Cleanup(func() {
-		exec.Command(runSh, "down", dir).Run()
-		if b, err := os.ReadFile(filepath.Join(dir, "qemu.pid")); err == nil {
-			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 1 {
-				if p, err := os.FindProcess(pid); err == nil {
-					p.Kill()
-				}
-			}
-		}
 		if t.Failed() {
 			if b, err := os.ReadFile(filepath.Join(dir, "console.log")); err == nil {
 				tail := string(b)
@@ -117,45 +178,65 @@ func boot(t *testing.T) *machine {
 				t.Logf("VM console (tail):\n%s", tail)
 			}
 		}
-		os.RemoveAll(dir)
+		regMu.Lock()
+		delete(reg, dir)
+		regMu.Unlock()
+		teardown(runSh, dir)
 	})
 
 	if out, err := exec.Command("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "telltale-lab", "-f", m.key).CombinedOutput(); err != nil {
 		t.Fatalf("ssh-keygen: %v\n%s", err, out)
 	}
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, runSh, "up", dir, m.key+".pub", strconv.Itoa(m.port))
-	var errb bytes.Buffer
-	cmd.Stdout, cmd.Stderr = os.Stderr, &errb
-	err = cmd.Run()
-	var ee *exec.ExitError
-	if errors.As(err, &ee) && ee.ExitCode() == exitSkip {
-		t.Skip(strings.TrimSpace(errb.String()))
-	}
-	if err != nil {
-		t.Fatalf("run.sh up: %v\n%s", err, errb.String())
+	// The first run downloads the image. A port that someone else took
+	// between freePort and QEMU's start (exit 78) is retried with another.
+	for attempt := 1; ; attempt++ {
+		m.port = freePort(t)
+		ctx, cancel := context.WithTimeout(context.Background(), budget(t, 20*time.Minute))
+		cmd := exec.CommandContext(ctx, runSh, "up", dir, m.key+".pub", strconv.Itoa(m.port))
+		var errb bytes.Buffer
+		cmd.Stdout, cmd.Stderr = os.Stderr, &errb
+		err = cmd.Run()
+		cancel()
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ExitCode() == exitSkip {
+			t.Skip(strings.TrimSpace(errb.String()))
+		}
+		if errors.As(err, &ee) && ee.ExitCode() == exitPortTaken && attempt < 4 {
+			t.Logf("port %d taken, retrying: %s", m.port, strings.TrimSpace(errb.String()))
+			continue
+		}
+		if err != nil {
+			t.Fatalf("run.sh up: %v\n%s", err, errb.String())
+		}
+		break
 	}
 	t.Logf("run.sh up took %s", time.Since(start).Round(time.Second))
 
 	// SSH answers early; cloud-init then installs the packages and builds and
 	// loads the module, so wait for it to finish as well.
-	deadline := time.Now().Add(10 * time.Minute)
+	sshBy := time.Now().Add(budget(t, 10*time.Minute))
 	for {
 		if _, _, code := m.ssh(30*time.Second, "true"); code == 0 {
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("the VM did not accept SSH within 10 minutes")
+		if time.Now().After(sshBy) {
+			t.Fatal("the VM did not accept SSH in time")
 		}
 		time.Sleep(5 * time.Second)
 	}
 	t.Logf("ssh up after %s", time.Since(start).Round(time.Second))
-	out, serr, code := m.ssh(25*time.Minute, "sudo cloud-init status --wait --long")
+	out, serr, code := m.ssh(budget(t, 25*time.Minute), "sudo cloud-init status --wait --long")
 	t.Logf("cloud-init: %s%s (exit %d), %s", out, serr, code, time.Since(start).Round(time.Second))
-	if _, _, ready := m.ssh(30*time.Second, "test -e /var/lib/telltale-lab-ready"); ready != 0 {
-		t.Fatalf("cloud-init did not finish the lab setup (exit %d):\n%s", code, out)
+	_, _, ready := m.ssh(30*time.Second, "test -e /var/lib/telltale-lab-ready")
+	if ready != 0 {
+		// user-data's setup script names the stage that failed.
+		stage, _, _ := m.ssh(30*time.Second, "cat /var/lib/telltale-lab-failed 2>/dev/null")
+		logTail, _, _ := m.ssh(30*time.Second, "sudo tail -n 40 /var/log/cloud-init-output.log")
+		if stage = strings.TrimSpace(stage); stage != "" {
+			t.Fatalf("lab setup failed at stage %q (sources/apt: installing build-essential, nftables and the kernel headers from snapshot.debian.org; make: building labmod; insmod: loading it; nftables: the ruleset)\n%s", stage, logTail)
+		}
+		t.Fatalf("lab setup did not finish: cloud-init status exit %d (not a setup stage failure; cloud-init itself or a timeout)\n%s\n%s", code, out, logTail)
 	}
 	return m
 }
@@ -261,5 +342,5 @@ func TestVMUnownedKernelModule(t *testing.T) {
 	case !fw.Pass || !strings.Contains(fw.Observed, "input policy drop"):
 		t.Errorf("TT-FW-001 = %+v, want a pass that reads the input policy drop", *fw)
 	}
-	fmt.Fprintln(os.Stderr, "vm: total", time.Since(start).Round(time.Second))
+	t.Logf("scan and collect took %s", time.Since(start).Round(time.Second))
 }

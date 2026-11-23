@@ -68,3 +68,7 @@ Hostnames default to `<distro>-<variant>`; set `Opts.Hostname` for the made-up n
 - Manifest: `{"requires":{...}, "with_snapshot":{"must":[{"key_prefix","severity"}], "must_not_severity_above"}, "without_snapshot":{...}}`. Both sections are required (an empty `{}` means nothing is expected). `lab.Check(m, report, withSnapshot)` returns the mismatches. A `must` entry is met by a finding whose key starts with the prefix and whose severity is exactly the given one.
 - `downgrade-package` and `new-service-package` install offline from .debs the image build fetched into `/var/cache/telltale-lab/debs/{openssl,lighttpd}` (see `images/common/setup.sh`). `downgrade-package` needs a machine at the newer snapshot (manifest `requires.newer_snapshot`): an image built with `BuildOpts{Newer: true}`, or by hand `docker build --build-arg LAB_NEWER=1`.
 - Manifest sections may carry a `comment` (ignored by the matcher) saying why they are empty or unusual.
+
+## Kernel checks in a VM
+
+`lab/vm/` boots a Debian 12 machine in QEMU (a pinned image, cached in `~/.cache/telltale-lab/vm/`), builds the inert `labmod` module in it and checks that telltale reports it, along with the kernel command line and the live firewall. It needs `qemu-system-x86` and `cloud-image-utils`, network access, and read and write access to `/dev/kvm` (else the test is skipped). Run it with `go test -tags 'lab vm' -timeout 30m ./lab/vm/`: the first run downloads the image and the VM installs packages. A VM left behind by a killed test ends itself after an hour.

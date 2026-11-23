@@ -20,7 +20,8 @@ write_files:
       obj-m += labmod.o
       all:
       	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
-  - path: /etc/nftables.conf
+  # Not /etc/nftables.conf: the package would ask about a changed conffile.
+  - path: /root/lab-nftables.conf
     permissions: "0644"
     content: |
       #!/usr/sbin/nft -f
@@ -33,8 +34,36 @@ write_files:
           tcp dport 22 accept
         }
       }
+  - path: /root/setup.sh
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # Each stage names itself in the failure marker, so a test failure says
+      # whether apt, make, insmod or nftables went wrong.
+      stage=sources
+      trap 'rc=$?; [ $rc -eq 0 ] || echo "$stage" >/var/lib/telltale-lab-failed' EXIT
+      set -e
+      export DEBIAN_FRONTEND=noninteractive
+      # Package sources pinned to the day after the image build (run.sh fills
+      # in the date from the image's file name), so that linux-headers for the
+      # image's kernel are still there when Debian moves on.
+      rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list
+      cat >/etc/apt/sources.list <<SRC
+      deb http://snapshot.debian.org/archive/debian/@SNAPSHOT@/ bookworm main
+      deb http://snapshot.debian.org/archive/debian-security/@SNAPSHOT@/ bookworm-security main
+      SRC
+      echo 'Acquire::Check-Valid-Until "false";' >/etc/apt/apt.conf.d/99snapshot
+      stage=apt
+      apt-get update
+      apt-get install -y -o Dpkg::Options::=--force-confold build-essential nftables linux-headers-$(uname -r)
+      stage=make
+      cd /root && make
+      stage=insmod
+      insmod /root/labmod.ko
+      lsmod | grep -q '^labmod '
+      stage=nftables
+      cp /root/lab-nftables.conf /etc/nftables.conf
+      systemctl enable --now nftables
+      touch /var/lib/telltale-lab-ready
 runcmd:
-  - [sh, -c, "export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y build-essential nftables linux-headers-$(uname -r)"]
-  - [sh, -c, "cd /root && make && insmod /root/labmod.ko"]
-  - [systemctl, enable, --now, nftables]
-  - [sh, -c, "touch /var/lib/telltale-lab-ready"]
+  - [sh, /root/setup.sh]
