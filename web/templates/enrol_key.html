@@ -1,0 +1,20 @@
+{{define "content"}}
+{{- with .Body}}
+<section class="narrow">
+<h1>Compare the fingerprint</h1>
+<p>The machine at <code>{{.Addr}}</code> offered this {{.KeyType}} host key:</p>
+<p class="fingerprint">{{.Fingerprint}}</p>
+<p>Check that this is really that machine's key before you go on. On the machine's own console (not over the network), run:</p>
+<pre><code>ssh-keygen -lf {{.KeyFile}}</code></pre>
+<p>and compare the SHA256 fingerprint it prints with the one above, character by character. The server pins this key and refuses any other on every visit.</p>
+<form method="post" action="/enrol/confirm" class="confirm">
+<input type="hidden" name="csrf" value="{{$.CSRF}}">
+<input type="hidden" name="pending" value="{{.Pending}}">
+<input type="hidden" name="confirm" value="yes">
+<button type="submit" class="btn primary">They match: enrol {{.Name}}</button>
+<a href="/enrol">They do not match: stop</a>
+</form>
+<p class="small">If they do not match, do not enrol the machine. Something between this server and the machine may be posing as it.</p>
+</section>
+{{- end}}
+{{end}}

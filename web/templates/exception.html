@@ -1,0 +1,19 @@
+{{define "content"}}
+{{- $csrf := .CSRF}}
+{{- with .Body}}
+<h1>Accept a finding on {{.Name}} as an exception</h1>
+<div class="callout warn">
+<p>An exception says this finding is intended. It stops being reported for as long as its value stays exactly what it is now. If it changes again, it is a finding again.</p>
+</div>
+{{template "finding" .Finding}}
+<form method="post" action="/machines/{{.MachineID}}/exception" class="confirm stack">
+<input type="hidden" name="csrf" value="{{$csrf}}">
+<input type="hidden" name="report" value="{{.ReportID}}">
+<input type="hidden" name="key" value="{{.FormKey}}">
+<input type="hidden" name="confirm" value="yes">
+<label for="note">Why it is intended (optional, shown with the exception)</label>
+<textarea id="note" name="note" rows="2" maxlength="500"></textarea>
+<div><button type="submit" class="btn primary">Yes, accept it as an exception</button> <a href="/machines/{{.MachineID}}?report={{.ReportID}}">Cancel</a></div>
+</form>
+{{- end}}
+{{end}}

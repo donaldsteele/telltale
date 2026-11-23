@@ -1,0 +1,81 @@
+{{define "content"}}
+{{- $csrf := .CSRF}}
+{{- with .Body}}
+<h1>Settings</h1>
+
+<section class="panel" id="general" aria-labelledby="general-title">
+<h2 id="general-title">Visits and alerts</h2>
+<form method="post" action="/settings/general" class="stack">
+<input type="hidden" name="csrf" value="{{$csrf}}">
+<label for="schedule">How often a newly enrolled machine is visited</label>
+<select id="schedule" name="schedule">{{range .Schedules}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}</select>
+<label for="alert_level">Send an alert for</label>
+<select id="alert_level" name="alert_level">{{range .AlertLevels}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}</select>
+<div><button type="submit" class="btn">Save</button></div>
+</form>
+</section>
+
+<section class="panel" id="server" aria-labelledby="server-title">
+<h2 id="server-title">This server</h2>
+<dl class="facts">
+<div><dt>SSH key fingerprint</dt><dd class="mono">{{if .SSHKeyError}}{{.SSHKeyError}}{{else}}{{.SSHKeyFP}}{{end}}</dd></div>
+<div><dt>Address machines see it from</dt><dd class="mono">{{.ServerAddr}}</dd></div>
+<div><dt>HTTPS certificate (SHA-256)</dt><dd class="mono small">{{.CertFP}}</dd></div>
+</dl>
+<p class="small">This key logs in as root to every enrolled machine. Its line in a machine's <code>/root/.ssh/authorized_keys</code> ends with <code>telltale-server</code>; to audit a machine, compare that line with this one:</p>
+{{with .SSHKeyLine}}<div class="fix"><div class="fix-head"><strong>The server's key line</strong> <button type="button" class="btn small copy" data-copy="server-key">Copy</button></div><pre><code id="server-key">{{.}}</code></pre></div>{{end}}
+</section>
+
+<section class="panel" id="keys" aria-labelledby="keys-title">
+<h2 id="keys-title">Trusted third-party repository keys</h2>
+<p>telltale checks packages from third-party APT repositories (Docker, a PPA, your own) only with a key bound to that repository: the one in the snapshot, a built-in vendor key, or one you add here. A key you add vouches only for the address you give with it and the addresses under it, never for any other repository, and never for the official Debian and Ubuntu archives.</p>
+{{if .Keys}}
+<table class="keys">
+<thead><tr><th scope="col">Fingerprint</th><th scope="col">Repository</th><th scope="col">Added</th><th scope="col"><span class="sr">Actions</span></th></tr></thead>
+<tbody>
+{{- range .Keys}}
+<tr><td class="mono small">{{.Fingerprint}}</td><td class="mono small">{{.URL}}</td><td class="small">{{.Added}}</td><td><form method="post" action="/settings/keys/{{.ID}}/remove" class="inline"><input type="hidden" name="csrf" value="{{$csrf}}"><button type="submit" class="btn small">Remove</button></form></td></tr>
+{{- end}}
+</tbody>
+</table>
+{{else}}
+<p class="dim">No keys added.</p>
+{{end}}
+<form method="post" action="/settings/keys" class="stack">
+<input type="hidden" name="csrf" value="{{$csrf}}">
+<label for="url">Repository address, as in the machines' APT sources (for example https://download.docker.com/linux/debian)</label>
+<input id="url" name="url" value="{{.KeyURL}}" maxlength="500" required autocomplete="off" spellcheck="false">
+<label for="key">The repository's public key, ASCII-armored (-----BEGIN PGP PUBLIC KEY BLOCK-----)</label>
+<textarea id="key" name="key" rows="6" required spellcheck="false">{{.KeyText}}</textarea>
+<p class="small">Get the key from the vendor's own HTTPS site and compare its fingerprint with one they publish somewhere else. Never copy it from a machine you are checking.</p>
+<div><button type="submit" class="btn">Add the key</button></div>
+</form>
+</section>
+
+<section class="panel" id="bubbles" aria-labelledby="bubbles-title">
+<h2 id="bubbles-title">Alerts through bubbles</h2>
+<p class="dim">Not connected. Pairing with a bubbles server comes in a later version.</p>
+</section>
+
+<section class="panel" id="mcp" aria-labelledby="mcp-title">
+<h2 id="mcp-title">MCP access tokens</h2>
+<p class="dim">None. Read-only MCP access comes in a later version.</p>
+</section>
+
+<section class="panel" id="password" aria-labelledby="password-title">
+<h2 id="password-title">Admin password</h2>
+<p>Changing the password logs out every browser, this one too.</p>
+<form method="post" action="/settings/password" class="stack">
+<input type="hidden" name="csrf" value="{{$csrf}}">
+<input type="text" name="username" value="admin" autocomplete="username" class="sr" tabindex="-1" aria-hidden="true" readonly>
+<label for="current">Current password</label>
+<input id="current" type="password" name="current" autocomplete="current-password" required>
+<label for="password-new">New password (at least 12 characters)</label>
+<input id="password-new" type="password" name="password" autocomplete="new-password" minlength="12" required>
+<label for="repeat">The new password again</label>
+<input id="repeat" type="password" name="repeat" autocomplete="new-password" minlength="12" required>
+<div><button type="submit" class="btn">Change the password</button></div>
+</form>
+</section>
+{{- end}}
+{{end}}

@@ -225,6 +225,22 @@ func TestBlobBoundToRow(t *testing.T) {
 	}
 }
 
+func TestReportOnly(t *testing.T) {
+	s := openPass(t, tmpDB(t), "pw")
+	id := addM(t, s, "a")
+	rid, err := s.PutReport(id, &model.Report{ExitCode: 2, Host: model.Host{Hostname: "h"}}, &model.Collection{Host: model.Host{Hostname: "big"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, mid, err := s.ReportOnly(rid)
+	if err != nil || mid != id || r.ExitCode != 2 || r.Host.Hostname != "h" {
+		t.Fatalf("ReportOnly: %+v %d %v", r, mid, err)
+	}
+	if _, _, err := s.ReportOnly(rid + 100); err == nil {
+		t.Error("a missing report opened")
+	}
+}
+
 func TestReportsHistoryOrder(t *testing.T) {
 	s := openPass(t, tmpDB(t), "pw")
 	id := addM(t, s, "a")

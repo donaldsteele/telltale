@@ -90,6 +90,9 @@ const (
 	// SettingAlertTimeout bounds each Notify; 60 seconds when unset or
 	// unreadable.
 	SettingAlertTimeout = "alert_timeout"
+	// SettingDefaultSchedule is the schedule a newly enrolled machine gets
+	// (ScheduleDaily when unset).
+	SettingDefaultSchedule = "default_schedule"
 )
 
 const (
@@ -471,8 +474,14 @@ func (c *Core) judgeAndStore(parent, ctx context.Context, m *store.Machine, col 
 	if err != nil {
 		return outcome{err: err}
 	}
+	owner, err := verifyOwnerKeys(c.Store)
+	if err != nil {
+		return outcome{err: err}
+	}
 	checks := checklist.Evaluate(col, sc)
-	opt := pkgverify.Options{CacheDir: c.CacheDir}
+	// The owner's repository keys go in on every visit, each bound to the
+	// repository addresses it was added for.
+	opt := pkgverify.Options{CacheDir: c.CacheDir, OwnerKeys: owner}
 	judge.VerifyScope(&opt, snap, col)
 	pkg := c.verify()(ctx, col, opt)
 	if parent.Err() != nil {
@@ -741,6 +750,41 @@ type rebaseState struct {
 	ReportID int64                  `json:"report_id"`
 	Stale    bool                   `json:"stale,omitempty"`
 	Accept   map[string]judge.Scope `json:"accept,omitempty"`
+}
+
+// Visiting reports whether a visit to the machine is running now.
+func (c *Core) Visiting(machineID int64) bool {
+	c.init()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.busy[machineID]
+}
+
+// Acceptable is what the owner can accept with AcceptChanges: the
+// machine's latest completed visit's report, and for each of its findings
+// about a change since the snapshot, the other findings that must be
+// accepted together with it. When Stale is set the baseline changed while
+// that report was being made and nothing can be accepted from it.
+type Acceptable struct {
+	ReportID int64
+	Stale    bool
+	With     map[string][]string
+}
+
+// Acceptable says what AcceptChanges would take for the machine now.
+func (c *Core) Acceptable(machineID int64) (Acceptable, error) {
+	var st rebaseState
+	if err := c.loadSecret(rebaseSetting(machineID), &st); err != nil {
+		return Acceptable{}, err
+	}
+	a := Acceptable{ReportID: st.ReportID, Stale: st.Stale, With: map[string][]string{}}
+	if st.Stale {
+		return a, nil
+	}
+	for k, s := range st.Accept {
+		a.With[k] = slices.Clone(s.With)
+	}
+	return a, nil
 }
 
 // MarkClean takes the machine's snapshot from one of its reports: that

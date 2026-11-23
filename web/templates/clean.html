@@ -1,0 +1,21 @@
+{{define "content"}}
+{{- $csrf := .CSRF}}
+{{- with .Body}}
+<h1>Take the snapshot of {{.Name}}</h1>
+<div class="callout warn">
+<p>Taking the snapshot says: <strong>this machine is clean, exactly as the report of {{.Report.Time}} shows it.</strong></p>
+<p>Every later visit is compared with the snapshot, and what is in it counts as normal from then on. If one of the findings below is really an attacker's work, it would stop showing up as a change. Look at each one before you go on.</p>
+{{if .Replaces}}<p>This machine already has a snapshot. This one replaces it.</p>{{end}}
+</div>
+<h2>The findings in this report ({{len .Report.Findings}})</h2>
+{{if not .Report.Findings}}<div class="panel"><p>This report has no findings.</p></div>{{end}}
+{{range .Report.Findings}}{{template "finding" .}}{{end}}
+<form method="post" action="/machines/{{.MachineID}}/clean" class="confirm">
+<input type="hidden" name="csrf" value="{{$csrf}}">
+<input type="hidden" name="report" value="{{.ReportID}}">
+<input type="hidden" name="confirm" value="yes">
+<button type="submit" class="btn primary">Yes, this machine is clean: take the snapshot</button>
+<a href="/machines/{{.MachineID}}?report={{.ReportID}}">Cancel</a>
+</form>
+{{- end}}
+{{end}}

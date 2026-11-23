@@ -1,0 +1,23 @@
+{{define "content"}}
+<div class="head-row">
+<h1>Machines</h1>
+<a class="btn" href="/enrol">Enrol a machine</a>
+</div>
+{{if not .Body}}
+<div class="panel"><p>No machines yet. <a href="/enrol">Enrol the first one</a>: you give its address, compare its SSH fingerprint, and add two snippets to it.</p></div>
+{{else}}
+<table class="machines">
+<thead><tr><th scope="col">Machine</th><th scope="col">Worst finding</th><th scope="col">Last visit</th><th scope="col"><span class="sr">Actions</span></th></tr></thead>
+<tbody>
+{{- range .Body}}
+<tr id="machine-{{.ID}}">
+<td data-label="Machine"><a class="strong" href="/machines/{{.ID}}">{{.Name}}</a><div class="dim mono small">{{.Addr}}</div>{{if not .Clean}}<div class="tag">No snapshot yet</div>{{end}}</td>
+<td data-label="Worst finding">{{if .Visited}}{{if .WorstLabel}}<span class="sev {{.WorstClass}}">{{.WorstLabel}}</span> {{.WorstTitle}}{{else}}<span class="sev ok">CLEAR</span>{{end}}<div class="dim small">{{.Count}}</div>{{else}}<span class="dim">Not visited yet</span>{{end}}</td>
+<td data-label="Last visit">{{if .Visiting}}Visiting now{{else if .LastVisit}}{{.LastVisit}}{{else}}<span class="dim">Never</span>{{end}}{{if .Failing}}<div class="tag hot">The last visit failed</div>{{end}}</td>
+<td class="actions">{{template "checknow" (checkArgs .ID $.CSRF false)}}</td>
+</tr>
+{{- end}}
+</tbody>
+</table>
+{{end}}
+{{end}}

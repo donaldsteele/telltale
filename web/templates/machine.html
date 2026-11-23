@@ -1,0 +1,66 @@
+{{define "content"}}
+{{- $csrf := .CSRF}}
+{{- with .Body}}
+{{- $m := .}}
+<div class="head-row">
+<div><h1>{{.Name}}</h1><p class="dim mono">{{.Addr}}</p></div>
+{{template "checknow" (checkArgs .ID $csrf true)}}
+</div>
+<dl class="facts">
+<div><dt>Last visit</dt><dd>{{if .Visiting}}A visit is running now.{{else if .LastVisit}}{{.LastVisit}}{{else}}Never{{end}}</dd></div>
+<div><dt>Snapshot</dt><dd>{{if .Clean}}Taken. Every visit is compared with it.{{else}}None yet. Review the findings below; if the machine is clean, take the snapshot.{{end}}</dd></div>
+<div><dt>Visits</dt><dd><form method="post" action="/machines/{{.ID}}/schedule" class="inline"><input type="hidden" name="csrf" value="{{$csrf}}"><label class="sr" for="schedule">How often the server visits</label><select id="schedule" name="schedule">{{range .Schedules}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}</select> <button type="submit" class="btn small">Save</button></form></dd></div>
+</dl>
+{{with .VisitError}}<div class="alert"><p><strong>The last visit failed.</strong> What went wrong:</p><p class="mono small">{{.}}</p></div>{{end}}
+{{if .Leftovers}}<div class="alert"><p>A telltale collector was left on the machine:{{range .Leftovers}} <code>{{.}}</code>{{end}}. The next visit removes it.</p></div>{{end}}
+{{if .Changes}}<div class="callout"><p><strong>{{.Changes}} {{if eq .Changes 1}}finding is a change{{else}}findings are changes{{end}} since the snapshot.</strong> If you made {{if eq .Changes 1}}it{{else}}them{{end}} on purpose (a new service, a config edit), you can accept {{if eq .Changes 1}}it{{else}}them{{end}} into the snapshot after looking at each one.</p><a class="btn" href="/machines/{{.ID}}/changes">Review the changes</a></div>{{end}}
+
+{{with .Report}}
+<section class="report" aria-labelledby="report-title">
+<h2 id="report-title">{{if $m.Latest}}Latest report{{else}}Older report{{end}}, {{.Time}}</h2>
+{{if not $m.Latest}}<p><a href="/machines/{{$m.ID}}">Back to the latest report</a></p>{{end}}
+<div class="meta">
+{{with .Host}}<p>{{.}}</p>{{end}}
+{{with .ComparedAgainst}}<p><strong>Compared against:</strong> {{.}}</p>{{end}}
+{{if .CouldNotRuleOut}}<p><strong>Could not rule out:</strong></p><ul>{{range .CouldNotRuleOut}}<li>{{.}}</li>{{end}}</ul>{{end}}
+</div>
+{{if not .Findings}}<div class="panel"><p>No findings.</p></div>{{end}}
+{{range .Findings}}{{template "finding" .}}{{end}}
+{{if .Explained}}<details class="panel"><summary>{{len .Explained}} {{if eq (len .Explained) 1}}group{{else}}groups{{end}} of changes explained by package updates</summary><ul>{{range .Explained}}<li>{{.}}</li>{{end}}</ul></details>{{end}}
+{{if .Exceptions}}<details class="panel"><summary>Exceptions in force for this report</summary><ul>{{range .Exceptions}}<li class="mono small">{{.}}</li>{{end}}</ul></details>{{end}}
+{{if .Skipped}}<details class="panel"><summary>Checks that were skipped</summary><ul>{{range .Skipped}}<li>{{.}}</li>{{end}}</ul></details>{{end}}
+</section>
+{{with $m.CleanURL}}
+<div class="callout">
+<p><strong>Is this machine clean?</strong> When you have looked at every finding above and believe the machine has not been tampered with, take the snapshot from this report. Every later visit is compared with it.</p>
+<a class="btn primary" href="{{.}}">This machine is believed clean: take the snapshot</a>
+</div>
+{{end}}
+{{else}}
+<div class="panel"><p>Not visited yet. Press Check now, or wait for the schedule. Make sure the two enrolment snippets are on the machine first.</p></div>
+{{end}}
+
+<h2>Exceptions</h2>
+{{if .Exceptions}}
+<p>Findings you accepted as intended. Each stays accepted only while its value stays exactly the same.</p>
+<ul class="plain">{{range .Exceptions}}<li class="mono small">{{.}}</li>{{end}}</ul>
+{{else}}
+<p class="dim">None. To accept a finding you meant to have (a locally built module, a setting you leave as it is), use "Accept as an exception" under it.</p>
+{{end}}
+
+<h2>History</h2>
+{{if .History}}
+<table class="history">
+<thead><tr><th scope="col">Report</th><th scope="col">Result</th><th scope="col">Findings</th></tr></thead>
+<tbody>
+{{- range .History}}
+<tr{{if .Selected}} class="selected"{{end}}><td><a href="/machines/{{$m.ID}}?report={{.ID}}">{{.Time}}</a></td><td><span class="dot {{.Class}}"></span>{{.Summary}}</td><td>{{.Count}}</td></tr>
+{{- end}}
+</tbody>
+</table>
+{{else}}
+<p class="dim">No reports yet.</p>
+{{end}}
+<p><a href="/machines/{{.ID}}/enrolled">Show the enrolment snippets again</a></p>
+{{- end}}
+{{end}}

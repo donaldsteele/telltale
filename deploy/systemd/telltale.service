@@ -1,0 +1,77 @@
+# telltale server, run as its own unprivileged user.
+#
+# Before the first start:
+#   useradd --system --home-dir /var/lib/telltale --shell /usr/sbin/nologin telltale
+#   install -d -m 0750 -o root -g telltale /etc/telltale
+#   install -m 0640 -o root -g telltale deploy/telltale.toml.example /etc/telltale/telltale.toml
+#   (edit listen in /etc/telltale/telltale.toml)
+#   install -m 0600 -o root -g root /dev/null /etc/telltale/passphrase
+#   (write the database passphrase into /etc/telltale/passphrase)
+#
+# systemd reads the passphrase file as root and hands it to the service as a
+# credential ($CREDENTIALS_DIRECTORY/passphrase), so the telltale user never
+# needs to read /etc/telltale/passphrase itself. With key_file set in the
+# configuration, remove the LoadCredential line.
+#
+# The first start prints a one-time setup code: journalctl -u telltale
+
+[Unit]
+Description=telltale server (backdoor and tamper detector)
+Documentation=https://github.com/donaldsteele/telltale
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telltale
+Group=telltale
+ExecStart=/usr/bin/telltale server --config /etc/telltale/telltale.toml
+LoadCredential=passphrase:/etc/telltale/passphrase
+Restart=on-failure
+RestartSec=5s
+
+# The data directory (database, TLS key, package cache), private to the
+# service.
+StateDirectory=telltale
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/telltale
+UMask=0077
+
+# No privileges at all: the web UI listens on an unprivileged port and the
+# server reaches machines over outgoing SSH.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SecureBits=noroot-locked
+
+# The rest of the system is read-only or hidden.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=yes
+KeyringMode=private
+
+# Only IP networking (and local sockets for logging).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

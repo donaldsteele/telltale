@@ -1,0 +1,16 @@
+{{define "content"}}
+{{- with .Body}}
+<section class="narrow">
+<h1>Enrol a machine</h1>
+<p>Give the machine a name and the address the server reaches it on over SSH. The server then fetches the machine's SSH host key and shows you its fingerprint to compare. Nothing is stored until you have compared it.</p>
+<form method="post" action="/enrol" class="stack">
+<input type="hidden" name="csrf" value="{{$.CSRF}}">
+<label for="name">Name (letters, digits, dots, dashes, underscores)</label>
+<input id="name" name="name" value="{{.Name}}" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,63}" required autocomplete="off" spellcheck="false">
+<label for="addr">Address, with the SSH port if it is not 22 (for example 192.168.1.20 or web01.lan:2222)</label>
+<input id="addr" name="addr" value="{{.Addr}}" maxlength="255" required autocomplete="off" spellcheck="false">
+<button type="submit" class="btn primary">Fetch the host key</button>
+</form>
+</section>
+{{- end}}
+{{end}}

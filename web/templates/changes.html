@@ -1,0 +1,22 @@
+{{define "content"}}
+{{- with .Body}}
+<h1>Changes since the snapshot on {{.Name}}</h1>
+{{if .Stale}}
+<div class="panel"><p>The snapshot changed while the latest visit was running, so nothing can be accepted from its report. Press Check now on the machine page and review the next report.</p></div>
+{{else if not .Groups}}
+<div class="panel"><p>There is nothing to accept: the latest report has no changes since the snapshot that could be accepted.</p></div>
+{{else}}
+<p>These findings are changes since the snapshot. If you made a change on purpose, accept it: the snapshot then rolls forward and the next visit is compared with the new one. Findings that cover the same thing go together. Package updates that telltale could check against the signed archive are accepted by themselves and are not listed.</p>
+{{if .AllURL}}<p><a class="btn" href="{{.AllURL}}">Accept all {{.AllCount}} changes</a> <span class="small dim">You will see them all once more before anything changes.</span></p>{{end}}
+{{if .Blocked}}<p class="small">Some changes cannot be accepted yet because accepting them would also hide a finding that is not a change since the snapshot. Fix that finding or accept it as an exception first.</p>{{end}}
+{{range .Groups}}
+<section class="group">
+{{range .Findings}}{{template "finding" .}}{{end}}
+{{if .AcceptURL}}<p><a class="btn small" href="{{.AcceptURL}}">{{if eq (len .Findings) 1}}Accept this change{{else}}Accept these {{len .Findings}} changes together{{end}}</a></p>
+{{else}}<p class="small">Not acceptable yet: it would also hide{{range .Blocked}} <code>{{.}}</code>{{end}}.</p>{{end}}
+</section>
+{{end}}
+{{end}}
+<p><a href="/machines/{{.MachineID}}">Back to {{.Name}}</a></p>
+{{- end}}
+{{end}}

@@ -1,0 +1,29 @@
+{{define "content"}}
+{{- $csrf := .CSRF}}
+{{- with .Body}}
+<h1>Let the server into {{.Name}}</h1>
+{{with .Error}}<p class="alert">The snippets could not be made: {{.}}</p>{{else}}
+<p>The server logs in to the machine as root with its own SSH key, and only from its own address. Root login stays off for everyone else: leave the machine's <code>PermitRootLogin no</code> as it is. Add these two snippets on the machine:</p>
+<ol class="steps">
+<li>
+<p>Add this line to <code>/root/.ssh/authorized_keys</code>. Create the file if it is not there; it must belong to root and be writable only by root.</p>
+<div class="fix"><div class="fix-head"><strong>authorized_keys line</strong> <button type="button" class="btn small copy" data-copy="snippet-keys">Copy</button></div><pre><code id="snippet-keys">{{.Keys}}</code></pre></div>
+</li>
+<li>
+<p>Add this block to the end of <code>/etc/ssh/sshd_config</code>. It lets root log in with a key, and only from the server's address.</p>
+<div class="fix"><div class="fix-head"><strong>sshd_config block</strong> <button type="button" class="btn small copy" data-copy="snippet-sshd">Copy</button></div><pre><code id="snippet-sshd">{{.SSHD}}</code></pre></div>
+</li>
+<li>
+<p>Check sshd's configuration and reload it:</p>
+<div class="fix"><div class="fix-head"><strong>Command</strong> <button type="button" class="btn small copy" data-copy="snippet-reload">Copy</button></div><pre><code id="snippet-reload">sshd -t &amp;&amp; systemctl reload ssh</code></pre></div>
+</li>
+<li>
+<p>Then check the machine. The first visit shows what telltale finds without a snapshot; take the snapshot once you have reviewed it.</p>
+{{template "checknow" (checkArgs .MachineID $csrf true)}}
+</li>
+</ol>
+<p class="small dim">Every visit expects exactly this key line and this block. Any other root key, or a broader rule, is reported.</p>
+{{end}}
+<p><a href="/machines/{{.MachineID}}">Go to {{.Name}}</a></p>
+{{- end}}
+{{end}}

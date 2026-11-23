@@ -1,0 +1,23 @@
+{{define "finding"}}
+<article class="finding {{.Class}}">
+<header><span class="sev {{.Class}}">{{.Label}}</span> <span class="title">{{.Title}}</span></header>
+{{- range .Evidence}}
+<div class="ev">
+{{- with .Where}}<div class="mono">{{.}}</div>{{end}}
+{{- with .Change}}<div class="mono">{{.}}</div>{{end}}
+{{- with .When}}<div class="dim">{{.}}</div>{{end}}
+{{- with .Detail}}<div class="dim">{{.}}</div>{{end}}
+</div>
+{{- end}}
+{{with .Why}}<p><strong>Why it matters:</strong> {{.}}</p>{{end}}
+{{- if .Fix}}
+<div class="fix">
+<div class="fix-head"><strong>Fix</strong>{{if .CanCopy}} <button type="button" class="btn small copy" data-copy="{{.FixID}}">Copy</button>{{end}}</div>
+<pre><code id="{{.FixID}}">{{.Fix}}</code></pre>
+</div>
+{{- end}}
+<p class="small dim">ID <code>{{.Key}}</code>{{with .Refs}} &middot; {{.}}{{end}}{{with .ExceptURL}} &middot; <a href="{{.}}">Accept as an exception</a>{{end}}</p>
+</article>
+{{end}}
+
+{{define "checknow"}}<form method="post" action="/machines/{{.ID}}/check" class="inline"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit" class="btn{{if .Primary}} primary{{else}} small{{end}}">Check now</button></form>{{end}}

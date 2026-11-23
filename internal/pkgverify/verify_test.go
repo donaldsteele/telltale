@@ -2322,6 +2322,37 @@ func TestVendorKeyBoundToPatterns(t *testing.T) {
 	}
 }
 
+// A key the owner added on the server vouches only for the repositories its
+// address pattern covers, with the same boundary rules as a vendor's pin.
+func TestOwnerKeyBoundToPattern(t *testing.T) {
+	repoKey := otherKey(t)
+	r := newThirdRepo(t, repoKey)
+	opt := r.f.opts()
+	opt.Vendors = &vendorkeys.Table{}
+	opt.OwnerKeys = []OwnerKey{{URLPattern: r.url, Keys: publicOnly(t, repoKey)}}
+	res := Verify(context.Background(), r.c, opt)
+	wantPaths(t, "Verified with the owner's key", res.Verified, "/usr/bin/thirdtool")
+	if !slices.ContainsFunc(res.SourcesUsed, func(s string) bool { return strings.Contains(s, "owner") }) {
+		t.Errorf("SourcesUsed does not say the owner's key was used: %q", res.SourcesUsed)
+	}
+	// A pattern above the repository covers it too.
+	opt.OwnerKeys = []OwnerKey{{URLPattern: r.srv.URL, Keys: publicOnly(t, repoKey)}}
+	res = Verify(context.Background(), r.c, opt)
+	wantPaths(t, "Verified with a covering pattern", res.Verified, "/usr/bin/thirdtool")
+
+	for _, pattern := range []string{r.srv.URL + "/other", r.srv.URL + "/rep", r.url + "/deeper", "https://dl.google.com/linux/chrome/deb", "not a url", ""} {
+		opt.OwnerKeys = []OwnerKey{{URLPattern: pattern, Keys: publicOnly(t, repoKey)}}
+		before := r.srv.totalHits()
+		res = Verify(context.Background(), r.c, opt)
+		if len(res.Verified) != 0 || len(res.Unverifiable) != 1 || res.Unverifiable[0].Kind != KindUntrusted {
+			t.Errorf("owner pattern %q vouched for %s: Verified %v, Unverifiable %+v", pattern, r.url, paths(res.Verified), res.Unverifiable)
+		}
+		if n := r.srv.totalHits() - before; n != 0 {
+			t.Errorf("owner pattern %q: contacted the repository %d times", pattern, n)
+		}
+	}
+}
+
 // The machine has the repository's key in its own keyring and names it in
 // its sources; the collection says so (RepoTrust). That is the examined
 // machine vouching for itself: without a snapshot, a vendor pin or --keys

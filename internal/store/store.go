@@ -483,6 +483,25 @@ func (s *Store) Report(reportID int64) (*model.Report, *model.Collection, error)
 	return &r, &c, nil
 }
 
+// ReportOnly opens one stored report without its collection, which can be
+// far larger, and says which machine it belongs to.
+func (s *Store) ReportOnly(reportID int64) (*model.Report, int64, error) {
+	var machineID int64
+	var rb []byte
+	err := s.db.QueryRow(`SELECT machine_id, report_blob FROM reports WHERE id=?`, reportID).Scan(&machineID, &rb)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, 0, fmt.Errorf("store: no report %d", reportID)
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	var r model.Report
+	if err := s.openJSON(rb, rowAAD("report", machineID, reportID), &r); err != nil {
+		return nil, 0, err
+	}
+	return &r, machineID, nil
+}
+
 // AddException records a lasting exception for the machine.
 func (s *Store) AddException(machineID int64, e model.Exception) error {
 	tx, err := s.db.Begin()

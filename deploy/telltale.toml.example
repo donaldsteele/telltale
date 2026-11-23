@@ -1,0 +1,38 @@
+# telltale server configuration.
+#
+# One setting per line: key = "value". Lines starting with # are comments.
+# Values are in double quotes and hold no backslashes or double quotes.
+# An unknown key, a key given twice, or any other kind of line stops the
+# server with the line number.
+
+# listen (required): the address and port of the web UI. Give this
+# machine's LAN address, so the UI is not on every interface. It must be a
+# literal IP address, not a host name. "0.0.0.0:8443" or "[::]:8443" puts
+# it on every interface and also needs --allow-all-interfaces.
+listen = "192.168.1.10:8443"
+
+# server_addr (optional): the IP address the monitored machines see the
+# server connect from. It goes into the two snippets you add to each
+# machine (from="..." for root's key and "Match Address ..." in
+# sshd_config), so it must be one literal IP address: no host name, range
+# or pattern. When it is not set it is the address in listen, which then
+# must not be 0.0.0.0 or ::.
+#server_addr = "192.168.1.10"
+
+# data_dir (optional): where the database, the HTTPS certificate and key
+# and the package cache are kept. Default /var/lib/telltale. It is made
+# private (0700).
+#data_dir = "/var/lib/telltale"
+
+# bin_dir (optional): the directory holding telltale-linux-amd64 and
+# telltale-linux-arm64, the collectors copied to machines on each visit.
+# Default: next to the running telltale binary (the binary itself serves
+# machines of its own architecture).
+#bin_dir = "/usr/lib/telltale"
+
+# key_file (optional): an age key file that unlocks the database instead
+# of a passphrase, for unattended restarts. It is created on first use.
+# Anyone who can read it can read the database, so keep it 0600 on this
+# machine only. Without it the passphrase comes from TELLTALE_PASSPHRASE,
+# from systemd's credential "passphrase", or from a prompt.
+#key_file = "/etc/telltale/data.key"

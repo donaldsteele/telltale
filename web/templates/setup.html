@@ -1,0 +1,18 @@
+{{define "content"}}
+<section class="narrow">
+<h1>First run: set the admin password</h1>
+<p>This server has no admin password yet. The server will hold the key that logs in as root to every machine you enrol, so choose a long password and keep it somewhere safe.</p>
+<p>To show that you are the person who started the server, type the one-time setup code it printed when it started. It is in the terminal you started it from, or in its log (<code>journalctl -u telltale</code>).</p>
+<form method="post" action="/setup" class="stack">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<label for="code">Setup code</label>
+<input id="code" name="code" autocomplete="off" spellcheck="false" required>
+<input type="text" name="username" value="admin" autocomplete="username" class="sr" tabindex="-1" aria-hidden="true" readonly>
+<label for="password">New password (at least 12 characters)</label>
+<input id="password" type="password" name="password" autocomplete="new-password" minlength="12" required>
+<label for="repeat">The same password again</label>
+<input id="repeat" type="password" name="repeat" autocomplete="new-password" minlength="12" required>
+<button type="submit" class="btn primary">Set the password</button>
+</form>
+</section>
+{{end}}

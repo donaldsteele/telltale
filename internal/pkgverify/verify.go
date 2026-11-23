@@ -202,11 +202,16 @@ type Options struct {
 	// (--keys). They are tried for every third-party source.
 	//
 	// A third-party source is read only when a key for it is at hand: from
-	// ExtraKeys, RepoTrust or Vendors. Its signed index is verified with
-	// those keys alone. Nothing the examined machine holds (its keyrings,
-	// the collection's own Packages.RepoTrust) is ever a reason to trust a
-	// source.
+	// ExtraKeys, OwnerKeys, RepoTrust or Vendors. Its signed index is
+	// verified with those keys alone. Nothing the examined machine holds
+	// (its keyrings, the collection's own Packages.RepoTrust) is ever a
+	// reason to trust a source.
 	ExtraKeys openpgp.EntityList
+	// OwnerKeys are keys the owner added on the server, each bound to the
+	// repository addresses its pattern covers (vendorkeys.Covers), the way
+	// a built-in vendor key is. Unlike ExtraKeys they vouch for nothing
+	// else.
+	OwnerKeys []OwnerKey
 	// RepoTrust is the SNAPSHOT's record of the keys each third-party
 	// repository was signed with when the machine was clean (never the
 	// examined collection's). An entry's keys vouch only for the repository
@@ -234,6 +239,15 @@ type Options struct {
 	// downloaded index gives a signed date and an Archive or OldFinder sets
 	// no clock of its own.
 	Now func() time.Time
+}
+
+// OwnerKey is a repository signing key the owner trusts for the
+// repositories one address pattern covers: the pattern itself, or an
+// address that continues it after a "/" (vendorkeys.Covers). A pattern that
+// is not a normalised http(s) address covers nothing.
+type OwnerKey struct {
+	URLPattern string
+	Keys       openpgp.EntityList
 }
 
 // Result is the outcome of verifying a collection's files.
@@ -915,7 +929,8 @@ var safeSuite = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+~-]*$`)
 // thirdPartyKeys returns the keys that vouch for one suite of the
 // third-party repository at uri, and where they come from: the snapshot's
 // record for exactly that repository and suite, the built-in vendors whose
-// address patterns cover it, and the owner's keys. The examined machine's own
+// address patterns cover it, the keys the owner added on the server for
+// addresses that cover it, and the owner's --keys. The examined machine's own
 // keyrings are not among them.
 func (s *session) thirdPartyKeys(uri, suite string) (openpgp.EntityList, string) {
 	var kr openpgp.EntityList
@@ -933,6 +948,16 @@ func (s *session) thirdPartyKeys(uri, suite string) (openpgp.EntityList, string)
 		for _, v := range s.vendors.Match(u) {
 			kr = append(kr, v.Keys()...)
 			how = append(how, "the built-in "+v.Name+" key")
+		}
+		owner := false
+		for _, k := range s.opt.OwnerKeys {
+			if len(k.Keys) > 0 && vendorkeys.Covers(k.URLPattern, u) {
+				kr = append(kr, k.Keys...)
+				owner = true
+			}
+		}
+		if owner {
+			how = append(how, "the owner's key for it")
 		}
 	}
 	if len(s.opt.ExtraKeys) > 0 {
