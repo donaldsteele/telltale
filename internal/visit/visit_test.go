@@ -1451,6 +1451,78 @@ func TestVisitNoticesASilentlyDeadConnection(t *testing.T) {
 	f.check(t)
 }
 
+// x/crypto/ssh can wait forever for the answer to a session it opens: one
+// opened just as a dropped connection is torn down is never answered and
+// never failed, and closing the client does not end the wait. That is how
+// a visit whose connection dropped during the collection hung in its
+// clean-up. An open like that still ends with its step: at once when the
+// connection is over, so the clean-up logs in again, and at the step's
+// limit when it is not.
+func TestVisitEndsWhenASessionOpenNeverReturns(t *testing.T) {
+	set(t, &stopGrace, 100*time.Millisecond)
+	set(t, &dialTimeout, 2*time.Second)
+	never := make(chan struct{})
+	t.Cleanup(func() { close(never) })
+	// stuckOnce makes the first open for which when() holds wait for good;
+	// every other open is a real one.
+	stuckOnce := func(t *testing.T, when func() bool) *atomic.Bool {
+		var stuck atomic.Bool
+		set(t, &openSession, func(c *ssh.Client) (*ssh.Session, error) {
+			if when() && stuck.CompareAndSwap(false, true) {
+				<-never
+				return nil, errors.New("never answered")
+			}
+			return c.NewSession()
+		})
+		return &stuck
+	}
+
+	t.Run("the connection dropped", func(t *testing.T) {
+		// Only seeing that the connection is over can end the clean-up's
+		// open here: its step has all the time in the world.
+		set(t, &cleanupTimeout, time.Hour)
+		f := newFake(t)
+		var dropped atomic.Bool
+		f.collect = func(c call) int {
+			dropped.Store(true)
+			c.drop()
+			return 1
+		}
+		stuck := stuckOnce(t, dropped.Load) // the clean-up's, on the dropped connection
+		var err error
+		within(t, 5*time.Second, func() {
+			_, err = Visit(testCtx(t), f.machine(), f.client, testContext(), f.binaries(t))
+		})
+		if !errors.Is(err, errNoExit) || errors.Is(err, ErrCollectorFailed) {
+			t.Errorf("err = %v, want the dropped connection", err)
+		}
+		if !stuck.Load() {
+			t.Error("no session was opened after the drop")
+		}
+		f.mu.Lock()
+		conns := f.conns
+		f.mu.Unlock()
+		if conns != 2 {
+			t.Errorf("%d connections, want 2: the clean-up logs in again", conns)
+		}
+		f.check(t)
+	})
+
+	t.Run("the connection is up", func(t *testing.T) {
+		set(t, &commandTimeout, time.Second)
+		f := newFake(t)
+		stuckOnce(t, func() bool { return true }) // uname's
+		var err error
+		within(t, 5*time.Second, func() {
+			_, err = Visit(testCtx(t), f.machine(), f.client, testContext(), f.binaries(t))
+		})
+		if !errors.Is(err, errStopped) || !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("err = %v, want uname stopped at its limit", err)
+		}
+		f.check(t)
+	})
+}
+
 // The error for a changed host key carries both fingerprints, for the
 // owner to compare.
 func TestHostKeyMismatchErrorFingerprints(t *testing.T) {

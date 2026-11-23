@@ -512,7 +512,7 @@ func (r *remote) run(ctx context.Context, what, line string, limit time.Duration
 		}
 	})()
 	go keepalive(client, finished, every, &dead)
-	s, err := client.NewSession()
+	s, err := newSession(ctx, client)
 	if err != nil {
 		if ctx.Err() != nil {
 			return stopped()
@@ -605,6 +605,61 @@ func (r *remote) run(ctx context.Context, what, line string, limit time.Duration
 		<-done
 		return stopped()
 	}
+}
+
+// openSession opens a session on a connection; tests replace it.
+var openSession = (*ssh.Client).NewSession
+
+// errConnectionOver: the connection ended while a session was being opened.
+var errConnectionOver = errors.New("the connection is over")
+
+// newSession opens a session on client, giving up when ctx ends or when the
+// connection is over. Closing the connection is not enough to end the wait:
+// x/crypto/ssh never answers nor fails a session it opens just as a dropped
+// connection is torn down (after its read loop has let go of the open
+// channels and before writes fail), and closing the client then changes
+// nothing. Such a wait is left behind, and a session that opens after all is
+// closed at once.
+func newSession(ctx context.Context, client *ssh.Client) (*ssh.Session, error) {
+	type opened struct {
+		s   *ssh.Session
+		err error
+	}
+	res := make(chan opened, 1)
+	open := openSession // read once: the goroutine below may outlive the call
+	go func() {
+		s, err := open(client)
+		res <- opened{s, err}
+	}()
+	// Wait returns once the connection's read loop is over, which is when
+	// nothing more can be answered.
+	over := make(chan struct{})
+	go func() {
+		client.Wait()
+		close(over)
+	}()
+	var err error
+	select {
+	case o := <-res:
+		return o.s, o.err
+	case <-ctx.Done():
+		err = ctx.Err()
+	case <-over:
+		// An open on a connection that is over mostly fails by itself, and
+		// its own error is kept when it is there.
+		select {
+		case o := <-res:
+			return o.s, o.err
+		default:
+		}
+		err = errConnectionOver
+	}
+	go func() {
+		if o := <-res; o.s != nil {
+			o.s.Close()
+		}
+	}()
+	return nil, err
 }
 
 // keepaliveMisses unanswered keepalives in a row close the connection.
