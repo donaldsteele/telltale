@@ -408,8 +408,10 @@ const (
 )
 
 // alertEvidence picks the one piece of evidence an alert shows, and what
-// it is. A changed line comes first: the evidence the judge marks "line
-// added" or "line removed". A snapshot finding about a persistence file
+// it is. A changed line comes first: the first evidence the judge marks
+// "line added", else the first marked "line removed" (a replaced line is
+// the old one removed and the new one added, and the new one is what
+// somebody put on the machine). A snapshot finding about a persistence file
 // starts with a summary of the file (its After is the file's hash, its
 // Line the first changed line), which is never shown as a line. Then a
 // line a check matched in a file (a line number and its text). Anything
@@ -422,7 +424,12 @@ func alertEvidence(f model.Finding) (e model.Evidence, kind int, ok bool) {
 		summary, evs = &evs[0], evs[1:]
 	}
 	for _, x := range evs {
-		if (x.Detail == "line added" && x.After != "") || (x.Detail == "line removed" && x.Before != "") {
+		if x.Detail == "line added" && x.After != "" {
+			return x, evidenceChange, true
+		}
+	}
+	for _, x := range evs {
+		if x.Detail == "line removed" && x.Before != "" {
 			return x, evidenceChange, true
 		}
 	}

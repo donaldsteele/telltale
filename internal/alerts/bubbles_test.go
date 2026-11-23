@@ -201,6 +201,28 @@ func TestAlertRemovedLineRedacted(t *testing.T) {
 	}
 }
 
+// A line that was replaced comes out of the judge as the old line removed
+// and the new one added, the removed one first. The alert shows the line
+// the machine has now, the one somebody put there; the snapshot's line is
+// only what it replaced.
+func TestAlertReplacedLineShowsTheNewLine(t *testing.T) {
+	fx := newFixture(t)
+	fx.connect(t)
+	f := model.Finding{Key: "snap.persist:/etc/ssh/sshd_config.d/00-lab.conf", Severity: model.SevBackdoor, Title: "SSH server configuration changed",
+		Evidence: []model.Evidence{
+			{Path: "/etc/ssh/sshd_config.d/00-lab.conf", Line: 1, Before: sum("a"), After: sum("b"), Detail: "1 line added, 1 line removed"},
+			{Path: "/etc/ssh/sshd_config.d/00-lab.conf", Line: 1, Before: "PermitRootLogin no", Detail: "line removed"},
+			{Path: "/etc/ssh/sshd_config.d/00-lab.conf", Line: 1, After: "PermitRootLogin yes", Detail: "line added"},
+		}}
+	if err := fx.b.Notify(t.Context(), machine, []model.Finding{f}, nil); err != nil {
+		t.Fatal(err)
+	}
+	n := fx.fake.Posts()[0]
+	if !strings.Contains(n.Text, "Changed line in "+mdText("/etc/ssh/sshd_config.d/00-lab.conf:1")+":\n```\nPermitRootLogin yes\n```") || strings.Contains(n.Text, "PermitRootLogin no") {
+		t.Errorf("text:\n%s", n.Text)
+	}
+}
+
 // Nothing is queued or sent before telltale is paired.
 func TestNotifyWithoutConnection(t *testing.T) {
 	fx := newFixture(t)
