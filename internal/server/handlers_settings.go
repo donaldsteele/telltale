@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -29,6 +30,8 @@ type settingsView struct {
 	ServerAddr  string
 	CertFP      string
 	Keys        []ownerKeyView
+	Tokens      []apiTokenView
+	TokenName   string
 	KeyURL      string
 	KeyText     string
 	Bubbles     alerts.Status
@@ -83,7 +86,61 @@ func (u *UI) settingsView() (settingsView, error) {
 	for _, k := range keys {
 		v.Keys = append(v.Keys, ownerKeyView{ID: k.ID, Fingerprint: groupFingerprint(escape.Terminal(k.Key.Fingerprint)), URL: escape.Terminal(k.URLPattern), Added: fmtTime(k.Added)})
 	}
+	tokens, err := APITokens(u.o.Store)
+	if err != nil {
+		return settingsView{}, err
+	}
+	for _, t := range tokens {
+		v.Tokens = append(v.Tokens, apiTokenView{ID: t.ID, Name: escape.Terminal(t.Name), Created: fmtTime(t.Created)})
+	}
 	return v, nil
+}
+
+type apiTokenView struct {
+	ID      int64
+	Name    string
+	Created string
+}
+
+type tokenCreatedView struct {
+	Name, Token, Server, Fingerprint string
+}
+
+// settingsAddToken makes an API token for telltale mcp and shows it, this
+// once; only its hash is kept.
+func (u *UI) settingsAddToken(c *reqCtx) {
+	name := strings.TrimSpace(c.r.PostForm.Get("name"))
+	tok, t, err := CreateAPIToken(u.o.Store, name, u.o.Now())
+	if err != nil {
+		u.renderSettings(c, http.StatusBadRequest, settingsView{TokenName: escape.Terminal(name)}, "The token was not made: "+escape.Terminal(err.Error()))
+		return
+	}
+	u.audit(actorOwner, "api token created", "token %d (%s)", t.ID, t.Name)
+	addr := u.o.Listen
+	if ap, ok := u.expectedHost(c.r); ok {
+		addr = ap.String()
+	}
+	v := tokenCreatedView{Name: t.Name, Token: tok, Server: "https://" + addr, Fingerprint: "SHA256:" + u.o.CertFingerprint}
+	u.page(c, http.StatusOK, "token_created", "Your new token", "settings", v, "")
+}
+
+func (u *UI) settingsRevokeToken(c *reqCtx) {
+	id, err := strconv.ParseInt(c.r.PathValue("id"), 10, 64)
+	if err != nil {
+		u.fail(c.w, c.r, http.StatusNotFound, "There is no such token.")
+		return
+	}
+	t, err := RevokeAPIToken(u.o.Store, id)
+	if errors.Is(err, errNoAPIToken) {
+		u.fail(c.w, c.r, http.StatusNotFound, "There is no such token.")
+		return
+	}
+	if err != nil {
+		u.serverError(c.w, c.r, err)
+		return
+	}
+	u.audit(actorOwner, "api token revoked", "token %d (%s)", t.ID, t.Name)
+	u.redirect(c, "/settings#mcp", "Token revoked. Anything still using it is refused from now on.")
 }
 
 func (u *UI) settingsPage(c *reqCtx) {
@@ -98,7 +155,7 @@ func (u *UI) renderSettings(c *reqCtx, status int, form settingsView, msg string
 		u.serverError(c.w, c.r, err)
 		return
 	}
-	v.KeyURL, v.KeyText = form.KeyURL, form.KeyText
+	v.KeyURL, v.KeyText, v.TokenName = form.KeyURL, form.KeyText, form.TokenName
 	u.page(c, status, "settings", "Settings", "settings", v, msg)
 }
 

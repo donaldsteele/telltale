@@ -88,7 +88,8 @@ type UI struct {
 	mux      *http.ServeMux
 	setupMu  sync.Mutex
 	pwSet    atomic.Bool
-	visits   sync.WaitGroup // visits Check now started
+	visits   sync.WaitGroup // visits Check now and the API started
+	api      *api
 }
 
 type staticFile struct {
@@ -134,6 +135,7 @@ func NewUI(o UIOptions) (*UI, error) {
 	if err := u.loadStatic(); err != nil {
 		return nil, err
 	}
+	u.api = newAPI(o.Core, o.Store, o.Now, o.Context, u.logf, &u.visits)
 	u.routes()
 	return u, nil
 }
@@ -335,11 +337,16 @@ func (u *UI) passwordSet() (bool, error) {
 }
 
 // ServeHTTP checks every request (host, body size, origin and form of a
-// POST, first run) and hands it to its page.
+// POST, first run) and hands it to its page, or to the API under /api/.
 func (u *UI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w.Header())
 	if !u.hostOK(r) {
 		http.Error(w, "Misdirected request: open the telltale server at https://"+u.o.Listen+"/", http.StatusMisdirectedRequest)
+		return
+	}
+	// The API is a door of its own: bearer tokens only, never the session.
+	if r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/") {
+		u.api.ServeHTTP(w, r)
 		return
 	}
 	if f, ok := u.static[r.URL.Path]; ok && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
@@ -435,6 +442,8 @@ func (u *UI) routes() {
 	m.HandleFunc("POST /settings/keys", u.authed(u.settingsAddKey))
 	m.HandleFunc("POST /settings/keys/confirm", u.authed(u.settingsConfirmKey))
 	m.HandleFunc("POST /settings/keys/{id}/remove", u.authed(u.settingsRemoveKey))
+	m.HandleFunc("POST /settings/tokens", u.authed(u.settingsAddToken))
+	m.HandleFunc("POST /settings/tokens/{id}/revoke", u.authed(u.settingsRevokeToken))
 	m.HandleFunc("GET /settings/bubbles", u.authed(u.bubblesPage))
 	m.HandleFunc("POST /settings/bubbles/inspect", u.authed(u.bubblesInspect))
 	m.HandleFunc("POST /settings/bubbles/nomatch", u.authed(u.bubblesNoMatch))

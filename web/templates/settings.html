@@ -72,7 +72,25 @@
 
 <section class="panel" id="mcp" aria-labelledby="mcp-title">
 <h2 id="mcp-title">MCP access tokens</h2>
-<p class="dim">None. Read-only MCP access comes in a later version.</p>
+<p>A token lets an AI assistant use <code>telltale mcp</code> to read this server's machines and reports and to start a visit. It cannot take a snapshot, accept changes or add exceptions: those stay here, with you.</p>
+{{if .Tokens}}
+<table class="keys">
+<thead><tr><th scope="col">Name</th><th scope="col">Made</th><th scope="col"><span class="sr">Actions</span></th></tr></thead>
+<tbody>
+{{- range .Tokens}}
+<tr><td>{{.Name}}</td><td class="small">{{.Created}}</td><td><form method="post" action="/settings/tokens/{{.ID}}/revoke" class="inline"><input type="hidden" name="csrf" value="{{$csrf}}"><button type="submit" class="btn small">Revoke</button></form></td></tr>
+{{- end}}
+</tbody>
+</table>
+{{else}}
+<p class="dim">No tokens.</p>
+{{end}}
+<form method="post" action="/settings/tokens" class="stack">
+<input type="hidden" name="csrf" value="{{$csrf}}">
+<label for="token-name">Name the token after where it is used (for example laptop)</label>
+<input id="token-name" name="name" value="{{.TokenName}}" maxlength="64" required autocomplete="off" spellcheck="false">
+<div><button type="submit" class="btn">Make a token</button></div>
+</form>
 </section>
 
 <section class="panel" id="password" aria-labelledby="password-title">

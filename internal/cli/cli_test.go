@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -53,8 +55,42 @@ func TestHelpListsVisibleCommandsOnly(t *testing.T) {
 }
 
 func TestStubExit3(t *testing.T) {
-	code, _, errs := run("mcp")
-	if code != 3 || !strings.Contains(errs, "not implemented yet") {
-		t.Fatalf("code=%d err=%q", code, errs)
+	// Every planned command is built now; the stub still answers for any
+	// that is not.
+	var errb bytes.Buffer
+	code := notImplemented("later")(&Context{Stderr: &errb})
+	if code != 3 || !strings.Contains(errb.String(), "not implemented yet") {
+		t.Fatalf("code=%d err=%q", code, errb.String())
+	}
+}
+
+func TestMCPRefusesBadSetup(t *testing.T) {
+	dir := t.TempDir()
+	open := filepath.Join(dir, "open")
+	if err := os.WriteFile(open, []byte("token\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(open, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	private := filepath.Join(dir, "private")
+	if err := os.WriteFile(private, []byte("token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fp := "SHA256:" + strings.TrimSuffix(strings.Repeat("AB:", 32), ":")
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{nil, "usage: telltale mcp"},
+		{[]string{"--server", "https://192.0.2.10:8443", "--token-file", private}, "usage: telltale mcp"},
+		{[]string{"--server", "https://192.0.2.10:8443", "--token-file", open, "--fingerprint", fp}, "chmod 600"},
+		{[]string{"--server", "http://192.0.2.10:8443", "--token-file", private, "--fingerprint", fp}, "https://"},
+		{[]string{"--server", "https://192.0.2.10:8443", "--token-file", private, "--fingerprint", "SHA256:AB"}, "64 hex digits"},
+	} {
+		code, out, errs := run(append([]string{"mcp"}, tc.args...)...)
+		if code != 3 || out != "" || !strings.Contains(errs, tc.want) {
+			t.Errorf("%q: code=%d out=%q err=%q", tc.args, code, out, errs)
+		}
 	}
 }

@@ -1,0 +1,23 @@
+{{define "content"}}
+{{- with .Body}}
+<section class="narrow">
+<h1>Your new token: {{.Name}}</h1>
+<p>This is the only time the token is shown. telltale keeps only a hash of it, so it cannot show it again; if you lose it, revoke it and make another.</p>
+<div class="fix"><div class="fix-head"><strong>Token</strong> <button type="button" class="btn small copy" data-copy="api-token">Copy</button></div><pre><code id="api-token">{{.Token}}</code></pre></div>
+<ol class="steps">
+<li>
+<p>On the computer where your AI assistant runs, save the token in a file only you can read. For example, make the file with:</p>
+<div class="fix"><div class="fix-head"><strong>Command</strong> <button type="button" class="btn small copy" data-copy="token-file">Copy</button></div><pre><code id="token-file">install -m 600 /dev/null ~/.telltale-token</code></pre></div>
+<p>then paste the token into it. <code>telltale mcp</code> refuses a token file that other users can read.</p>
+</li>
+<li>
+<p>Add this command to your MCP client's configuration as a stdio server:</p>
+<div class="fix"><div class="fix-head"><strong>Command</strong> <button type="button" class="btn small copy" data-copy="mcp-command">Copy</button></div><pre><code id="mcp-command">telltale mcp --server {{.Server}} --token-file ~/.telltale-token --fingerprint {{.Fingerprint}}</code></pre></div>
+<p>The fingerprint is this server's HTTPS certificate. <code>telltale mcp</code> talks only to a server with exactly that certificate.</p>
+</li>
+</ol>
+<p class="small">The assistant can read every machine's reports and start visits, at most one a minute per machine. It can never change a snapshot or accept anything. Text from monitored machines can try to give it instructions, so it is told never to follow such text and never to run fix commands.</p>
+<p><a href="/settings#mcp">Back to settings</a></p>
+</section>
+{{- end}}
+{{end}}
