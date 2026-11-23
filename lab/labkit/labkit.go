@@ -58,6 +58,10 @@ type Opts struct {
 	ExecShm bool
 	// Binds are extra read-only bind mounts, "hostdir:containerdir".
 	Binds []string
+	// Tmpfs are extra tmpfs mounts as docker run --tmpfs takes them,
+	// "dir:options" (for example "/var/tmp:noexec"). Not /tmp or /dev/shm,
+	// which Noexec and ExecShm own, nor /run with Systemd.
+	Tmpfs []string
 }
 
 // BuildOpts picks a flavour of an image.
@@ -351,6 +355,9 @@ func Start(t testing.TB, image string, opts Opts) *Machine {
 		args = append(args, "--tmpfs", "/tmp:noexec", "--tmpfs", "/dev/shm:noexec")
 	} else if opts.ExecShm {
 		args = append(args, "--tmpfs", "/dev/shm:exec,nosuid,nodev,size=64m")
+	}
+	for _, mnt := range opts.Tmpfs {
+		args = append(args, "--tmpfs", mnt)
 	}
 	if opts.Privileged {
 		args = append(args, "--privileged")

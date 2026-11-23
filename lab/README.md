@@ -47,6 +47,13 @@ A scan with a snapshot of a `thirdparty` machine uses a second bundle, built wit
 
 Hostnames default to `<distro>-<variant>`; set `Opts.Hostname` for the made-up names later scenarios use.
 
+## The visit suite
+
+`visit_test.go` runs server mode's visit (`internal/visit`) from the host against a Debian 12 machine, as the server would. The host reaches each machine's sshd directly at its address on the lab network, so no port is published. Each test enrols the machine in the owner's order: fetch the host key and compare its fingerprint with the machine's own `ssh-keygen -lf`, pin it, add the server's `authorized_keys` line for root and the `Match Address` block through `docker exec` exactly as the enrolment snippets say, and reload sshd. Then it visits and checks that a collection came back, that no `telltale.*` directory is left in `/run`, `/var/tmp`, `/root` or `/tmp`, and that the visit changed no file beyond the login records any SSH session writes.
+
+- `TestVisitCleanMachine`: the clean machine. The collector runs from `/run`.
+- `TestVisitNoexecMachine`: the noexec machine with `/run` and `/var/tmp` also mounted `noexec`, as `/run` is under systemd. Only `/root` is left for the collector.
+
 ## Notes
 
 - The `noexec` variant is the plain image run with `--tmpfs /tmp:noexec --tmpfs /dev/shm:noexec`; `labkit.Start` adds those flags for it.
@@ -54,6 +61,7 @@ Hostnames default to `<distro>-<variant>`; set `Opts.Hostname` for the made-up n
 - `BuildOpts{Newer: true}` builds an image at the newer pinned snapshot, upgraded. The downgrade break runs on it and goes back to the older openssl .debs the build kept.
 - Machines get `CAP_SYS_PTRACE`, so that root in the container can see the programs of other accounts' processes, as root on a real machine can.
 - `Opts.ExecShm` (manifest `requires.exec_shm`) mounts `/dev/shm` without `noexec`. Docker's own `/dev/shm` is `noexec`; a real machine's is not.
+- `Opts.Tmpfs` adds `docker run --tmpfs` mounts (`"dir:options"`), for example `/var/tmp:noexec`.
 - `Opts.Egress` puts a machine on `telltale-lab-egress`, the one lab network with a route out. The harness refuses to plant anything on such a machine.
 - The `thirdparty` image is built while a copy of the repository server runs on Docker's default network (builds happen there), reached as `telltale-lab-repo` through `docker build --add-host`. Its tag depends on the repository image's ID, because the image holds that build's public key. The two servers on the lab network are started once per run and removed with everything else at the end.
 - The two package snapshots in `images/common/pins.env` have to differ: the base pin is old enough that openssl, among others, has an update at the newer pin on all four distros.
