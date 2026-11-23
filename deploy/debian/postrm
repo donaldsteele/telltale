@@ -1,0 +1,13 @@
+#!/bin/sh
+# The data directory (/var/lib/telltale: the database, the HTTPS key and the
+# package cache) and the telltale account are kept, also on purge: the
+# database holds the machines' snapshots. Remove them by hand when you mean
+# to.
+set -e
+if [ "$1" = purge ] && dpkg-statoverride --list /etc/telltale >/dev/null 2>&1; then
+	dpkg-statoverride --remove /etc/telltale
+fi
+if [ -d /run/systemd/system ]; then
+	systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+exit 0

@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -74,7 +73,7 @@ func buildRepoImage() (string, string, error) {
 		fmt.Fprintf(h, "%s\x00%d\x00", rel, len(data))
 		h.Write(data)
 	}
-	tag := "telltale-lab/repo:" + hex.EncodeToString(h.Sum(nil))[:12]
+	tag := "telltale-lab/repo:" + archTag() + hex.EncodeToString(h.Sum(nil))[:12]
 	imageID := func() string {
 		out, _, code := docker("image", "inspect", "--format", "{{.Id}}", tag)
 		if code != 0 {
@@ -92,8 +91,9 @@ func buildRepoImage() (string, string, error) {
 	defer os.RemoveAll(dir)
 	for bin, pkg := range map[string]string{"repo-server": "server", "lab-vendord": "vendord"} {
 		cmd := exec.Command("go", "build", "-tags", "lab", "-trimpath", "-ldflags", "-s -w", "-o", filepath.Join(dir, bin), filepath.Join(src, pkg))
-		// For the architecture the images are built for: the host's.
-		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
+		// For the architecture the images are built for (Arch): the
+		// image packs lab-vendord into .debs of that architecture.
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+Arch)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return "", "", fmt.Errorf("build %s: %v\n%s", bin, err, out)
 		}
@@ -108,7 +108,7 @@ func buildRepoImage() (string, string, error) {
 		}
 	}
 	start := time.Now()
-	if so, se, code := docker("build", "-q", "--label", Label, "-t", tag, dir); code != 0 {
+	if so, se, code := docker("build", "-q", "--platform", Platform(), "--label", Label, "-t", tag, dir); code != 0 {
 		return "", "", fmt.Errorf("docker build %s: exit %d\n%s%s", tag, code, so, se)
 	}
 	fmt.Fprintf(os.Stderr, "lab: built %s in %v\n", tag, time.Since(start).Round(time.Second))
@@ -131,7 +131,7 @@ func withBuildRepo(t testing.TB, fn func(ip string)) {
 	}
 	name := "telltale-lab-repo-build-" + randHex()
 	defer docker("rm", "-f", name)
-	mustDocker(t, "run", "-d", "--name", name, "--label", Label, tag)
+	mustDocker(t, "run", "-d", "--platform", Platform(), "--name", name, "--label", Label, tag)
 	out := mustDocker(t, "inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", name)
 	ips := strings.Fields(out)
 	if len(ips) == 0 {
@@ -157,8 +157,8 @@ func StartRepo(t testing.TB) *Repo {
 		t.Fatalf("repository image: %v", err)
 	}
 	r := &Repo{name: "telltale-lab-repo-" + randHex(), swapped: "telltale-lab-repo-swapped-" + randHex()}
-	mustDocker(t, "run", "-d", "--name", r.name, "--network", NetworkName, "--network-alias", RepoHost, "--label", Label, tag, "-tree", "a")
-	mustDocker(t, "run", "-d", "--name", r.swapped, "--network", NetworkName, "--network-alias", RepoSwappedHost, "--label", Label, tag, "-tree", "b")
+	mustDocker(t, "run", "-d", "--platform", Platform(), "--name", r.name, "--network", NetworkName, "--network-alias", RepoHost, "--label", Label, tag, "-tree", "a")
+	mustDocker(t, "run", "-d", "--platform", Platform(), "--name", r.swapped, "--network", NetworkName, "--network-alias", RepoSwappedHost, "--label", Label, tag, "-tree", "b")
 	return r
 }
 

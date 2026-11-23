@@ -28,7 +28,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -40,6 +39,7 @@ import (
 	"github.com/donaldsteele/telltale/internal/escape"
 	"github.com/donaldsteele/telltale/internal/model"
 	"github.com/donaldsteele/telltale/internal/store"
+	"github.com/donaldsteele/telltale/internal/visitdir"
 )
 
 var (
@@ -59,9 +59,6 @@ var (
 // a lost connection left behind is gone at the next boot; /tmp comes last
 // because it is the one most often mounted noexec.
 var execDirs = []string{"/run", "/var/tmp", "/root", "/tmp"}
-
-// tempDirRE is the only form of mktemp output a visit uses in a command.
-var tempDirRE = regexp.MustCompile(`^/(run|var/tmp|root|tmp)/telltale\.[A-Za-z0-9]{8}$`)
 
 // Limits on each step. Every step also ends when the visit's context does;
 // the clean-up's steps do not (see remote.cleanup). Variables, so tests can
@@ -219,7 +216,7 @@ func loginConfig(m store.Machine, signer ssh.Signer) (string, *ssh.ClientConfig,
 // IsTempDir reports whether d has the form of a directory a visit makes
 // (/run, /var/tmp, /root or /tmp, then telltale. and eight letters or
 // digits): the only form RemoveLeftovers puts in a command.
-func IsTempDir(d string) bool { return tempDirRE.MatchString(d) }
+func IsTempDir(d string) bool { return visitdir.Is(d) }
 
 // RemoveLeftovers logs into m as Visit does and removes directories an
 // earlier visit could not (a *LeftOnMachineError's Dirs). Every one must
@@ -349,7 +346,7 @@ func (r *remote) execDir(ctx context.Context, bin *io.SectionReader) (string, er
 }
 
 // mktemp makes a directory of the visit's own in base and returns its name,
-// which is used in later commands only after it matches tempDirRE.
+// which is used in later commands only after it passes IsTempDir.
 func (r *remote) mktemp(ctx context.Context, base string) (string, error) {
 	var out []byte
 	err := r.run(ctx, "mktemp", "mktemp -d "+base+"/telltale.XXXXXXXX", commandTimeout, nil, maxShortOutput, keep(&out))
@@ -364,7 +361,7 @@ func (r *remote) mktemp(ctx context.Context, base string) (string, error) {
 		return "", err
 	}
 	d := strings.TrimSuffix(string(out), "\n")
-	if !tempDirRE.MatchString(d) || !strings.HasPrefix(d, base+"/telltale.") {
+	if !IsTempDir(d) || !strings.HasPrefix(d, base+"/telltale.") {
 		return "", fmt.Errorf("%w: mktemp in %s printed \"%s\", not a new directory there; nothing was run with it, and a directory mktemp may have made in %s is left on the machine",
 			errOdd, base, escape.Terminal(d), base)
 	}

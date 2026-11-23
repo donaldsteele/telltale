@@ -1,0 +1,8 @@
+#!/bin/sh
+# On removal (not on upgrade) the service is stopped and disabled: its unit
+# file goes with the package.
+set -e
+if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+	systemctl disable --now telltale.service >/dev/null 2>&1 || true
+fi
+exit 0

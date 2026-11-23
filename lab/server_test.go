@@ -68,6 +68,9 @@ const (
 )
 
 func TestServerEndToEnd(t *testing.T) {
+	if labkit.Emulated() {
+		t.Skipf("the end-to-end test runs on the host's architecture only, not TELLTALE_LAB_ARCH=%s", labkit.Arch)
+	}
 	for _, d := range []string{"debian12", "ubuntu2404"} {
 		if !wantDistro(d) {
 			t.Skipf("TELLTALE_LAB_DISTROS leaves out %s", d)
@@ -85,7 +88,7 @@ func TestServerEndToEnd(t *testing.T) {
 	ubuImage := labkit.Build(t, "ubuntu2404", "noexec")
 	bubImage := bubblesImage(t)
 	baseImage := serverBaseImage(t)
-	binDir := buildDist(t)
+	dist := buildDist(t)
 	phase("images and scripts/build.sh", start)
 
 	// The server's configuration: it listens on its fixed address on the
@@ -94,7 +97,7 @@ func TestServerEndToEnd(t *testing.T) {
 	serverIP := lastHost(labkit.Subnet(t))
 	cfgDir := t.TempDir()
 	cfg := filepath.Join(cfgDir, "telltale.toml")
-	writeFile(t, cfg, fmt.Sprintf("listen = %q\ndata_dir = \"/var/lib/telltale\"\nbin_dir = \"/opt/telltale/bin\"\n", serverIP.String()+":"+e2ePort), 0o644)
+	writeFile(t, cfg, fmt.Sprintf("listen = %q\ndata_dir = \"/var/lib/telltale\"\nbin_dir = \"/opt/telltale/collector\"\n", serverIP.String()+":"+e2ePort), 0o644)
 	cache := filepath.Join(labkit.CacheDir(), "server-pkgcache")
 	if err := os.MkdirAll(cache, 0o700); err != nil {
 		t.Fatal(err)
@@ -105,7 +108,7 @@ func TestServerEndToEnd(t *testing.T) {
 		"TELLTALE_LAB_UID=" + strconv.Itoa(os.Getuid()),
 		"TELLTALE_LAB_GID=" + strconv.Itoa(os.Getgid()),
 		"TELLTALE_PASSPHRASE=" + randomText(t),
-		"TELLTALE_LAB_BIN_DIR=" + binDir,
+		"TELLTALE_LAB_DIST_DIR=" + dist,
 		"TELLTALE_LAB_CONFIG=" + cfg,
 		"TELLTALE_LAB_PKGCACHE=" + cache,
 		"TELLTALE_LAB_SERVER_IP=" + serverIP.String(),
@@ -270,7 +273,7 @@ func TestServerEndToEnd(t *testing.T) {
 	// telltale mcp, on the host, pinned to the server's certificate, gives
 	// the same findings.
 	start = time.Now()
-	e.checkMCP(binDir, mcpCmd[3], mcpCmd[7], token, keyFinding)
+	e.checkMCP(filepath.Join(dist, "bin"), mcpCmd[3], mcpCmd[7], token, keyFinding)
 	phase("telltale mcp", start)
 
 	// The key goes; the next visit resolves its alert, and only that one.
@@ -1101,7 +1104,8 @@ func codeLines(md string) []string {
 // bubblesImage is the bubbles server image of the version telltale's go.mod
 // requires, telltale-lab/bubbles:<version>. When it is missing it is built
 // from bubbles' own deploy/docker/Dockerfile in a clean checkout of that
-// version's tag: $TELLTALE_LAB_BUBBLES_SRC, or ~/code/bubbles.
+// version's tag: $TELLTALE_LAB_BUBBLES_SRC, or ~/code/bubbles. bubbles.env
+// pins the version and the tag's commit; the checkout must be at it.
 func bubblesImage(t *testing.T) string {
 	gomod, err := os.ReadFile("../go.mod")
 	if err != nil {
@@ -1110,6 +1114,15 @@ func bubblesImage(t *testing.T) string {
 	ver := firstGroup(regexp.MustCompile(`(?m)^\s*github\.com/donaldsteele/bubbles\s+(v[0-9][^\s]*)`), string(gomod))
 	if ver == "" {
 		t.Fatal("go.mod does not require github.com/donaldsteele/bubbles")
+	}
+	pin, err := os.ReadFile("bubbles.env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinVer := firstGroup(regexp.MustCompile(`(?m)^BUBBLES_VERSION=(\S+)$`), string(pin))
+	pinCommit := firstGroup(regexp.MustCompile(`(?m)^BUBBLES_COMMIT=([0-9a-f]{40})$`), string(pin))
+	if pinVer != ver || pinCommit == "" {
+		t.Fatalf("lab/bubbles.env pins bubbles %q (commit %q) but go.mod requires %s: update the version and the commit its tag points at", pinVer, pinCommit, ver)
 	}
 	tag := "telltale-lab/bubbles:" + ver
 	if exec.Command("docker", "image", "inspect", tag).Run() == nil {
@@ -1130,8 +1143,8 @@ func bubblesImage(t *testing.T) string {
 		}
 		return strings.TrimSpace(string(out))
 	}
-	if head, want := git("rev-parse", "HEAD"), git("rev-parse", ver+"^{commit}"); head != want {
-		t.Fatalf("%s is at %s, not at bubbles %s (%s): check out the tag", src, head, ver, want)
+	if head, want := git("rev-parse", "HEAD"), git("rev-parse", ver+"^{commit}"); head != want || want != pinCommit {
+		t.Fatalf("%s is at %s and its tag %s at %s, not at the commit lab/bubbles.env pins (%s): check out the tag", src, head, ver, want, pinCommit)
 	}
 	if dirty := git("status", "--porcelain"); dirty != "" {
 		t.Fatalf("%s has local changes; the lab builds bubbles %s only from a clean checkout:\n%s", src, ver, dirty)
@@ -1172,22 +1185,25 @@ func serverBaseImage(t *testing.T) string {
 }
 
 // buildDist runs scripts/build.sh into a temporary directory and returns
-// its bin directory, telltale-linux-amd64 and telltale-linux-arm64.
+// it: bin/ holds the full binaries, which run the server and mcp, and
+// collector/ the collector build the server copies to the machines, as the
+// .deb lays them out. The packages are not needed here (TELLTALE_DEB=0).
 func buildDist(t *testing.T) string {
 	out := filepath.Join(t.TempDir(), "dist")
 	cmd := exec.Command("bash", "scripts/build.sh")
 	cmd.Dir = ".."
-	cmd.Env = append(os.Environ(), "TELLTALE_DIST_DIR="+out, "VERSION=0.0.0-lab")
+	cmd.Env = append(os.Environ(), "TELLTALE_DIST_DIR="+out, "VERSION=0.0.0-lab", "TELLTALE_DEB=0")
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("scripts/build.sh: %v\n%s", err, b)
 	}
-	bin := filepath.Join(out, "bin")
-	for _, arch := range []string{"amd64", "arm64"} {
-		if _, err := os.Stat(filepath.Join(bin, "telltale-linux-"+arch)); err != nil {
-			t.Fatalf("scripts/build.sh made no %s binary: %v", arch, err)
+	for _, dir := range []string{"bin", "collector"} {
+		for _, arch := range []string{"amd64", "arm64"} {
+			if _, err := os.Stat(filepath.Join(out, dir, "telltale-linux-"+arch)); err != nil {
+				t.Fatalf("scripts/build.sh made no %s/telltale-linux-%s: %v", dir, arch, err)
+			}
 		}
 	}
-	return bin
+	return out
 }
 
 // lastHost is the last host address of an IPv4 subnet: Docker hands out

@@ -1,0 +1,20 @@
+Package: telltale
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: telltale developers <https://github.com/donaldsteele/telltale/issues>
+Installed-Size: @SIZE@
+Section: admin
+Priority: optional
+Homepage: https://github.com/donaldsteele/telltale
+Description: backdoor and tamper detector for Linux machines (server)
+ telltale tells whether a Linux machine has been backdoored. It compares the
+ machine with a known-good snapshot, checks system files against the
+ distribution's signed packages, runs a hardening checklist and looks for
+ things that are suspicious on any machine. It reports and never fixes:
+ every finding comes with the command that would fix it.
+ .
+ This package holds the full telltale binary (/usr/bin/telltale), whose
+ server keeps the snapshots and visits enrolled machines over SSH on a
+ schedule, and the collector binaries it copies to them on each visit
+ (/usr/lib/telltale, for amd64 and arm64). The service is not started on
+ installation; see /usr/share/doc/telltale/README.md.

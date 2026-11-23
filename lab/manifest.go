@@ -26,6 +26,11 @@ type Requires struct {
 	ExecShm       bool     `json:"exec_shm,omitempty"`       // labkit Opts.ExecShm: /dev/shm allows running programs
 	NewerSnapshot bool     `json:"newer_snapshot,omitempty"` // the image is built at the *_NEWER package snapshot
 	Distros       []string `json:"distros,omitempty"`        // only these distros; empty means all
+	// NativeExe: the break is detected from which program a process runs
+	// (/proc/PID/exe). Under QEMU user-mode emulation (labkit.Emulated) the
+	// kernel reports the emulator for every process, so such a case is
+	// skipped there.
+	NativeExe bool `json:"native_exe,omitempty"`
 }
 
 // Must is one finding the report has to contain: some finding whose key

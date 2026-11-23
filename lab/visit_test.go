@@ -124,7 +124,7 @@ kill -HUP "$(pgrep -o -x sshd)"`, "enrol", authorizedKeys, match)
 	waitFor(t, 30*time.Second, "sshd to let the server in as root", func() bool { return rootLogin(ip, signer, key) })
 
 	binDir := t.TempDir()
-	copyFile(t, binPath, filepath.Join(binDir, "telltale-linux-amd64"))
+	copyFile(t, binPath, filepath.Join(binDir, "telltale-linux-"+labkit.Arch))
 	digest := make([]byte, 32)
 	rand.Read(digest)
 	sc := model.ScanContext{

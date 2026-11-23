@@ -31,40 +31,22 @@ type Command struct {
 
 var registry = map[string]Command{}
 
-// Register adds or replaces a command. Later tasks call it from init().
+// Register adds or replaces a command. Each command's file calls it from
+// init().
 func Register(c Command) { registry[c.Name] = c }
 
-// planned lists commands that exist but are not built yet. A real command
-// registered under the same name takes precedence.
-var planned = []Command{
-	{Name: "scan", Summary: "check this machine against a snapshot and the hardening checklist"},
-	{Name: "snapshot", Summary: "record a known-good snapshot of this machine"},
-	{Name: "accept", Summary: "accept reviewed changes into the snapshot"},
-	{Name: "fetch-refs", Summary: "download reference data"},
-	{Name: "server", Summary: "run the telltale server"},
-	{Name: "mcp", Summary: "run the MCP server"},
-	{Name: "collect", Summary: "write this machine's raw collection as JSON, for fetch-refs or offline analysis"},
-}
+// flavour follows the version when this is not the full build (see
+// collector.go).
+var flavour = ""
 
-func notImplemented(name string) func(*Context) int {
-	return func(ctx *Context) int {
-		fmt.Fprintf(ctx.Stderr, "telltale %s: not implemented yet\n", name)
-		return ExitUsage
-	}
-}
-
-// all returns the registered commands plus the planned ones not yet registered.
+// all returns the registered commands plus version and help.
 func all() []Command {
 	m := map[string]Command{}
-	for _, c := range planned {
-		c.Run = notImplemented(c.Name)
-		m[c.Name] = c
-	}
 	for n, c := range registry {
 		m[n] = c
 	}
 	m["version"] = Command{Name: "version", Summary: "print the version", Run: func(ctx *Context) int {
-		fmt.Fprintf(ctx.Stdout, "telltale %s\n", version.Version)
+		fmt.Fprintf(ctx.Stdout, "telltale %s%s\n", version.Version, flavour)
 		return 0
 	}}
 	m["help"] = Command{Name: "help", Summary: "show this help", Run: func(ctx *Context) int {

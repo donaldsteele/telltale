@@ -81,6 +81,9 @@ func keys(fs []model.Finding) []string {
 func want(t *testing.T, c *model.Collection, key string, sev model.Severity) model.Finding {
 	t.Helper()
 	fs := Run(inventoried(c), ctx, cleanOwned())
+	for _, f := range fs {
+		checkRule(t, f)
+	}
 	f := find(fs, key)
 	if f == nil {
 		t.Fatalf("no finding %s; got %v", key, keys(fs))

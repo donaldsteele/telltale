@@ -7,15 +7,18 @@ on:
 permissions:
   contents: read
 
+# Third-party actions are pinned to full commit SHAs; the comment names the
+# version each SHA is.
+
 jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: '1.26.x'
           cache: true
@@ -24,10 +27,17 @@ jobs:
         run: bash scripts/gofmt-check.sh
 
       - name: vet
-        run: go vet ./...
+        run: |
+          go vet ./...
+          go vet -tags collector ./...
+          go vet -tags lab ./lab/...
+          go vet -tags 'lab vm' ./lab/vm/
 
       - name: test
         run: go test ./...
+
+      - name: test the collector build
+        run: go test -tags collector ./internal/cli/...
 
       - name: race test
         run: go test -race ./...
@@ -35,7 +45,64 @@ jobs:
       - name: build
         run: VERSION="ci-${GITHUB_SHA::7}" bash scripts/build.sh
 
-      - name: static check
+      # Every binary static, for the right architecture and of the right
+      # flavour; every tarball and package complete; SHA256SUMS right.
+      - name: check the build
+        run: REQUIRE_DEB=1 bash scripts/check-dist.sh
+
+  # The Docker lab (lab/README.md): every clean variant, break and scenario
+  # on Debian 12 and Ubuntu 24.04, the visits, and the server end to end
+  # with bubbles and MCP. The kernel checks in a QEMU virtual machine
+  # (go test -tags 'lab vm' ./lab/vm/) need /dev/kvm and are run by hand,
+  # not here.
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.26.x'
+          cache: true
+
+      # TestServerEndToEnd builds the bubbles server from a checkout of the
+      # version go.mod requires, at the commit lab/bubbles.env pins.
+      - name: bubbles source
         run: |
-          bash scripts/static-check.sh dist/bin/telltale-linux-amd64
-          bash scripts/static-check.sh dist/bin/telltale-linux-arm64
+          . lab/bubbles.env
+          src="$RUNNER_TEMP/bubbles"
+          git clone --quiet --depth 1 --branch "$BUBBLES_VERSION" https://github.com/donaldsteele/bubbles "$src"
+          head=$(git -C "$src" rev-parse HEAD)
+          if [ "$head" != "$BUBBLES_COMMIT" ]; then
+            echo "bubbles $BUBBLES_VERSION is at $head, not at $BUBBLES_COMMIT as lab/bubbles.env pins" >&2
+            exit 1
+          fi
+          echo "TELLTALE_LAB_BUBBLES_SRC=$src" >> "$GITHUB_ENV"
+
+      - name: lab (debian12, ubuntu2404)
+        env:
+          TELLTALE_LAB_DISTROS: debian12,ubuntu2404
+        run: go test -tags lab -timeout 110m ./lab/...
+
+  # The same machines on arm64, under QEMU emulation: the clean variants and
+  # every break on Debian 12.
+  lab-arm64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    needs: test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.26.x'
+          cache: true
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - name: lab (debian12, arm64)
+        env:
+          TELLTALE_LAB_ARCH: arm64
+          TELLTALE_LAB_DISTROS: debian12
+        run: go test -tags lab -timeout 170m ./lab/ -run 'TestCleanMachinesAreClean|TestEveryBreakDetected'

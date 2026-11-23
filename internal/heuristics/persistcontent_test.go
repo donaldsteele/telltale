@@ -22,6 +22,7 @@ func callbackFindings(t *testing.T, pf model.PersistFile) []model.Finding {
 	c.Persist = append(c.Persist, pf)
 	var out []model.Finding
 	for _, f := range Run(c, ctx, cleanOwned()) {
+		checkRule(t, f)
 		if strings.HasPrefix(f.Key, "heur.persist_callback:") {
 			out = append(out, f)
 		}

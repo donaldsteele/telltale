@@ -287,7 +287,7 @@ func BuildWith(t testing.TB, distro, variant string, bo BuildOpts) string {
 		t.Fatalf("stage build context: %v", err)
 	}
 	name := distro + "-" + variant
-	args := []string{"build", "-q", "--label", Label, "--build-arg", "VARIANT=" + variant}
+	args := []string{"build", "-q", "--platform", Platform(), "--label", Label, "--build-arg", "VARIANT=" + variant}
 	if bo.Newer {
 		name += "-newer"
 		args = append(args, "--build-arg", "LAB_NEWER=1")
@@ -296,7 +296,7 @@ func BuildWith(t testing.TB, distro, variant string, bo BuildOpts) string {
 		name += "-systemd"
 		args = append(args, "--build-arg", "LAB_SYSTEMD=1")
 	}
-	tag := fmt.Sprintf("telltale-lab/%s:%s", name, hash)
+	tag := fmt.Sprintf("telltale-lab/%s:%s%s", name, archTag(), hash)
 	buildMu.Lock()
 	defer buildMu.Unlock()
 	if built[tag] {
@@ -370,7 +370,7 @@ func Start(t testing.TB, image string, opts Opts) *Machine {
 	}
 	// SYS_PTRACE is what lets root see the programs of other accounts'
 	// processes (/proc/PID/exe), as root on a real machine can.
-	args := []string{"run", "-d", "--name", name, "--network", network, "--hostname", host,
+	args := []string{"run", "-d", "--platform", Platform(), "--name", name, "--network", network, "--hostname", host,
 		"--label", Label, "--cap-add", "SYS_PTRACE"}
 	for _, b := range opts.Binds {
 		args = append(args, "-v", b+":ro")

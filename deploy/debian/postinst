@@ -1,0 +1,23 @@
+#!/bin/sh
+# telltale server package: the service account and the configuration
+# directory. The service is not enabled or started: it needs a configuration
+# and a passphrase first (see /lib/systemd/system/telltale.service).
+set -e
+
+if [ "$1" = configure ]; then
+	if ! getent passwd telltale >/dev/null; then
+		useradd --system --user-group --home-dir /var/lib/telltale --no-create-home \
+			--shell /usr/sbin/nologin --comment "telltale server" telltale
+	fi
+	# The configuration directory is readable by the service, not by others.
+	if ! dpkg-statoverride --list /etc/telltale >/dev/null 2>&1; then
+		dpkg-statoverride --update --add root telltale 0750 /etc/telltale
+	fi
+	if [ -d /run/systemd/system ]; then
+		systemctl daemon-reload >/dev/null 2>&1 || true
+	fi
+	if [ -z "$2" ] && [ ! -e /etc/telltale/telltale.toml ]; then
+		echo "telltale: write /etc/telltale/telltale.toml (start from telltale.toml.example) and the passphrase file, then: systemctl enable --now telltale"
+	fi
+fi
+exit 0

@@ -1,5 +1,7 @@
 {
-  "requires": {},
+  "requires": {
+    "native_exe": true
+  },
   "with_snapshot": {
     "must": [
       {

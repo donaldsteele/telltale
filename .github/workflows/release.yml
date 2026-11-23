@@ -1,0 +1,73 @@
+name: release
+
+# A tag vX.Y.Z publishes a GitHub release: the full and carry tarballs for
+# amd64 and arm64, the server .deb packages and SHA256SUMS, with the
+# CHANGELOG.md entry for the version as the release notes.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.26.x'
+          cache: true
+
+      # Before anything else: a release needs its notes.
+      - name: changelog entry
+        run: bash scripts/release-notes.sh "$GITHUB_REF_NAME" > /dev/null
+
+      - name: gofmt
+        run: bash scripts/gofmt-check.sh
+
+      - name: vet
+        run: |
+          go vet ./...
+          go vet -tags collector ./...
+
+      - name: test
+        run: |
+          go test ./...
+          go test -tags collector ./internal/cli/...
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Only this job may write: it creates the release.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.26.x'
+          cache: true
+
+      - name: release notes
+        run: bash scripts/release-notes.sh "$GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.md"
+
+      - name: build
+        run: RELEASE=1 VERSION="$GITHUB_REF_NAME" bash scripts/build.sh
+
+      # static-check on every binary, in dist/ and inside every tarball and
+      # package, and each one's architecture and flavour; SHA256SUMS.
+      - name: check the artifacts
+        run: REQUIRE_DEB=1 bash scripts/check-dist.sh
+
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "telltale $GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md" \
+            dist/telltale_*.tar.gz dist/telltale-carry_*.tar.gz dist/telltale_*.deb dist/SHA256SUMS

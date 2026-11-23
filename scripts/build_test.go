@@ -45,16 +45,28 @@ func write(t *testing.T, p, data string) {
 	}
 }
 
-const sumLine = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  telltale_0.1.0_linux_amd64.tar.gz\n"
+const (
+	sumLine = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  telltale_0.1.0_linux_amd64.tar.gz\n"
+	sumHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  "
+)
 
 // previousDist lays out what build.sh leaves behind.
 func previousDist(t *testing.T, d string) {
 	t.Helper()
-	write(t, filepath.Join(d, "SHA256SUMS"), sumLine+strings.Replace(sumLine, "amd64", "arm64", 1))
-	write(t, filepath.Join(d, "telltale_0.1.0_linux_amd64.tar.gz"), "x")
-	write(t, filepath.Join(d, "telltale_0.1.0_linux_arm64.tar.gz"), "x")
-	write(t, filepath.Join(d, "bin", "telltale-linux-amd64"), "x")
-	write(t, filepath.Join(d, "bin", "telltale-linux-arm64"), "x")
+	var sums strings.Builder
+	for _, name := range []string{
+		"telltale_0.1.0_linux_amd64.tar.gz", "telltale_0.1.0_linux_arm64.tar.gz",
+		"telltale-carry_0.1.0_linux_amd64.tar.gz", "telltale-carry_0.1.0_linux_arm64.tar.gz",
+		"telltale_0.1.0-1_amd64.deb", "telltale_0.0.0~ci-abc1234-1_arm64.deb",
+	} {
+		write(t, filepath.Join(d, name), "x")
+		sums.WriteString(sumHash + name + "\n")
+	}
+	write(t, filepath.Join(d, "SHA256SUMS"), sums.String())
+	for _, dir := range []string{"bin", "collector"} {
+		write(t, filepath.Join(d, dir, "telltale-linux-amd64"), "x")
+		write(t, filepath.Join(d, dir, "telltale-linux-arm64"), "x")
+	}
 }
 
 // build.sh never empties an output directory it did not write: one
@@ -88,6 +100,14 @@ func TestPrepareDist(t *testing.T) {
 		"a previous build's and someone's file": {func(t *testing.T, d string) {
 			previousDist(t, d)
 			write(t, filepath.Join(d, ".keep"), "")
+		}, false},
+		"another file in collector": {func(t *testing.T, d string) {
+			previousDist(t, d)
+			write(t, filepath.Join(d, "collector", "tool"), "x")
+		}, false},
+		"a package build.sh did not name": {func(t *testing.T, d string) {
+			previousDist(t, d)
+			write(t, filepath.Join(d, "other_1.0_amd64.deb"), "x")
 		}, false},
 		"another file in bin": {func(t *testing.T, d string) {
 			previousDist(t, d)
@@ -199,6 +219,33 @@ func TestPrepareDistLinkWithSlash(t *testing.T) {
 		}
 		if _, err := os.Stat(filepath.Join(other, "SHA256SUMS")); err != nil {
 			t.Errorf("%s: the link's target lost its files: %v", name, err)
+		}
+	}
+}
+
+// release-notes.sh prints a version's entry from the changelog, and fails
+// for a version the changelog does not have: a release needs its notes.
+func TestReleaseNotes(t *testing.T) {
+	needBash(t)
+	changelog := filepath.Join(t.TempDir(), "CHANGELOG.md")
+	write(t, changelog, "# Changelog\n\nIntro.\n\n## v0.2.0 (2026-12-01)\n\n- Two.\n\n## v0.1.0 (2026-11-23)\n\nFirst release.\n\n- One.\n")
+	notes := func(v string) (int, string, string) {
+		t.Helper()
+		var out bytes.Buffer
+		cmd := exec.Command("bash", "release-notes.sh", v, changelog)
+		cmd.Stdout = &out
+		code, stderr := exitCode(t, cmd)
+		return code, out.String(), stderr
+	}
+	if code, out, stderr := notes("v0.1.0"); code != 0 || out != "First release.\n\n- One.\n" {
+		t.Errorf("v0.1.0: exit %d, notes %q (%s)", code, out, stderr)
+	}
+	if code, out, stderr := notes("0.2.0"); code != 0 || out != "- Two.\n" {
+		t.Errorf("0.2.0: exit %d, notes %q (%s)", code, out, stderr)
+	}
+	for _, v := range []string{"v0.3.0", "v0.1", "v0.1.0.1", ""} {
+		if code, out, stderr := notes(v); code == 0 || out != "" || !strings.Contains(stderr, "CHANGELOG") {
+			t.Errorf("%q: exit %d, notes %q, stderr %q; want a failure", v, code, out, stderr)
 		}
 	}
 }

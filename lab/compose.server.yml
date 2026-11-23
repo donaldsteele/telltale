@@ -24,15 +24,16 @@ services:
   server:
     image: ${TELLTALE_LAB_SERVER_IMAGE:?the server base image}
     pull_policy: never
-    # The collector binaries from scripts/build.sh; the server runs the one
-    # for its own architecture. It runs as the user who started the test,
-    # so the package cache it shares with the host stays theirs.
+    # scripts/build.sh's output: the server runs the full binary for its own
+    # architecture from bin/ and copies the collectors from collector/ (its
+    # bin_dir), as the .deb lays them out. It runs as the user who started
+    # the test, so the package cache it shares with the host stays theirs.
     entrypoint: ["/opt/telltale/bin/telltale-linux-${TELLTALE_LAB_ARCH:-amd64}", "server", "--config", "/etc/telltale/telltale.toml"]
     user: "${TELLTALE_LAB_UID:?}:${TELLTALE_LAB_GID:?}"
     environment:
       TELLTALE_PASSPHRASE: ${TELLTALE_PASSPHRASE:?the store passphrase}
     volumes:
-      - ${TELLTALE_LAB_BIN_DIR:?scripts/build.sh output}:/opt/telltale/bin:ro
+      - ${TELLTALE_LAB_DIST_DIR:?scripts/build.sh output}:/opt/telltale:ro
       - ${TELLTALE_LAB_CONFIG:?the server configuration}:/etc/telltale/telltale.toml:ro
       - ${TELLTALE_LAB_PKGCACHE:?the package cache}:/var/lib/telltale/pkgcache
     tmpfs:

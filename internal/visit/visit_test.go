@@ -1138,24 +1138,6 @@ func TestVisitRefusesAnotherKeyType(t *testing.T) {
 	}
 }
 
-func TestTempDirPattern(t *testing.T) {
-	for s, want := range map[string]bool{
-		"/run/telltale.ABCDEFGH":       true,
-		"/var/tmp/telltale.a1b2c3d4":   true,
-		"/run/telltale.ABCDEFGH\n":     false,
-		"/run/telltale.ABCDEFGH\n/etc": false,
-		"/etc\n/run/telltale.ABCDEFGH": false,
-		"/run/telltale.ABCDEFGH\r":     false,
-		"/run/telltale.ABCDEFGHI":      false,
-		"/usr/telltale.ABCDEFGH":       false,
-		"/run/telltale.ABCD/FGH":       false,
-	} {
-		if got := tempDirRE.MatchString(s); got != want {
-			t.Errorf("tempDirRE.MatchString(%q) = %v, want %v", s, got, want)
-		}
-	}
-}
-
 // When everything but the removal worked, the collection is not lost: it
 // comes back inside the *LeftOnMachineError, for the server to keep.
 func TestVisitKeepsTheCollectionWhenCleanupFails(t *testing.T) {
@@ -1543,5 +1525,39 @@ func TestRemoveLeftoversRefuses(t *testing.T) {
 	}
 	if err := RemoveLeftovers(testCtx(t), f.machine(), f.client, nil); err != nil {
 		t.Errorf("nothing to remove: %v", err)
+	}
+}
+
+// Without a bin directory the collectors are looked for next to the
+// running executable, then in ../lib/telltale beside it, where the .deb
+// installs them (/usr/bin/telltale and /usr/lib/telltale/), and only then
+// is the running executable itself used for its own architecture.
+func TestBinariesForInstalledLayout(t *testing.T) {
+	root := t.TempDir()
+	exe := filepath.Join(root, "usr", "bin", "telltale")
+	lib := filepath.Join(root, "usr", "lib", "telltale")
+	for _, d := range []string{filepath.Dir(exe), lib} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range []string{exe, filepath.Join(lib, "telltale-linux-amd64"), filepath.Join(lib, "telltale-linux-arm64")} {
+		if err := os.WriteFile(p, []byte("x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set(t, &executable, func() (string, error) { return exe, nil })
+	for arch, goarch := range map[string]string{"x86_64": "amd64", "aarch64": "arm64"} {
+		if p, err := (Binaries{}).For(arch); err != nil || p != filepath.Join(lib, "telltale-linux-"+goarch) {
+			t.Errorf("For(%s) = %q, %v; want the collector in %s", arch, p, err, lib)
+		}
+	}
+	// One next to the executable comes first.
+	beside := filepath.Join(filepath.Dir(exe), "telltale-linux-arm64")
+	if err := os.WriteFile(beside, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := (Binaries{}).For("aarch64"); err != nil || p != beside {
+		t.Errorf("For(aarch64) = %q, %v; want %s", p, err, beside)
 	}
 }

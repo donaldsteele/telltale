@@ -10,14 +10,21 @@ import (
 )
 
 // Binaries finds the collector binary to copy to a machine. Nothing is
-// embedded: scripts/build.sh writes telltale-linux-amd64 and
-// telltale-linux-arm64 (to dist/bin), and the server finds them in Dir.
+// embedded: scripts/build.sh writes the collector build of telltale as
+// telltale-linux-amd64 and telltale-linux-arm64 (to dist/collector), the
+// .deb installs them in /usr/lib/telltale, and the server finds them in
+// Dir.
 type Binaries struct {
-	// Dir holds telltale-linux-<arch> (the server's --bin-dir). When it is
+	// Dir holds telltale-linux-<arch> (the server's bin_dir). When it is
 	// empty, the binaries are looked for next to the running executable,
-	// and the running executable itself serves its own architecture.
+	// then in ../lib/telltale beside it (/usr/lib/telltale for
+	// /usr/bin/telltale), and the running executable itself serves its own
+	// architecture.
 	Dir string
 }
+
+// executable is os.Executable, a variable for tests.
+var executable = os.Executable
 
 // goarchOf maps what uname -m prints to Go's architecture names.
 var goarchOf = map[string]string{"x86_64": "amd64", "aarch64": "arm64"}
@@ -37,21 +44,24 @@ func (b Binaries) For(arch string) (string, error) {
 		}
 		return p, nil
 	}
-	exe, err := os.Executable()
+	exe, err := executable()
 	if err == nil {
 		exe, err = filepath.EvalSymlinks(exe)
 	}
 	if err != nil {
 		return "", fmt.Errorf("find the running executable: %w", err)
 	}
-	p := filepath.Join(filepath.Dir(exe), name)
-	if usable(p) == nil {
-		return p, nil
+	dir := filepath.Dir(exe)
+	tried := []string{filepath.Join(dir, name), filepath.Join(filepath.Dir(dir), "lib", "telltale", name)}
+	for _, p := range tried {
+		if usable(p) == nil {
+			return p, nil
+		}
 	}
 	if runtime.GOOS == "linux" && runtime.GOARCH == goarch {
 		return exe, nil
 	}
-	return "", fmt.Errorf("no collector for %s: %s is missing and this server is %s/%s; build it with scripts/build.sh and give its directory as the bin directory", arch, p, runtime.GOOS, runtime.GOARCH)
+	return "", fmt.Errorf("no collector for %s: neither %s nor %s is there and this server is %s/%s; build them with scripts/build.sh and give their directory as bin_dir", arch, tried[0], tried[1], runtime.GOOS, runtime.GOARCH)
 }
 
 // usable checks that p is a regular, non-empty file.

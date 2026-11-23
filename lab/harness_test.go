@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -25,7 +26,11 @@ import (
 	"github.com/donaldsteele/telltale/lab/labkit"
 )
 
-var binPath string
+// binPath is the telltale the machines run: the collector build (what a
+// server copies to machines and carry mode uses) for the machines'
+// architecture, labkit.Arch. hostBinPath is the same build for the host,
+// which runs fetch-refs; it is binPath when the two architectures agree.
+var binPath, hostBinPath string
 
 // minParallel is the lowest -parallel the lab runs with; machineSlots is what
 // really bounds the load.
@@ -36,14 +41,23 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
+	build := func(out, goarch string) {
+		cmd := exec.Command("go", "build", "-tags", "collector", "-o", out, "./cmd/telltale")
+		cmd.Dir = ".."
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+goarch)
+		if b, err := cmd.CombinedOutput(); err != nil {
+			os.RemoveAll(dir)
+			println("build telltale for", goarch+":", err.Error(), string(b))
+			os.Exit(1)
+		}
+	}
 	binPath = filepath.Join(dir, "telltale")
-	cmd := exec.Command("go", "build", "-o", binPath, "./cmd/telltale")
-	cmd.Dir = ".."
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		os.RemoveAll(dir)
-		println("build telltale:", err.Error(), string(out))
-		os.Exit(1)
+	build(binPath, labkit.Arch)
+	hostBinPath = binPath
+	if labkit.Emulated() {
+		hostBinPath = filepath.Join(dir, "telltale-host")
+		build(hostBinPath, runtime.GOARCH)
+		fmt.Fprintf(os.Stderr, "lab: the machines are %s and run under emulation\n", labkit.Arch)
 	}
 	// The tests that go over the distros all have to be running at once for
 	// the gate to move on (see distroGate), and each also needs room for its
@@ -181,6 +195,11 @@ func onDistros(t *testing.T, only []string, fn func(t *testing.T, distro string)
 			}
 			t.Run(distro, func(t *testing.T) {
 				labkit.RequireFree(t)
+				if labkit.Arch != "amd64" && strings.HasPrefix(distro, "ubuntu") {
+					// Ubuntu keeps arm64 in another archive (ubuntu-ports), which
+					// the images do not point at.
+					t.Skipf("the lab builds %s for amd64 only", distro)
+				}
 				fn(t, distro)
 			})
 		}()
@@ -242,7 +261,7 @@ var standins = sync.OnceValues(func() (string, error) {
 		return "", err
 	}
 	standinsDir = dir
-	if _, err := run("cp", id+":/standins/amd64", filepath.Join(dir, "standins")); err != nil {
+	if _, err := run("cp", id+":/standins/"+labkit.Arch, filepath.Join(dir, "standins")); err != nil {
 		return "", err
 	}
 	return filepath.Join(dir, "standins"), nil
@@ -352,7 +371,7 @@ func refsWith(t *testing.T, m *labkit.Machine, snap string) (string, *model.Coll
 		errs, _ := m.Exec(t, "cat", errInside)
 		t.Fatalf("%s: telltale collect exit %d: %s", m.Name, code, errs)
 	}
-	dir, err := EnsureBundle(binPath, []byte(out), bundleTrust(t, m, snap))
+	dir, err := EnsureBundle(hostBinPath, []byte(out), bundleTrust(t, m, snap))
 	if err != nil {
 		t.Fatalf("%s: reference bundle: %v", m.Name, err)
 	}

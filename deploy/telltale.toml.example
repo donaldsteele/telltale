@@ -27,9 +27,12 @@ listen = "192.168.1.10:8443"
 #data_dir = "/var/lib/telltale"
 
 # bin_dir (optional): the directory holding telltale-linux-amd64 and
-# telltale-linux-arm64, the collectors copied to machines on each visit.
-# Default: next to the running telltale binary (the binary itself serves
-# machines of its own architecture).
+# telltale-linux-arm64, the collectors copied to machines on each visit
+# (the collector build of telltale, which scripts/build.sh writes to
+# dist/collector). Default: next to the running telltale binary, then
+# ../lib/telltale beside it, which is /usr/lib/telltale for the .deb's
+# /usr/bin/telltale; failing both, the running binary itself serves
+# machines of its own architecture.
 #bin_dir = "/usr/lib/telltale"
 
 # key_file (optional): an age key file that unlocks the database instead

@@ -30,9 +30,19 @@ The lab is careful with the Docker disk, which it usually shares:
 
 `TELLTALE_LAB_DISTROS=debian12,ubuntu2404` limits a run to some distros. `TELLTALE_LAB_REPORTS=DIR` keeps every report as JSON under `DIR/<distro>/`.
 
+## arm64
+
+`TELLTALE_LAB_ARCH=arm64` (default: the host's architecture) builds the images and runs the machines for arm64, with `docker --platform linux/arm64`. Image tags carry `arm64-` before the hash, so the two architectures never share one. On an amd64 host the machines run under QEMU user-mode emulation, which needs `binfmt_misc` handlers for arm64 (`sudo apt-get install qemu-user-static binfmt-support`, or `docker/setup-qemu-action` in CI). The binary the machines run is built for arm64 and a second one for the host, which runs `fetch-refs`; the lab repository's image and its `lab-vendor` packages are built for arm64 too, and the stand-ins come from `/standins/arm64`. The sink stays native.
+
+Under emulation the kernel reports the emulator (`/usr/bin/qemu-aarch64`) as every process's program, so breaks detected from `/proc/PID/exe` (manifest `requires.native_exe`: `devshm-process`, `deleted-exe-process`, `listener-port`, `new-service-package`) are skipped there with that reason; they run on native machines. Only the Debian images are built for arm64: Ubuntu keeps arm64 in `ubuntu-ports`, which the images do not use, so Ubuntu subtests are skipped. `TestServerEndToEnd` runs on the host's architecture only. CI runs `TestCleanMachinesAreClean` and `TestEveryBreakDetected` on Debian 12 arm64:
+
+```
+TELLTALE_LAB_ARCH=arm64 TELLTALE_LAB_DISTROS=debian12 go test -tags lab ./lab/ -run 'TestCleanMachinesAreClean|TestEveryBreakDetected'
+```
+
 ## The scan suite
 
-`scan_test.go` runs the real static binary inside the machines and compares every report with the manifests:
+`scan_test.go` runs the real static binary inside the machines (the collector build, `go build -tags collector`, which a server copies to machines and carry mode uses) and compares every report with the manifests:
 
 - `TestCleanMachinesAreClean`: every variant of every distro, nothing planted.
 - `TestEveryBreakDetected` and `TestScenarios`: each break and each scenario on each distro.
@@ -57,11 +67,11 @@ Hostnames default to `<distro>-<variant>`; set `Opts.Hostname` for the made-up n
 
 ## The server end-to-end test
 
-`TestServerEndToEnd` (`server_test.go`) runs `compose.server.yml` as Compose project `telltale-lab-e2e`: a real `telltale server`, a bubbles server, the clean Debian 12 machine and the Ubuntu 24.04 noexec machine (with `/run` and `/var/tmp` noexec too). The server runs the binaries `scripts/build.sh` writes (built into a temporary directory with `TELLTALE_DIST_DIR`), which are also its collectors. It has a fixed address on `telltale-lab`, its `server_addr`, and also joins `telltale-lab-egress` to fetch packages for verification; the machines and bubbles are on `telltale-lab` only. Its package cache is kept in `$TELLTALE_LAB_CACHE/server-pkgcache` between runs.
+`TestServerEndToEnd` (`server_test.go`) runs `compose.server.yml` as Compose project `telltale-lab-e2e`: a real `telltale server`, a bubbles server, the clean Debian 12 machine and the Ubuntu 24.04 noexec machine (with `/run` and `/var/tmp` noexec too). The server runs what `scripts/build.sh` writes (into a temporary directory with `TELLTALE_DIST_DIR`, without the .debs), laid out as the .deb lays it out: the full binary from `bin/` runs the server, and `collector/` is its `bin_dir`, the collectors it copies to the machines. It has a fixed address on `telltale-lab`, its `server_addr`, and also joins `telltale-lab-egress` to fetch packages for verification; the machines and bubbles are on `telltale-lab` only. Its package cache is kept in `$TELLTALE_LAB_CACHE/server-pkgcache` between runs.
 
 The owner's part goes through the web UI's real forms: the setup code the server prints, the admin password, the login, CSRF tokens and the confirmation pages. The test pairs with bubbles (the fingerprint telltale shows is compared with bubbles' Admin > Overview, and the request is approved through bubbles' admin API, signed in with the generated admin password bubbles prints), makes an MCP token, enrols both machines (the snippets the UI shows are added through `docker exec` as shown), presses Check now, takes both snapshots, plants `root-key` and `regress-root-login` on Debian 12, and checks the machine page, the critical alerts in bubbles (only the changed line of a file, and not the server's own key or Match block), `latest_report` through `telltale mcp` on the host, and that the root key's alert is resolved once the key is gone. After every visit nothing may be left on the machine, and on the noexec machine the collector must have run from `/root`.
 
-The bubbles image is `telltale-lab/bubbles:<version>`, the version `go.mod` requires. When it is missing it is built from bubbles' own `deploy/docker/Dockerfile` in a clean checkout of that tag: `TELLTALE_LAB_BUBBLES_SRC=DIR`, or `~/code/bubbles` (`git clone --branch v0.4.0 https://github.com/donaldsteele/bubbles DIR`). The test is skipped when `TELLTALE_LAB_DISTROS` leaves out debian12 or ubuntu2404.
+The bubbles image is `telltale-lab/bubbles:<version>`, the version `go.mod` requires. When it is missing it is built from bubbles' own `deploy/docker/Dockerfile` in a clean checkout of that tag: `TELLTALE_LAB_BUBBLES_SRC=DIR`, or `~/code/bubbles` (`git clone --branch v0.4.0 https://github.com/donaldsteele/bubbles DIR`). `bubbles.env` pins the version and the commit its tag points at: the test fails when the version is not the one `go.mod` requires, and builds only from a checkout at that commit; CI clones the tag and checks the commit the same way. The test is skipped when `TELLTALE_LAB_DISTROS` leaves out debian12 or ubuntu2404.
 
 ## Notes
 
@@ -70,6 +80,7 @@ The bubbles image is `telltale-lab/bubbles:<version>`, the version `go.mod` requ
 - `BuildOpts{Newer: true}` builds an image at the newer pinned snapshot, upgraded. The downgrade break runs on it and goes back to the older openssl .debs the build kept.
 - Machines get `CAP_SYS_PTRACE`, so that root in the container can see the programs of other accounts' processes, as root on a real machine can.
 - `Opts.ExecShm` (manifest `requires.exec_shm`) mounts `/dev/shm` without `noexec`. Docker's own `/dev/shm` is `noexec`; a real machine's is not.
+- Manifest `requires.native_exe`: the break is detected from which program a process runs; skipped under emulation (see arm64).
 - `Opts.Tmpfs` adds `docker run --tmpfs` mounts (`"dir:options"`), for example `/var/tmp:noexec`.
 - `Opts.Egress` puts a machine on `telltale-lab-egress`, the one lab network with a route out. The harness refuses to plant anything on such a machine.
 - The `thirdparty` image is built while a copy of the repository server runs on Docker's default network (builds happen there), reached as `telltale-lab-repo` through `docker build --add-host`. Its tag depends on the repository image's ID, because the image holds that build's public key. The two servers on the lab network are started once per run and removed with everything else at the end.
@@ -88,4 +99,4 @@ The bubbles image is `telltale-lab/bubbles:<version>`, the version `go.mod` requ
 
 ## Kernel checks in a VM
 
-`lab/vm/` boots a Debian 12 machine in QEMU (a pinned image, cached in `~/.cache/telltale-lab/vm/`), builds the inert `labmod` module in it and checks that telltale reports it, along with the kernel command line and the live firewall. It needs `qemu-system-x86` and `cloud-image-utils`, network access, and read and write access to `/dev/kvm` (else the test is skipped). Run it with `go test -tags 'lab vm' -timeout 30m ./lab/vm/`: the first run downloads the image and the VM installs packages. A VM left behind by a killed test ends itself after an hour.
+`lab/vm/` boots a Debian 12 machine in QEMU (a pinned image, cached in `~/.cache/telltale-lab/vm/`), builds the inert `labmod` module in it and checks that telltale reports it, along with the kernel command line and the live firewall. It needs `qemu-system-x86` and `cloud-image-utils`, network access, and read and write access to `/dev/kvm` (else the test is skipped). Run it with `go test -tags 'lab vm' -timeout 30m ./lab/vm/`: the first run downloads the image and the VM installs packages. A VM left behind by a killed test ends itself after an hour. CI does not run it (GitHub's hosted runners give no usable `/dev/kvm` without extra setup); run it by hand before a release.

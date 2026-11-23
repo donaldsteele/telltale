@@ -1,5 +1,7 @@
 {
-  "requires": {},
+  "requires": {
+    "native_exe": true
+  },
   "with_snapshot": {
     "comment": "The spec ranks a newly installed package that adds a listening service or an enabled unit as a backdoor sign; the listener itself, served by the package's own program, is a note.",
     "must": [

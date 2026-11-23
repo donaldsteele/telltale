@@ -52,6 +52,9 @@ func loadCases(t *testing.T, kind, parent string) []labCase {
 func machineFor(t *testing.T, distro string, c labCase) *labkit.Machine {
 	t.Helper()
 	req := c.man.Requires
+	if req.NativeExe && labkit.Emulated() {
+		t.Skipf("%s is detected from the program a process runs, and under emulation the kernel reports qemu as every process's program; it is checked on %s machines that are not emulated", c.id, labkit.Arch)
+	}
 	if len(req.Distros) > 0 && !slices.Contains(req.Distros, distro) {
 		t.Skipf("%s does not apply to %s", c.id, distro)
 	}

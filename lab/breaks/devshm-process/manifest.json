@@ -1,6 +1,7 @@
 {
   "requires": {
-    "exec_shm": true
+    "exec_shm": true,
+    "native_exe": true
   },
   "with_snapshot": {
     "must": [

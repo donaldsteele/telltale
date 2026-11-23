@@ -1,3 +1,5 @@
+//go:build !collector
+
 package cli
 
 import (

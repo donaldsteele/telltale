@@ -1,21 +1,25 @@
 # telltale server, run as its own unprivileged user.
 #
-# Before the first start:
-#   useradd --system --home-dir /var/lib/telltale --shell /usr/sbin/nologin telltale
+# Before the first start (the .deb package does the first two steps):
+#   useradd --system --user-group --home-dir /var/lib/telltale --no-create-home --shell /usr/sbin/nologin telltale
 #   install -d -m 0750 -o root -g telltale /etc/telltale
-#   install -m 0640 -o root -g telltale deploy/telltale.toml.example /etc/telltale/telltale.toml
+#   install -m 0640 -o root -g telltale /etc/telltale/telltale.toml.example /etc/telltale/telltale.toml
 #   (edit listen in /etc/telltale/telltale.toml)
 #   install -m 0600 -o root -g root /dev/null /etc/telltale/passphrase
 #   (write the database passphrase into /etc/telltale/passphrase)
+#   systemctl enable --now telltale
 #
 # systemd reads the passphrase file as root and hands it to the service as a
 # credential ($CREDENTIALS_DIRECTORY/passphrase), so the telltale user never
 # needs to read /etc/telltale/passphrase itself. With key_file set in the
-# configuration, remove the LoadCredential line. ProtectSystem=strict below
-# leaves only /var/lib/telltale writable, so a key file the server creates
-# on first use must be in it (key_file = "/var/lib/telltale/data.key", as in
-# the example). A key file anywhere else must exist before the first start,
-# owned by telltale and mode 0600.
+# configuration there is no passphrase: clear the credential with
+# "systemctl edit telltale" and these two lines:
+#   [Service]
+#   LoadCredential=
+# ProtectSystem=strict below leaves only /var/lib/telltale writable, so a
+# key file the server creates on first use must be in it (key_file =
+# "/var/lib/telltale/data.key", as in the example). A key file anywhere else
+# must exist before the first start, owned by telltale and mode 0600.
 #
 # The first start prints a one-time setup code: journalctl -u telltale
 

@@ -12,7 +12,7 @@ import (
 
 	"github.com/donaldsteele/telltale/internal/collect"
 	"github.com/donaldsteele/telltale/internal/model"
-	"github.com/donaldsteele/telltale/internal/visit"
+	"github.com/donaldsteele/telltale/internal/visitdir"
 )
 
 const (
@@ -95,9 +95,9 @@ func runCollect(ctx *Context) int {
 }
 
 // visitDir is the directory of the collector at exe when it is one a server
-// visit made for it (visit.IsTempDir: telltale.XXXXXXXX in /run, /var/tmp,
+// visit made for it (visitdir.Is: telltale.XXXXXXXX in /run, /var/tmp,
 // /root or /tmp).
 func visitDir(exe string) (string, bool) {
 	d := filepath.Dir(exe)
-	return d, visit.IsTempDir(d)
+	return d, visitdir.Is(d)
 }
