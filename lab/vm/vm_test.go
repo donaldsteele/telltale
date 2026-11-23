@@ -61,7 +61,7 @@ func (m *machine) sshArgs() []string {
 // ssh itself did not run it).
 func (m *machine) ssh(timeout time.Duration, command string) (string, string, int) {
 	m.t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), budget(m.t, timeout))
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "ssh", append(m.sshArgs(), "debian@127.0.0.1", command)...)
 	var out, errb bytes.Buffer
@@ -80,11 +80,13 @@ func (m *machine) ssh(timeout time.Duration, command string) (string, string, in
 
 func (m *machine) copyTo(local, remote string) {
 	m.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), budget(m.t, 2*time.Minute))
+	defer cancel()
 	args := []string{"-i", m.key, "-P", strconv.Itoa(m.port),
 		"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
 		"-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
 		local, "debian@127.0.0.1:" + remote}
-	if out, err := exec.Command("scp", args...).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(ctx, "scp", args...).CombinedOutput(); err != nil {
 		m.t.Fatalf("scp %s: %v\n%s", local, err, out)
 	}
 }
@@ -142,7 +144,7 @@ func teardown(runSh, dir string) {
 func budget(t *testing.T, want time.Duration) time.Duration {
 	t.Helper()
 	if dl, ok := t.Deadline(); ok {
-		if left := time.Until(dl) - 45*time.Second; left < want {
+		if left := time.Until(dl) - 2*time.Minute; left < want {
 			if left <= 0 {
 				t.Fatal("no time left before the test timeout (run with -timeout 30m)")
 			}
@@ -244,7 +246,9 @@ func boot(t *testing.T) *machine {
 func buildTelltale(t *testing.T, dir string) string {
 	t.Helper()
 	bin := filepath.Join(dir, "telltale")
-	cmd := exec.Command("go", "build", "-o", bin, "./cmd/telltale")
+	ctx, cancel := context.WithTimeout(context.Background(), budget(t, 5*time.Minute))
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "build", "-o", bin, "./cmd/telltale")
 	cmd.Dir = filepath.Join("..", "..")
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
 	if out, err := cmd.CombinedOutput(); err != nil {

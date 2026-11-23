@@ -97,9 +97,11 @@ up)
 		-pidfile "$work/qemu.pid" >/dev/null 2>"$work/qemu.err" </dev/null &
 	# QEMU fails at once when the forwarded port is taken; tell the caller
 	# (78) so that it can pick another one.
-	for _ in 1 2 3 4 5 6 7 8 9 10; do
+	for i in 1 2 3 4 5 6 7 8 9 10; do
 		sleep 0.5
 		pid=$(cat "$work/qemu.pid" 2>/dev/null || true)
+		# Alive for a second: the port was free.
+		if [ "$i" -ge 2 ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then break; fi
 		if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
 			sleep 0.5
 			if grep -qi 'host forwarding\|address already in use' "$work/qemu.err" 2>/dev/null; then
