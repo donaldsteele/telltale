@@ -143,7 +143,7 @@ func serve(ctx *Context, cfg *config.Config, st *store.Store) int {
 	bub := &alerts.Bubbles{Store: st, Log: logger, Context: runCtx}
 	core := &server.Core{
 		Store:      st,
-		Bins:       visit.Binaries{Dir: cfg.BinDir},
+		Bins:       visit.Binaries{Dir: cfg.BinDir, Log: logger},
 		CacheDir:   filepath.Join(cfg.DataDir, pkgCacheDir),
 		ServerAddr: cfg.ServerAddr,
 		Alerts:     bub,

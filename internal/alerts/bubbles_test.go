@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -221,6 +222,60 @@ func TestAlertReplacedLineShowsTheNewLine(t *testing.T) {
 	if !strings.Contains(n.Text, "Changed line in "+mdText("/etc/ssh/sshd_config.d/00-lab.conf:1")+":\n```\nPermitRootLogin yes\n```") || strings.Contains(n.Text, "PermitRootLogin no") ||
 		strings.Contains(n.Text, "other changed line") {
 		t.Errorf("text:\n%s", n.Text)
+	}
+}
+
+// The judge numbers removed lines in the old file and added lines in the new
+// one, so an earlier change that adds or removes lines moves the number the
+// replacement gets. Here a blank line 1 was deleted and then line 5
+// replaced: the new line is line 4 of the new file. The alert still shows
+// the planted line, not the harmless one it replaced.
+func TestAlertReplacementAfterAnEarlierChangeShowsTheNewLine(t *testing.T) {
+	const p = "/etc/ssh/sshd_config.d/00-lab.conf"
+	for name, evs := range map[string][]model.Evidence{
+		"a line removed before": {
+			{Path: p, Line: 1, Detail: "line removed"},
+			{Path: p, Line: 5, Before: "PermitRootLogin no", Detail: "line removed"},
+			{Path: p, Line: 4, After: "PermitRootLogin yes", Detail: "line added"},
+		},
+		"two lines added before": {
+			{Path: p, Line: 1, Detail: "line added"},
+			{Path: p, Line: 2, Detail: "line added"},
+			{Path: p, Line: 5, Before: "PermitRootLogin no", Detail: "line removed"},
+			{Path: p, Line: 7, After: "PermitRootLogin yes", Detail: "line added"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fx := newFixture(t)
+			fx.connect(t)
+			f := model.Finding{Key: "snap.persist:" + p, Severity: model.SevBackdoor, Title: "SSH server configuration changed",
+				Evidence: append([]model.Evidence{{Path: p, Line: 1, Before: sum("a"), After: sum("b"), Detail: "changed"}}, evs...)}
+			if err := fx.b.Notify(t.Context(), machine, []model.Finding{f}, nil); err != nil {
+				t.Fatal(err)
+			}
+			n := fx.fake.Posts()[0]
+			if !strings.Contains(n.Text, "Changed line in "+mdText(p+":"+strconv.Itoa(evs[len(evs)-1].Line))+":\n```\nPermitRootLogin yes\n```") ||
+				strings.Contains(n.Text, "PermitRootLogin no") || strings.Contains(n.Text, "Removed line") {
+				t.Errorf("text:\n%s", n.Text)
+			}
+		})
+	}
+	// An added block that does not start where the removed one would be
+	// now is not its replacement: the removed line is shown.
+	fx := newFixture(t)
+	fx.connect(t)
+	f := model.Finding{Key: "snap.persist:" + p, Severity: model.SevBackdoor, Title: "SSH server configuration changed",
+		Evidence: []model.Evidence{
+			{Path: p, Line: 1, Before: sum("a"), After: sum("b"), Detail: "changed"},
+			{Path: p, Line: 1, Detail: "line removed"},
+			{Path: p, Line: 5, Before: "PermitRootLogin no", Detail: "line removed"},
+			{Path: p, Line: 5, After: "# unrelated", Detail: "line added"},
+		}}
+	if err := fx.b.Notify(t.Context(), machine, []model.Finding{f}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if n := fx.fake.Posts()[0]; !strings.Contains(n.Text, "Removed line in "+mdText(p+":5")+":\n```\nPermitRootLogin no\n```") {
+		t.Errorf("not a replacement, text:\n%s", n.Text)
 	}
 }
 

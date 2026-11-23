@@ -1,13 +1,25 @@
 #!/bin/sh
 # telltale server package: the service account and the configuration
-# directory. The service is not enabled or started: it needs a configuration
-# and a passphrase first (see /lib/systemd/system/telltale.service).
+# directory. On a first install the service is not enabled or started: it
+# needs a configuration and a passphrase first (see
+# /lib/systemd/system/telltale.service). On an upgrade a running service is
+# restarted, so it runs the new binary.
 set -e
+
+add_account() {
+	useradd --system "$@" --home-dir /var/lib/telltale --no-create-home \
+		--shell /usr/sbin/nologin --comment "telltale server" telltale
+}
 
 if [ "$1" = configure ]; then
 	if ! getent passwd telltale >/dev/null; then
-		useradd --system --user-group --home-dir /var/lib/telltale --no-create-home \
-			--shell /usr/sbin/nologin --comment "telltale server" telltale
+		# A telltale group left from an earlier install (the account was
+		# removed by hand, the group not) becomes the account's group.
+		if getent group telltale >/dev/null; then
+			add_account --gid telltale
+		else
+			add_account --user-group
+		fi
 	fi
 	# The configuration directory is readable by the service, not by others.
 	if ! dpkg-statoverride --list /etc/telltale >/dev/null 2>&1; then
@@ -15,6 +27,10 @@ if [ "$1" = configure ]; then
 	fi
 	if [ -d /run/systemd/system ]; then
 		systemctl daemon-reload >/dev/null 2>&1 || true
+		if [ -n "$2" ]; then
+			# An upgrade: restart the service if it is running.
+			systemctl try-restart telltale.service || true
+		fi
 	fi
 	if [ -z "$2" ] && [ ! -e /etc/telltale/telltale.toml ]; then
 		echo "telltale: write /etc/telltale/telltale.toml (start from telltale.toml.example) and the passphrase file, then: systemctl enable --now telltale"

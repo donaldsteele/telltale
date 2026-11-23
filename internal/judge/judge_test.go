@@ -675,6 +675,42 @@ func TestJudgeNoSnapshotComparedAgainstText(t *testing.T) {
 	}
 }
 
+// With a snapshot, package verification looks only at the package files that
+// changed since it. When none did it has nothing to check and reads no
+// source; that is not a gap and the report must not say it is.
+func TestJudgeNoRefLimitOnlyWhenFilesWentUnchecked(t *testing.T) {
+	noRef := func(r *model.Report) bool {
+		return slices.ContainsFunc(r.CouldNotRuleOut, func(s string) bool { return strings.Contains(s, "no package reference could be used") })
+	}
+	nothing := func() *pkgverify.Result { return &pkgverify.Result{Mode: pkgverify.ModeRefs} }
+
+	r := run(clean(), snapOf(clean()), nothing())
+	if noRef(r) {
+		t.Errorf("no package file changed, yet the report says no package reference could be used: %q", r.CouldNotRuleOut)
+	}
+	if PackagesIncomplete(r) {
+		t.Errorf("no package file changed, yet package verification is reported incomplete: %q", r.CouldNotRuleOut)
+	}
+
+	// A changed package file that no reference could be used for is a gap.
+	snap := snapOf(clean())
+	cur := clean()
+	cur.Files[1] = file("/usr/bin/ls", "ls 9.1 rebuilt", 0o755)
+	if r := run(cur, snap, nothing()); !noRef(r) {
+		t.Errorf("a changed package file went unchecked and the gap is not stated: %q", r.CouldNotRuleOut)
+	}
+	down := &pkgverify.Result{Mode: pkgverify.ModeArchive, Errors: []string{"fetch https://deb.debian.org/debian/dists/bookworm/InRelease: no route to host"},
+		Unverifiable: []pkgverify.FileVerdict{{Path: "/usr/bin/ls", Package: "coreutils", Version: "9.1-1", Reason: "no route to host", Kind: pkgverify.KindUnreachable}}}
+	if r := run(cur, snapOf(clean()), down); !noRef(r) {
+		t.Errorf("the archive could not be reached for a changed package file and the gap is not stated: %q", r.CouldNotRuleOut)
+	}
+	// Without a snapshot every package file is in scope, so reading no
+	// source at all is a gap.
+	if r := run(clean(), nil, nothing()); !noRef(r) {
+		t.Errorf("no snapshot and no source used, and the gap is not stated: %q", r.CouldNotRuleOut)
+	}
+}
+
 func itoa(n int) string {
 	b, _ := json.Marshal(n)
 	return string(b)

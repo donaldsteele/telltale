@@ -172,7 +172,11 @@ func (j *judge) packages() {
 		j.compared = append(j.compared, OfflineReference)
 		j.couldNot = append(j.couldNot, offlineLimit)
 	case !j.pkgUsed():
-		j.couldNot = append(j.couldNot, noRefLimit)
+		// No reference is claimed either way; it is a gap only when there
+		// were files to check.
+		if j.pkgNeeded() {
+			j.couldNot = append(j.couldNot, noRefLimit)
+		}
 	case r.Mode == pkgverify.ModeRefs:
 		j.compared = append(j.compared, "reference bundle")
 	default:
@@ -220,6 +224,16 @@ func PackagesIncomplete(r *model.Report) bool {
 func (j *judge) pkgUsed() bool {
 	r := j.in.Pkg
 	return len(r.SourcesUsed) > 0 || len(r.Verified) > 0 || len(r.Mismatch) > 0 || len(r.Suspicious) > 0
+}
+
+// pkgNeeded reports whether package verification had files to check: it
+// ran into a problem or left a file unverified, there is no usable snapshot
+// (then every package file is in scope), or a package file changed since
+// the snapshot. With a snapshot under which no package file changed it has
+// nothing to look at, so reading no source is no gap.
+func (j *judge) pkgNeeded() bool {
+	r := j.in.Pkg
+	return len(r.Errors) > 0 || len(r.Unverifiable) > 0 || j.old == nil || j.ownedChanged
 }
 
 func distroPackages(osID string) string {

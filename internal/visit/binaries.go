@@ -2,6 +2,7 @@ package visit
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -21,6 +22,17 @@ type Binaries struct {
 	// /usr/bin/telltale), and the running executable itself serves its own
 	// architecture.
 	Dir string
+	// Log is the server log, which hears when the running executable
+	// stands in for a missing collector; nil means the standard logger.
+	Log *log.Logger
+}
+
+func (b Binaries) logf(format string, args ...any) {
+	if b.Log != nil {
+		b.Log.Printf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
 }
 
 // executable is os.Executable, a variable for tests.
@@ -59,6 +71,7 @@ func (b Binaries) For(arch string) (string, error) {
 		}
 	}
 	if runtime.GOOS == "linux" && runtime.GOARCH == goarch {
+		b.logf("telltale server: warning: no collector for %s (neither %s nor %s is there); copying this server's full binary to the machine instead, which works but is larger and has the server in it. Install the collectors (the .deb has them) or set bin_dir.", arch, tried[0], tried[1])
 		return exe, nil
 	}
 	return "", fmt.Errorf("no collector for %s: neither %s nor %s is there and this server is %s/%s; build them with scripts/build.sh and give their directory as bin_dir", arch, tried[0], tried[1], runtime.GOOS, runtime.GOARCH)

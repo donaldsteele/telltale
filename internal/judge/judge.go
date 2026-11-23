@@ -127,7 +127,10 @@ type judge struct {
 	// indexes could not be used, so nothing about the package was checked.
 	unreachable   map[string]pkgverify.FileVerdict
 	extraInstalls []diff.Change // a second architecture of a package that also changed
-	foldedMax     map[*model.Finding]model.Severity
+	// ownedChanged is set when a package-owned file or a maintainer script
+	// changed since the snapshot: what package verification checks then.
+	ownedChanged bool
+	foldedMax    map[*model.Finding]model.Severity
 }
 
 func newJudge(in Input, c *model.Collection) *judge {
@@ -240,6 +243,7 @@ func JudgeRebase(in Input) (*model.Report, *Rebase) {
 	if j.old != nil {
 		chs = diff.Compare(in.Snapshot, c, checks)
 		j.index(chs)
+		j.ownedChanged = len(changedOwnedIn(chs, in.Snapshot, c)) > 0
 	}
 	j.packages()
 	j.packageDirLinks()

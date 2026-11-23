@@ -413,8 +413,9 @@ const (
 // of the evidence it marks "line added" or "line removed". The one
 // exception is a replaced line, a removed line with lines added in its
 // place (after the rest of its block of removed lines, see replacement):
-// then the added one is shown, the line the machine has now. Taking the first change in order means a harmless second change (a
-// comment added further down) cannot stand in for the one that matters. A
+// then the added one is shown, the line the machine has now. Taking the
+// first change in order means a harmless second change (a comment added
+// further down) cannot stand in for the one that matters. A
 // snapshot finding about a persistence file starts with a summary of the
 // file (its After is the file's hash, its Line the first changed line),
 // which is never shown as a line. Then a line a check matched in a file (a
@@ -471,10 +472,14 @@ func alertEvidence(f model.Finding) (e model.Evidence, kind, others int, ok bool
 // change: lines[at]. The judge lists a replaced block as every removed line
 // and then every added one (removed lines 2 and 3, then added lines 2 and
 // 3), numbering removed lines in the old file and added lines in the new
-// one. So the removed line was replaced when its block of removed lines,
-// one after another in the same file, is followed by a block of lines added
-// in that file from the same line number on. The line shown is the first
-// added line that is not blank.
+// one. Earlier changes in the file move that numbering: each line added
+// before the block puts its replacement one line further down in the new
+// file, each line removed one line further up. So the removed line was
+// replaced when its block of removed lines, one after another in the same
+// file, is followed by a block of lines added in that file from the line
+// where the block now is on. The line shown is the first added line that
+// is not blank. The judge keeps a finding's evidence in order and drops
+// only the last, so every earlier change is in lines.
 func replacement(lines []model.Evidence, at int) (model.Evidence, bool) {
 	if at < 0 || lines[at].Detail != "line removed" {
 		return model.Evidence{}, false
@@ -487,11 +492,22 @@ func replacement(lines []model.Evidence, at int) (model.Evidence, bool) {
 	for start > 0 && next(start) {
 		start--
 	}
+	shift := 0 // how far earlier changes in the file move the block
+	for _, e := range lines[:start] {
+		if e.Path != lines[start].Path {
+			continue
+		}
+		if e.Detail == "line added" {
+			shift++
+		} else {
+			shift--
+		}
+	}
 	i := at + 1
 	for i < len(lines) && next(i) {
 		i++
 	}
-	if i == len(lines) || lines[i].Detail != "line added" || lines[i].Path != lines[start].Path || lines[i].Line != lines[start].Line {
+	if i == len(lines) || lines[i].Detail != "line added" || lines[i].Path != lines[start].Path || lines[i].Line != lines[start].Line+shift {
 		return model.Evidence{}, false
 	}
 	for ; i < len(lines); i++ {

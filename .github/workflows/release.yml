@@ -47,11 +47,15 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The job that holds a token able to write keeps it out of the
+      # checkout, and builds without a cache another run could have filled.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: '1.26.x'
-          cache: true
+          cache: false
 
       - name: release notes
         run: bash scripts/release-notes.sh "$GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.md"

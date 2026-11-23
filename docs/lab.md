@@ -2,8 +2,12 @@
 
 telltale is developed against a lab of Docker machines that is part of the
 repository (`lab/`): clean machines, and machines with backdoors planted on
-them, each with a written list of what telltale must report. CI runs it on
-every push. This page is the overview; `lab/README.md` is the reference.
+them, each with a written list of what telltale must report. On every push
+CI runs the whole Docker lab on Debian 12 and Ubuntu 24.04 on amd64, and the
+clean machines and every break on Debian 12 on arm64 under emulation. The
+other distributions are run by hand, and so is the QEMU virtual machine test
+of the kernel checks, which CI does not run. This page is the overview;
+`lab/README.md` is the reference.
 
 ## The machines
 

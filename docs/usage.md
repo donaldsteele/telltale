@@ -147,7 +147,10 @@ Could not rule out: kernel-level rootkits (any on-machine check can be fooled)
 The header names the machine, what the scan compared against, and what it
 could not rule out: always kernel rootkits, and anything else that limited
 this scan (no root, no snapshot, a container sharing its host's kernel, no
-usable package reference).
+usable package reference). `checklist (43 items)` counts the checklist items
+that apply to this machine: the checklist has 44, and an item that could not
+be judged here is listed under the skipped checks at the end of the report
+instead.
 
 Then come the findings, most serious first, newest evidence first within a
 severity:

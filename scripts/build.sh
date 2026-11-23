@@ -164,8 +164,10 @@ if [ "$debs" = 1 ]; then
   mkdir -p "$stage/out"
   # The container has no network, runs as the calling user and is removed
   # afterwards; --root-owner-group makes every file root's in the package.
+  # Its label is its own, not the lab's: the lab's reaper removes every
+  # telltale-lab container and must never stop a package build.
   # shellcheck disable=SC2086 # ARCHES is a list
-  docker run --rm --network none --label telltale-lab=1 \
+  docker run --rm --network none --label telltale-build=1 \
     --user "$(id -u):$(id -g)" -v "$stage:/work" -w /work "$DEB_IMAGE" \
     sh -euc 'v=$1; shift; for a in "$@"; do dpkg-deb --root-owner-group -Zxz --build "deb-$a" "out/telltale_${v}_$a.deb"; done' \
     sh "$DEBVERSION" $ARCHES >/dev/null

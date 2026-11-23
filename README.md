@@ -15,7 +15,8 @@ tampering.
 It assumes the machine may be lying. It is one static binary that loads none
 of the machine's libraries, reads `/proc`, `/sys` and the filesystem itself
 instead of trusting `ps`, `ss` or `ls`, never trusts the package database's
-checksums or the machine's keyrings, and keeps the snapshot off the machine.
+checksums or the machine's current keyrings, and keeps the snapshot off the
+machine.
 It reports and never fixes: every finding comes with why it matters, the
 evidence (which file, which line, before and after) and the exact command
 that would fix it, for a person to read and run.
@@ -67,11 +68,15 @@ That is a real report, from a clean Debian 12 machine in the [test lab](#the-tes
 on which four breaks were then planted: a changed `/usr/bin/id`, a root SSH key, a
 cron job that calls out, and root login turned back on. It is shortened here; each
 finding in full has its evidence, why it matters and the fix, as the first one
-shows. The machine is a container, so its kernel belongs to its host.
+shows. The machine is a container, so its kernel belongs to its host. The
+header's `checklist (43 items)` counts the items that apply to this machine:
+the checklist has 44, and an item that could not be judged here is listed
+under the skipped checks at the end of the report instead.
 
 ## Two ways to run it
 
-The same binary does both.
+The full build does both. The carry download (the collector build) only
+carries: it cannot run the server.
 
 - **Carry it.** Copy telltale to a machine, run it, read the report. Nothing
   is installed. The snapshot is a file you keep somewhere else (encrypted
@@ -228,10 +233,13 @@ model, package verification and which changes count as routine.
   boot files, each a backdoor sign), and after a snapshot every ESM upgrade
   that changes files is a backdoor sign for you to review.
 - **Third-party repositories need a key telltale trusts.** A repository is
-  verified only with a key bound to it: one the snapshot recorded, a
-  built-in key of a well-known vendor (Google Chrome, Microsoft, Docker,
-  GitHub CLI, Grafana and others), or one you add (`--keys`, or the server's
-  settings). Without one, an upgrade from that repository cannot be
+  verified only with a key telltale has for it: one the snapshot recorded
+  for that repository, a built-in key of a well-known vendor (Google Chrome,
+  Microsoft, Docker, GitHub CLI, Grafana and others) for that vendor's
+  addresses, a key you add in the server's settings for the addresses you
+  give it, or a key you pass with `--keys`, which is tried for every
+  third-party repository rather than bound to one. Never the machine's
+  current keyrings. Without one, an upgrade from that repository cannot be
   confirmed, and after a snapshot it is reported as a backdoor sign.
   Repositories that need a login are fetched without it, so they count as
   having no key.

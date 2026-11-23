@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net"
 	"os"
 	"path"
@@ -1559,5 +1560,42 @@ func TestBinariesForInstalledLayout(t *testing.T) {
 	}
 	if p, err := (Binaries{}).For("aarch64"); err != nil || p != beside {
 		t.Errorf("For(aarch64) = %q, %v; want %s", p, err, beside)
+	}
+}
+
+// With no collector found, the server copies its own, full binary to a
+// machine of its architecture. That works, but it is the server build
+// (larger, and with the server in it) on every machine, so the server log
+// says so, with where the collector was looked for.
+func TestBinariesForWarnsWhenItFallsBackToTheFullBinary(t *testing.T) {
+	own := map[string]string{"amd64": "x86_64", "arm64": "aarch64"}[runtime.GOARCH]
+	if own == "" || runtime.GOOS != "linux" {
+		t.Skipf("no collector architecture for %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	exe := filepath.Join(t.TempDir(), "bin", "telltale")
+	if err := os.MkdirAll(filepath.Dir(exe), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	set(t, &executable, func() (string, error) { return exe, nil })
+	var buf bytes.Buffer
+	b := Binaries{Log: log.New(&buf, "", 0)}
+	if p, err := b.For(own); err != nil || p != exe {
+		t.Fatalf("For(%s) = %q, %v; want the running executable %q", own, p, err, exe)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "warning") || !strings.Contains(logged, "full binary") ||
+		!strings.Contains(logged, filepath.Join(filepath.Dir(exe), "telltale-linux-"+runtime.GOARCH)) {
+		t.Errorf("the fallback to the full binary is not logged as a warning with where the collector was looked for: %q", logged)
+	}
+	// A collector that is there is used without a word.
+	buf.Reset()
+	if err := os.WriteFile(filepath.Join(filepath.Dir(exe), "telltale-linux-"+runtime.GOARCH), []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.For(own); err != nil || buf.Len() != 0 {
+		t.Errorf("For(%s) with a collector: %v, logged %q", own, err, buf.String())
 	}
 }

@@ -52,9 +52,13 @@ It installs:
 
 It creates the `telltale` system account and makes `/etc/telltale` readable
 by it, and starts nothing: the server needs a configuration and a
-passphrase first. Removing the package stops and disables the service;
-purging it keeps the data directory and the account, because the database
-holds your snapshots.
+passphrase first. Upgrading the package restarts the service if it is
+running. Removing the package stops and disables the service; purging it
+keeps the data directory and the account, because the database holds your
+snapshots. Purging also leaves `/etc/telltale/telltale.toml` and the
+passphrase file, which you wrote and the package does not own. The
+passphrase file is a secret (it decrypts the database): delete it yourself
+when you no longer need it.
 
 Without the package, the full tarball's binary works the same way: put the
 collectors from the carry tarballs (renamed to `telltale-linux-amd64` and
@@ -179,7 +183,9 @@ Match Address 192.168.1.10
     PermitRootLogin prohibit-password
 ```
 
-- The global `PermitRootLogin no` stays as it is.
+- Set the global setting to `no` (TT-SSH-001): `PermitRootLogin no`.
+  Debian and Ubuntu ship `prohibit-password`, which lets root log in with
+  any key from anywhere.
 - `from="..."` makes the key work only from the server's address, even if
   the key leaked.
 - The `Match Address` block lets root log in **with a key only**, and only

@@ -44,6 +44,11 @@ const dpkgInfo = "/var/lib/dpkg/info/"
 // snapshot says what the machine looked like before: the package-owned paths
 // that changed, plus every changed or added dpkg maintainer script.
 func changedOwnedPaths(snap *model.Snapshot, cur *model.Collection) map[string]bool {
+	return changedOwnedIn(diff.Compare(snap, cur, nil), snap, cur)
+}
+
+// changedOwnedIn is changedOwnedPaths for changes already compared.
+func changedOwnedIn(chs []diff.Change, snap *model.Snapshot, cur *model.Collection) map[string]bool {
 	owned := map[string]bool{}
 	for _, col := range []*model.Collection{cur, snap.Collection} {
 		if col == nil {
@@ -59,7 +64,7 @@ func changedOwnedPaths(snap *model.Snapshot, cur *model.Collection) map[string]b
 		}
 	}
 	only := map[string]bool{}
-	for _, ch := range diff.Compare(snap, cur, nil) {
+	for _, ch := range chs {
 		switch ch.Kind {
 		case diff.FileModified, diff.FileAdded, diff.FileRemoved, diff.PersistChanged:
 			if owned[ch.Subject] {
