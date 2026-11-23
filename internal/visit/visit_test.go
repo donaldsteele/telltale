@@ -692,22 +692,18 @@ func TestVisitCleansUpAfterFailure(t *testing.T) {
 			}
 			f := newFake(t)
 			f.collect = tc.collect
-			ctx := testCtx(t)
+			ctx := context.Background()
 			if tc.timeout > 0 {
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithTimeout(ctx, tc.timeout)
 				defer cancel()
 			}
-			start := time.Now()
-			c, err := Visit(ctx, f.machine(), f.client, testContext(), f.binaries(t))
+			c, err := quickVisit(t, ctx, f)
 			if err == nil {
 				t.Fatalf("Visit succeeded: %+v", c)
 			}
 			if c != nil {
 				t.Error("a collection came back with an error")
-			}
-			if time.Since(start) > 20*time.Second {
-				t.Errorf("Visit took %v", time.Since(start))
 			}
 			for _, w := range tc.want {
 				if !strings.Contains(err.Error(), w) {
@@ -1334,6 +1330,23 @@ func within(t *testing.T, limit time.Duration, fn func()) {
 	case <-time.After(limit + 10*time.Second):
 		t.Fatalf("still running after %v", limit+10*time.Second)
 	}
+}
+
+// quickVisit runs Visit on f for a visit that should end at once: within a
+// short deadline, with short limits on the clean-up and on logging in again,
+// and failing the test in seconds if it does not end at all.
+func quickVisit(t *testing.T, ctx context.Context, f *fakeMachine) (*model.Collection, error) {
+	t.Helper()
+	set(t, &cleanupTimeout, 2*time.Second)
+	set(t, &dialTimeout, 2*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var c *model.Collection
+	var err error
+	within(t, 10*time.Second, func() {
+		c, err = Visit(ctx, f.machine(), f.client, testContext(), f.binaries(t))
+	})
+	return c, err
 }
 
 // When mktemp itself runs out of time it may have made its directory.

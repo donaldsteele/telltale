@@ -103,7 +103,7 @@ func TestVisitMarksACollectorThatMisbehaves(t *testing.T) {
 			set(t, &maxEntries, caps)
 			f := newFake(t)
 			f.collect = tc.collect
-			_, err := Visit(testCtx(t), f.machine(), f.client, testContext(), f.binaries(t))
+			_, err := quickVisit(t, context.Background(), f)
 			if err == nil || errors.Is(err, ErrCollectorFailed) != tc.want {
 				t.Errorf("err = %v; ErrCollectorFailed = %v, want %v", err, errors.Is(err, ErrCollectorFailed), tc.want)
 			}
