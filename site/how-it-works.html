@@ -51,7 +51,7 @@
 <li><strong>The snapshot never lives on the machine.</strong> You keep it somewhere else, encrypted with a passphrase, or the server keeps it, encrypted at rest. It is never written to the machine's disk.</li>
 <li><strong>Keys are built in.</strong> The Debian and Ubuntu archive keys are built into telltale. The machine's current keyrings and its package database's checksums are never proof of anything; the one exception is <code>scan --offline</code>, which says so at the top of the report.</li>
 <li><strong>The machine's clock is not trusted either.</strong> Signature dates are checked against the newest date the archive itself signed.</li>
-<li><strong>No secrets are kept.</strong> Password hashes become a keyed digest, private key files are recorded by hash, permissions and owner only, and secrets in startup files are replaced by keyed digests before anything is stored or reported.</li>
+<li><strong>Password hashes and private keys are never kept; other secrets are redacted by pattern.</strong> Password hashes become a keyed digest, and private key files are recorded by hash, permissions and owner only. Secrets in startup files are replaced by keyed digests before anything is stored or reported, where they match a known pattern: <code>Environment=</code> and <code>export</code> values, <code>password=</code>, <code>token:</code> and similar keys (also quoted, as in JSON and YAML), the password in a URL, <code>Authorization:</code> headers, <code>curl -u</code>, <code>--password</code> options, <code>sshpass -p</code> and <code>mysql -p</code>. A secret in an unusual format may slip through.</li>
 </ul>
 </section>
 

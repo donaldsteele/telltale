@@ -62,12 +62,29 @@ built around that.
   "valid until" dates of the archive's signed indexes are checked against
   the newest date the archive itself signed, not against the machine's
   clock, which root can set. A clock far off is reported as a note.
-- **No secrets are kept.** Password hashes are reduced to a keyed digest
-  (so a changed password still shows as a change), private key files are
-  recorded by hash, permissions and owner only, and in the text telltale
-  keeps from startup files, secrets (`Environment=` values, exported
-  tokens, `password=...`, the password in a URL) are replaced by keyed
-  digests. Reports and alerts carry only redacted lines.
+- **Password hashes and private keys are never kept; other secrets are
+  redacted by pattern.** Password hashes are reduced to a keyed digest (so
+  a changed password still shows as a change), and private key files are
+  recorded by hash, permissions and owner only. In the text telltale keeps
+  from startup files, secrets are found by their shape and replaced by
+  keyed digests before anything is stored, reported or sent in an alert.
+  The shapes it knows:
+  - systemd `Environment=` values and shell `export NAME=value`;
+  - `key=value` and `key: value` where the key holds `password`,
+    `passwd`, `secret`, `token`, `key` or `credential`, with the key bare
+    or quoted as in JSON and YAML (`"password": "..."`);
+  - the user and password in a URL;
+  - `Authorization:` header values;
+  - `curl -u user:password` and `--user user:password`;
+  - `--password ...`, `--token ...` and similar options;
+  - `sshpass -p ...`, and `-p<password>` for the MySQL and MariaDB
+    clients.
+
+  This is pattern matching, not understanding: a secret written in an
+  unusual format (a bare positional argument, a home-made option name, a
+  secret split across lines) is not recognised and is kept as text. If
+  your startup files hold such secrets, treat snapshots, reports and
+  alerts as holding them too.
 - **A user's link cannot aim the scan at root's files.** The scan runs as
   root and reads startup files that ordinary users own (shell start-up
   files, systemd user units). Where one of those is a symbolic link, the

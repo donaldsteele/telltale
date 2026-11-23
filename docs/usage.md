@@ -99,11 +99,13 @@ installing it, or after you have reviewed a scan without a snapshot.
 - It needs root: without root it would miss files and processes, and every
   later root scan would show them as changes. `--allow-non-root` takes an
   incomplete snapshot anyway.
-- It never holds secrets: password hashes are reduced to a keyed digest (so a
-  password change still shows), private keys are recorded by hash,
-  permissions and owner only, and secrets in the text it keeps (tokens in
-  shell start-up files, passwords in units and cron lines) are replaced by
-  keyed digests.
+- It never holds password hashes or private keys: password hashes are
+  reduced to a keyed digest (so a password change still shows), and private
+  keys are recorded by hash, permissions and owner only. Other secrets in
+  the text it keeps (tokens in shell start-up files, passwords in units and
+  cron lines) are replaced by keyed digests where they match a known
+  pattern; a secret in an unusual format may slip through. The patterns are
+  listed in [how-it-works.md](how-it-works.md).
 - An existing file is not overwritten without `--force`.
 
 ## accept
