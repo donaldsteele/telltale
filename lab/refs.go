@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -125,6 +126,27 @@ func EnsureBundle(bin string, collectionJSON []byte, trust BundleTrust) (string,
 // proxy: the distributions' archives.
 const directHosts = ".debian.org,.ubuntu.com,.launchpad.net,.canonical.com"
 
+// staleBuildDirs lists the build directories in root that an earlier build
+// of this bundle left: ".building-<key>-" followed by the digits
+// os.MkdirTemp adds, and nothing else. A glob on ".building-<key>-*" would
+// also match the build directory of a bundle whose key extends this one
+// (the same packages with "-t<trust>"), which may be building right now.
+func staleBuildDirs(root, key string) []string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	prefix := ".building-" + key + "-"
+	var out []string
+	for _, e := range entries {
+		rest, ok := strings.CutPrefix(e.Name(), prefix)
+		if ok && rest != "" && strings.Trim(rest, "0123456789") == "" {
+			out = append(out, filepath.Join(root, e.Name()))
+		}
+	}
+	return out
+}
+
 func buildBundle(bin, key string, collectionJSON []byte, trust BundleTrust) error {
 	dst := filepath.Join(RefsRoot(), key)
 	if _, err := os.Stat(filepath.Join(dst, "bundle.json")); err == nil {
@@ -137,10 +159,8 @@ func buildBundle(bin, key string, collectionJSON []byte, trust BundleTrust) erro
 	if err := os.RemoveAll(dst); err != nil {
 		return err
 	}
-	if stale, err := filepath.Glob(filepath.Join(RefsRoot(), ".building-"+key+"-*")); err == nil {
-		for _, d := range stale {
-			_ = os.RemoveAll(d)
-		}
+	for _, d := range staleBuildDirs(RefsRoot(), key) {
+		_ = os.RemoveAll(d)
 	}
 	fetchSlots <- struct{}{}
 	defer func() { <-fetchSlots }()
